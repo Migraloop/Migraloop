@@ -33,8 +33,8 @@ A user-defined, high-expressiveness transformation (Mongo aggregation–like) th
 _Avoid_: Thin mapping, light transform, ETL job (too generic)
 
 **Derived Dataset**:
-The platform-managed output produced by a Rich Transform; a dataset the platform materializes and maintains, not a verbatim copy of a single source table.
-_Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored)
+The platform-managed output produced by a Rich Transform; a dataset the platform materializes and maintains, not a verbatim copy of a single source table. When Base Datasets change, the platform must update the Derived Dataset **incrementally by Output Identity** (recompute/repair only affected identities, then Delivery upsert/delete). Full recompute of an entire Derived Dataset is not an acceptable steady-state approach. Incremental maintenance must be **correct**—semantically equivalent to re-evaluating the Rich Transform for those identities—not a best-effort approximation.
+_Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored), periodic full-table recompute as the normal path
 
 **Pipeline**:
 A user-defined flow inside a Deployment that produces one target table/collection. A Deployment has many Pipelines; a Pipeline does not define the Source/Target System pair—that is the Deployment. Every Pipeline is in one of two modes: Direct or Transform.
