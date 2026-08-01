@@ -37,8 +37,16 @@ The platform-managed output produced by a Rich Transform; a dataset the platform
 _Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored)
 
 **Pipeline**:
-A user-defined flow inside a Deployment that produces one target table/collection. Examples: source table A → target table A (direct); source tables A+B → target table B (via Rich Transform). A Deployment has many Pipelines; a Pipeline does not define the Source/Target System pair—that is the Deployment.
+A user-defined flow inside a Deployment that produces one target table/collection. A Deployment has many Pipelines; a Pipeline does not define the Source/Target System pair—that is the Deployment. Every Pipeline is in one of two modes: Direct or Transform.
 _Avoid_: The whole system config, Deployment, single global job
+
+**Direct Pipeline**:
+A Pipeline with no Rich Transform: one Base Dataset is Delivered to the Target Binding. For Oracle → MongoDB, the default shape is one source row → one document with flattened fields; the source primary key maps to the document identity (`_id` or a configured id field). There is no useful alternate default without a transform.
+_Avoid_: Mirror mode (implies zero field mapping/config), raw dump
+
+**Transform Pipeline**:
+A Pipeline that runs a Rich Transform over one or more Base Datasets, materializes a Derived Dataset, and Delivers that to the Target Binding.
+_Avoid_: ETL job (too generic), thin mapping-only pipeline
 
 **Target Binding**:
 The part of a Pipeline that maps its output dataset (Base or Derived) to a specific table/collection in the Target System. It declares Managed Columns/fields; the target table/collection may have additional fields outside the binding.
