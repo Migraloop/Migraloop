@@ -37,8 +37,12 @@ The first materialization of needed Base Datasets (and then Derived Datasets / D
 _Avoid_: Zero-impact backfill, unbounded full-table slam, assuming a separate replica connection is required for correctness, gap-tolerant cutover, relying on later repair as the primary cutover strategy, reloading unrelated Base Datasets when adding one table
 
 **Incremental Capture**:
-Ongoing change capture into Base Datasets after Initial Load, driving Affect Analysis, Derived updates, and Delivery. Capture mechanisms are pluggable per Source System kind (and may offer more than one mechanism per kind). For Oracle, v1 ships **LogMiner** first; other Oracle mechanisms may be added later without changing Sync/Pipeline/Delivery concepts.
-_Avoid_: Initial Load (different phase), hard-wiring the domain to a single vendor capture product
+Ongoing change capture into Base Datasets after Initial Load, driving Affect Analysis, Derived updates, and Delivery. Capture mechanisms are pluggable per Source System kind (and may offer more than one mechanism per kind). For Oracle, v1 ships **LogMiner** first; other Oracle mechanisms may be added later without changing Sync/Pipeline/Delivery concepts. Engine-specific **Source Prerequisites** (e.g. Oracle supplemental logging, adequate redo retention) are documented and checked before run; unmet prerequisites fail fast with a clear error (see ADR-0021).
+_Avoid_: Initial Load (different phase), hard-wiring the domain to a single vendor capture product, discovering missing Oracle logging only after silent data loss
+
+**Source Prerequisites**:
+Per-engine requirements the Source System must satisfy for Sync to be correct (see ADR-0021). The platform documents them and validates at startup/apply time; it does not assume operators already know, and v1 does not auto-mutate Source settings to “fix” them.
+_Avoid_: Undocumented tribal knowledge, auto-altering customer Oracle config by default
 
 **Base Dataset**:
 A platform-managed copy of a source table or collection, kept aligned by Sync, close to the source shape. It is the unit Rich Transforms and direct Pipelines may read; it is not the user's source or target database. Within a Deployment, each source table/collection has at most one Base Dataset, shared by every Pipeline that needs it—never captured or stored once per Pipeline. Which **tables** are synced is determined by Pipeline references—not whole-schema mirror (see ADR-0019). Once a table is included, the Base Dataset keeps the **full row** of Supported Source Types for that table, even if current Pipelines use only some fields—so later Pipelines can reuse the same Base without column backfill. When a new Pipeline needs a table with no Base Dataset yet, run **table-level Initial Load for that table only**; existing Bases stay on Incremental Capture and are not reloaded.
