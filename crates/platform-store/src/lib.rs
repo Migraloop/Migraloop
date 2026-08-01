@@ -122,6 +122,10 @@ pub struct BaseDataset {
     pub columns: Vec<BaseColumn>,
     pub omitted_columns: Vec<OmittedColumn>,
     pub row_count: i32,
+    /// Count of Incremental Capture changes applied into this Base Dataset.
+    pub sync_applied_changes: i32,
+    /// Operator-visible Sync Health for this Base: unknown | ok.
+    pub sync_health: String,
 }
 
 /// One row stored in a Base Dataset (supported columns only).
@@ -327,14 +331,17 @@ pub async fn replace_base_dataset(
         r#"
         INSERT INTO base_datasets (
             deployment_name, source_table, source_schema, status,
-            primary_key_json, columns_json, omitted_columns_json, row_count, loaded_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+            primary_key_json, columns_json, omitted_columns_json, row_count,
+            sync_applied_changes, sync_health, loaded_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
         ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
             status = EXCLUDED.status,
             primary_key_json = EXCLUDED.primary_key_json,
             columns_json = EXCLUDED.columns_json,
             omitted_columns_json = EXCLUDED.omitted_columns_json,
             row_count = EXCLUDED.row_count,
+            sync_applied_changes = EXCLUDED.sync_applied_changes,
+            sync_health = EXCLUDED.sync_health,
             loaded_at = now()
         "#,
     )
@@ -346,6 +353,8 @@ pub async fn replace_base_dataset(
     .bind(&columns_json)
     .bind(&omitted_json)
     .bind(dataset.row_count)
+    .bind(dataset.sync_applied_changes)
+    .bind(&dataset.sync_health)
     .execute(&mut *tx)
     .await
     .map_err(PlatformStoreError::Persist)?;
@@ -454,7 +463,8 @@ pub async fn list_base_datasets(
         r#"
         SELECT
             deployment_name, source_table, source_schema, status,
-            primary_key_json, columns_json, omitted_columns_json, row_count
+            primary_key_json, columns_json, omitted_columns_json, row_count,
+            sync_applied_changes, sync_health
         FROM base_datasets
         ORDER BY deployment_name, source_schema, source_table
         "#,
@@ -482,7 +492,8 @@ pub async fn get_base_rows(
             r#"
             SELECT
                 deployment_name, source_table, source_schema, status,
-                primary_key_json, columns_json, omitted_columns_json, row_count
+                primary_key_json, columns_json, omitted_columns_json, row_count,
+                sync_applied_changes, sync_health
             FROM base_datasets
             WHERE source_table = $1 AND deployment_name = $2
             ORDER BY source_schema
@@ -498,7 +509,8 @@ pub async fn get_base_rows(
             r#"
             SELECT
                 deployment_name, source_table, source_schema, status,
-                primary_key_json, columns_json, omitted_columns_json, row_count
+                primary_key_json, columns_json, omitted_columns_json, row_count,
+                sync_applied_changes, sync_health
             FROM base_datasets
             WHERE source_table = $1
             ORDER BY deployment_name, source_schema
@@ -636,6 +648,8 @@ struct BaseDatasetRow {
     columns_json: String,
     omitted_columns_json: String,
     row_count: i32,
+    sync_applied_changes: i32,
+    sync_health: String,
 }
 
 /// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
@@ -765,6 +779,8 @@ impl BaseDatasetRow {
             omitted_columns: serde_json::from_str(&self.omitted_columns_json)
                 .map_err(PlatformStoreError::InvalidJson)?,
             row_count: self.row_count,
+            sync_applied_changes: self.sync_applied_changes,
+            sync_health: self.sync_health,
         })
     }
 }

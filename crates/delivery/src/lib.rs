@@ -108,6 +108,31 @@ pub async fn upsert_managed_documents(
     Ok(delivered)
 }
 
+/// Delete entire Target documents for the given Output Identities.
+///
+/// When an Output Identity disappears from the platform dataset, Delivery removes
+/// the whole Mongo document (ADR-0002). Missing identities are a no-op.
+pub async fn delete_documents_by_identity(
+    target: &MongoTargetConnection,
+    collection_name: &str,
+    identities: &[Value],
+) -> Result<usize, DeliveryError> {
+    let coll = collection(target, collection_name).await?;
+    let mut deleted = 0usize;
+
+    for identity_value in identities {
+        let identity = json_to_bson(identity_value)?;
+        let filter = doc! { "_id": identity };
+        let result = coll
+            .delete_one(filter)
+            .await
+            .map_err(|err| DeliveryError::Apply(err.to_string()))?;
+        deleted += result.deleted_count as usize;
+    }
+
+    Ok(deleted)
+}
+
 /// Read Target documents for operator-facing inspection (CLI seam).
 pub async fn list_target_documents(
     target: &MongoTargetConnection,

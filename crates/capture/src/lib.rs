@@ -16,6 +16,27 @@ pub enum CaptureError {
     UnknownTable(String),
 }
 
+/// Kind of Incremental Capture change from the Source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeOp {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// One Incremental Capture change for a Source table row (by Output Identity / PK).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeEvent {
+    pub table: String,
+    pub op: ChangeOp,
+    /// Primary-key columns locating the row (Direct Pipeline Output Identity).
+    pub identity: BTreeMap<String, serde_json::Value>,
+    /// Full source row for insert/update (may include unsupported columns to omit).
+    /// `None` for delete.
+    pub row: Option<BTreeMap<String, serde_json::Value>>,
+}
+
 /// Column metadata discovered from the Source schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceColumn {
@@ -125,4 +146,51 @@ fn json_str(value: &str) -> serde_json::Value {
 
 fn json_num(value: i64) -> serde_json::Value {
     serde_json::Value::Number(value.into())
+}
+
+/// Emit stub Incremental Capture changes for a table after Initial Load.
+///
+/// Happy-path fixture for Direct Pipeline: update, insert, and delete against
+/// CUSTOMERS. Does not model no-gap cutover or resumable checkpoints.
+pub fn incremental_changes_stub(table: &str) -> Result<Vec<ChangeEvent>, CaptureError> {
+    match table {
+        "CUSTOMERS" => Ok(customers_incremental_fixture()),
+        "ORDERS" => Ok(Vec::new()),
+        other => Err(CaptureError::UnknownTable(other.to_string())),
+    }
+}
+
+fn customers_incremental_fixture() -> Vec<ChangeEvent> {
+    vec![
+        ChangeEvent {
+            table: "CUSTOMERS".to_string(),
+            op: ChangeOp::Update,
+            identity: row(&[("ID", json_num(1))]),
+            row: Some(row(&[
+                ("ID", json_num(1)),
+                ("NAME", json_str("Alicia")),
+                ("EMAIL", json_str("alicia@example.com")),
+                ("ACTIVE", json_num(1)),
+                ("BIO", json_str("blob-bytes-alicia")),
+            ])),
+        },
+        ChangeEvent {
+            table: "CUSTOMERS".to_string(),
+            op: ChangeOp::Insert,
+            identity: row(&[("ID", json_num(3))]),
+            row: Some(row(&[
+                ("ID", json_num(3)),
+                ("NAME", json_str("Carol")),
+                ("EMAIL", json_str("carol@example.com")),
+                ("ACTIVE", json_num(1)),
+                ("BIO", json_str("blob-bytes-carol")),
+            ])),
+        },
+        ChangeEvent {
+            table: "CUSTOMERS".to_string(),
+            op: ChangeOp::Delete,
+            identity: row(&[("ID", json_num(2))]),
+            row: None,
+        },
+    ]
 }
