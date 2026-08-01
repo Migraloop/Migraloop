@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use migraloop_capture::initial_load_stub;
 use migraloop_platform_store::{
-    get_base_rows, health, list_base_datasets, list_deployments, list_pipelines, migrate,
-    replace_base_dataset, replace_pipelines, upsert_deployment, BaseColumn, BaseDataset,
-    Deployment, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind,
-    SystemConnection,
+    base_dataset_exists, delete_base_datasets_not_in, get_base_rows, health, list_base_datasets,
+    list_deployments, list_pipelines, migrate, replace_base_dataset, replace_pipelines,
+    upsert_deployment, BaseColumn, BaseDataset, Deployment, OmittedColumn, Pipeline,
+    PlatformStoreHealth, SecretRef, SecretRefKind, SystemConnection,
 };
 use thiserror::Error;
 
@@ -61,6 +61,9 @@ pub enum Command {
         /// Source table name of the Base Dataset
         #[arg(long)]
         table: String,
+        /// Deployment name when multiple Bases share a table name
+        #[arg(long)]
+        deployment: Option<String>,
     },
     /// Run the app: migrate on startup, then keep the process alive
     Run {
@@ -171,7 +174,7 @@ async fn ensure_store_healthy(platform_store_url: &str) -> Result<(), CliError> 
     }
 }
 
-async fn initial_load_referenced_tables(
+async fn sync_base_datasets_for_pipelines(
     platform_store_url: &str,
     deployment_name: &str,
     pipelines: &[Pipeline],
@@ -183,8 +186,22 @@ async fn initial_load_referenced_tables(
             pipeline.source_table.clone(),
         ));
     }
+    let keep: Vec<(String, String)> = tables.iter().cloned().collect();
+
+    // Capture scope follows Pipeline references: drop Bases for tables no longer referenced.
+    delete_base_datasets_not_in(platform_store_url, deployment_name, &keep)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
 
     for (schema, table) in tables {
+        let already = base_dataset_exists(platform_store_url, deployment_name, &schema, &table)
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+        if already {
+            // Existing Bases stay; do not reload on Pipeline re-apply (ADR-0019).
+            continue;
+        }
+
         let snapshot = initial_load_stub(&table).map_err(|err| CliError::Failed(err.to_string()))?;
 
         let columns: Vec<BaseColumn> = snapshot
@@ -203,11 +220,17 @@ async fn initial_load_referenced_tables(
                 oracle_type: c.oracle_type.clone(),
             })
             .collect();
+        let supported_names: BTreeSet<String> =
+            columns.iter().map(|c| c.name.clone()).collect();
 
         let rows: Vec<serde_json::Map<String, serde_json::Value>> = snapshot
             .rows
             .into_iter()
-            .map(|row| row.into_iter().collect())
+            .map(|row| {
+                row.into_iter()
+                    .filter(|(name, _)| supported_names.contains(name))
+                    .collect()
+            })
             .collect();
 
         let dataset = BaseDataset {
@@ -247,9 +270,7 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
-    if !pipelines.is_empty() {
-        initial_load_referenced_tables(platform_store_url, &deployment.name, &pipelines).await?;
-    }
+    sync_base_datasets_for_pipelines(platform_store_url, &deployment.name, &pipelines).await?;
 
     println!("Deployment applied: {}", deployment.name);
     Ok(())
@@ -340,10 +361,14 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn print_base(platform_store_url: &str, table: &str) -> Result<(), CliError> {
+async fn print_base(
+    platform_store_url: &str,
+    table: &str,
+    deployment: Option<&str>,
+) -> Result<(), CliError> {
     ensure_store_healthy(platform_store_url).await?;
 
-    let (dataset, rows) = get_base_rows(platform_store_url, table)
+    let (dataset, rows) = get_base_rows(platform_store_url, table, deployment)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
@@ -387,7 +412,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Base {
             platform_store_url,
             table,
-        } => print_base(&platform_store_url, &table).await,
+            deployment,
+        } => print_base(&platform_store_url, &table, deployment.as_deref()).await,
         Command::Run { platform_store_url } => {
             apply_migrations(&platform_store_url).await?;
             println!("migraloop is running");

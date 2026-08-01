@@ -214,6 +214,57 @@ async fn base_contains_full_supported_type_rows_not_projected_subset() {
         );
     }
     assert!(found_row, "expected at least one Base row JSON object, got:\n{stdout}");
+    assert!(
+        !stdout.to_lowercase().contains("blob-bytes"),
+        "unsupported BIO payload must be omitted from Base rows, got:\n{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn reapply_does_not_reload_existing_base_dataset() {
+    let url = ephemeral_database_url().await;
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &deployment_with_direct_pipeline("CUSTOMERS"),
+    );
+
+    migrate_and_apply(&url, &config);
+
+    let reapply = Command::new(bin())
+        .env("ORACLE_PASSWORD", "oracle-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .args([
+            "apply",
+            "--platform-store-url",
+            &url,
+            "--file",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .expect("re-apply");
+    assert!(
+        reapply.status.success(),
+        "re-apply failed: {}",
+        String::from_utf8_lossy(&reapply.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&reapply.stdout);
+    assert!(
+        !stdout.contains("Initial Load complete"),
+        "existing Base must not be reloaded on re-apply, got:\n{stdout}"
+    );
+
+    let status = Command::new(bin())
+        .args(["status", "--platform-store-url", &url])
+        .output()
+        .expect("status");
+    let status_out = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_out.contains("Base Dataset: CUSTOMERS")
+            && status_out.contains("initial_load_complete"),
+        "Base Dataset should remain after re-apply, got:\n{status_out}"
+    );
 }
 
 #[tokio::test]

@@ -425,31 +425,64 @@ pub async fn list_base_datasets(
 }
 
 /// Load Base Dataset rows for a Source table (operator-facing inspect).
+///
+/// When `deployment_name` is `None`, exactly one matching Base Dataset must exist.
 pub async fn get_base_rows(
     database_url: &str,
     table: &str,
+    deployment_name: Option<&str>,
 ) -> Result<(BaseDataset, Vec<BaseRow>), PlatformStoreError> {
     let pool = connect(database_url).await?;
-    let dataset_row = sqlx::query_as::<_, BaseDatasetRow>(
-        r#"
-        SELECT
-            deployment_name, source_table, source_schema, status,
-            columns_json, omitted_columns_json, row_count
-        FROM base_datasets
-        WHERE source_table = $1
-        ORDER BY deployment_name
-        LIMIT 1
-        "#,
-    )
-    .bind(table)
-    .fetch_optional(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
+    let dataset_rows = if let Some(deployment_name) = deployment_name {
+        sqlx::query_as::<_, BaseDatasetRow>(
+            r#"
+            SELECT
+                deployment_name, source_table, source_schema, status,
+                columns_json, omitted_columns_json, row_count
+            FROM base_datasets
+            WHERE source_table = $1 AND deployment_name = $2
+            ORDER BY source_schema
+            "#,
+        )
+        .bind(table)
+        .bind(deployment_name)
+        .fetch_all(&pool)
+        .await
+        .map_err(PlatformStoreError::Load)?
+    } else {
+        sqlx::query_as::<_, BaseDatasetRow>(
+            r#"
+            SELECT
+                deployment_name, source_table, source_schema, status,
+                columns_json, omitted_columns_json, row_count
+            FROM base_datasets
+            WHERE source_table = $1
+            ORDER BY deployment_name, source_schema
+            "#,
+        )
+        .bind(table)
+        .fetch_all(&pool)
+        .await
+        .map_err(PlatformStoreError::Load)?
+    };
 
-    let Some(dataset_row) = dataset_row else {
-        return Err(PlatformStoreError::NotFound(format!(
-            "no Base Dataset found for table {table}"
-        )));
+    let dataset_row = match dataset_rows.as_slice() {
+        [] => {
+            return Err(PlatformStoreError::NotFound(format!(
+                "no Base Dataset found for table {table}"
+            )));
+        }
+        [only] => only.clone(),
+        many => {
+            return Err(PlatformStoreError::NotFound(format!(
+                "multiple Base Datasets found for table {table} across Deployments {}; \
+                 pass --deployment to disambiguate",
+                many.iter()
+                    .map(|row| row.deployment_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
     };
     let dataset = dataset_row.into_base_dataset()?;
 
@@ -545,7 +578,7 @@ impl PipelineRow {
     }
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct BaseDatasetRow {
     deployment_name: String,
     source_table: String,
@@ -554,6 +587,85 @@ struct BaseDatasetRow {
     columns_json: String,
     omitted_columns_json: String,
     row_count: i32,
+}
+
+/// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
+pub async fn delete_base_datasets_not_in(
+    database_url: &str,
+    deployment_name: &str,
+    keep_tables: &[(String, String)],
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let existing = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT source_schema, source_table
+        FROM base_datasets
+        WHERE deployment_name = $1
+        "#,
+    )
+    .bind(deployment_name)
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    for (schema, table) in existing {
+        let keep = keep_tables
+            .iter()
+            .any(|(s, t)| s == &schema && t == &table);
+        if keep {
+            continue;
+        }
+        sqlx::query(
+            r#"
+            DELETE FROM base_rows
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(&schema)
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        sqlx::query(
+            r#"
+            DELETE FROM base_datasets
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(&schema)
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    }
+    Ok(())
+}
+
+/// Whether a Base Dataset already exists for the given Deployment table.
+pub async fn base_dataset_exists(
+    database_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<bool, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let found = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT 1
+        FROM base_datasets
+        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+        LIMIT 1
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .fetch_optional(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+    Ok(found.is_some())
 }
 
 impl BaseDatasetRow {

@@ -64,18 +64,21 @@ fn customers_fixture() -> InitialLoadSnapshot {
             col("ACTIVE", "NUMBER", true),
             col("BIO", "BLOB", false),
         ],
+        // Include unsupported BIO values so Initial Load must actively omit them.
         rows: vec![
             row(&[
                 ("ID", json_num(1)),
                 ("NAME", json_str("Alice")),
                 ("EMAIL", json_str("alice@example.com")),
                 ("ACTIVE", json_num(1)),
+                ("BIO", json_str("blob-bytes-alice")),
             ]),
             row(&[
                 ("ID", json_num(2)),
                 ("NAME", json_str("Bob")),
                 ("EMAIL", json_str("bob@example.com")),
                 ("ACTIVE", json_num(0)),
+                ("BIO", json_str("blob-bytes-bob")),
             ]),
         ],
     }
