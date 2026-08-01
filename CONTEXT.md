@@ -2,10 +2,20 @@
 
 An open-source platform for continuous database-to-database synchronization, with first-class rich transforms that shape multi-table data into derived outputs. Transform compute runs against platform-managed data, not the user's source or target databases. The platform owns applying changes to user-configured target tables.
 
+The product goal is **many source engines × many target engines**. The domain model and boundaries must stay engine-agnostic so new sources/targets plug in without reshaping Sync, Rich Transform, Delivery, or checks. The first shipping pair is **Oracle → MongoDB**; that pair is a vertical slice, not the ceiling.
+
 ## Language
 
+**Source System**:
+A user database instance the platform captures from (e.g. an Oracle database). Identified by engine kind plus connection identity. The platform must support multiple engine kinds over time.
+_Avoid_: Source DB (fine colloquially; prefer Source System when distinguishing from Target System)
+
+**Target System**:
+A user database instance the platform delivers into (e.g. a MongoDB deployment). Identified by engine kind plus connection identity. The platform must support multiple engine kinds over time.
+_Avoid_: Destination database
+
 **Sync**:
-Continuous one-way capture of changes from a source database into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the user's target table has been updated—that is Delivery. Reverse flow is not a product feature; users who need the opposite direction deploy a separate pipeline with source and target swapped.
+Continuous one-way capture of changes from a Source System into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the Target System has been updated—that is Delivery. Reverse flow is not a product feature; users who need the opposite direction deploy a separate pipeline with source and target swapped. Capture mechanics are engine-specific; the Sync concept is not.
 _Avoid_: Replication (unless referring to the underlying mechanism), mirror-only (implies zero transform capability), bidirectional sync, active-active
 
 **Base Dataset**:
