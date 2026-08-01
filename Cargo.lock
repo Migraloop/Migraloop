@@ -736,12 +736,18 @@ dependencies = [
 [[package]]
 name = "migraloop-capture"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "migraloop-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "migraloop-capture",
  "migraloop-platform-store",
  "serde",
  "serde_json",
@@ -759,6 +765,7 @@ name = "migraloop-platform-store"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",

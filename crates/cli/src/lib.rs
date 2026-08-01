@@ -2,16 +2,20 @@
 
 mod config;
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use migraloop_capture::initial_load_stub;
 use migraloop_platform_store::{
-    health, list_deployments, migrate, upsert_deployment, Deployment, PlatformStoreHealth,
-    SecretRef, SecretRefKind, SystemConnection,
+    get_base_rows, health, list_base_datasets, list_deployments, list_pipelines, migrate,
+    replace_base_dataset, replace_pipelines, upsert_deployment, BaseColumn, BaseDataset,
+    Deployment, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind,
+    SystemConnection,
 };
 use thiserror::Error;
 
-use crate::config::{load_deployment_config, DeploymentDocument, ResolvedSecretRef};
+use crate::config::{load_deployment_config, DeploymentDocument, PipelineSpec, ResolvedSecretRef};
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -43,11 +47,20 @@ pub enum Command {
         #[arg(long, short = 'f')]
         file: PathBuf,
     },
-    /// Report Platform Store reachability, health, and applied Deployments
+    /// Report Platform Store reachability, health, Deployments, Pipelines, and Base Datasets
     Status {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
+    },
+    /// Inspect Base Dataset rows for a Source table (operator-facing Platform Store check)
+    Base {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Source table name of the Base Dataset
+        #[arg(long)]
+        table: String,
     },
     /// Run the app: migrate on startup, then keep the process alive
     Run {
@@ -69,7 +82,7 @@ async fn apply_migrations(platform_store_url: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn document_to_deployment(doc: DeploymentDocument) -> Result<Deployment, CliError> {
+fn document_to_deployment(doc: &DeploymentDocument) -> Result<Deployment, CliError> {
     // Resolve to validate references exist; never persist resolved secret values.
     let _ = doc.spec.source.password.resolve("source.password")?;
     let _ = doc.spec.target.password.resolve("target.password")?;
@@ -79,24 +92,46 @@ fn document_to_deployment(doc: DeploymentDocument) -> Result<Deployment, CliErro
         secret_ref_from_resolved(doc.spec.target.password.resolved_ref("target.password")?);
 
     Ok(Deployment {
-        name: doc.metadata.name,
+        name: doc.metadata.name.clone(),
         source: SystemConnection {
-            kind: doc.spec.source.kind,
-            host: doc.spec.source.host,
+            kind: doc.spec.source.kind.clone(),
+            host: doc.spec.source.host.clone(),
             port: doc.spec.source.port,
-            database: doc.spec.source.database,
-            username: doc.spec.source.username,
+            database: doc.spec.source.database.clone(),
+            username: doc.spec.source.username.clone(),
             password_ref: source_password_ref,
         },
         target: SystemConnection {
-            kind: doc.spec.target.kind,
-            host: doc.spec.target.host,
+            kind: doc.spec.target.kind.clone(),
+            host: doc.spec.target.host.clone(),
             port: doc.spec.target.port,
-            database: doc.spec.target.database,
-            username: doc.spec.target.username,
+            database: doc.spec.target.database.clone(),
+            username: doc.spec.target.username.clone(),
             password_ref: target_password_ref,
         },
     })
+}
+
+fn pipelines_from_document(doc: &DeploymentDocument) -> Vec<Pipeline> {
+    doc.spec
+        .pipelines
+        .iter()
+        .map(|pipeline| pipeline_from_spec(&doc.metadata.name, pipeline))
+        .collect()
+}
+
+fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipeline {
+    Pipeline {
+        deployment_name: deployment_name.to_string(),
+        name: pipeline.name.clone(),
+        mode: pipeline.mode.clone(),
+        source_table: pipeline.source.table.clone(),
+        source_schema: pipeline
+            .source
+            .schema
+            .clone()
+            .unwrap_or_default(),
+    }
 }
 
 fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
@@ -124,26 +159,98 @@ fn format_system_line(label: &str, system: &SystemConnection) -> String {
     )
 }
 
-async fn apply_deployment(platform_store_url: &str, file: &PathBuf) -> Result<(), CliError> {
+async fn ensure_store_healthy(platform_store_url: &str) -> Result<(), CliError> {
     match health(platform_store_url).await {
-        PlatformStoreHealth::Healthy { .. } => {}
-        PlatformStoreHealth::Unhealthy { reason } => {
-            return Err(CliError::Failed(format!(
-                "Platform Store is not healthy; run `migraloop migrate` first: {reason}"
-            )));
-        }
-        PlatformStoreHealth::Unreachable { reason } => {
-            return Err(CliError::Failed(format!(
-                "Platform Store is unreachable: {reason}"
-            )));
-        }
+        PlatformStoreHealth::Healthy { .. } => Ok(()),
+        PlatformStoreHealth::Unhealthy { reason } => Err(CliError::Failed(format!(
+            "Platform Store is not healthy; run `migraloop migrate` first: {reason}"
+        ))),
+        PlatformStoreHealth::Unreachable { reason } => Err(CliError::Failed(format!(
+            "Platform Store is unreachable: {reason}"
+        ))),
+    }
+}
+
+async fn initial_load_referenced_tables(
+    platform_store_url: &str,
+    deployment_name: &str,
+    pipelines: &[Pipeline],
+) -> Result<(), CliError> {
+    let mut tables = BTreeSet::new();
+    for pipeline in pipelines {
+        tables.insert((
+            pipeline.source_schema.clone(),
+            pipeline.source_table.clone(),
+        ));
     }
 
+    for (schema, table) in tables {
+        let snapshot = initial_load_stub(&table).map_err(|err| CliError::Failed(err.to_string()))?;
+
+        let columns: Vec<BaseColumn> = snapshot
+            .supported_columns()
+            .into_iter()
+            .map(|c| BaseColumn {
+                name: c.name.clone(),
+                oracle_type: c.oracle_type.clone(),
+            })
+            .collect();
+        let omitted_columns: Vec<OmittedColumn> = snapshot
+            .omitted_columns()
+            .into_iter()
+            .map(|c| OmittedColumn {
+                name: c.name.clone(),
+                oracle_type: c.oracle_type.clone(),
+            })
+            .collect();
+
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> = snapshot
+            .rows
+            .into_iter()
+            .map(|row| row.into_iter().collect())
+            .collect();
+
+        let dataset = BaseDataset {
+            deployment_name: deployment_name.to_string(),
+            source_table: table.clone(),
+            source_schema: schema,
+            status: "initial_load_complete".to_string(),
+            columns,
+            omitted_columns,
+            row_count: rows.len() as i32,
+        };
+
+        replace_base_dataset(platform_store_url, &dataset, &rows)
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+
+        println!(
+            "Initial Load complete: Base Dataset {table} ({} rows)",
+            dataset.row_count
+        );
+    }
+
+    Ok(())
+}
+
+async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+
     let doc = load_deployment_config(file)?;
-    let deployment = document_to_deployment(doc)?;
+    let deployment = document_to_deployment(&doc)?;
+    let pipelines = pipelines_from_document(&doc);
+
     upsert_deployment(platform_store_url, &deployment)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
+    replace_pipelines(platform_store_url, &deployment.name, &pipelines)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    if !pipelines.is_empty() {
+        initial_load_referenced_tables(platform_store_url, &deployment.name, &pipelines).await?;
+    }
+
     println!("Deployment applied: {}", deployment.name);
     Ok(())
 }
@@ -177,11 +284,93 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     if deployments.is_empty() {
         println!("Deployment: (none)");
     } else {
-        for deployment in deployments {
+        for deployment in &deployments {
             println!("Deployment: {}", deployment.name);
             println!("{}", format_system_line("Source", &deployment.source));
             println!("{}", format_system_line("Target", &deployment.target));
         }
+    }
+
+    let pipelines = list_pipelines(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    if pipelines.is_empty() {
+        println!("Pipeline: (none)");
+    } else {
+        for pipeline in &pipelines {
+            println!(
+                "Pipeline: {} ({}) source={}",
+                pipeline.name, pipeline.mode, pipeline.source_table
+            );
+        }
+    }
+
+    let bases = list_base_datasets(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    if bases.is_empty() {
+        println!("Base Dataset: (none)");
+    } else {
+        for base in &bases {
+            let columns = base
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let omitted = if base.omitted_columns.is_empty() {
+                "(none)".to_string()
+            } else {
+                base.omitted_columns
+                    .iter()
+                    .map(|c| format!("{} ({})", c.name, c.oracle_type))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!(
+                "Base Dataset: {} status={} rows={} columns=[{}] omittedUnsupported=[{}]",
+                base.source_table, base.status, base.row_count, columns, omitted
+            );
+            if base.status == "initial_load_complete" {
+                println!("  Initial Load complete");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn print_base(platform_store_url: &str, table: &str) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+
+    let (dataset, rows) = get_base_rows(platform_store_url, table)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    println!(
+        "Base Dataset: {} status={} rows={}",
+        dataset.source_table, dataset.status, dataset.row_count
+    );
+    let columns = dataset
+        .columns
+        .iter()
+        .map(|c| format!("{}:{}", c.name, c.oracle_type))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("columns: [{columns}]");
+    if !dataset.omitted_columns.is_empty() {
+        let omitted = dataset
+            .omitted_columns
+            .iter()
+            .map(|c| format!("{} ({})", c.name, c.oracle_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("omittedUnsupported: [{omitted}]");
+    }
+
+    for row in rows {
+        let value = serde_json::Value::Object(row.data);
+        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
     }
 
     Ok(())
@@ -195,6 +384,10 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             file,
         } => apply_deployment(&platform_store_url, &file).await,
         Command::Status { platform_store_url } => print_status(&platform_store_url).await,
+        Command::Base {
+            platform_store_url,
+            table,
+        } => print_base(&platform_store_url, &table).await,
         Command::Run { platform_store_url } => {
             apply_migrations(&platform_store_url).await?;
             println!("migraloop is running");
