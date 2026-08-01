@@ -116,6 +116,10 @@ _Avoid_: Manual-only release, requiring long-running chaos programs as the sole 
 How versions move forward in production (see ADR-0014). Platform Store uses versioned schema migrations applied on startup; configuration is SemVer’d with compatible reads of older configs. Upgrades must be **backward compatible**: a newer app must run existing Deployments and accepted older config/store data without forcing a rebuild or hand-rewriting Pipelines. Breaking changes require an explicit, automated compatibility path—not silent breakage. Short sync pause during single-instance upgrade is allowed; data/checkpoint loss is not.
 _Avoid_: Manual SQL-only upgrades, wipe-and-rebuild as the normal path, breaking existing Pipelines on upgrade without a migration path
 
+**Required Privileges**:
+The minimum Source System and Target System rights the platform needs to run (see ADR-0016)—enough for Initial Load, Incremental Capture, Delivery, and checks, documented per engine. The product must not require superuser/admin as the only supported mode when a narrower grant suffices.
+_Avoid_: Admin-only-by-default, undocumented privilege sprawl
+
 **Schema Change Handling**:
 How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless. This pause-the-Pipeline rule is for stream-wide blockers (e.g. unblockable DDL), not for single-row poison data.
 _Avoid_: Ignoring DDL, blind skip of blocking changes, endless retry on unblockable DDL
