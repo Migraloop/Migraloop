@@ -100,6 +100,10 @@ _Avoid_: Trusting Sync Health alone, full table dump
 Whether the change stream for a Pipeline's Target Binding is caught up and applying successfully (lag, checkpoints, apply failures). Edits to non-Managed Columns are irrelevant to this signal.
 _Avoid_: Sync success (ambiguous), replication lag (mechanism-specific)
 
+**Observability Surface**:
+The minimum production signal set the platform exposes: structured logs; Sync Health and Delivery Health (lag, checkpoints, errors); per-Pipeline status; Prometheus metrics; failure counters suitable for alerting (see ADR-0008). Distributed tracing/APM integrations are optional later, not v1 requirements.
+_Avoid_: Logs-only operations, requiring a specific SaaS APM to run
+
 **Drift Check**:
 A non-real-time, resource-gated verification that Managed Columns on the target match the platform's expected dataset for that Pipeline. Uses the platform dataset as baseline only when Source Alignment (for Bases) or equivalent Derived correctness guarantees hold. By default, detected drift on Managed Columns is auto-repaired back to the Pipeline's expected values; non-Managed Columns are ignored. Auto-repair must not imply extra source load beyond what alignment/verification already requires.
 _Avoid_: Sync check (ambiguous), audit (too vague), preserving manual edits on Managed Columns
