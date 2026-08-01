@@ -8,5 +8,8 @@ description = "Operator CLI for the DB Sync Platform"
 [dependencies]
 clap = { workspace = true }
 migraloop-platform-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

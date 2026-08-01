@@ -20,3 +20,4 @@ tokio = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 sqlx = { workspace = true }
+tempfile = "3.14"
