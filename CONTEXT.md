@@ -1,11 +1,11 @@
 # DB Sync Platform
 
-An open-source platform for continuous database-to-database synchronization, with first-class rich transforms that shape multi-table data into derived outputs. Transform compute runs against platform-managed data, not the user's source or target databases.
+An open-source platform for continuous database-to-database synchronization, with first-class rich transforms that shape multi-table data into derived outputs. Transform compute runs against platform-managed data, not the user's source or target databases. The platform owns applying changes to user-configured target tables.
 
 ## Language
 
 **Sync**:
-Continuous capture of changes from a source database into platform-managed Base Datasets, with delivery toward a user target as a separate concern. Latency and resumability are first-class.
+Continuous capture of changes from a source database into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the user's target table has been updated—that is Delivery.
 _Avoid_: Replication (unless referring to the underlying mechanism), mirror-only (implies zero transform capability)
 
 **Base Dataset**:
@@ -13,9 +13,17 @@ A platform-managed copy of a source table or collection, kept aligned by Sync, c
 _Avoid_: Raw table (ambiguous), source mirror, target table
 
 **Rich Transform**:
-A user-defined, high-expressiveness transformation (Mongo aggregation–like) that can combine multiple platform-managed datasets into a new data shape. It reads only platform-managed data—never the user's source or target DB. It may be slower than Sync, but must still be performance-oriented.
+A user-defined, high-expressiveness transformation (Mongo aggregation–like) that can combine multiple platform-managed datasets into a new data shape. It reads only platform-managed data—never the user's source or target DB as a compute engine. It may be slower than Sync, but must still be performance-oriented.
 _Avoid_: Thin mapping, light transform, ETL job (too generic)
 
 **Derived Dataset**:
 The platform-managed output produced by a Rich Transform; a dataset the platform materializes and maintains, not a verbatim copy of a single source table.
 _Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored)
+
+**Target Binding**:
+The user's configuration that maps a platform dataset (Base or Derived) to a specific table/collection in a user target database—whether the path is direct (Base → target) or via Rich Transform (Derived → target).
+_Avoid_: Destination (vague), sink (implementation-flavored)
+
+**Delivery**:
+The platform-owned process that applies insert/update/delete to the bound target table so the user does not implement write logic themselves. Writing to the target for Delivery is allowed; using the target as Rich Transform input/compute is not.
+_Avoid_: Load job (too batch-flavored), sync (overloaded—Sync is capture into the platform)
