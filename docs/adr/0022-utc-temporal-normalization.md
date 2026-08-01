@@ -1,3 +1,3 @@
-# Temporal values normalize to UTC; naive times use a user-defined timezone
+# Temporal values normalize to UTC; naive times use DB timezone or user override
 
-Timezone-aware Oracle values become absolute instants and are stored/processed as UTC in the Platform Store. Timezone-naive DATE/TIMESTAMP values are interpreted with a **user-defined timezone** configured for the Source/Deployment (not inferred from the app host’s local zone), then converted to UTC. MongoDB Delivery writes UTC datetime. Leaving naive timestamps ambiguous or stringifying all times is rejected.
+Timezone-aware Oracle values become absolute instants and are stored/processed as UTC. Timezone-naive DATE/TIMESTAMP values are interpreted with the **Oracle DB timezone when the platform can read it**; if not, the user sets a timezone on the **Source System / Deployment** (single zone for that source). That instant is then stored as UTC. MongoDB Delivery writes UTC datetime. Do not guess from the app host timezone; do not require per-table or per-Pipeline zones in v1.

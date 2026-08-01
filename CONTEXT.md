@@ -137,8 +137,8 @@ The Oracle column types v1 will read after schema discovery and convert through 
 _Avoid_: Stringifying all columns, implicit unsupported-type conversion, BLOB-as-first-class v1 sync, rejecting a whole table merely because one unsupported column exists, silent local-timezone reinterpretation of DATE
 
 **Temporal Normalization**:
-The rule for carrying time values through Base / Derived / Delivery (see ADR-0022): platform-internal UTC; timezone-aware source values converted to absolute instants; timezone-naive Oracle DATE/TIMESTAMP interpreted using a **user-defined timezone** (not guessed from the client machine), then converted to UTC; Mongo outputs UTC datetime.
-_Avoid_: Storing times only as opaque strings, silent local-machine timezone guessing, leaving naive timestamps ambiguous
+The rule for carrying time values through Base / Derived / Delivery (see ADR-0022): platform-internal UTC; timezone-aware source values converted to absolute instants; timezone-naive Oracle DATE/TIMESTAMP interpreted using the **Source DB timezone when readable**, otherwise a **user-configured timezone on the Source System / Deployment** (one zone for that source—not per table/Pipeline), then converted to UTC; never guessed from the app host. Mongo outputs UTC datetime.
+_Avoid_: Storing times only as opaque strings, silent local-machine timezone guessing, leaving naive timestamps ambiguous, per-table timezone maps
 
 **Schema Change Handling**:
 How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless. This pause-the-Pipeline rule is for stream-wide blockers (e.g. unblockable DDL), not for single-row poison data.
