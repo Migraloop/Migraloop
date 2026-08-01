@@ -5,8 +5,8 @@ An open-source platform for continuous database-to-database synchronization, wit
 ## Language
 
 **Sync**:
-Continuous capture of changes from a source database into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the user's target table has been updated—that is Delivery.
-_Avoid_: Replication (unless referring to the underlying mechanism), mirror-only (implies zero transform capability)
+Continuous one-way capture of changes from a source database into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the user's target table has been updated—that is Delivery. Reverse flow is not a product feature; users who need the opposite direction deploy a separate pipeline with source and target swapped.
+_Avoid_: Replication (unless referring to the underlying mechanism), mirror-only (implies zero transform capability), bidirectional sync, active-active
 
 **Base Dataset**:
 A platform-managed copy of a source table or collection, kept aligned by Sync, close to the source shape. It is the unit Rich Transforms may read; it is not the user's source or target database.
