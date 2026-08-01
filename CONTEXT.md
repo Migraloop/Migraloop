@@ -112,6 +112,10 @@ _Avoid_: Unlimited user under-provisioning with no product feedback, auto-pausin
 What must pass before a build is production-releasable (see ADR-0011): correctness tests (unit, Affect Analysis, Initial↔CDC hand-off, idempotent Delivery), Oracle→Mongo contract tests, performance/load benchmarks with regression thresholds, and basic fault/error tests (e.g. process restart resume, clear apply failures). Multi-week chaos and full-scale endurance are not v1 release blockers.
 _Avoid_: Manual-only release, requiring long-running chaos programs as the sole v1 bar
 
+**Upgrade Compatibility**:
+How versions move forward in production (see ADR-0014). Platform Store uses versioned schema migrations applied on startup; configuration is SemVer’d with compatible reads of older configs. Upgrades must be **backward compatible**: a newer app must run existing Deployments and accepted older config/store data without forcing a rebuild or hand-rewriting Pipelines. Breaking changes require an explicit, automated compatibility path—not silent breakage. Short sync pause during single-instance upgrade is allowed; data/checkpoint loss is not.
+_Avoid_: Manual SQL-only upgrades, wipe-and-rebuild as the normal path, breaking existing Pipelines on upgrade without a migration path
+
 **Schema Change Handling**:
 How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless.
 _Avoid_: Ignoring DDL, blind skip of blocking changes, endless retry on unblockable DDL

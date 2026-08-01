@@ -1,0 +1,3 @@
+# Upgrades are automatic, versioned, and backward compatible
+
+Platform Store schema changes ship as versioned migrations applied on app startup. Configuration uses SemVer with compatible reading of older files. Every upgrade must be **backward compatible**: the new app must continue existing Deployments (Pipelines, checkpoints, Base/Derived state) without rebuild-by-default or manual Pipeline rewrites. Breaking changes need an explicit automated compatibility path. Single-instance upgrades may briefly pause sync while migrating/restarting; they must not lose checkpoints or require wiping the Platform Store. Downgrade support is not required for v1.
