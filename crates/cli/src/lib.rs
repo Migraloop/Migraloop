@@ -7,11 +7,15 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use migraloop_capture::initial_load_stub;
+use migraloop_delivery::{
+    list_target_documents, upsert_managed_documents, DeliveryDocument, MongoTargetConnection,
+};
 use migraloop_platform_store::{
     base_dataset_exists, delete_base_datasets_not_in, get_base_rows, health, list_base_datasets,
     list_deployments, list_pipelines, migrate, replace_base_dataset, replace_pipelines,
-    upsert_deployment, BaseColumn, BaseDataset, Deployment, OmittedColumn, Pipeline,
-    PlatformStoreHealth, SecretRef, SecretRefKind, SystemConnection,
+    update_base_primary_key, update_pipeline_delivery_status, upsert_deployment, BaseColumn,
+    BaseDataset, Deployment, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef,
+    SecretRefKind, SystemConnection,
 };
 use thiserror::Error;
 
@@ -62,6 +66,18 @@ pub enum Command {
         #[arg(long)]
         table: String,
         /// Deployment name when multiple Bases share a table name
+        #[arg(long)]
+        deployment: Option<String>,
+    },
+    /// Inspect Target documents for a Pipeline collection (operator-facing Delivery check)
+    Target {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Target collection name
+        #[arg(long)]
+        collection: String,
+        /// Deployment name when multiple Pipelines share a collection name
         #[arg(long)]
         deployment: Option<String>,
     },
@@ -124,6 +140,16 @@ fn pipelines_from_document(doc: &DeploymentDocument) -> Vec<Pipeline> {
 }
 
 fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipeline {
+    let target_collection = pipeline
+        .target
+        .as_ref()
+        .map(|t| t.collection.clone())
+        .unwrap_or_default();
+    let delivery_status = if target_collection.is_empty() {
+        "not_configured".to_string()
+    } else {
+        "pending".to_string()
+    };
     Pipeline {
         deployment_name: deployment_name.to_string(),
         name: pipeline.name.clone(),
@@ -134,7 +160,81 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
             .schema
             .clone()
             .unwrap_or_default(),
+        target_collection,
+        delivery_status,
     }
+}
+
+fn resolve_secret_value(reference: &SecretRef, field: &str) -> Result<String, CliError> {
+    match reference.kind {
+        SecretRefKind::Env => std::env::var(&reference.value).map_err(|_| {
+            CliError::Failed(format!(
+                "unresolvable secret reference: {field} fromEnv {} is missing",
+                reference.value
+            ))
+        }),
+        SecretRefKind::File => {
+            let contents = std::fs::read_to_string(&reference.value).map_err(|err| {
+                CliError::Failed(format!(
+                    "unresolvable secret reference: {field} {}: {err}",
+                    reference.value
+                ))
+            })?;
+            let trimmed = contents.trim_end_matches(['\n', '\r']).to_string();
+            if trimmed.is_empty() {
+                return Err(CliError::Failed(format!(
+                    "unresolvable secret reference: {field} {} is empty",
+                    reference.value
+                )));
+            }
+            Ok(trimmed)
+        }
+    }
+}
+
+fn output_identity_from_row(
+    row: &serde_json::Map<String, serde_json::Value>,
+    primary_key: &[String],
+) -> Result<serde_json::Value, CliError> {
+    if primary_key.is_empty() {
+        return Err(CliError::Failed(
+            "Base Dataset has no primary key for Output Identity".to_string(),
+        ));
+    }
+    if primary_key.len() == 1 {
+        let key = &primary_key[0];
+        return row.get(key).cloned().ok_or_else(|| {
+            CliError::Failed(format!(
+                "Base row missing Output Identity column {key}"
+            ))
+        });
+    }
+    let mut identity = serde_json::Map::new();
+    for key in primary_key {
+        let value = row.get(key).cloned().ok_or_else(|| {
+            CliError::Failed(format!(
+                "Base row missing Output Identity column {key}"
+            ))
+        })?;
+        identity.insert(key.clone(), value);
+    }
+    Ok(serde_json::Value::Object(identity))
+}
+
+fn mongo_target_from_deployment(deployment: &Deployment) -> Result<MongoTargetConnection, CliError> {
+    if deployment.target.port <= 0 || deployment.target.port > u16::MAX as i32 {
+        return Err(CliError::Failed(
+            "target.port must be a valid TCP port".to_string(),
+        ));
+    }
+    let password = resolve_secret_value(&deployment.target.password_ref, "target.password")?;
+    Ok(MongoTargetConnection {
+        host: deployment.target.host.clone(),
+        port: deployment.target.port as u16,
+        database: deployment.target.database.clone(),
+        username: deployment.target.username.clone(),
+        password,
+    })
 }
 
 fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
@@ -199,6 +299,8 @@ async fn sync_base_datasets_for_pipelines(
             .map_err(|err| CliError::Failed(err.to_string()))?;
         if already {
             // Existing Bases stay; do not reload on Pipeline re-apply (ADR-0019).
+            // Backfill Output Identity PK metadata when an older Base predates Delivery.
+            ensure_base_primary_key(platform_store_url, deployment_name, &schema, &table).await?;
             continue;
         }
 
@@ -238,6 +340,7 @@ async fn sync_base_datasets_for_pipelines(
             source_table: table.clone(),
             source_schema: schema,
             status: "initial_load_complete".to_string(),
+            primary_key: snapshot.primary_key,
             columns,
             omitted_columns,
             row_count: rows.len() as i32,
@@ -250,6 +353,102 @@ async fn sync_base_datasets_for_pipelines(
         println!(
             "Initial Load complete: Base Dataset {table} ({} rows)",
             dataset.row_count
+        );
+    }
+
+    Ok(())
+}
+
+async fn ensure_base_primary_key(
+    platform_store_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<(), CliError> {
+    let (dataset, _) = get_base_rows(platform_store_url, source_table, Some(deployment_name))
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    if !dataset.primary_key.is_empty() {
+        return Ok(());
+    }
+
+    let snapshot =
+        initial_load_stub(source_table).map_err(|err| CliError::Failed(err.to_string()))?;
+    if snapshot.primary_key.is_empty() {
+        return Err(CliError::Failed(format!(
+            "stub Source table {source_table} has no primary key for Output Identity"
+        )));
+    }
+
+    update_base_primary_key(
+        platform_store_url,
+        deployment_name,
+        source_schema,
+        source_table,
+        &snapshot.primary_key,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+    Ok(())
+}
+
+async fn deliver_direct_pipelines(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    pipelines: &[Pipeline],
+) -> Result<(), CliError> {
+    let needs_delivery = pipelines
+        .iter()
+        .any(|p| p.mode == "direct" && !p.target_collection.is_empty());
+    if !needs_delivery {
+        return Ok(());
+    }
+
+    let mongo = mongo_target_from_deployment(deployment)?;
+
+    for pipeline in pipelines {
+        if pipeline.mode != "direct" || pipeline.target_collection.is_empty() {
+            continue;
+        }
+
+        let (dataset, rows) = get_base_rows(
+            platform_store_url,
+            &pipeline.source_table,
+            Some(&pipeline.deployment_name),
+        )
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+        let mut documents = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let identity = output_identity_from_row(&row.data, &dataset.primary_key)?;
+            // Direct Pipeline Managed fields default to all supported Base columns.
+            let managed_fields = row.data.clone();
+            documents.push(DeliveryDocument {
+                identity,
+                managed_fields,
+            });
+        }
+
+        let delivered = upsert_managed_documents(&mongo, &pipeline.target_collection, &documents)
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+
+        update_pipeline_delivery_status(
+            platform_store_url,
+            &pipeline.deployment_name,
+            &pipeline.name,
+            "delivered",
+        )
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+        println!(
+            "Delivery complete: Pipeline {} → {}.{} ({} documents)",
+            pipeline.name,
+            deployment.target.database,
+            pipeline.target_collection,
+            delivered
         );
     }
 
@@ -271,6 +470,7 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
     sync_base_datasets_for_pipelines(platform_store_url, &deployment.name, &pipelines).await?;
+    deliver_direct_pipelines(platform_store_url, &deployment, &pipelines).await?;
 
     println!("Deployment applied: {}", deployment.name);
     Ok(())
@@ -319,10 +519,21 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         println!("Pipeline: (none)");
     } else {
         for pipeline in &pipelines {
-            println!(
-                "Pipeline: {} ({}) source={}",
-                pipeline.name, pipeline.mode, pipeline.source_table
-            );
+            if pipeline.target_collection.is_empty() {
+                println!(
+                    "Pipeline: {} ({}) source={}",
+                    pipeline.name, pipeline.mode, pipeline.source_table
+                );
+            } else {
+                println!(
+                    "Pipeline: {} ({}) source={} target={} Delivery: {}",
+                    pipeline.name,
+                    pipeline.mode,
+                    pipeline.source_table,
+                    pipeline.target_collection,
+                    pipeline.delivery_status
+                );
+            }
         }
     }
 
@@ -401,6 +612,81 @@ async fn print_base(
     Ok(())
 }
 
+async fn print_target(
+    platform_store_url: &str,
+    collection: &str,
+    deployment_name: Option<&str>,
+) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+
+    let pipelines = list_pipelines(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let matching: Vec<_> = pipelines
+        .into_iter()
+        .filter(|p| {
+            p.target_collection == collection
+                && deployment_name
+                    .map(|name| p.deployment_name == name)
+                    .unwrap_or(true)
+        })
+        .collect();
+
+    let pipeline = match matching.as_slice() {
+        [] => {
+            return Err(CliError::Failed(format!(
+                "no Pipeline Target Binding found for collection {collection}"
+            )));
+        }
+        [only] => only.clone(),
+        many => {
+            return Err(CliError::Failed(format!(
+                "multiple Pipelines bind collection {collection} across Deployments {}; \
+                 pass --deployment to disambiguate",
+                many.iter()
+                    .map(|p| p.deployment_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    };
+
+    let deployments = list_deployments(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let deployment = deployments
+        .into_iter()
+        .find(|d| d.name == pipeline.deployment_name)
+        .ok_or_else(|| {
+            CliError::Failed(format!(
+                "Deployment {} not found for Target inspect",
+                pipeline.deployment_name
+            ))
+        })?;
+
+    let mongo = mongo_target_from_deployment(&deployment)?;
+    let documents = list_target_documents(&mongo, collection)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    println!(
+        "Target: {}.{} Deployment={} Pipeline={} Delivery={}",
+        deployment.target.database,
+        collection,
+        pipeline.deployment_name,
+        pipeline.name,
+        pipeline.delivery_status
+    );
+    println!("documents: {}", documents.len());
+    for document in documents {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&document).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Migrate { platform_store_url } => apply_migrations(&platform_store_url).await,
@@ -414,6 +700,11 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             table,
             deployment,
         } => print_base(&platform_store_url, &table, deployment.as_deref()).await,
+        Command::Target {
+            platform_store_url,
+            collection,
+            deployment,
+        } => print_target(&platform_store_url, &collection, deployment.as_deref()).await,
         Command::Run { platform_store_url } => {
             apply_migrations(&platform_store_url).await?;
             println!("migraloop is running");

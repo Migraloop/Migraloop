@@ -43,6 +43,9 @@ pub struct PipelineSpec {
     pub name: String,
     pub mode: String,
     pub source: PipelineSourceSpec,
+    /// Target Binding for Delivery. Optional so Deployment/Base-only apply still works.
+    #[serde(default)]
+    pub target: Option<PipelineTargetSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +54,13 @@ pub struct PipelineSourceSpec {
     pub table: String,
     #[serde(default)]
     pub schema: Option<String>,
+}
+
+/// Target Binding: which Target collection receives Managed-field Delivery.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineTargetSpec {
+    pub collection: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -341,6 +351,13 @@ fn validate_pipeline(pipeline: &PipelineSpec) -> Result<(), CliError> {
         return Err(CliError::Failed(
             "pipeline.source.table must not be empty".to_string(),
         ));
+    }
+    if let Some(target) = &pipeline.target {
+        if target.collection.trim().is_empty() {
+            return Err(CliError::Failed(
+                "pipeline.target.collection must not be empty".to_string(),
+            ));
+        }
     }
     Ok(())
 }

@@ -90,6 +90,10 @@ pub struct Pipeline {
     pub mode: String,
     pub source_table: String,
     pub source_schema: String,
+    /// Target collection for Delivery; empty means Delivery not configured.
+    pub target_collection: String,
+    /// Operator-visible Delivery progress: not_configured | pending | delivered.
+    pub delivery_status: String,
 }
 
 /// Supported column kept in a Base Dataset.
@@ -113,6 +117,8 @@ pub struct BaseDataset {
     pub source_table: String,
     pub source_schema: String,
     pub status: String,
+    /// Source primary-key column names used as Direct Pipeline Output Identity.
+    pub primary_key: Vec<String>,
     pub columns: Vec<BaseColumn>,
     pub omitted_columns: Vec<OmittedColumn>,
     pub row_count: i32,
@@ -267,8 +273,9 @@ pub async fn replace_pipelines(
         sqlx::query(
             r#"
             INSERT INTO pipelines (
-                deployment_name, name, mode, source_table, source_schema, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, now())
+                deployment_name, name, mode, source_table, source_schema,
+                target_collection, delivery_status, applied_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -276,6 +283,8 @@ pub async fn replace_pipelines(
         .bind(&pipeline.mode)
         .bind(&pipeline.source_table)
         .bind(&pipeline.source_schema)
+        .bind(&pipeline.target_collection)
+        .bind(&pipeline.delivery_status)
         .execute(&mut *tx)
         .await
         .map_err(PlatformStoreError::Persist)?;
@@ -311,15 +320,18 @@ pub async fn replace_base_dataset(
         serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
     let omitted_json =
         serde_json::to_string(&dataset.omitted_columns).map_err(PlatformStoreError::InvalidJson)?;
+    let primary_key_json =
+        serde_json::to_string(&dataset.primary_key).map_err(PlatformStoreError::InvalidJson)?;
 
     sqlx::query(
         r#"
         INSERT INTO base_datasets (
             deployment_name, source_table, source_schema, status,
-            columns_json, omitted_columns_json, row_count, loaded_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+            primary_key_json, columns_json, omitted_columns_json, row_count, loaded_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
         ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
             status = EXCLUDED.status,
+            primary_key_json = EXCLUDED.primary_key_json,
             columns_json = EXCLUDED.columns_json,
             omitted_columns_json = EXCLUDED.omitted_columns_json,
             row_count = EXCLUDED.row_count,
@@ -330,6 +342,7 @@ pub async fn replace_base_dataset(
     .bind(&dataset.source_table)
     .bind(&dataset.source_schema)
     .bind(&dataset.status)
+    .bind(&primary_key_json)
     .bind(&columns_json)
     .bind(&omitted_json)
     .bind(dataset.row_count)
@@ -389,7 +402,8 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     let pool = connect(database_url).await?;
     let rows = sqlx::query_as::<_, PipelineRow>(
         r#"
-        SELECT deployment_name, name, mode, source_table, source_schema
+        SELECT deployment_name, name, mode, source_table, source_schema,
+               target_collection, delivery_status
         FROM pipelines
         ORDER BY deployment_name, name
         "#,
@@ -401,6 +415,36 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     Ok(rows.into_iter().map(PipelineRow::into_pipeline).collect())
 }
 
+/// Update Delivery status for one Pipeline.
+pub async fn update_pipeline_delivery_status(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+    delivery_status: &str,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let result = sqlx::query(
+        r#"
+        UPDATE pipelines
+        SET delivery_status = $3
+        WHERE deployment_name = $1 AND name = $2
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .bind(delivery_status)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    if result.rows_affected() == 0 {
+        return Err(PlatformStoreError::NotFound(format!(
+            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+        )));
+    }
+    Ok(())
+}
+
 /// List Base Datasets for all Deployments.
 pub async fn list_base_datasets(
     database_url: &str,
@@ -410,7 +454,7 @@ pub async fn list_base_datasets(
         r#"
         SELECT
             deployment_name, source_table, source_schema, status,
-            columns_json, omitted_columns_json, row_count
+            primary_key_json, columns_json, omitted_columns_json, row_count
         FROM base_datasets
         ORDER BY deployment_name, source_schema, source_table
         "#,
@@ -438,7 +482,7 @@ pub async fn get_base_rows(
             r#"
             SELECT
                 deployment_name, source_table, source_schema, status,
-                columns_json, omitted_columns_json, row_count
+                primary_key_json, columns_json, omitted_columns_json, row_count
             FROM base_datasets
             WHERE source_table = $1 AND deployment_name = $2
             ORDER BY source_schema
@@ -454,7 +498,7 @@ pub async fn get_base_rows(
             r#"
             SELECT
                 deployment_name, source_table, source_schema, status,
-                columns_json, omitted_columns_json, row_count
+                primary_key_json, columns_json, omitted_columns_json, row_count
             FROM base_datasets
             WHERE source_table = $1
             ORDER BY deployment_name, source_schema
@@ -564,6 +608,8 @@ struct PipelineRow {
     mode: String,
     source_table: String,
     source_schema: String,
+    target_collection: String,
+    delivery_status: String,
 }
 
 impl PipelineRow {
@@ -574,6 +620,8 @@ impl PipelineRow {
             mode: self.mode,
             source_table: self.source_table,
             source_schema: self.source_schema,
+            target_collection: self.target_collection,
+            delivery_status: self.delivery_status,
         }
     }
 }
@@ -584,6 +632,7 @@ struct BaseDatasetRow {
     source_table: String,
     source_schema: String,
     status: String,
+    primary_key_json: String,
     columns_json: String,
     omitted_columns_json: String,
     row_count: i32,
@@ -668,6 +717,40 @@ pub async fn base_dataset_exists(
     Ok(found.is_some())
 }
 
+/// Backfill Output Identity source primary-key metadata without reloading Base rows.
+pub async fn update_base_primary_key(
+    database_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    primary_key: &[String],
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let primary_key_json =
+        serde_json::to_string(primary_key).map_err(PlatformStoreError::InvalidJson)?;
+    let result = sqlx::query(
+        r#"
+        UPDATE base_datasets
+        SET primary_key_json = $4
+        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(&primary_key_json)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    if result.rows_affected() == 0 {
+        return Err(PlatformStoreError::NotFound(format!(
+            "no Base Dataset found for table {source_table}"
+        )));
+    }
+    Ok(())
+}
+
 impl BaseDatasetRow {
     fn into_base_dataset(self) -> Result<BaseDataset, PlatformStoreError> {
         Ok(BaseDataset {
@@ -675,6 +758,8 @@ impl BaseDatasetRow {
             source_table: self.source_table,
             source_schema: self.source_schema,
             status: self.status,
+            primary_key: serde_json::from_str(&self.primary_key_json)
+                .map_err(PlatformStoreError::InvalidJson)?,
             columns: serde_json::from_str(&self.columns_json)
                 .map_err(PlatformStoreError::InvalidJson)?,
             omitted_columns: serde_json::from_str(&self.omitted_columns_json)

@@ -29,3 +29,5 @@ serde_yaml = "0.9"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate"] }
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "process", "signal"] }
 thiserror = "2.0"
+mongodb = { version = "3.8", default-features = true }
+bson = "2.15"
