@@ -14,7 +14,7 @@ use migraloop_delivery::{
 use migraloop_platform_store::{
     base_dataset_exists, delete_base_datasets_not_in, get_base_rows, health, list_base_datasets,
     list_deployments, list_pipelines, migrate, replace_base_dataset, replace_pipelines,
-    update_base_primary_key, update_pipeline_delivery_status, upsert_deployment, BaseColumn,
+    update_base_primary_key, update_pipeline_delivery_progress, upsert_deployment, BaseColumn,
     BaseDataset, Deployment, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef,
     SecretRefKind, SystemConnection,
 };
@@ -82,7 +82,7 @@ pub enum Command {
         #[arg(long)]
         deployment: Option<String>,
     },
-    /// Apply Incremental Capture from Source into Base Datasets, then Deliver
+    /// Run Incremental Capture into Base Datasets, then Delivery for Direct Pipelines
     Sync {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
@@ -169,6 +169,7 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
             .unwrap_or_default(),
         target_collection,
         delivery_status,
+        delivery_applied_changes: 0,
     }
 }
 
@@ -443,11 +444,12 @@ async fn deliver_direct_pipelines(
             .await
             .map_err(|err| CliError::Failed(err.to_string()))?;
 
-        update_pipeline_delivery_status(
+        update_pipeline_delivery_progress(
             platform_store_url,
             &pipeline.deployment_name,
             &pipeline.name,
             "delivered",
+            Some(delivered as i32),
         )
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
@@ -569,8 +571,8 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             ));
         }
 
-        // Per-table Incremental Capture into Base, then Direct Pipeline Delivery of the batch.
-        let mut delivered_changes: Vec<(String, Vec<ChangeEvent>)> = Vec::new();
+        // Incremental Capture into Base first; Delivery reads Base (and delete identities).
+        let mut captured_by_table: Vec<(String, Vec<ChangeEvent>)> = Vec::new();
 
         for (schema, table) in tables {
             let changes = incremental_changes_stub(&table)
@@ -613,7 +615,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 changes.len(),
                 updated.row_count
             );
-            delivered_changes.push((table, changes));
+            captured_by_table.push((table, changes));
         }
 
         let mongo = mongo_target_from_deployment(deployment)?;
@@ -622,14 +624,15 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 continue;
             }
 
-            let Some((_, changes)) = delivered_changes
+            let Some((_, changes)) = captured_by_table
                 .iter()
                 .find(|(table, _)| table == &pipeline.source_table)
             else {
                 continue;
             };
 
-            let (dataset, _) = get_base_rows(
+            // Direct Pipeline Delivery: upserts from current Base rows; deletes by identity.
+            let (dataset, base_rows) = get_base_rows(
                 platform_store_url,
                 &pipeline.source_table,
                 Some(&pipeline.deployment_name),
@@ -637,24 +640,28 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             .await
             .map_err(|err| CliError::Failed(err.to_string()))?;
 
-            let supported_names: BTreeSet<String> =
-                dataset.columns.iter().map(|c| c.name.clone()).collect();
-
             let mut upserts = Vec::new();
             let mut deletes = Vec::new();
             for change in changes {
                 match change.op {
                     ChangeOp::Insert | ChangeOp::Update => {
-                        let managed = supported_row_from_change(change, &supported_names)?;
+                        let Some(base_row) = base_rows
+                            .iter()
+                            .find(|row| row_matches_identity(&row.data, &change.identity))
+                        else {
+                            return Err(CliError::Failed(format!(
+                                "Base Dataset {} missing row for Output Identity {:?}",
+                                pipeline.source_table, change.identity
+                            )));
+                        };
                         let identity =
-                            output_identity_from_row(&managed, &dataset.primary_key)?;
+                            output_identity_from_row(&base_row.data, &dataset.primary_key)?;
                         upserts.push(DeliveryDocument {
                             identity,
-                            managed_fields: managed,
+                            managed_fields: base_row.data.clone(),
                         });
                     }
                     ChangeOp::Delete => {
-                        // Identity-keyed delete of the entire Target document.
                         let identity_map: serde_json::Map<String, serde_json::Value> = change
                             .identity
                             .iter()
@@ -677,23 +684,25 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                     .await
                     .map_err(|err| CliError::Failed(err.to_string()))?;
 
-            update_pipeline_delivery_status(
+            let applied = (upserted + deleted) as i32;
+            update_pipeline_delivery_progress(
                 platform_store_url,
                 &pipeline.deployment_name,
                 &pipeline.name,
                 "delivered",
+                Some(applied),
             )
             .await
             .map_err(|err| CliError::Failed(err.to_string()))?;
 
             println!(
-                "Delivery complete: Pipeline {} incremental upserts={} deletes={}",
+                "Delivery complete: Pipeline {} upserts={} deletes={} (from Base)",
                 pipeline.name, upserted, deleted
             );
         }
     }
 
-    println!("Sync complete");
+    println!("Incremental Capture and Delivery complete");
     Ok(())
 }
 
@@ -804,8 +813,11 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             _ => "unknown",
         };
         println!(
-            "  Delivery Health: {} Pipeline={} status={}",
-            delivery_health, pipeline.name, pipeline.delivery_status
+            "  Delivery Health: {} Pipeline={} status={} appliedChanges={}",
+            delivery_health,
+            pipeline.name,
+            pipeline.delivery_status,
+            pipeline.delivery_applied_changes
         );
     }
 

@@ -350,10 +350,15 @@ async fn incremental_delivery_preserves_non_managed_fields_and_status_shows_prog
         "expected Sync progress/health in status, got:\n{status_out}"
     );
     assert!(
-        status_out.contains("Delivery")
-            && (status_out.contains("delivered")
-                || status_out.contains("complete")
-                || status_out.contains("ok")),
-        "expected Delivery progress in status, got:\n{status_out}"
+        status_out.contains("Delivery Health")
+            && status_out.contains("appliedChanges=")
+            && (status_out.contains("delivered") || status_out.contains("ok")),
+        "expected Delivery Health progress after incremental Delivery, got:\n{status_out}"
+    );
+    // Initial Load delivered 2 docs; stub batch Delivers 3 Output Identity applies (2 upsert + 1 delete).
+    assert!(
+        status_out.contains("Delivery Health: ok")
+            && status_out.contains("appliedChanges=5"),
+        "expected Delivery Health appliedChanges=5 after Initial Load + incremental, got:\n{status_out}"
     );
 }

@@ -94,6 +94,8 @@ pub struct Pipeline {
     pub target_collection: String,
     /// Operator-visible Delivery progress: not_configured | pending | delivered.
     pub delivery_status: String,
+    /// Count of Output Identity Delivery applies (upserts + deletes) for progress.
+    pub delivery_applied_changes: i32,
 }
 
 /// Supported column kept in a Base Dataset.
@@ -278,8 +280,8 @@ pub async fn replace_pipelines(
             r#"
             INSERT INTO pipelines (
                 deployment_name, name, mode, source_table, source_schema,
-                target_collection, delivery_status, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+                target_collection, delivery_status, delivery_applied_changes, applied_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -289,6 +291,7 @@ pub async fn replace_pipelines(
         .bind(&pipeline.source_schema)
         .bind(&pipeline.target_collection)
         .bind(&pipeline.delivery_status)
+        .bind(pipeline.delivery_applied_changes)
         .execute(&mut *tx)
         .await
         .map_err(PlatformStoreError::Persist)?;
@@ -412,7 +415,7 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     let rows = sqlx::query_as::<_, PipelineRow>(
         r#"
         SELECT deployment_name, name, mode, source_table, source_schema,
-               target_collection, delivery_status
+               target_collection, delivery_status, delivery_applied_changes
         FROM pipelines
         ORDER BY deployment_name, name
         "#,
@@ -431,20 +434,56 @@ pub async fn update_pipeline_delivery_status(
     pipeline_name: &str,
     delivery_status: &str,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let result = sqlx::query(
-        r#"
-        UPDATE pipelines
-        SET delivery_status = $3
-        WHERE deployment_name = $1 AND name = $2
-        "#,
+    update_pipeline_delivery_progress(
+        database_url,
+        deployment_name,
+        pipeline_name,
+        delivery_status,
+        None,
     )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .bind(delivery_status)
-    .execute(&pool)
     .await
-    .map_err(PlatformStoreError::Persist)?;
+}
+
+/// Update Delivery status and optionally accumulate applied Output Identity changes.
+pub async fn update_pipeline_delivery_progress(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+    delivery_status: &str,
+    additional_applied_changes: Option<i32>,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let result = if let Some(additional) = additional_applied_changes {
+        sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET delivery_status = $3,
+                delivery_applied_changes = delivery_applied_changes + $4
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .bind(delivery_status)
+        .bind(additional)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET delivery_status = $3
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .bind(delivery_status)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?
+    };
 
     if result.rows_affected() == 0 {
         return Err(PlatformStoreError::NotFound(format!(
@@ -622,6 +661,7 @@ struct PipelineRow {
     source_schema: String,
     target_collection: String,
     delivery_status: String,
+    delivery_applied_changes: i32,
 }
 
 impl PipelineRow {
@@ -634,6 +674,7 @@ impl PipelineRow {
             source_schema: self.source_schema,
             target_collection: self.target_collection,
             delivery_status: self.delivery_status,
+            delivery_applied_changes: self.delivery_applied_changes,
         }
     }
 }
