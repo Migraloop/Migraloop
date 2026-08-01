@@ -1,0 +1,12 @@
+[package]
+name = "migraloop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Operator CLI for the DB Sync Platform"
+
+[dependencies]
+clap = { workspace = true }
+migraloop-platform-store = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

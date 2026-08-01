@@ -1,0 +1,6 @@
+[package]
+name = "migraloop-transform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rich Transform and Affect Analysis"
