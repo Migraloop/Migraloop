@@ -1,6 +1,6 @@
 # DB Sync Platform
 
-An open-source platform for continuous database-to-database synchronization, with first-class rich transforms that shape multi-table data into derived outputs. Transform compute runs against platform-managed data, not the user's source or target databases. The platform owns applying changes to user-configured target tables.
+An open-source platform for continuous database-to-database synchronization, with first-class rich transforms that shape multi-table data into derived outputs. Transform compute runs against platform-managed data, not the user's source or target databases. The platform owns applying changes to user-configured target tables. The project is licensed **Apache-2.0**, optimizes for adoption first, and is intended to be self-hosted next to customer databases—not offered as multi-tenant SaaS by default (see ADR-0012).
 
 The product must support **many database engine kinds** over time (multiple source kinds and multiple target kinds). The domain model stays engine-agnostic so new engines plug in without reshaping Sync, Rich Transform, Delivery, or checks. The first shipping pair is **Oracle → MongoDB**; that pair is a vertical slice, not the ceiling.
 
