@@ -25,8 +25,8 @@ Continuous one-way capture of changes from a Source System into platform-managed
 _Avoid_: Replication (unless referring to the underlying mechanism), mirror-only (implies zero transform capability), bidirectional sync, active-active
 
 **Initial Load**:
-The first materialization of needed Base Datasets (and then Derived Datasets / Delivery) from the Source System so a Pipeline can start from existing data, not only future changes. It inherently reads large volumes from the source and will load the Source System; the platform must throttle, chunk, and resource-gate that read load (and prefer gentler paths such as replicas or vendor dump/export when available)—not pretend the impact is zero.
-_Avoid_: Zero-impact backfill, assuming CDC-only is enough for history
+The first materialization of needed Base Datasets (and then Derived Datasets / Delivery) from the Source System so a Pipeline can start from existing data, not only future changes. It inherently reads large volumes from the source, but the platform must be designed so it does not overwhelm the Source System: chunked reads, rate limits, pause/resume, and backoff under pressure. v1 uses the same Source connection for Initial Load and Incremental Capture; splitting read/CDC connections is optional later, not required for safety.
+_Avoid_: Zero-impact backfill, unbounded full-table slam, assuming a separate replica connection is required for correctness
 
 **Incremental Capture**:
 Ongoing change capture into Base Datasets after Initial Load, driving Affect Analysis, Derived updates, and Delivery.
