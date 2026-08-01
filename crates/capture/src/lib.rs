@@ -28,6 +28,8 @@ pub struct SourceColumn {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InitialLoadSnapshot {
     pub table: String,
+    /// Source primary-key column names; Direct Pipeline Output Identity defaults from these.
+    pub primary_key: Vec<String>,
     pub columns: Vec<SourceColumn>,
     pub rows: Vec<BTreeMap<String, serde_json::Value>>,
 }
@@ -57,6 +59,7 @@ pub fn initial_load_stub(table: &str) -> Result<InitialLoadSnapshot, CaptureErro
 fn customers_fixture() -> InitialLoadSnapshot {
     InitialLoadSnapshot {
         table: "CUSTOMERS".to_string(),
+        primary_key: vec!["ID".to_string()],
         columns: vec![
             col("ID", "NUMBER", true),
             col("NAME", "VARCHAR2", true),
@@ -87,6 +90,7 @@ fn customers_fixture() -> InitialLoadSnapshot {
 fn orders_fixture() -> InitialLoadSnapshot {
     InitialLoadSnapshot {
         table: "ORDERS".to_string(),
+        primary_key: vec!["ORDER_ID".to_string()],
         columns: vec![
             col("ORDER_ID", "NUMBER", true),
             col("CUSTOMER_ID", "NUMBER", true),
