@@ -2,7 +2,9 @@
 
 An open-source platform for continuous database-to-database synchronization, with first-class rich transforms that shape multi-table data into derived outputs. Transform compute runs against platform-managed data, not the user's source or target databases. The platform owns applying changes to user-configured target tables.
 
-The product goal is **many source engines × many target engines**. The domain model and boundaries must stay engine-agnostic so new sources/targets plug in without reshaping Sync, Rich Transform, Delivery, or checks. The first shipping pair is **Oracle → MongoDB**; that pair is a vertical slice, not the ceiling.
+The product must support **many database engine kinds** over time (multiple source kinds and multiple target kinds). The domain model stays engine-agnostic so new engines plug in without reshaping Sync, Rich Transform, Delivery, or checks. The first shipping pair is **Oracle → MongoDB**; that pair is a vertical slice, not the ceiling.
+
+A single running system performs **one Source System → one Target System** sync. Wanting another pair means deploying another system (or another independent run), not fan-in/fan-out inside one sync.
 
 ## Language
 
@@ -30,8 +32,12 @@ _Avoid_: Thin mapping, light transform, ETL job (too generic)
 The platform-managed output produced by a Rich Transform; a dataset the platform materializes and maintains, not a verbatim copy of a single source table.
 _Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored)
 
+**Pipeline**:
+The user-defined configuration for one Source System → one Target System run: what to Sync, optional Rich Transforms, Target Bindings, and Managed Columns. One Pipeline does not span multiple Source Systems or multiple Target Systems.
+_Avoid_: Job graph spanning many databases, bidirectional link
+
 **Target Binding**:
-The user's configuration that maps a platform dataset (Base or Derived) to a specific table/collection in a user target database—whether the path is direct (Base → target) or via Rich Transform (Derived → target). The binding declares which columns the pipeline owns; the target table may have additional columns outside the binding.
+The user's configuration that maps a platform dataset (Base or Derived) to a specific table/collection in the Target System—whether the path is direct (Base → target) or via Rich Transform (Derived → target). The binding declares which columns/fields the Pipeline owns; the target table/collection may have additional fields outside the binding.
 _Avoid_: Destination (vague), sink (implementation-flavored)
 
 **Managed Columns**:
