@@ -1,5 +1,5 @@
-# Sync captures only Pipeline-referenced tables/columns, with table-level Initial Load
+# Sync selects tables by Pipeline use; each Base keeps full supported rows
 
-Initial Load and Incremental Capture include only Source tables/columns actually referenced by Pipelines in the Deployment. We do not default to whole-schema mirroring.
+Which Source **tables** enter Sync is determined by Pipeline references in the Deployment—not whole-schema mirroring. When a newly referenced table has no Base Dataset, run a **table-level Initial Load** for that table only; existing Bases stay incremental.
 
-When a Pipeline is added at runtime and references a table that does not yet have a Base Dataset, the platform performs a **table-level Initial Load for that table only** (then overlaps into Incremental Capture with no-gap cutover). Already-synced Base Datasets are left on incremental paths and are not reloaded. Shared Base Datasets remain one per source table for all Pipelines that need them.
+Once a table is included, its Base Dataset stores the **full row** for all **Supported Source Types** on that table—even if current Pipelines use only a subset of fields. We do not project Bases down to “only columns this transform touches,” so a later Pipeline can reuse the same Base without column-level backfill. Unsupported types (e.g. BLOB) remain excluded per ADR-0018.
