@@ -1,0 +1,23 @@
+[package]
+name = "migraloop-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DB Sync Platform application binary"
+
+[[bin]]
+name = "migraloop"
+path = "src/main.rs"
+
+[dependencies]
+migraloop-cli = { workspace = true }
+migraloop-capture = { workspace = true }
+migraloop-transform = { workspace = true }
+migraloop-delivery = { workspace = true }
+migraloop-platform-store = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }

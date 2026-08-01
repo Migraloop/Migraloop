@@ -1,0 +1,11 @@
+[package]
+name = "migraloop-platform-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform Store connectivity, schema migrations, and health checks"
+
+[dependencies]
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
