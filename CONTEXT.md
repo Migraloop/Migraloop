@@ -25,8 +25,8 @@ Continuous one-way capture of changes from a Source System into platform-managed
 _Avoid_: Replication (unless referring to the underlying mechanism), mirror-only (implies zero transform capability), bidirectional sync, active-active
 
 **Base Dataset**:
-A platform-managed copy of a source table or collection, kept aligned by Sync, close to the source shape. It is the unit Rich Transforms and direct Pipelines may read; it is not the user's source or target database. The same Base Dataset may be reused by multiple Pipelines in a Deployment.
-_Avoid_: Raw table (ambiguous), source mirror, target table
+A platform-managed copy of a source table or collection, kept aligned by Sync, close to the source shape. It is the unit Rich Transforms and direct Pipelines may read; it is not the user's source or target database. Within a Deployment, each source table/collection has at most one Base Dataset, shared by every Pipeline that needs it—never captured or stored once per Pipeline.
+_Avoid_: Raw table (ambiguous), source mirror, target table, per-pipeline copy of the same source table
 
 **Rich Transform**:
 A user-defined, high-expressiveness transformation (Mongo aggregation–like) that can combine multiple platform-managed datasets into a new data shape. It reads only platform-managed data—never the user's source or target DB as a compute engine. It may be slower than Sync, but must still be performance-oriented.
