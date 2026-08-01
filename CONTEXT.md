@@ -105,8 +105,8 @@ The minimum production signal set the platform exposes: structured logs; Sync He
 _Avoid_: Logs-only operations, requiring a specific SaaS APM to run
 
 **Platform Store Guardrails**:
-Product-enforced minimums and safe defaults for the bundled PostgreSQL Platform Store so users cannot configure the store absurdly too small/low for the app to run. Crossing a defined safe threshold (e.g. free disk) must warn; critical exhaustion follows the pause-and-alert path rather than silent failure (see ADR-0010).
-_Avoid_: Unlimited user under-provisioning with no product feedback, silent disk-full crashes only
+Product-enforced minimums and safe defaults for the bundled PostgreSQL Platform Store so users cannot configure the store absurdly too small/low for the app to run. Crossing a defined safe threshold (e.g. free disk) must **warn only**—the platform does not auto-pause solely for resource pressure; if operators ignore warnings until the store fails, that is an operational failure, not something pause would have meaningfully saved (see ADR-0010).
+_Avoid_: Unlimited user under-provisioning with no product feedback, auto-pausing on disk threshold as if it restored capacity
 
 **Schema Change Handling**:
 How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless.
