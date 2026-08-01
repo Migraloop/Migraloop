@@ -79,12 +79,12 @@ The part of a Pipeline that maps its output dataset (Base or Derived) to a speci
 _Avoid_: Destination (vague), sink (implementation-flavored)
 
 **Managed Columns**:
-The columns/fields declared by a Pipeline's Target Binding as owned by the platform. Delivery, Drift Check, and auto-repair apply only to these. Extra fields on the target table/collection are out of scope.
-_Avoid_: All columns, full document ownership (unless the binding literally lists every field)
+The columns/fields the Pipeline defines as its output shape and that Delivery will write. On document Target Systems (e.g. MongoDB), the platform does not inventory “non-managed” fields—it simply never writes keys outside the Managed set, so other fields are naturally untouched. On relational Target Systems (e.g. PostgreSQL), Managed Columns are the schema the platform must create/maintain on the target table; other columns remain out of scope for updates.
+_Avoid_: All columns, full document ownership (unless the binding literally lists every field), requiring a catalog of non-managed fields on document stores
 
 **Delivery**:
-The platform-owned process that applies insert/update/delete for a Pipeline's Output Identity on the Target System so the user does not implement write logic themselves. Updates must touch only Managed Columns/fields and must not alter non-Managed fields. When Affect Analysis / Derived maintenance decides an Output Identity no longer exists, Delivery may **delete the entire target document/row** (including non-Managed fields on that document). Writing to the target for Delivery is allowed; using the target as Rich Transform input/compute is not.
-_Avoid_: Load job (too batch-flavored), sync (overloaded—Sync is capture into the platform), overwriting or clearing non-Managed fields on update
+The platform-owned process that applies insert/update/delete for a Pipeline's Output Identity on the Target System so the user does not implement write logic themselves. Updates write only Managed Columns/fields. On document targets, unknown other fields are simply not touched. On relational targets, Delivery also implies establishing Managed Columns in the table schema. When an Output Identity no longer exists, Delivery may **delete the entire target document/row**. Writing to the target for Delivery is allowed; using the target as Rich Transform input/compute is not.
+_Avoid_: Load job (too batch-flavored), sync (overloaded—Sync is capture into the platform), overwriting document fields outside the Managed set, dropping relational columns the platform does not own
 
 **Sync Health**:
 Whether capture from source into a Base Dataset is caught up and applying successfully (lag, checkpoints, capture/apply failures). Necessary but not sufficient to claim the Base Dataset matches the source.
