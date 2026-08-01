@@ -94,6 +94,8 @@ pub struct Pipeline {
     pub target_collection: String,
     /// Operator-visible Delivery progress: not_configured | pending | delivered.
     pub delivery_status: String,
+    /// Count of Output Identity Delivery applies (upserts + deletes) for progress.
+    pub delivery_applied_changes: i32,
 }
 
 /// Supported column kept in a Base Dataset.
@@ -122,6 +124,10 @@ pub struct BaseDataset {
     pub columns: Vec<BaseColumn>,
     pub omitted_columns: Vec<OmittedColumn>,
     pub row_count: i32,
+    /// Count of Incremental Capture changes applied into this Base Dataset.
+    pub sync_applied_changes: i32,
+    /// Operator-visible Sync Health for this Base: unknown | ok.
+    pub sync_health: String,
 }
 
 /// One row stored in a Base Dataset (supported columns only).
@@ -274,8 +280,8 @@ pub async fn replace_pipelines(
             r#"
             INSERT INTO pipelines (
                 deployment_name, name, mode, source_table, source_schema,
-                target_collection, delivery_status, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+                target_collection, delivery_status, delivery_applied_changes, applied_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -285,6 +291,7 @@ pub async fn replace_pipelines(
         .bind(&pipeline.source_schema)
         .bind(&pipeline.target_collection)
         .bind(&pipeline.delivery_status)
+        .bind(pipeline.delivery_applied_changes)
         .execute(&mut *tx)
         .await
         .map_err(PlatformStoreError::Persist)?;
@@ -327,14 +334,17 @@ pub async fn replace_base_dataset(
         r#"
         INSERT INTO base_datasets (
             deployment_name, source_table, source_schema, status,
-            primary_key_json, columns_json, omitted_columns_json, row_count, loaded_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+            primary_key_json, columns_json, omitted_columns_json, row_count,
+            sync_applied_changes, sync_health, loaded_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
         ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
             status = EXCLUDED.status,
             primary_key_json = EXCLUDED.primary_key_json,
             columns_json = EXCLUDED.columns_json,
             omitted_columns_json = EXCLUDED.omitted_columns_json,
             row_count = EXCLUDED.row_count,
+            sync_applied_changes = EXCLUDED.sync_applied_changes,
+            sync_health = EXCLUDED.sync_health,
             loaded_at = now()
         "#,
     )
@@ -346,6 +356,8 @@ pub async fn replace_base_dataset(
     .bind(&columns_json)
     .bind(&omitted_json)
     .bind(dataset.row_count)
+    .bind(dataset.sync_applied_changes)
+    .bind(&dataset.sync_health)
     .execute(&mut *tx)
     .await
     .map_err(PlatformStoreError::Persist)?;
@@ -403,7 +415,7 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     let rows = sqlx::query_as::<_, PipelineRow>(
         r#"
         SELECT deployment_name, name, mode, source_table, source_schema,
-               target_collection, delivery_status
+               target_collection, delivery_status, delivery_applied_changes
         FROM pipelines
         ORDER BY deployment_name, name
         "#,
@@ -422,20 +434,56 @@ pub async fn update_pipeline_delivery_status(
     pipeline_name: &str,
     delivery_status: &str,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let result = sqlx::query(
-        r#"
-        UPDATE pipelines
-        SET delivery_status = $3
-        WHERE deployment_name = $1 AND name = $2
-        "#,
+    update_pipeline_delivery_progress(
+        database_url,
+        deployment_name,
+        pipeline_name,
+        delivery_status,
+        None,
     )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .bind(delivery_status)
-    .execute(&pool)
     .await
-    .map_err(PlatformStoreError::Persist)?;
+}
+
+/// Update Delivery status and optionally accumulate applied Output Identity changes.
+pub async fn update_pipeline_delivery_progress(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+    delivery_status: &str,
+    additional_applied_changes: Option<i32>,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let result = if let Some(additional) = additional_applied_changes {
+        sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET delivery_status = $3,
+                delivery_applied_changes = delivery_applied_changes + $4
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .bind(delivery_status)
+        .bind(additional)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET delivery_status = $3
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .bind(delivery_status)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?
+    };
 
     if result.rows_affected() == 0 {
         return Err(PlatformStoreError::NotFound(format!(
@@ -454,7 +502,8 @@ pub async fn list_base_datasets(
         r#"
         SELECT
             deployment_name, source_table, source_schema, status,
-            primary_key_json, columns_json, omitted_columns_json, row_count
+            primary_key_json, columns_json, omitted_columns_json, row_count,
+            sync_applied_changes, sync_health
         FROM base_datasets
         ORDER BY deployment_name, source_schema, source_table
         "#,
@@ -482,7 +531,8 @@ pub async fn get_base_rows(
             r#"
             SELECT
                 deployment_name, source_table, source_schema, status,
-                primary_key_json, columns_json, omitted_columns_json, row_count
+                primary_key_json, columns_json, omitted_columns_json, row_count,
+                sync_applied_changes, sync_health
             FROM base_datasets
             WHERE source_table = $1 AND deployment_name = $2
             ORDER BY source_schema
@@ -498,7 +548,8 @@ pub async fn get_base_rows(
             r#"
             SELECT
                 deployment_name, source_table, source_schema, status,
-                primary_key_json, columns_json, omitted_columns_json, row_count
+                primary_key_json, columns_json, omitted_columns_json, row_count,
+                sync_applied_changes, sync_health
             FROM base_datasets
             WHERE source_table = $1
             ORDER BY deployment_name, source_schema
@@ -610,6 +661,7 @@ struct PipelineRow {
     source_schema: String,
     target_collection: String,
     delivery_status: String,
+    delivery_applied_changes: i32,
 }
 
 impl PipelineRow {
@@ -622,6 +674,7 @@ impl PipelineRow {
             source_schema: self.source_schema,
             target_collection: self.target_collection,
             delivery_status: self.delivery_status,
+            delivery_applied_changes: self.delivery_applied_changes,
         }
     }
 }
@@ -636,6 +689,8 @@ struct BaseDatasetRow {
     columns_json: String,
     omitted_columns_json: String,
     row_count: i32,
+    sync_applied_changes: i32,
+    sync_health: String,
 }
 
 /// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
@@ -765,6 +820,8 @@ impl BaseDatasetRow {
             omitted_columns: serde_json::from_str(&self.omitted_columns_json)
                 .map_err(PlatformStoreError::InvalidJson)?,
             row_count: self.row_count,
+            sync_applied_changes: self.sync_applied_changes,
+            sync_health: self.sync_health,
         })
     }
 }
