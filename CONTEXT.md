@@ -28,10 +28,18 @@ _Avoid_: Destination (vague), sink (implementation-flavored)
 The platform-owned process that applies insert/update/delete to the bound target table so the user does not implement write logic themselves. Writing to the target for Delivery is allowed; using the target as Rich Transform input/compute is not.
 _Avoid_: Load job (too batch-flavored), sync (overloaded—Sync is capture into the platform)
 
+**Sync Health**:
+Whether capture from source into a Base Dataset is caught up and applying successfully (lag, checkpoints, capture/apply failures). Necessary but not sufficient to claim the Base Dataset matches the source.
+_Avoid_: Sync success (ambiguous), replication lag (mechanism-specific)
+
+**Source Alignment Check**:
+A non-real-time, resource-gated verification that a Base Dataset matches its source. Required before the platform may treat that Base Dataset as a reliable baseline for Drift Check. Must keep source reads lightweight and run only when the source has enough spare capacity.
+_Avoid_: Trusting Sync Health alone, full table dump
+
 **Delivery Health**:
 Whether the change stream for a Target Binding is caught up and applying successfully (lag, checkpoints, apply failures). Manual edits on the target are out of scope for this signal.
 _Avoid_: Sync success (ambiguous), replication lag (mechanism-specific)
 
 **Drift Check**:
-A non-real-time verification that the target table's state still matches the platform's expected dataset for that binding. May detect manual deletes/edits and other divergence. Must be resource-conscious toward user databases.
+A non-real-time, resource-gated verification that the target table matches the platform's expected dataset for that binding (Base or Derived). Uses the platform dataset as baseline only when Source Alignment (for Bases) or equivalent Derived correctness guarantees hold. Detects manual deletes/edits and other target divergence without using the target as transform compute.
 _Avoid_: Sync check (ambiguous), audit (too vague)
