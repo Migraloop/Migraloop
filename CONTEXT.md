@@ -21,8 +21,16 @@ One running configuration that pairs exactly one Source System with exactly one 
 _Avoid_: Cluster (infra-flavored), pipeline (a Deployment contains many Pipelines)
 
 **Sync**:
-Continuous one-way capture of changes from a Source System into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the Target System has been updated—that is Delivery. Reverse flow is not a product feature; users who need the opposite direction create a separate Deployment with source and target swapped. Capture mechanics are engine-specific; the Sync concept is not.
+Continuous one-way capture of changes from a Source System into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the Target System has been updated—that is Delivery. Reverse flow is not a product feature; users who need the opposite direction create a separate Deployment with source and target swapped. Capture mechanics are engine-specific; the Sync concept is not. Sync has two first-class phases: Initial Load then Incremental Capture.
 _Avoid_: Replication (unless referring to the underlying mechanism), mirror-only (implies zero transform capability), bidirectional sync, active-active
+
+**Initial Load**:
+The first materialization of needed Base Datasets (and then Derived Datasets / Delivery) from the Source System so a Pipeline can start from existing data, not only future changes. It inherently reads large volumes from the source and will load the Source System; the platform must throttle, chunk, and resource-gate that read load (and prefer gentler paths such as replicas or vendor dump/export when available)—not pretend the impact is zero.
+_Avoid_: Zero-impact backfill, assuming CDC-only is enough for history
+
+**Incremental Capture**:
+Ongoing change capture into Base Datasets after Initial Load, driving Affect Analysis, Derived updates, and Delivery.
+_Avoid_: Initial Load (different phase)
 
 **Base Dataset**:
 A platform-managed copy of a source table or collection, kept aligned by Sync, close to the source shape. It is the unit Rich Transforms and direct Pipelines may read; it is not the user's source or target database. Within a Deployment, each source table/collection has at most one Base Dataset, shared by every Pipeline that needs it—never captured or stored once per Pipeline.
