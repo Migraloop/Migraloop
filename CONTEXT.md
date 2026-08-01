@@ -120,6 +120,10 @@ _Avoid_: Manual SQL-only upgrades, wipe-and-rebuild as the normal path, breaking
 The minimum Source System and Target System rights the platform needs to run (see ADR-0016)—enough for Initial Load, Incremental Capture, Delivery, and checks, documented per engine. The product must not require superuser/admin as the only supported mode when a narrower grant suffices.
 _Avoid_: Admin-only-by-default, undocumented privilege sprawl
 
+**Connection Security**:
+How the app connects to Source, Target, and Platform Store (see ADR-0017). TLS is supported for all three and recommended for production; cleartext is allowed for local/dev or explicitly chosen setups in v1.
+_Avoid_: No TLS support, mandating TLS for every local dev connection in v1
+
 **Schema Change Handling**:
 How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless. This pause-the-Pipeline rule is for stream-wide blockers (e.g. unblockable DDL), not for single-row poison data.
 _Avoid_: Ignoring DDL, blind skip of blocking changes, endless retry on unblockable DDL
