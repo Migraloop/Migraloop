@@ -117,8 +117,12 @@ How versions move forward in production (see ADR-0014). Platform Store uses vers
 _Avoid_: Manual SQL-only upgrades, wipe-and-rebuild as the normal path, breaking existing Pipelines on upgrade without a migration path
 
 **Schema Change Handling**:
-How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless.
+How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless. This pause-the-Pipeline rule is for stream-wide blockers (e.g. unblockable DDL), not for single-row poison data.
 _Avoid_: Ignoring DDL, blind skip of blocking changes, endless retry on unblockable DDL
+
+**Poison Change Handling**:
+When a single change or Output Identity repeatedly fails to apply but the rest of the stream can continue (see ADR-0015): after bounded retries the platform **quarantines** that change/identity, **alerts**, and **keeps the Pipeline running**. Quarantined keys are marked unhealthy / not aligned until repaired or retried; they are not silently skipped.
+_Avoid_: Pausing the whole Pipeline for one bad row, silent skip, infinite retry blocking the stream
 
 **Drift Check**:
 A non-real-time, resource-gated verification that Managed Columns on the target match the platform's expected dataset for that Pipeline. Uses the platform dataset as baseline only when Source Alignment (for Bases) or equivalent Derived correctness guarantees hold. By default, detected drift on Managed Columns is auto-repaired back to the Pipeline's expected values; non-Managed Columns are ignored. Auto-repair must not imply extra source load beyond what alignment/verification already requires.
