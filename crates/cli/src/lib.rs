@@ -11,7 +11,7 @@ use migraloop_platform_store::{
 };
 use thiserror::Error;
 
-use crate::config::{load_deployment_config, resolve_secret_ref, DeploymentDocument};
+use crate::config::{load_deployment_config, DeploymentDocument, ResolvedSecretRef};
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -70,12 +70,13 @@ async fn apply_migrations(platform_store_url: &str) -> Result<(), CliError> {
 }
 
 fn document_to_deployment(doc: DeploymentDocument) -> Result<Deployment, CliError> {
-    let source_password = doc.spec.source.password.clone();
-    let target_password = doc.spec.target.password.clone();
-
     // Resolve to validate references exist; never persist resolved secret values.
-    resolve_secret_ref(&source_password, "source.password")?;
-    resolve_secret_ref(&target_password, "target.password")?;
+    let _ = doc.spec.source.password.resolve("source.password")?;
+    let _ = doc.spec.target.password.resolve("target.password")?;
+    let source_password_ref =
+        secret_ref_from_resolved(doc.spec.source.password.resolved_ref("source.password")?);
+    let target_password_ref =
+        secret_ref_from_resolved(doc.spec.target.password.resolved_ref("target.password")?);
 
     Ok(Deployment {
         name: doc.metadata.name,
@@ -85,7 +86,7 @@ fn document_to_deployment(doc: DeploymentDocument) -> Result<Deployment, CliErro
             port: doc.spec.source.port,
             database: doc.spec.source.database,
             username: doc.spec.source.username,
-            password_ref: secret_ref_from_config(source_password)?,
+            password_ref: source_password_ref,
         },
         target: SystemConnection {
             kind: doc.spec.target.kind,
@@ -93,24 +94,21 @@ fn document_to_deployment(doc: DeploymentDocument) -> Result<Deployment, CliErro
             port: doc.spec.target.port,
             database: doc.spec.target.database,
             username: doc.spec.target.username,
-            password_ref: secret_ref_from_config(target_password)?,
+            password_ref: target_password_ref,
         },
     })
 }
 
-fn secret_ref_from_config(password: config::PasswordField) -> Result<SecretRef, CliError> {
-    match password {
-        config::PasswordField::FromEnv { from_env } => Ok(SecretRef {
+fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
+    match resolved {
+        ResolvedSecretRef::Env(name) => SecretRef {
             kind: SecretRefKind::Env,
-            value: from_env,
-        }),
-        config::PasswordField::FromFile { from_file } => Ok(SecretRef {
+            value: name,
+        },
+        ResolvedSecretRef::File(path) => SecretRef {
             kind: SecretRefKind::File,
-            value: from_file,
-        }),
-        config::PasswordField::Invalid(_) => Err(CliError::Failed(
-            "password must be a secret reference (fromEnv or fromFile), not plaintext".to_string(),
-        )),
+            value: path.display().to_string(),
+        },
     }
 }
 

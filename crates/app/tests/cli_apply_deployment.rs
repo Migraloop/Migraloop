@@ -426,6 +426,204 @@ spec:
 }
 
 #[tokio::test]
+async fn apply_rejects_password_object_with_extra_plaintext_field() {
+    let url = ephemeral_database_url().await;
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        r#"
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: sneaky-plaintext
+spec:
+  source:
+    kind: oracle
+    host: oracle.example.com
+    port: 1521
+    database: ORCLPDB1
+    username: sync_user
+    password:
+      fromEnv: ORACLE_PASSWORD
+      plaintext: "should-not-be-accepted"
+  target:
+    kind: mongodb
+    host: mongo.example.com
+    port: 27017
+    database: appdb
+    username: deliver_user
+    password:
+      fromEnv: MONGO_PASSWORD
+"#,
+    );
+
+    let migrate = Command::new(bin())
+        .args(["migrate", "--platform-store-url", &url])
+        .output()
+        .expect("run migrate");
+    assert!(migrate.status.success());
+
+    let apply = Command::new(bin())
+        .env("ORACLE_PASSWORD", "o")
+        .env("MONGO_PASSWORD", "m")
+        .args([
+            "apply",
+            "--platform-store-url",
+            &url,
+            "--file",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run apply");
+
+    assert!(
+        !apply.status.success(),
+        "password objects with unknown plaintext fields must be rejected"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert!(
+        combined.to_lowercase().contains("unknown field")
+            || combined.to_lowercase().contains("plaintext")
+            || combined.contains("fromEnv"),
+        "expected rejection of unknown password fields, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn apply_supports_docker_secret_references() {
+    let url = ephemeral_database_url().await;
+    let dir = TempDir::new().expect("tempdir");
+
+    // Simulate Docker's /run/secrets mount with a writable temp root via symlink is hard;
+    // instead write the secret where fromDockerSecret resolves: we can't write /run/secrets
+    // without root, so exercise fromDockerSecret through a failing clear error when missing,
+    // and a successful fromFile path that matches Docker's mount convention.
+    let secrets_dir = dir.path().join("secrets");
+    fs::create_dir_all(&secrets_dir).expect("secrets dir");
+    let oracle_secret = secrets_dir.join("oracle_password");
+    let mongo_secret = secrets_dir.join("mongo_password");
+    fs::write(&oracle_secret, "oracle-docker-secret\n").expect("write oracle");
+    fs::write(&mongo_secret, "mongo-docker-secret\n").expect("write mongo");
+
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &format!(
+            r#"
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: docker-secrets
+spec:
+  source:
+    kind: oracle
+    host: oracle.example.com
+    port: 1521
+    database: ORCLPDB1
+    username: sync_user
+    password:
+      fromFile: {}
+  target:
+    kind: mongodb
+    host: mongo.example.com
+    port: 27017
+    database: appdb
+    username: deliver_user
+    password:
+      fromFile: {}
+"#,
+            oracle_secret.display(),
+            mongo_secret.display()
+        ),
+    );
+
+    let migrate = Command::new(bin())
+        .args(["migrate", "--platform-store-url", &url])
+        .output()
+        .expect("migrate");
+    assert!(migrate.status.success());
+
+    let apply = Command::new(bin())
+        .args([
+            "apply",
+            "--platform-store-url",
+            &url,
+            "--file",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .expect("apply");
+    assert!(
+        apply.status.success(),
+        "mounted-secret file refs (Docker secrets path shape) should apply: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+
+    // fromDockerSecret resolves under /run/secrets; missing name must fail clearly.
+    let docker_cfg = write_config(
+        &dir,
+        "docker.yaml",
+        r#"
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: docker-secret-name
+spec:
+  source:
+    kind: oracle
+    host: oracle.example.com
+    port: 1521
+    database: ORCLPDB1
+    username: sync_user
+    password:
+      fromDockerSecret: missing_oracle_secret
+  target:
+    kind: mongodb
+    host: mongo.example.com
+    port: 27017
+    database: appdb
+    username: deliver_user
+    password:
+      fromDockerSecret: missing_mongo_secret
+"#,
+    );
+    let apply_docker = Command::new(bin())
+        .args([
+            "apply",
+            "--platform-store-url",
+            &url,
+            "--file",
+            docker_cfg.to_str().unwrap(),
+        ])
+        .output()
+        .expect("apply docker");
+    assert!(
+        !apply_docker.status.success(),
+        "missing Docker secret should fail"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply_docker.stdout),
+        String::from_utf8_lossy(&apply_docker.stderr)
+    );
+    assert!(
+        combined.contains("missing_oracle_secret")
+            || combined.contains("/run/secrets/missing_oracle_secret"),
+        "expected clear Docker-secret resolution error, got:\n{combined}"
+    );
+    assert!(
+        combined.to_lowercase().contains("unresolvable")
+            || combined.to_lowercase().contains("secret"),
+        "expected unresolvable-secret wording, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
 async fn apply_json_creates_deployment() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");

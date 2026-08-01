@@ -1,13 +1,16 @@
 //! Declarative Deployment config (YAML/JSON) with secrets by reference.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::CliError;
 
 const SUPPORTED_API_VERSION: &str = "migraloop.dev/v1";
+const V1_SOURCE_KIND: &str = "oracle";
+const V1_TARGET_KIND: &str = "mongodb";
+const DOCKER_SECRETS_DIR: &str = "/run/secrets";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,17 +22,20 @@ pub struct DeploymentDocument {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Metadata {
     pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     pub source: SystemSpec,
     pub target: SystemSpec,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemSpec {
     pub kind: String,
     pub host: String,
@@ -43,16 +49,148 @@ pub struct SystemSpec {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum PasswordField {
-    FromEnv {
-        #[serde(rename = "fromEnv")]
-        from_env: String,
-    },
-    FromFile {
-        #[serde(rename = "fromFile")]
-        from_file: String,
-    },
+    Ref(PasswordRef),
     /// Catch plaintext strings / unknown shapes so we can emit a clear error.
     Invalid(serde_yaml::Value),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasswordRef {
+    #[serde(rename = "fromEnv")]
+    from_env: Option<String>,
+    #[serde(rename = "fromFile")]
+    from_file: Option<String>,
+    /// Docker secret name; resolved from `/run/secrets/<name>` (mounted Docker secrets).
+    #[serde(rename = "fromDockerSecret")]
+    from_docker_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedSecretRef {
+    Env(String),
+    File(PathBuf),
+}
+
+impl PasswordField {
+    pub fn validate(&self, field: &str) -> Result<(), CliError> {
+        match self {
+            Self::Ref(reference) => reference.validate(field),
+            Self::Invalid(value) => {
+                if value.as_str().is_some() {
+                    Err(CliError::Failed(format!(
+                        "{field} must be a secret reference \
+                         (fromEnv, fromFile, or fromDockerSecret), not plaintext"
+                    )))
+                } else {
+                    Err(CliError::Failed(format!(
+                        "{field} must be a secret reference with exactly one of \
+                         fromEnv, fromFile, or fromDockerSecret"
+                    )))
+                }
+            }
+        }
+    }
+
+    pub fn resolved_ref(&self, field: &str) -> Result<ResolvedSecretRef, CliError> {
+        match self {
+            Self::Ref(reference) => reference.resolved_ref(field),
+            Self::Invalid(_) => Err(CliError::Failed(format!(
+                "{field} must be a secret reference \
+                 (fromEnv, fromFile, or fromDockerSecret), not plaintext"
+            ))),
+        }
+    }
+
+    /// Resolve a secret reference from env, a mounted file, or a Docker secret.
+    /// Returns the secret value only for validation; callers must not persist it.
+    pub fn resolve(&self, field: &str) -> Result<String, CliError> {
+        match self.resolved_ref(field)? {
+            ResolvedSecretRef::Env(name) => std::env::var(&name).map_err(|_| {
+                CliError::Failed(format!(
+                    "unresolvable secret reference: {field} fromEnv {name} is missing"
+                ))
+            }),
+            ResolvedSecretRef::File(path) => {
+                let contents = fs::read_to_string(&path).map_err(|err| {
+                    CliError::Failed(format!(
+                        "unresolvable secret reference: {field} {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                let trimmed = contents.trim_end_matches(['\n', '\r']).to_string();
+                if trimmed.is_empty() {
+                    return Err(CliError::Failed(format!(
+                        "unresolvable secret reference: {field} {} is empty",
+                        path.display()
+                    )));
+                }
+                Ok(trimmed)
+            }
+        }
+    }
+}
+
+impl PasswordRef {
+    fn present_keys(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.from_env.is_some() {
+            keys.push("fromEnv");
+        }
+        if self.from_file.is_some() {
+            keys.push("fromFile");
+        }
+        if self.from_docker_secret.is_some() {
+            keys.push("fromDockerSecret");
+        }
+        keys
+    }
+
+    fn validate(&self, field: &str) -> Result<(), CliError> {
+        let keys = self.present_keys();
+        if keys.len() != 1 {
+            return Err(CliError::Failed(format!(
+                "{field} must set exactly one of fromEnv, fromFile, or fromDockerSecret"
+            )));
+        }
+        match (
+            self.from_env.as_deref(),
+            self.from_file.as_deref(),
+            self.from_docker_secret.as_deref(),
+        ) {
+            (Some(name), None, None) if name.trim().is_empty() => Err(CliError::Failed(format!(
+                "{field}.fromEnv must not be empty"
+            ))),
+            (None, Some(path), None) if path.trim().is_empty() => Err(CliError::Failed(format!(
+                "{field}.fromFile must not be empty"
+            ))),
+            (None, None, Some(name)) if name.trim().is_empty() => Err(CliError::Failed(format!(
+                "{field}.fromDockerSecret must not be empty"
+            ))),
+            (Some(_), None, None) | (None, Some(_), None) | (None, None, Some(_)) => Ok(()),
+            _ => Err(CliError::Failed(format!(
+                "{field} must set exactly one of fromEnv, fromFile, or fromDockerSecret"
+            ))),
+        }
+    }
+
+    fn resolved_ref(&self, field: &str) -> Result<ResolvedSecretRef, CliError> {
+        self.validate(field)?;
+        if let Some(name) = &self.from_env {
+            return Ok(ResolvedSecretRef::Env(name.clone()));
+        }
+        if let Some(path) = &self.from_file {
+            return Ok(ResolvedSecretRef::File(PathBuf::from(path)));
+        }
+        if let Some(name) = &self.from_docker_secret {
+            return Ok(ResolvedSecretRef::File(
+                Path::new(DOCKER_SECRETS_DIR).join(name),
+            ));
+        }
+        Err(CliError::Failed(format!(
+            "{field} must set exactly one of fromEnv, fromFile, or fromDockerSecret"
+        )))
+    }
 }
 
 pub fn load_deployment_config(path: &Path) -> Result<DeploymentDocument, CliError> {
@@ -65,7 +203,8 @@ pub fn load_deployment_config(path: &Path) -> Result<DeploymentDocument, CliErro
 
     let doc = parse_document(path, &raw)?;
     validate_document(&doc)?;
-    validate_password_fields(&doc)?;
+    doc.spec.source.password.validate("source.password")?;
+    doc.spec.target.password.validate("target.password")?;
     Ok(doc)
 }
 
@@ -97,7 +236,7 @@ fn parse_document(path: &Path, raw: &str) -> Result<DeploymentDocument, CliError
         if looks_like_plaintext_password_error(&err, raw) {
             CliError::Failed(
                 "invalid Deployment config: password must be a secret reference \
-                 (fromEnv or fromFile), not plaintext"
+                 (fromEnv, fromFile, or fromDockerSecret), not plaintext"
                     .to_string(),
             )
         } else {
@@ -116,7 +255,9 @@ fn looks_like_plaintext_password_error(err: &str, raw: &str) -> bool {
             || lower.contains("invalid type")
             || lower.contains("expected")
             || lower.contains("fromenv")
-            || lower.contains("fromfile"))
+            || lower.contains("fromfile")
+            || lower.contains("fromdockersecret")
+            || lower.contains("unknown field"))
 }
 
 fn validate_document(doc: &DeploymentDocument) -> Result<(), CliError> {
@@ -137,6 +278,18 @@ fn validate_document(doc: &DeploymentDocument) -> Result<(), CliError> {
             "Deployment metadata.name must not be empty".to_string(),
         ));
     }
+    if doc.spec.source.kind != V1_SOURCE_KIND {
+        return Err(CliError::Failed(format!(
+            "v1 source.kind must be {V1_SOURCE_KIND}, got {:?}",
+            doc.spec.source.kind
+        )));
+    }
+    if doc.spec.target.kind != V1_TARGET_KIND {
+        return Err(CliError::Failed(format!(
+            "v1 target.kind must be {V1_TARGET_KIND}, got {:?}",
+            doc.spec.target.kind
+        )));
+    }
     if doc.spec.source.port <= 0 || doc.spec.source.port > u16::MAX as i32 {
         return Err(CliError::Failed(
             "source.port must be a valid TCP port".to_string(),
@@ -148,64 +301,4 @@ fn validate_document(doc: &DeploymentDocument) -> Result<(), CliError> {
         ));
     }
     Ok(())
-}
-
-fn validate_password_fields(doc: &DeploymentDocument) -> Result<(), CliError> {
-    validate_password(&doc.spec.source.password, "source.password")?;
-    validate_password(&doc.spec.target.password, "target.password")?;
-    Ok(())
-}
-
-fn validate_password(password: &PasswordField, field: &str) -> Result<(), CliError> {
-    match password {
-        PasswordField::FromEnv { from_env } if from_env.trim().is_empty() => Err(CliError::Failed(
-            format!("{field}.fromEnv must not be empty"),
-        )),
-        PasswordField::FromFile { from_file } if from_file.trim().is_empty() => {
-            Err(CliError::Failed(format!(
-                "{field}.fromFile must not be empty"
-            )))
-        }
-        PasswordField::FromEnv { .. } | PasswordField::FromFile { .. } => Ok(()),
-        PasswordField::Invalid(value) => {
-            if value.as_str().is_some() {
-                Err(CliError::Failed(format!(
-                    "{field} must be a secret reference (fromEnv or fromFile), not plaintext"
-                )))
-            } else {
-                Err(CliError::Failed(format!(
-                    "{field} must be a secret reference with fromEnv or fromFile"
-                )))
-            }
-        }
-    }
-}
-
-/// Resolve a secret reference from env or a mounted/Docker secret file.
-/// Returns the secret value only for validation; callers must not persist it.
-pub fn resolve_secret_ref(password: &PasswordField, field: &str) -> Result<String, CliError> {
-    match password {
-        PasswordField::FromEnv { from_env } => std::env::var(from_env).map_err(|_| {
-            CliError::Failed(format!(
-                "unresolvable secret reference: {field} fromEnv {from_env} is missing"
-            ))
-        }),
-        PasswordField::FromFile { from_file } => {
-            let contents = fs::read_to_string(from_file).map_err(|err| {
-                CliError::Failed(format!(
-                    "unresolvable secret reference: {field} fromFile {from_file}: {err}"
-                ))
-            })?;
-            let trimmed = contents.trim_end_matches(['\n', '\r']).to_string();
-            if trimmed.is_empty() {
-                return Err(CliError::Failed(format!(
-                    "unresolvable secret reference: {field} fromFile {from_file} is empty"
-                )));
-            }
-            Ok(trimmed)
-        }
-        PasswordField::Invalid(_) => Err(CliError::Failed(format!(
-            "{field} must be a secret reference (fromEnv or fromFile), not plaintext"
-        ))),
-    }
 }
