@@ -61,8 +61,8 @@ The platform-managed output produced by a Rich Transform; a dataset the platform
 _Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored), periodic full-table recompute as the normal path, recomputing unaffected identities
 
 **Pipeline**:
-A user-defined flow inside a Deployment that produces one target table/collection. A Deployment has many Pipelines; a Pipeline does not define the Source/Target System pair—that is the Deployment. Every Pipeline is in one of two modes: Direct or Transform.
-_Avoid_: The whole system config, Deployment, single global job
+A user-defined flow inside a Deployment that produces one target table/collection. A Deployment has many Pipelines; a Pipeline does not define the Source/Target System pair—that is the Deployment. Every Pipeline is in one of two modes: Direct or Transform. Pipelines are declared in config (YAML/JSON) and applied via CLI; users must be able to **add a Pipeline at runtime** without restarting the whole Deployment—existing Pipelines keep running while the new one starts (including its Initial Load as needed) (see ADR-0007).
+_Avoid_: The whole system config, Deployment, single global job, requiring a full process restart to add a Pipeline
 
 **Direct Pipeline**:
 A Pipeline with no Rich Transform: one Base Dataset is Delivered to the Target Binding. For Oracle → MongoDB, the default shape is one source row → one document with flattened fields; the source primary key maps to the document identity (`_id` or a configured id field). There is no useful alternate default without a transform.
