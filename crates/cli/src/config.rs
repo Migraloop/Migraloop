@@ -32,6 +32,25 @@ pub struct Metadata {
 pub struct Spec {
     pub source: SystemSpec,
     pub target: SystemSpec,
+    /// Pipelines hosted by this Deployment. Empty means Deployment-only apply.
+    #[serde(default)]
+    pub pipelines: Vec<PipelineSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineSpec {
+    pub name: String,
+    pub mode: String,
+    pub source: PipelineSourceSpec,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineSourceSpec {
+    pub table: String,
+    #[serde(default)]
+    pub schema: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -298,6 +317,29 @@ fn validate_document(doc: &DeploymentDocument) -> Result<(), CliError> {
     if doc.spec.target.port <= 0 || doc.spec.target.port > u16::MAX as i32 {
         return Err(CliError::Failed(
             "target.port must be a valid TCP port".to_string(),
+        ));
+    }
+    for pipeline in &doc.spec.pipelines {
+        validate_pipeline(pipeline)?;
+    }
+    Ok(())
+}
+
+fn validate_pipeline(pipeline: &PipelineSpec) -> Result<(), CliError> {
+    if pipeline.name.trim().is_empty() {
+        return Err(CliError::Failed(
+            "pipeline.name must not be empty".to_string(),
+        ));
+    }
+    if pipeline.mode != "direct" {
+        return Err(CliError::Failed(format!(
+            "unsupported pipeline.mode {:?}; v1 Initial Load slice supports only \"direct\"",
+            pipeline.mode
+        )));
+    }
+    if pipeline.source.table.trim().is_empty() {
+        return Err(CliError::Failed(
+            "pipeline.source.table must not be empty".to_string(),
         ));
     }
     Ok(())

@@ -17,6 +17,10 @@ pub enum PlatformStoreError {
     Persist(#[source] sqlx::Error),
     #[error("failed to load Deployments: {0}")]
     Load(#[source] sqlx::Error),
+    #[error("{0}")]
+    NotFound(String),
+    #[error("invalid stored JSON: {0}")]
+    InvalidJson(#[source] serde_json::Error),
 }
 
 /// How a secret is referenced (never stored as plaintext).
@@ -76,6 +80,49 @@ pub struct Deployment {
     pub name: String,
     pub source: SystemConnection,
     pub target: SystemConnection,
+}
+
+/// A Pipeline declared inside a Deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pipeline {
+    pub deployment_name: String,
+    pub name: String,
+    pub mode: String,
+    pub source_table: String,
+    pub source_schema: String,
+}
+
+/// Supported column kept in a Base Dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseColumn {
+    pub name: String,
+    pub oracle_type: String,
+}
+
+/// Unsupported Source column omitted from the Base Dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmittedColumn {
+    pub name: String,
+    pub oracle_type: String,
+}
+
+/// Platform-managed Base Dataset for one Source table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseDataset {
+    pub deployment_name: String,
+    pub source_table: String,
+    pub source_schema: String,
+    pub status: String,
+    pub columns: Vec<BaseColumn>,
+    pub omitted_columns: Vec<OmittedColumn>,
+    pub row_count: i32,
+}
+
+/// One row stored in a Base Dataset (supported columns only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaseRow {
+    pub row_ordinal: i32,
+    pub data: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Health of the Platform Store as observed by operators.
@@ -201,6 +248,118 @@ pub async fn upsert_deployment(
     Ok(())
 }
 
+/// Replace all Pipelines for a Deployment with the provided set.
+pub async fn replace_pipelines(
+    database_url: &str,
+    deployment_name: &str,
+    pipelines: &[Pipeline],
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
+
+    sqlx::query("DELETE FROM pipelines WHERE deployment_name = $1")
+        .bind(deployment_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+    for pipeline in pipelines {
+        sqlx::query(
+            r#"
+            INSERT INTO pipelines (
+                deployment_name, name, mode, source_table, source_schema, applied_at
+            ) VALUES ($1, $2, $3, $4, $5, now())
+            "#,
+        )
+        .bind(&pipeline.deployment_name)
+        .bind(&pipeline.name)
+        .bind(&pipeline.mode)
+        .bind(&pipeline.source_table)
+        .bind(&pipeline.source_schema)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    }
+
+    tx.commit().await.map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+/// Persist a Base Dataset snapshot (metadata + full supported-type rows).
+pub async fn replace_base_dataset(
+    database_url: &str,
+    dataset: &BaseDataset,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM base_rows
+        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+        "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.source_schema)
+    .bind(&dataset.source_table)
+    .execute(&mut *tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    let columns_json =
+        serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+    let omitted_json =
+        serde_json::to_string(&dataset.omitted_columns).map_err(PlatformStoreError::InvalidJson)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO base_datasets (
+            deployment_name, source_table, source_schema, status,
+            columns_json, omitted_columns_json, row_count, loaded_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+        ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
+            status = EXCLUDED.status,
+            columns_json = EXCLUDED.columns_json,
+            omitted_columns_json = EXCLUDED.omitted_columns_json,
+            row_count = EXCLUDED.row_count,
+            loaded_at = now()
+        "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.source_table)
+    .bind(&dataset.source_schema)
+    .bind(&dataset.status)
+    .bind(&columns_json)
+    .bind(&omitted_json)
+    .bind(dataset.row_count)
+    .execute(&mut *tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    for (ordinal, row) in rows.iter().enumerate() {
+        let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
+        sqlx::query(
+            r#"
+            INSERT INTO base_rows (
+                deployment_name, source_schema, source_table, row_ordinal, row_json
+            ) VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.source_schema)
+        .bind(&dataset.source_table)
+        .bind(ordinal as i32)
+        .bind(&row_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    }
+
+    tx.commit().await.map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
 /// List applied Deployments ordered by name.
 pub async fn list_deployments(
     database_url: &str,
@@ -223,6 +382,130 @@ pub async fn list_deployments(
     .map_err(PlatformStoreError::Load)?;
 
     rows.into_iter().map(DeploymentRow::into_deployment).collect()
+}
+
+/// List Pipelines for all Deployments, ordered by deployment then name.
+pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let rows = sqlx::query_as::<_, PipelineRow>(
+        r#"
+        SELECT deployment_name, name, mode, source_table, source_schema
+        FROM pipelines
+        ORDER BY deployment_name, name
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+
+    Ok(rows.into_iter().map(PipelineRow::into_pipeline).collect())
+}
+
+/// List Base Datasets for all Deployments.
+pub async fn list_base_datasets(
+    database_url: &str,
+) -> Result<Vec<BaseDataset>, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let rows = sqlx::query_as::<_, BaseDatasetRow>(
+        r#"
+        SELECT
+            deployment_name, source_table, source_schema, status,
+            columns_json, omitted_columns_json, row_count
+        FROM base_datasets
+        ORDER BY deployment_name, source_schema, source_table
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+
+    rows.into_iter()
+        .map(BaseDatasetRow::into_base_dataset)
+        .collect()
+}
+
+/// Load Base Dataset rows for a Source table (operator-facing inspect).
+///
+/// When `deployment_name` is `None`, exactly one matching Base Dataset must exist.
+pub async fn get_base_rows(
+    database_url: &str,
+    table: &str,
+    deployment_name: Option<&str>,
+) -> Result<(BaseDataset, Vec<BaseRow>), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let dataset_rows = if let Some(deployment_name) = deployment_name {
+        sqlx::query_as::<_, BaseDatasetRow>(
+            r#"
+            SELECT
+                deployment_name, source_table, source_schema, status,
+                columns_json, omitted_columns_json, row_count
+            FROM base_datasets
+            WHERE source_table = $1 AND deployment_name = $2
+            ORDER BY source_schema
+            "#,
+        )
+        .bind(table)
+        .bind(deployment_name)
+        .fetch_all(&pool)
+        .await
+        .map_err(PlatformStoreError::Load)?
+    } else {
+        sqlx::query_as::<_, BaseDatasetRow>(
+            r#"
+            SELECT
+                deployment_name, source_table, source_schema, status,
+                columns_json, omitted_columns_json, row_count
+            FROM base_datasets
+            WHERE source_table = $1
+            ORDER BY deployment_name, source_schema
+            "#,
+        )
+        .bind(table)
+        .fetch_all(&pool)
+        .await
+        .map_err(PlatformStoreError::Load)?
+    };
+
+    let dataset_row = match dataset_rows.as_slice() {
+        [] => {
+            return Err(PlatformStoreError::NotFound(format!(
+                "no Base Dataset found for table {table}"
+            )));
+        }
+        [only] => only.clone(),
+        many => {
+            return Err(PlatformStoreError::NotFound(format!(
+                "multiple Base Datasets found for table {table} across Deployments {}; \
+                 pass --deployment to disambiguate",
+                many.iter()
+                    .map(|row| row.deployment_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    };
+    let dataset = dataset_row.into_base_dataset()?;
+
+    let rows = sqlx::query_as::<_, BaseRowDb>(
+        r#"
+        SELECT row_ordinal, row_json
+        FROM base_rows
+        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+        ORDER BY row_ordinal
+        "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.source_schema)
+    .bind(&dataset.source_table)
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+
+    let base_rows = rows
+        .into_iter()
+        .map(BaseRowDb::into_base_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((dataset, base_rows))
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -270,6 +553,156 @@ impl DeploymentRow {
                     value: self.target_password_ref_value,
                 },
             },
+        })
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PipelineRow {
+    deployment_name: String,
+    name: String,
+    mode: String,
+    source_table: String,
+    source_schema: String,
+}
+
+impl PipelineRow {
+    fn into_pipeline(self) -> Pipeline {
+        Pipeline {
+            deployment_name: self.deployment_name,
+            name: self.name,
+            mode: self.mode,
+            source_table: self.source_table,
+            source_schema: self.source_schema,
+        }
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct BaseDatasetRow {
+    deployment_name: String,
+    source_table: String,
+    source_schema: String,
+    status: String,
+    columns_json: String,
+    omitted_columns_json: String,
+    row_count: i32,
+}
+
+/// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
+pub async fn delete_base_datasets_not_in(
+    database_url: &str,
+    deployment_name: &str,
+    keep_tables: &[(String, String)],
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let existing = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT source_schema, source_table
+        FROM base_datasets
+        WHERE deployment_name = $1
+        "#,
+    )
+    .bind(deployment_name)
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    for (schema, table) in existing {
+        let keep = keep_tables
+            .iter()
+            .any(|(s, t)| s == &schema && t == &table);
+        if keep {
+            continue;
+        }
+        sqlx::query(
+            r#"
+            DELETE FROM base_rows
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(&schema)
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        sqlx::query(
+            r#"
+            DELETE FROM base_datasets
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(&schema)
+        .bind(&table)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    }
+    Ok(())
+}
+
+/// Whether a Base Dataset already exists for the given Deployment table.
+pub async fn base_dataset_exists(
+    database_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<bool, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let found = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT 1
+        FROM base_datasets
+        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+        LIMIT 1
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .fetch_optional(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+    Ok(found.is_some())
+}
+
+impl BaseDatasetRow {
+    fn into_base_dataset(self) -> Result<BaseDataset, PlatformStoreError> {
+        Ok(BaseDataset {
+            deployment_name: self.deployment_name,
+            source_table: self.source_table,
+            source_schema: self.source_schema,
+            status: self.status,
+            columns: serde_json::from_str(&self.columns_json)
+                .map_err(PlatformStoreError::InvalidJson)?,
+            omitted_columns: serde_json::from_str(&self.omitted_columns_json)
+                .map_err(PlatformStoreError::InvalidJson)?,
+            row_count: self.row_count,
+        })
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct BaseRowDb {
+    row_ordinal: i32,
+    row_json: String,
+}
+
+impl BaseRowDb {
+    fn into_base_row(self) -> Result<BaseRow, PlatformStoreError> {
+        let value: serde_json::Value =
+            serde_json::from_str(&self.row_json).map_err(PlatformStoreError::InvalidJson)?;
+        let data = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| {
+                PlatformStoreError::NotFound("stored Base row is not a JSON object".to_string())
+            })?;
+        Ok(BaseRow {
+            row_ordinal: self.row_ordinal,
+            data,
         })
     }
 }
