@@ -1,0 +1,3 @@
+# PostgreSQL as the locked Platform Store
+
+The platform needs a dedicated data plane for Base Datasets, Derived Datasets, Maintenance State, and checkpoints, isolated from user source/target systems. We lock **PostgreSQL** as that Platform Store: it is free to self-host, strong enough for CDC apply plus indexed per-identity recompute, and avoids building a query layer on a raw KV store. Users do not choose the store engine. RocksDB was considered for raw write speed but rejected for v1 because joins/secondary-index aggregations would require a heavy custom layer; MongoDB was rejected as the store brand to avoid SSPL friction and confusion with MongoDB as a Target System. The Platform Store should ship installed with the app by default (not BYO).
