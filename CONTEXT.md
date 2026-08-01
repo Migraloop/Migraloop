@@ -1,0 +1,153 @@
+# DB Sync Platform
+
+An open-source platform for continuous database-to-database synchronization, with first-class rich transforms that shape multi-table data into derived outputs. Transform compute runs against platform-managed data, not the user's source or target databases. The platform owns applying changes to user-configured target tables. The project is licensed **Apache-2.0**, optimizes for adoption first, and is intended to be self-hosted next to customer databases—not offered as multi-tenant SaaS by default (see ADR-0012).
+
+The product must support **many database engine kinds** over time (multiple source kinds and multiple target kinds). The domain model stays engine-agnostic so new engines plug in without reshaping Sync, Rich Transform, Delivery, or checks. The first shipping pair is **Oracle → MongoDB**; that pair is a vertical slice, not the ceiling.
+
+A single **Deployment** connects **one Source System to one Target System** and may contain **many Pipelines**. Wanting a different database pair means another Deployment (source/target swapped or replaced), not multi-database fan-in inside one Deployment.
+
+v1 runs a Deployment as **one active app instance** (internally concurrent) plus the Platform Store. All durable Deployment state lives in the Platform Store so a replacement instance can resume without local-only recovery. Automatic multi-instance failover is a later stage; active processing remains single-leader (not multi-writer). The app is implemented in **Rust** (see ADR-0013), including Oracle Incremental Capture via LogMiner over OCI. The repo is a **modular monorepo** (capture / platform-store / transform / delivery / cli / app) compiled to one v1 binary, preserving seams for later paid modules (see ADR-0024).
+
+Base Datasets, Derived Datasets, and Maintenance State live in a dedicated **Platform Store**: an independent database solely for the platform, never the user's Source or Target System. Its engine brand is chosen by the product and locked—not a user-selectable option.
+
+## Language
+
+**Source System**:
+A user database instance the platform captures from (e.g. an Oracle database). Identified by engine kind plus connection identity. The platform must support multiple engine kinds over time.
+_Avoid_: Source DB (fine colloquially; prefer Source System when distinguishing from Target System)
+
+**Target System**:
+A user database instance the platform delivers into (e.g. a MongoDB deployment). Identified by engine kind plus connection identity. The platform must support multiple engine kinds over time.
+_Avoid_: Destination database
+
+**Deployment**:
+One running configuration that pairs exactly one Source System with exactly one Target System and hosts one or more Pipelines between them.
+_Avoid_: Cluster (infra-flavored), pipeline (a Deployment contains many Pipelines)
+
+**Platform Store**:
+The independent database dedicated to platform-managed data (Base Datasets, Derived Datasets, Maintenance State, checkpoints). It exists so Sync, Rich Transform, and Affect Analysis never use the user's Source or Target System as their data plane. The store's engine is a product-locked choice, not configured per user preference (see ADR-0001). Default installation ships the Platform Store with the app as a separate container beside the app (one install, two containers): engine locked, Postgres settings/volumes/resources user-tunable; not BYO alternate engines. Connection configuration may be stored; **secrets (passwords, keys) are not stored in plaintext** in the Platform Store or Pipeline definitions—they are supplied via environment variables, Docker secrets, or mounted secret files, referenced by name (see ADR-0006).
+_Avoid_: Using source/target as platform storage, user-pluggable store engine, BYO database for the platform data plane, single-process “DB inside the app container” as the default, plaintext passwords in Pipeline config
+
+**Sync**:
+Continuous one-way capture of changes from a Source System into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the Target System has been updated—that is Delivery. Reverse flow is not a product feature; users who need the opposite direction create a separate Deployment with source and target swapped. Capture mechanics are engine-specific; the Sync concept is not. Sync has two first-class phases: Initial Load then Incremental Capture.
+_Avoid_: Replication (unless referring to the underlying mechanism), mirror-only (implies zero transform capability), bidirectional sync, active-active
+
+**Initial Load**:
+The first materialization of needed Base Datasets (and then Derived Datasets / Delivery) from the Source System so a Pipeline can start from existing data, not only future changes. It is scoped to newly introduced **tables** (**table-level** when only some Base Datasets are missing); included tables load full supported-type rows, not a Pipeline-specific column projection. It inherently reads large volumes from the source, but the platform must be designed so it does not overwhelm the Source System: chunked reads, rate limits, pause/resume, and backoff under pressure. v1 uses the same Source connection for Initial Load and Incremental Capture; splitting read/CDC connections is optional later, not required for safety. Hand-off to Incremental Capture must not create gaps: establish a low-watermark capture position first, run Initial Load with Incremental Capture overlapping that window, and absorb duplicates via idempotent apply/dedup. **No out-of-sync from cutover is allowed**—prefer duplicate applies over missing changes; never start Incremental Capture after the snapshot window without overlap.
+_Avoid_: Zero-impact backfill, unbounded full-table slam, assuming a separate replica connection is required for correctness, gap-tolerant cutover, relying on later repair as the primary cutover strategy, reloading unrelated Base Datasets when adding one table
+
+**Incremental Capture**:
+Ongoing change capture into Base Datasets after Initial Load, driving Affect Analysis, Derived updates, and Delivery. Capture mechanisms are pluggable per Source System kind (and may offer more than one mechanism per kind). For Oracle, v1 ships **LogMiner** first; other Oracle mechanisms may be added later without changing Sync/Pipeline/Delivery concepts. Engine-specific **Source Prerequisites** (e.g. Oracle supplemental logging, adequate redo retention) are documented and checked before run; unmet prerequisites fail fast with a clear error (see ADR-0021).
+_Avoid_: Initial Load (different phase), hard-wiring the domain to a single vendor capture product, discovering missing Oracle logging only after silent data loss
+
+**Source Prerequisites**:
+Per-engine requirements the Source System must satisfy for Sync to be correct (see ADR-0021). The platform documents them and validates at startup/apply time; it does not assume operators already know, and v1 does not auto-mutate Source settings to “fix” them.
+_Avoid_: Undocumented tribal knowledge, auto-altering customer Oracle config by default
+
+**Base Dataset**:
+A platform-managed copy of a source table or collection, kept aligned by Sync, close to the source shape. It is the unit Rich Transforms and direct Pipelines may read; it is not the user's source or target database. Within a Deployment, each source table/collection has at most one Base Dataset, shared by every Pipeline that needs it—never captured or stored once per Pipeline. Which **tables** are synced is determined by Pipeline references—not whole-schema mirror (see ADR-0019). Once a table is included, the Base Dataset keeps the **full row** of Supported Source Types for that table, even if current Pipelines use only some fields—so later Pipelines can reuse the same Base without column backfill. When a new Pipeline needs a table with no Base Dataset yet, run **table-level Initial Load for that table only**; existing Bases stay on Incremental Capture and are not reloaded.
+_Avoid_: Raw table (ambiguous), source mirror, target table, per-pipeline copy of the same source table, whole-schema capture by default, full Deployment reload when one new table is needed, projecting Base Datasets down to only currently used columns
+
+**Rich Transform**:
+A user-defined transformation composed of operators the platform can analyze. It reads only platform-managed data—never the user's source or target DB as a compute engine. From the Pipeline definition alone, the platform must determine which Base fields and values each Derived result depends on, so incremental maintenance knows what must be recomputed and what must not. Definitions are **declarative** (DSL/config of supported operators only). Free-form user scripts are out of scope because they make Affect Analysis impossible. A UI may author the same declarative definition later; the declarative form remains the source of truth. The v1 operator surface is anchored on **Oracle → MongoDB** (document-friendly, incrementally maintainable)—including project/addFields/rename/remove, filter, equiLookup, unwind, groupBy with sum/count/min/max/avg, distinct/addToSet, and union. Broader Mongo stages that break Affect Analysis stay out. Later source/target engines adapt or subset this surface; they do not each get a separate transform language.
+_Avoid_: Thin mapping, light transform, ETL job (too generic), opaque free-form scripts the platform cannot analyze, arbitrary SQL/JS as the transform definition, engine-specific transform dialects per pair
+
+**Affect Analysis**:
+Strict determination, from the Pipeline's Rich Transform definition and an incoming Base change, of which Output Identities (if any) require Derived recomputation. Unused fields must not trigger recompute (e.g. an order address update does not recompute a sum-of-price-by-customer). Operator semantics decide value-level cases (e.g. distinct-customer count updates for a new customer id, but not for a duplicate already-counted id).
+_Avoid_: Heuristic invalidation, always-recompute, best-effort skip
+
+**Maintenance State**:
+Platform-internal state kept only when an operator needs it for correct incremental Affect Analysis or updates beyond what the Derived Dataset and the change themselves already provide. Example: per-`customerId` row counts to know whether a distinct-customer aggregate must change. It must not be created blindly—e.g. `sum(price) by customerId` should not invent extra structures if the Derived totals plus the change suffice. Never stored in the user's source or target for this purpose.
+_Avoid_: Always-on side tables per Pipeline, dumping maintenance data into the Target System
+
+**Derived Dataset**:
+The platform-managed output produced by a Rich Transform; a dataset the platform materializes and maintains, not a verbatim copy of a single source table. When Base Datasets change, the platform must update the Derived Dataset **incrementally by Output Identity**, driven by Affect Analysis: never recompute work that Affect Analysis proves unnecessary. Prefer operator-equivalent fast paths (e.g. adjusting a per-identity sum using pre-apply Base values) when they are correct; otherwise recompute from the platform Base inputs for only the affected identities. If an identity’s input set is huge, that per-identity cost may be unavoidable. Steady-state full recompute of an entire Derived Dataset is unacceptable. Incremental maintenance must be **correct**—semantically equivalent to re-evaluating the Rich Transform for affected identities.
+_Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored), periodic full-table recompute as the normal path, recomputing unaffected identities
+
+**Pipeline**:
+A user-defined flow inside a Deployment that produces one target table/collection. A Deployment has many Pipelines; a Pipeline does not define the Source/Target System pair—that is the Deployment. Every Pipeline is in one of two modes: Direct or Transform. Pipelines are declared in config (YAML/JSON) and applied via CLI. At runtime the control plane must support **add, pause, resume, remove, and change** without restarting the whole Deployment (see ADR-0007). A **change** applies a new Pipeline revision: pause the old revision's Delivery, rebuild that Pipeline's Derived Dataset and re-Deliver as required by the change, then continue incremental work; shared Base Datasets are not rebuilt for a Pipeline change. Metadata-only changes may skip rebuild. Not an undefined hot-patch of live semantics mid-flight.
+_Avoid_: The whole system config, Deployment, single global job, requiring a full process restart to add a Pipeline, silently mutating a live transform without a revision transition, rebuilding shared Base Datasets on every Pipeline change
+
+**Direct Pipeline**:
+A Pipeline with no Rich Transform: one Base Dataset is Delivered to the Target Binding. For Oracle → MongoDB, the default shape is one source row → one document with flattened fields; the source primary key maps to the document identity (`_id` or a configured id field). There is no useful alternate default without a transform.
+_Avoid_: Mirror mode (implies zero field mapping/config), raw dump
+
+**Transform Pipeline**:
+A Pipeline that runs a Rich Transform over one or more Base Datasets, materializes a Derived Dataset, and Delivers that to the Target Binding. It must declare an Output Identity before it can run.
+_Avoid_: ETL job (too generic), thin mapping-only pipeline
+
+**Output Identity**:
+The stable key that locates one output row/document on the Target System for Delivery insert/update/delete (and Drift Check). For a Direct Pipeline it defaults to the source primary key. For a Transform Pipeline the user must define it over the Rich Transform output. It must be deterministic from the input/transform data—no randomness (e.g. generated UUIDs), so the same logical result always resolves to the same target key.
+_Avoid_: Surrogate random id, guessed primary key, source PK (when the transform’s grain differs)
+
+**Target Binding**:
+The part of a Pipeline that maps its output dataset (Base or Derived) to a specific table/collection in the Target System. It declares Managed Columns/fields and (with the Pipeline) the Output Identity; the target table/collection may have additional fields outside the binding.
+_Avoid_: Destination (vague), sink (implementation-flavored)
+
+**Managed Columns**:
+The columns/fields the Pipeline defines as its output shape and that Delivery will write. On document Target Systems (e.g. MongoDB), the platform does not inventory “non-managed” fields—it simply never writes keys outside the Managed set, so other fields are naturally untouched. On relational Target Systems (e.g. PostgreSQL), Managed Columns are the schema the platform must create/maintain on the target table; other columns remain out of scope for updates. This document-vs-relational distinction is part of the domain model even though v1 only ships MongoDB as a Target System.
+_Avoid_: All columns, full document ownership (unless the binding literally lists every field), requiring a catalog of non-managed fields on document stores
+
+**Delivery**:
+The platform-owned process that applies insert/update/delete for a Pipeline's Output Identity on the Target System so the user does not implement write logic themselves. Updates write only Managed Columns/fields. On document targets, unknown other fields are simply not touched. On relational targets, Delivery also implies establishing Managed Columns in the table schema—specified now for design continuity, implemented when a relational Target System ships. When an Output Identity no longer exists, Delivery may **delete the entire target document/row**. Writing to the target for Delivery is allowed; using the target as Rich Transform input/compute is not. v1 implements document Delivery (MongoDB) only. Reliability is **at-least-once with idempotent apply**: retries may occasionally write the same Output Identity more than once; Managed results are upserted/deleted by identity so duplicates do not change correctness. Rare duplicate target writes are an accepted, minor cost—not a reason to chase end-to-end exactly-once. Change events applied into the Platform Store are deduplicated so incremental Derived maintenance does not double-apply the same source change.
+_Avoid_: Load job (too batch-flavored), sync (overloaded—Sync is capture into the platform), overwriting document fields outside the Managed set, dropping relational columns the platform does not own, at-most-once Delivery, requiring distributed exactly-once for correctness
+
+**Backpressure**:
+How the platform behaves when Downstream (Platform Store apply, Derived maintenance, or Target Delivery) cannot keep up (see ADR-0020). Stages use bounded queues and slow capture/apply rather than buffering without limit. Lag remains visible on Sync Health / Delivery Health and metrics. The platform must not grow unbounded in memory; pausing an entire Pipeline solely because the target is slow is not the default.
+_Avoid_: Unbounded in-memory buffers, OOM-as-backpressure, pause-on-any-slowness as the default
+
+**Sync Health**:
+Whether capture from source into a Base Dataset is caught up and applying successfully (lag, checkpoints, capture/apply failures). Necessary but not sufficient to claim the Base Dataset matches the source.
+_Avoid_: Sync success (ambiguous), replication lag (mechanism-specific)
+
+**Source Alignment Check**:
+A non-real-time, resource-gated verification that a Base Dataset matches its source. Required before the platform may treat that Base Dataset as a reliable baseline for Drift Check. Must keep source reads lightweight and run only when the source has enough spare capacity. When misalignment is found, the platform repairs the Base Dataset from source using data already required for the check where possible—not by writing to the source.
+_Avoid_: Trusting Sync Health alone, full table dump
+
+**Delivery Health**:
+Whether the change stream for a Pipeline's Target Binding is caught up and applying successfully (lag, checkpoints, apply failures). Edits to non-Managed Columns are irrelevant to this signal.
+_Avoid_: Sync success (ambiguous), replication lag (mechanism-specific)
+
+**Observability Surface**:
+The minimum production signal set the platform exposes: structured logs; Sync Health and Delivery Health (lag, checkpoints, errors); per-Pipeline status; Prometheus metrics; failure counters suitable for alerting (see ADR-0008). Distributed tracing/APM integrations are optional later, not v1 requirements. Includes Platform Store resource signals (e.g. disk) with warn thresholds (see ADR-0010).
+_Avoid_: Logs-only operations, requiring a specific SaaS APM to run
+
+**Platform Store Guardrails**:
+Product-enforced minimums and safe defaults for the bundled PostgreSQL Platform Store so users cannot configure the store absurdly too small/low for the app to run. Crossing a defined safe threshold (e.g. free disk) must **warn only**—the platform does not auto-pause solely for resource pressure; if operators ignore warnings until the store fails, that is an operational failure, not something pause would have meaningfully saved (see ADR-0010).
+_Avoid_: Unlimited user under-provisioning with no product feedback, auto-pausing on disk threshold as if it restored capacity
+
+**Release Quality Gate**:
+What must pass before a build is production-releasable (see ADR-0011): correctness tests (unit, Affect Analysis, Initial↔CDC hand-off, idempotent Delivery), Oracle→Mongo contract tests, performance/load benchmarks with regression thresholds, and basic fault/error tests (e.g. process restart resume, clear apply failures). Multi-week chaos and full-scale endurance are not v1 release blockers.
+_Avoid_: Manual-only release, requiring long-running chaos programs as the sole v1 bar
+
+**Upgrade Compatibility**:
+How versions move forward in production (see ADR-0014). Platform Store uses versioned schema migrations applied on startup; configuration is SemVer’d with compatible reads of older configs. Upgrades must be **backward compatible**: a newer app must run existing Deployments and accepted older config/store data without forcing a rebuild or hand-rewriting Pipelines. Breaking changes require an explicit, automated compatibility path—not silent breakage. Short sync pause during single-instance upgrade is allowed; data/checkpoint loss is not.
+_Avoid_: Manual SQL-only upgrades, wipe-and-rebuild as the normal path, breaking existing Pipelines on upgrade without a migration path
+
+**Required Privileges**:
+The minimum Source System and Target System rights the platform needs to run (see ADR-0016)—enough for Initial Load, Incremental Capture, Delivery, and checks, documented per engine. The product must not require superuser/admin as the only supported mode when a narrower grant suffices.
+_Avoid_: Admin-only-by-default, undocumented privilege sprawl
+
+**Connection Security**:
+How the app connects to Source, Target, and Platform Store (see ADR-0017). TLS is supported for all three and recommended for production; cleartext is allowed for local/dev or explicitly chosen setups in v1.
+_Avoid_: No TLS support, mandating TLS for every local dev connection in v1
+
+**Supported Source Types**:
+The Oracle column types v1 will read after schema discovery and convert through the Platform Store into MongoDB (see ADR-0018, ADR-0023). Conversion is schema-driven and table-driven: unsupported types are never silently coerced. If a synced table has unsupported columns (e.g. BLOB), those columns are omitted and the omission is surfaced; the table still syncs on supported columns. A Pipeline that requires an unsupported column cannot use it. Temporal values are normalized to **UTC** in the platform; timestamp-with-time-zone becomes an absolute instant; DATE / timestamp-without-time-zone use DB timezone when readable, else the user-configured Source/Deployment timezone (see ADR-0022); MongoDB Delivery uses UTC datetime. Oracle NUMBER maps to precision-preserving Mongo numeric types (e.g. NumberLong / Decimal128) by schema. If a column’s declared precision/scale cannot be represented safely as a Mongo number, the Pipeline **must not apply** until the user either removes that field from Managed output or explicitly maps it to string—this is a configure-time decision, not a runtime quarantine of individual rows (see ADR-0023). Never silent double rounding.
+_Avoid_: Stringifying all columns by default, implicit unsupported-type conversion, BLOB-as-first-class v1 sync, rejecting a whole table merely because one unsupported column exists, silent local-timezone reinterpretation of DATE, defaulting NUMBER to IEEE double, treating schema-unsafe NUMBER columns as runtime poison rows
+
+**Temporal Normalization**:
+The rule for carrying time values through Base / Derived / Delivery (see ADR-0022): platform-internal UTC; timezone-aware source values converted to absolute instants; timezone-naive Oracle DATE/TIMESTAMP interpreted using the **Source DB timezone when readable**, otherwise a **user-configured timezone on the Source System / Deployment** (one zone for that source—not per table/Pipeline), then converted to UTC; never guessed from the app host. Mongo outputs UTC datetime.
+_Avoid_: Storing times only as opaque strings, silent local-machine timezone guessing, leaving naive timestamps ambiguous, per-table timezone maps
+
+**Schema Change Handling**:
+How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless. This pause-the-Pipeline rule is for stream-wide blockers (e.g. unblockable DDL), not for single-row poison data.
+_Avoid_: Ignoring DDL, blind skip of blocking changes, endless retry on unblockable DDL
+
+**Poison Change Handling**:
+When a single change or Output Identity repeatedly fails to apply but the rest of the stream can continue (see ADR-0015): after bounded retries the platform **quarantines** that change/identity, **alerts**, and **keeps the Pipeline running**. Quarantined keys are marked unhealthy / not aligned until repaired or retried; they are not silently skipped.
+_Avoid_: Pausing the whole Pipeline for one bad row, silent skip, infinite retry blocking the stream
+
+**Drift Check**:
+A non-real-time, resource-gated verification that Managed Columns on the target match the platform's expected dataset for that Pipeline. Uses the platform dataset as baseline only when Source Alignment (for Bases) or equivalent Derived correctness guarantees hold. By default, detected drift on Managed Columns is auto-repaired back to the Pipeline's expected values; non-Managed Columns are ignored. Auto-repair must not imply extra source load beyond what alignment/verification already requires.
+_Avoid_: Sync check (ambiguous), audit (too vague), preserving manual edits on Managed Columns

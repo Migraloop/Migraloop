@@ -1,0 +1,3 @@
+# Platform Store has minimum config guardrails and warn-only thresholds
+
+The bundled PostgreSQL Platform Store ships with safe defaults and product-enforced minimums so users cannot set resources absurdly too low. The platform monitors store health (especially free disk) against a safe threshold and **warns** when crossed. It does not auto-pause merely because a resource threshold was crossed: pause would still leave the system non-operative, same as eventually failing when the disk is full, and ignoring warnings is an operator problem. Documented Postgres backup remains the user’s responsibility alongside these guardrails.
