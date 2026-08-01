@@ -36,6 +36,10 @@ _Avoid_: Thin mapping, light transform, ETL job (too generic), opaque free-form 
 Strict determination, from the Pipeline's Rich Transform definition and an incoming Base change, of which Output Identities (if any) require Derived recomputation. Unused fields must not trigger recompute (e.g. an order address update does not recompute a sum-of-price-by-customer). Operator semantics decide value-level cases (e.g. distinct-customer count updates for a new customer id, but not for a duplicate already-counted id).
 _Avoid_: Heuristic invalidation, always-recompute, best-effort skip
 
+**Maintenance State**:
+Platform-internal state kept only when an operator needs it for correct incremental Affect Analysis or updates beyond what the Derived Dataset and the change themselves already provide. Example: per-`customerId` row counts to know whether a distinct-customer aggregate must change. It must not be created blindly—e.g. `sum(price) by customerId` should not invent extra structures if the Derived totals plus the change suffice. Never stored in the user's source or target for this purpose.
+_Avoid_: Always-on side tables per Pipeline, dumping maintenance data into the Target System
+
 **Derived Dataset**:
 The platform-managed output produced by a Rich Transform; a dataset the platform materializes and maintains, not a verbatim copy of a single source table. When Base Datasets change, the platform must update the Derived Dataset **incrementally by Output Identity**, driven by Affect Analysis. Full recompute of an entire Derived Dataset is not an acceptable steady-state approach. Incremental maintenance must be **correct**—semantically equivalent to re-evaluating the Rich Transform for affected identities—not a best-effort approximation.
 _Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored), periodic full-table recompute as the normal path
