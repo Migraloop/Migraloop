@@ -6,6 +6,8 @@ The product must support **many database engine kinds** over time (multiple sour
 
 A single **Deployment** connects **one Source System to one Target System** and may contain **many Pipelines**. Wanting a different database pair means another Deployment (source/target swapped or replaced), not multi-database fan-in inside one Deployment.
 
+v1 runs a Deployment as **one active app instance** (internally concurrent) plus the Platform Store. All durable Deployment state lives in the Platform Store so a replacement instance can resume without local-only recovery. Automatic multi-instance failover is a later stage; active processing remains single-leader (not multi-writer).
+
 Base Datasets, Derived Datasets, and Maintenance State live in a dedicated **Platform Store**: an independent database solely for the platform, never the user's Source or Target System. Its engine brand is chosen by the product and locked—not a user-selectable option.
 
 ## Language
