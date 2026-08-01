@@ -108,6 +108,10 @@ _Avoid_: Logs-only operations, requiring a specific SaaS APM to run
 Product-enforced minimums and safe defaults for the bundled PostgreSQL Platform Store so users cannot configure the store absurdly too small/low for the app to run. Crossing a defined safe threshold (e.g. free disk) must **warn only**—the platform does not auto-pause solely for resource pressure; if operators ignore warnings until the store fails, that is an operational failure, not something pause would have meaningfully saved (see ADR-0010).
 _Avoid_: Unlimited user under-provisioning with no product feedback, auto-pausing on disk threshold as if it restored capacity
 
+**Release Quality Gate**:
+What must pass before a build is production-releasable (see ADR-0011): correctness tests (unit, Affect Analysis, Initial↔CDC hand-off, idempotent Delivery), Oracle→Mongo contract tests, performance/load benchmarks with regression thresholds, and basic fault/error tests (e.g. process restart resume, clear apply failures). Multi-week chaos and full-scale endurance are not v1 release blockers.
+_Avoid_: Manual-only release, requiring long-running chaos programs as the sole v1 bar
+
 **Schema Change Handling**:
 How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless.
 _Avoid_: Ignoring DDL, blind skip of blocking changes, endless retry on unblockable DDL
