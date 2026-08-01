@@ -1,3 +1,10 @@
-# Control plane is config + CLI, with runtime Pipeline adds
+# Control plane is config + CLI with full runtime Pipeline lifecycle
 
-v1 manages Deployments through declarative YAML/JSON and a CLI (apply/status/pause), plus minimal HTTP health/status if useful. Users must be able to add a Pipeline while the Deployment is running: apply accepts the new Pipeline without restarting the whole process, existing Pipelines continue, and the new Pipeline starts its own Initial Load/Incremental path as required. A full REST/UI control plane can come later on top of the same declarative model.
+v1 manages Deployments through declarative YAML/JSON and a CLI (apply/status/pause/resume/remove/change), plus minimal HTTP health/status if useful. Runtime operations must not require restarting the whole Deployment.
+
+- **Add**: start the new Pipeline (Initial Load as needed) while others keep running.
+- **Pause / resume**: stop or continue Delivery/processing for that Pipeline.
+- **Remove**: stop the Pipeline and cease Delivery.
+- **Change**: apply a new Pipeline revision—pause old Delivery, rebuild that Pipeline's Derived Dataset and re-Deliver as the change requires, then resume incremental work. Shared Base Datasets are not rebuilt. Metadata-only changes may skip rebuild.
+
+A full REST/UI can come later on the same declarative model.
