@@ -6,6 +6,8 @@ The product must support **many database engine kinds** over time (multiple sour
 
 A single **Deployment** connects **one Source System to one Target System** and may contain **many Pipelines**. Wanting a different database pair means another Deployment (source/target swapped or replaced), not multi-database fan-in inside one Deployment.
 
+Base Datasets, Derived Datasets, and Maintenance State live in a dedicated **Platform Store**: an independent database solely for the platform, never the user's Source or Target System. Its engine brand is chosen by the product and locked—not a user-selectable option.
+
 ## Language
 
 **Source System**:
@@ -19,6 +21,10 @@ _Avoid_: Destination database
 **Deployment**:
 One running configuration that pairs exactly one Source System with exactly one Target System and hosts one or more Pipelines between them.
 _Avoid_: Cluster (infra-flavored), pipeline (a Deployment contains many Pipelines)
+
+**Platform Store**:
+The independent database dedicated to platform-managed data (Base Datasets, Derived Datasets, Maintenance State, checkpoints). It exists so Sync, Rich Transform, and Affect Analysis never use the user's Source or Target System as their data plane. The store's engine is a product-locked choice, not configured per user preference.
+_Avoid_: Using source/target as platform storage, user-pluggable store engine
 
 **Sync**:
 Continuous one-way capture of changes from a Source System into platform-managed Base Datasets. Latency and resumability are first-class. Sync alone does not imply the Target System has been updated—that is Delivery. Reverse flow is not a product feature; users who need the opposite direction create a separate Deployment with source and target swapped. Capture mechanics are engine-specific; the Sync concept is not. Sync has two first-class phases: Initial Load then Incremental Capture.
