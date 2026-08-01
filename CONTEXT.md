@@ -27,3 +27,11 @@ _Avoid_: Destination (vague), sink (implementation-flavored)
 **Delivery**:
 The platform-owned process that applies insert/update/delete to the bound target table so the user does not implement write logic themselves. Writing to the target for Delivery is allowed; using the target as Rich Transform input/compute is not.
 _Avoid_: Load job (too batch-flavored), sync (overloaded—Sync is capture into the platform)
+
+**Delivery Health**:
+Whether the change stream for a Target Binding is caught up and applying successfully (lag, checkpoints, apply failures). Manual edits on the target are out of scope for this signal.
+_Avoid_: Sync success (ambiguous), replication lag (mechanism-specific)
+
+**Drift Check**:
+A non-real-time verification that the target table's state still matches the platform's expected dataset for that binding. May detect manual deletes/edits and other divergence. Must be resource-conscious toward user databases.
+_Avoid_: Sync check (ambiguous), audit (too vague)
