@@ -101,8 +101,12 @@ Whether the change stream for a Pipeline's Target Binding is caught up and apply
 _Avoid_: Sync success (ambiguous), replication lag (mechanism-specific)
 
 **Observability Surface**:
-The minimum production signal set the platform exposes: structured logs; Sync Health and Delivery Health (lag, checkpoints, errors); per-Pipeline status; Prometheus metrics; failure counters suitable for alerting (see ADR-0008). Distributed tracing/APM integrations are optional later, not v1 requirements.
+The minimum production signal set the platform exposes: structured logs; Sync Health and Delivery Health (lag, checkpoints, errors); per-Pipeline status; Prometheus metrics; failure counters suitable for alerting (see ADR-0008). Distributed tracing/APM integrations are optional later, not v1 requirements. Includes Platform Store resource signals (e.g. disk) with warn thresholds (see ADR-0010).
 _Avoid_: Logs-only operations, requiring a specific SaaS APM to run
+
+**Platform Store Guardrails**:
+Product-enforced minimums and safe defaults for the bundled PostgreSQL Platform Store so users cannot configure the store absurdly too small/low for the app to run. Crossing a defined safe threshold (e.g. free disk) must warn; critical exhaustion follows the pause-and-alert path rather than silent failure (see ADR-0010).
+_Avoid_: Unlimited user under-provisioning with no product feedback, silent disk-full crashes only
 
 **Schema Change Handling**:
 How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless.
