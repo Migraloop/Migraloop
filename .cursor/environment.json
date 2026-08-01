@@ -1,0 +1,4 @@
+{
+  "install": "echo 'Migraloop env ready'",
+  "start": "echo 'Migraloop env started'"
+}
