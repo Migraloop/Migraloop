@@ -29,11 +29,15 @@ A platform-managed copy of a source table or collection, kept aligned by Sync, c
 _Avoid_: Raw table (ambiguous), source mirror, target table, per-pipeline copy of the same source table
 
 **Rich Transform**:
-A user-defined, high-expressiveness transformation (Mongo aggregation–like) that can combine multiple platform-managed datasets into a new data shape. It reads only platform-managed data—never the user's source or target DB as a compute engine. It may be slower than Sync, but must still be performance-oriented.
-_Avoid_: Thin mapping, light transform, ETL job (too generic)
+A user-defined transformation composed of operators the platform can analyze. It reads only platform-managed data—never the user's source or target DB as a compute engine. From the Pipeline definition alone, the platform must determine which Base fields and values each Derived result depends on, so incremental maintenance knows what must be recomputed and what must not.
+_Avoid_: Thin mapping, light transform, ETL job (too generic), opaque free-form scripts the platform cannot analyze
+
+**Affect Analysis**:
+Strict determination, from the Pipeline's Rich Transform definition and an incoming Base change, of which Output Identities (if any) require Derived recomputation. Unused fields must not trigger recompute (e.g. an order address update does not recompute a sum-of-price-by-customer). Operator semantics decide value-level cases (e.g. distinct-customer count updates for a new customer id, but not for a duplicate already-counted id).
+_Avoid_: Heuristic invalidation, always-recompute, best-effort skip
 
 **Derived Dataset**:
-The platform-managed output produced by a Rich Transform; a dataset the platform materializes and maintains, not a verbatim copy of a single source table. When Base Datasets change, the platform must update the Derived Dataset **incrementally by Output Identity** (recompute/repair only affected identities, then Delivery upsert/delete). Full recompute of an entire Derived Dataset is not an acceptable steady-state approach. Incremental maintenance must be **correct**—semantically equivalent to re-evaluating the Rich Transform for those identities—not a best-effort approximation.
+The platform-managed output produced by a Rich Transform; a dataset the platform materializes and maintains, not a verbatim copy of a single source table. When Base Datasets change, the platform must update the Derived Dataset **incrementally by Output Identity**, driven by Affect Analysis. Full recompute of an entire Derived Dataset is not an acceptable steady-state approach. Incremental maintenance must be **correct**—semantically equivalent to re-evaluating the Rich Transform for affected identities—not a best-effort approximation.
 _Avoid_: View (implies non-materialized / DB-native only), sink table (implementation-flavored), periodic full-table recompute as the normal path
 
 **Pipeline**:
