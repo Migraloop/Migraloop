@@ -18,6 +18,5 @@ migraloop-platform-store = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }

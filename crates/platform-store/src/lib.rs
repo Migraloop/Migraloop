@@ -12,14 +12,13 @@ pub enum PlatformStoreError {
     Connect(#[source] sqlx::Error),
     #[error("failed to migrate Platform Store: {0}")]
     Migrate(#[source] sqlx::migrate::MigrateError),
-    #[error("failed to query Platform Store: {0}")]
-    Query(#[source] sqlx::Error),
 }
 
 /// Health of the Platform Store as observed by operators.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlatformStoreHealth {
     Healthy { schema_version: i64 },
+    Unhealthy { reason: String },
     Unreachable { reason: String },
 }
 
@@ -67,11 +66,11 @@ pub async fn health(database_url: &str) -> PlatformStoreHealth {
 
     match version {
         Ok(Some(schema_version)) => PlatformStoreHealth::Healthy { schema_version },
-        Ok(None) => PlatformStoreHealth::Unreachable {
+        Ok(None) => PlatformStoreHealth::Unhealthy {
             reason: "schema migrations have not been applied".to_string(),
         },
-        Err(err) => PlatformStoreHealth::Unreachable {
-            reason: format!("schema migrations have not been applied ({err})"),
+        Err(_) => PlatformStoreHealth::Unhealthy {
+            reason: "schema migrations have not been applied".to_string(),
         },
     }
 }

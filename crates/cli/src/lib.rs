@@ -7,7 +7,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error("{0}")]
-    Message(String),
+    Failed(String),
 }
 
 #[derive(Debug, Parser)]
@@ -43,34 +43,40 @@ pub fn parse() -> Cli {
     Cli::parse()
 }
 
+async fn apply_migrations(platform_store_url: &str) -> Result<(), CliError> {
+    migrate(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    println!("Platform Store migrations applied");
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Command::Migrate { platform_store_url } => {
-            migrate(&platform_store_url)
-                .await
-                .map_err(|err| CliError::Message(err.to_string()))?;
-            println!("Platform Store migrations applied");
-            Ok(())
-        }
+        Command::Migrate { platform_store_url } => apply_migrations(&platform_store_url).await,
         Command::Status { platform_store_url } => match health(&platform_store_url).await {
             PlatformStoreHealth::Healthy { schema_version } => {
                 println!("Platform Store: healthy");
                 println!("Schema version: {schema_version}");
                 Ok(())
             }
+            PlatformStoreHealth::Unhealthy { reason } => {
+                println!("Platform Store: unhealthy");
+                eprintln!("{reason}");
+                Err(CliError::Failed(
+                    "Platform Store is reachable but not healthy".to_string(),
+                ))
+            }
             PlatformStoreHealth::Unreachable { reason } => {
                 println!("Platform Store: unreachable");
                 eprintln!("{reason}");
-                Err(CliError::Message(
-                    "Platform Store is unreachable or not migrated".to_string(),
+                Err(CliError::Failed(
+                    "Platform Store is unreachable".to_string(),
                 ))
             }
         },
         Command::Run { platform_store_url } => {
-            migrate(&platform_store_url)
-                .await
-                .map_err(|err| CliError::Message(err.to_string()))?;
-            println!("Platform Store migrations applied");
+            apply_migrations(&platform_store_url).await?;
             println!("migraloop is running");
             // Keep the single app instance alive for the compose one-install setup.
             // Future slices attach Deployment runtime work here.

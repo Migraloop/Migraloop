@@ -102,3 +102,27 @@ async fn status_reports_unreachable_for_bad_platform_store_url() {
         "expected unreachable Platform Store report, got:\n{combined}"
     );
 }
+
+#[tokio::test]
+async fn status_reports_unhealthy_when_reachable_but_not_migrated() {
+    let url = ephemeral_database_url().await;
+
+    let status = Command::new(bin())
+        .args(["status", "--platform-store-url", &url])
+        .output()
+        .expect("run status");
+
+    assert!(
+        !status.status.success(),
+        "status should fail when Platform Store is not migrated"
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("Platform Store: unhealthy"),
+        "expected unhealthy (reachable but not migrated), got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Platform Store: unreachable"),
+        "must not mislabel a reachable unmigrated store as unreachable:\n{stdout}"
+    );
+}
