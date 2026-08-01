@@ -45,11 +45,15 @@ A Pipeline with no Rich Transform: one Base Dataset is Delivered to the Target B
 _Avoid_: Mirror mode (implies zero field mapping/config), raw dump
 
 **Transform Pipeline**:
-A Pipeline that runs a Rich Transform over one or more Base Datasets, materializes a Derived Dataset, and Delivers that to the Target Binding.
+A Pipeline that runs a Rich Transform over one or more Base Datasets, materializes a Derived Dataset, and Delivers that to the Target Binding. It must declare an Output Identity before it can run.
 _Avoid_: ETL job (too generic), thin mapping-only pipeline
 
+**Output Identity**:
+The stable key that locates one output row/document on the Target System for Delivery insert/update/delete (and Drift Check). For a Direct Pipeline it defaults to the source primary key. For a Transform Pipeline the user must define it over the Rich Transform output. It must be deterministic from the input/transform data—no randomness (e.g. generated UUIDs), so the same logical result always resolves to the same target key.
+_Avoid_: Surrogate random id, guessed primary key, source PK (when the transform’s grain differs)
+
 **Target Binding**:
-The part of a Pipeline that maps its output dataset (Base or Derived) to a specific table/collection in the Target System. It declares Managed Columns/fields; the target table/collection may have additional fields outside the binding.
+The part of a Pipeline that maps its output dataset (Base or Derived) to a specific table/collection in the Target System. It declares Managed Columns/fields and (with the Pipeline) the Output Identity; the target table/collection may have additional fields outside the binding.
 _Avoid_: Destination (vague), sink (implementation-flavored)
 
 **Managed Columns**:
