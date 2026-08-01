@@ -43,8 +43,8 @@ A platform-managed copy of a source table or collection, kept aligned by Sync, c
 _Avoid_: Raw table (ambiguous), source mirror, target table, per-pipeline copy of the same source table
 
 **Rich Transform**:
-A user-defined transformation composed of operators the platform can analyze. It reads only platform-managed data—never the user's source or target DB as a compute engine. From the Pipeline definition alone, the platform must determine which Base fields and values each Derived result depends on, so incremental maintenance knows what must be recomputed and what must not.
-_Avoid_: Thin mapping, light transform, ETL job (too generic), opaque free-form scripts the platform cannot analyze
+A user-defined transformation composed of operators the platform can analyze. It reads only platform-managed data—never the user's source or target DB as a compute engine. From the Pipeline definition alone, the platform must determine which Base fields and values each Derived result depends on, so incremental maintenance knows what must be recomputed and what must not. Definitions are **declarative** (DSL/config of supported operators only). Free-form user scripts are out of scope because they make Affect Analysis impossible. A UI may author the same declarative definition later; the declarative form remains the source of truth.
+_Avoid_: Thin mapping, light transform, ETL job (too generic), opaque free-form scripts the platform cannot analyze, arbitrary SQL/JS as the transform definition
 
 **Affect Analysis**:
 Strict determination, from the Pipeline's Rich Transform definition and an incoming Base change, of which Output Identities (if any) require Derived recomputation. Unused fields must not trigger recompute (e.g. an order address update does not recompute a sum-of-price-by-customer). Operator semantics decide value-level cases (e.g. distinct-customer count updates for a new customer id, but not for a duplicate already-counted id).
