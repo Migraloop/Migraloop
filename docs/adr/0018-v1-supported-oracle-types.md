@@ -1,0 +1,3 @@
+# v1 supports a fixed Oracle scalar type set; no LOBs
+
+After reading Source schema, v1 converts only an allow-listed Oracle type set through the Platform Store to MongoDB. Proposed allow-list: NUMBER (with precision/scale rules), FLOAT/BINARY_FLOAT/BINARY_DOUBLE, CHAR/NCHAR/VARCHAR2/NVARCHAR2, DATE, TIMESTAMP (and WITH TIME ZONE / LOCAL TIME ZONE as documented), RAW (with a size cap), and NULLABLE forms of the above. Out of scope for v1: BLOB, CLOB, NCLOB, BFILE, LONG/LONG RAW, XMLType, user-defined object types, nested tables/VARRAYs, ROWID/UROWID, and other exotic types. Unsupported types used by a Pipeline’s selected columns block that usage rather than silent conversion.

@@ -124,6 +124,10 @@ _Avoid_: Admin-only-by-default, undocumented privilege sprawl
 How the app connects to Source, Target, and Platform Store (see ADR-0017). TLS is supported for all three and recommended for production; cleartext is allowed for local/dev or explicitly chosen setups in v1.
 _Avoid_: No TLS support, mandating TLS for every local dev connection in v1
 
+**Supported Source Types**:
+The Oracle column types v1 will read after schema discovery and convert through the Platform Store into MongoDB (see ADR-0018). Conversion is schema-driven and table-driven: unsupported types are rejected (Pipeline/table cannot run with those columns in use), never silently coerced. v1 does not support LOBs such as BLOB/CLOB or exotic Oracle types (XMLType, nested tables, etc.).
+_Avoid_: Stringifying all columns, implicit unsupported-type conversion, BLOB-as-first-class v1 sync
+
 **Schema Change Handling**:
 How Source DDL is treated relative to Pipelines (see ADR-0009). If a change does not affect a Pipeline's transform/output dependencies, processing continues and schema can catch up. If it affects a Pipeline but does not block safe apply, processing continues. If it would block (retries cannot make progress), the platform **warns and pauses** the affected Pipeline(s)—retrying a stuck apply is useless. This pause-the-Pipeline rule is for stream-wide blockers (e.g. unblockable DDL), not for single-row poison data.
 _Avoid_: Ignoring DDL, blind skip of blocking changes, endless retry on unblockable DDL
