@@ -717,6 +717,40 @@ pub async fn base_dataset_exists(
     Ok(found.is_some())
 }
 
+/// Backfill Output Identity source primary-key metadata without reloading Base rows.
+pub async fn update_base_primary_key(
+    database_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    primary_key: &[String],
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let primary_key_json =
+        serde_json::to_string(primary_key).map_err(PlatformStoreError::InvalidJson)?;
+    let result = sqlx::query(
+        r#"
+        UPDATE base_datasets
+        SET primary_key_json = $4
+        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(&primary_key_json)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    if result.rows_affected() == 0 {
+        return Err(PlatformStoreError::NotFound(format!(
+            "no Base Dataset found for table {source_table}"
+        )));
+    }
+    Ok(())
+}
+
 impl BaseDatasetRow {
     fn into_base_dataset(self) -> Result<BaseDataset, PlatformStoreError> {
         Ok(BaseDataset {

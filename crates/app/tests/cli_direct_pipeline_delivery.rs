@@ -274,22 +274,10 @@ async fn managed_field_upsert_preserves_non_managed_target_fields() {
     );
     let stdout = String::from_utf8_lossy(&target.stdout);
 
-    // Find the document for identity 1 in pretty-printed CLI output.
-    let mut found_id_1 = false;
-    for chunk in stdout.split('{').skip(1) {
-        let Some(end) = chunk.rfind('}') else {
-            continue;
-        };
-        let doc_json = format!("{{{}", &chunk[..=end]);
-        if !(doc_json.contains("\"_id\": 1") || doc_json.contains("\"_id\":1")) {
-            continue;
-        }
-        // Pretty print may span multiple braces; use a simpler containment check on stdout slices.
-        found_id_1 = true;
-        break;
-    }
-    assert!(found_id_1, "expected document _id=1, got:\n{stdout}");
-
+    assert!(
+        stdout.contains("\"_id\": 1") || stdout.contains("\"_id\":1"),
+        "expected document _id=1, got:\n{stdout}"
+    );
     assert!(
         stdout.contains("Alice") && stdout.contains("alice@example.com"),
         "Managed fields must upsert to Base values, got:\n{stdout}"
@@ -301,6 +289,117 @@ async fn managed_field_upsert_preserves_non_managed_target_fields() {
     assert!(
         stdout.contains("keep-me") || stdout.contains("EXTRA"),
         "non-Managed Target field EXTRA must not be cleared, got:\n{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn existing_base_without_target_can_later_deliver_with_output_identity() {
+    // #6 → #7 path: Initial Load into Base first, then apply Target Binding for Delivery.
+    let url = ephemeral_database_url().await;
+    let mongo_database = unique_mongo_database();
+    let dir = TempDir::new().expect("tempdir");
+
+    let base_only = write_config(
+        &dir,
+        "base-only.yaml",
+        &format!(
+            r#"
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: oracle-to-mongo
+spec:
+  source:
+    kind: oracle
+    host: stub
+    port: 1521
+    database: STUB
+    username: sync_user
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: {host}
+    port: {port}
+    database: {mongo_database}
+    username: deliver_user
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: customers
+      mode: direct
+      source:
+        table: CUSTOMERS
+"#,
+            host = mongo_host(),
+            port = mongo_port(),
+        ),
+    );
+    migrate_and_apply(&url, &base_only);
+
+    // Simulate a pre-Delivery Base (migration default / older slice) with empty PK metadata.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect Platform Store");
+    sqlx::query(
+        "UPDATE base_datasets SET primary_key_json = '[]' WHERE source_table = 'CUSTOMERS'",
+    )
+    .execute(&pool)
+    .await
+    .expect("clear primary key metadata");
+
+    let with_delivery = write_config(
+        &dir,
+        "with-delivery.yaml",
+        &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
+    );
+    let apply = Command::new(bin())
+        .env("ORACLE_PASSWORD", "oracle-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .args([
+            "apply",
+            "--platform-store-url",
+            &url,
+            "--file",
+            with_delivery.to_str().unwrap(),
+        ])
+        .output()
+        .expect("re-apply with Target Binding");
+    assert!(
+        apply.status.success(),
+        "Delivery apply after existing Base failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let apply_out = String::from_utf8_lossy(&apply.stdout);
+    assert!(
+        apply_out.contains("Delivery complete"),
+        "expected Delivery after Target Binding apply, got:\n{apply_out}"
+    );
+    assert!(
+        !apply_out.contains("Initial Load complete"),
+        "existing Base must not reload, got:\n{apply_out}"
+    );
+
+    let target = Command::new(bin())
+        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .args([
+            "target",
+            "--platform-store-url",
+            &url,
+            "--collection",
+            "customers",
+        ])
+        .output()
+        .expect("run target");
+    assert!(target.status.success());
+    let stdout = String::from_utf8_lossy(&target.stdout);
+    assert!(
+        (stdout.contains("\"_id\": 1") || stdout.contains("\"_id\":1"))
+            && stdout.contains("Alice"),
+        "Output Identity from source PK must work for pre-existing Base, got:\n{stdout}"
     );
 }
 

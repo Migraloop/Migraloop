@@ -13,8 +13,9 @@ use migraloop_delivery::{
 use migraloop_platform_store::{
     base_dataset_exists, delete_base_datasets_not_in, get_base_rows, health, list_base_datasets,
     list_deployments, list_pipelines, migrate, replace_base_dataset, replace_pipelines,
-    update_pipeline_delivery_status, upsert_deployment, BaseColumn, BaseDataset, Deployment,
-    OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind, SystemConnection,
+    update_base_primary_key, update_pipeline_delivery_status, upsert_deployment, BaseColumn,
+    BaseDataset, Deployment, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef,
+    SecretRefKind, SystemConnection,
 };
 use thiserror::Error;
 
@@ -298,6 +299,8 @@ async fn sync_base_datasets_for_pipelines(
             .map_err(|err| CliError::Failed(err.to_string()))?;
         if already {
             // Existing Bases stay; do not reload on Pipeline re-apply (ADR-0019).
+            // Backfill Output Identity PK metadata when an older Base predates Delivery.
+            ensure_base_primary_key(platform_store_url, deployment_name, &schema, &table).await?;
             continue;
         }
 
@@ -353,6 +356,39 @@ async fn sync_base_datasets_for_pipelines(
         );
     }
 
+    Ok(())
+}
+
+async fn ensure_base_primary_key(
+    platform_store_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+) -> Result<(), CliError> {
+    let (dataset, _) = get_base_rows(platform_store_url, source_table, Some(deployment_name))
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    if !dataset.primary_key.is_empty() {
+        return Ok(());
+    }
+
+    let snapshot =
+        initial_load_stub(source_table).map_err(|err| CliError::Failed(err.to_string()))?;
+    if snapshot.primary_key.is_empty() {
+        return Err(CliError::Failed(format!(
+            "stub Source table {source_table} has no primary key for Output Identity"
+        )));
+    }
+
+    update_base_primary_key(
+        platform_store_url,
+        deployment_name,
+        source_schema,
+        source_table,
+        &snapshot.primary_key,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
     Ok(())
 }
 
