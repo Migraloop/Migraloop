@@ -83,8 +83,8 @@ The columns/fields declared by a Pipeline's Target Binding as owned by the platf
 _Avoid_: All columns, full document ownership (unless the binding literally lists every field)
 
 **Delivery**:
-The platform-owned process that applies insert/update/delete to Managed Columns on the bound target table/collection so the user does not implement write logic themselves. Writing to the target for Delivery is allowed; using the target as Rich Transform input/compute is not.
-_Avoid_: Load job (too batch-flavored), sync (overloaded—Sync is capture into the platform)
+The platform-owned process that applies insert/update/delete for a Pipeline's Output Identity on the Target System so the user does not implement write logic themselves. Updates must touch only Managed Columns/fields and must not alter non-Managed fields. When Affect Analysis / Derived maintenance decides an Output Identity no longer exists, Delivery may **delete the entire target document/row** (including non-Managed fields on that document). Writing to the target for Delivery is allowed; using the target as Rich Transform input/compute is not.
+_Avoid_: Load job (too batch-flavored), sync (overloaded—Sync is capture into the platform), overwriting or clearing non-Managed fields on update
 
 **Sync Health**:
 Whether capture from source into a Base Dataset is caught up and applying successfully (lag, checkpoints, capture/apply failures). Necessary but not sufficient to claim the Base Dataset matches the source.
