@@ -35,8 +35,8 @@ The first materialization of needed Base Datasets (and then Derived Datasets / D
 _Avoid_: Zero-impact backfill, unbounded full-table slam, assuming a separate replica connection is required for correctness
 
 **Incremental Capture**:
-Ongoing change capture into Base Datasets after Initial Load, driving Affect Analysis, Derived updates, and Delivery.
-_Avoid_: Initial Load (different phase)
+Ongoing change capture into Base Datasets after Initial Load, driving Affect Analysis, Derived updates, and Delivery. Capture mechanisms are pluggable per Source System kind (and may offer more than one mechanism per kind). For Oracle, v1 ships **LogMiner** first; other Oracle mechanisms may be added later without changing Sync/Pipeline/Delivery concepts.
+_Avoid_: Initial Load (different phase), hard-wiring the domain to a single vendor capture product
 
 **Base Dataset**:
 A platform-managed copy of a source table or collection, kept aligned by Sync, close to the source shape. It is the unit Rich Transforms and direct Pipelines may read; it is not the user's source or target database. Within a Deployment, each source table/collection has at most one Base Dataset, shared by every Pipeline that needs it—never captured or stored once per Pipeline.
