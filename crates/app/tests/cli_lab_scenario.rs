@@ -352,6 +352,30 @@ async fn lab_scenario_list_includes_change_pipeline() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_poison_quarantine() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("poison-quarantine"),
+        "catalog must list poison-quarantine Lab Scenario (#22), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("quarantine")
+            && (lower.contains("poison") || lower.contains("unhealthy")),
+        "poison-quarantine summary should mention quarantine/poison/unhealthy, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {
@@ -2120,6 +2144,135 @@ async fn lab_scenario_idempotent_redelivery_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove idempotent-redelivery failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Manual Lab Scenario seam for Poison Change quarantine (#22 / ADR-0015 / ADR-0025).
+///
+/// ```bash
+/// export LD_LIBRARY_PATH=/path/to/instantclient
+/// cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_poison_quarantine_run_and_inspect() {
+    let lab = lab_dir();
+    let store_url = "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop";
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "poison-quarantine",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario run poison-quarantine");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run poison-quarantine failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+    assert!(
+        run_out.to_ascii_lowercase().contains("quarantine")
+            && run_out.to_ascii_lowercase().contains("alert"),
+        "Scenario must quarantine with ALERT, got:\n{run_out}"
+    );
+    assert!(
+        run_out.to_ascii_lowercase().contains("logminer")
+            || run_out.contains("Incremental Capture"),
+        "Scenario must use real capture path, got:\n{run_out}"
+    );
+
+    let status = Command::new(bin())
+        .args(["status", "--platform-store-url", store_url])
+        .output()
+        .expect("status after poison-quarantine");
+    let status_out = String::from_utf8_lossy(&status.stdout);
+    assert!(status.status.success());
+    assert!(
+        status_out.contains("Delivery Health: unhealthy")
+            && status_out.to_ascii_lowercase().contains("quarantine")
+            && (status_out.contains("identity=1")
+                || status_out.to_ascii_lowercase().contains("identity=1")),
+        "status must show unhealthy quarantine for identity 1, got:\n{status_out}"
+    );
+
+    let target = Command::new(bin())
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "target",
+            "--platform-store-url",
+            store_url,
+            "--collection",
+            "lab_pq_customers",
+        ])
+        .output()
+        .expect("target inspect");
+    let target_out = String::from_utf8_lossy(&target.stdout);
+    assert!(target.status.success());
+    assert!(
+        target_out.contains("Alice")
+            && !target_out.contains("Alicia")
+            && target_out.contains("Carol")
+            && !target_out.contains("Bob"),
+        "Target must keep Alice, Deliver Carol, delete Bob, got:\n{target_out}"
+    );
+
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "poison-quarantine",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove poison-quarantine");
+    assert!(
+        remove.status.success(),
+        "lab scenario remove poison-quarantine failed: {}",
         String::from_utf8_lossy(&remove.stderr)
     );
 

@@ -23,7 +23,7 @@ When a single change or Output Identity repeatedly fails but the rest of the str
 3. **Alert** Operators
 4. **Keep the Pipeline running**
 
-Quarantined keys stay unhealthy / not aligned until repaired or retried—never a silent skip. Do not expect a whole-Pipeline pause for one bad row. Until quarantine surfaces in `status`, watch apply errors and Delivery Health for stuck identities.
+Quarantined keys stay unhealthy / not aligned until repaired or retried—never a silent skip. Do not expect a whole-Pipeline pause for one bad row. After bounded Delivery retries, `migraloop sync` persists the quarantine, emits an Operator-visible **ALERT**, and continues other changes; `migraloop status` shows `Delivery Health: unhealthy` with each quarantined Output Identity marked unhealthy / not aligned.
 
 ## Backpressure
 

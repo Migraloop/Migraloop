@@ -22,11 +22,12 @@ use migraloop_delivery::{
 use migraloop_platform_store::{
     base_dataset_exists, delete_base_datasets_not_in, delete_pipeline,
     filter_unapplied_change_ids, get_base_rows, get_derived_rows, health, list_base_datasets,
-    list_deployments, list_derived_datasets, list_pipelines, migrate,
+    list_deployments, list_derived_datasets, list_pipelines, list_quarantined_changes, migrate,
     record_applied_source_changes, replace_base_dataset, replace_derived_dataset, replace_pipelines,
     set_pipeline_paused, update_base_primary_key, update_pipeline_delivery_progress,
-    upsert_deployment, BaseColumn, BaseDataset, Deployment, DerivedDataset, FieldMappingAs,
-    OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind, SystemConnection,
+    upsert_deployment, upsert_quarantined_change, BaseColumn, BaseDataset, Deployment,
+    DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth,
+    QuarantinedChange, SecretRef, SecretRefKind, SystemConnection,
 };
 use migraloop_transform::{
     analyze_affect, derived_projected_fields, evaluate_transform,
@@ -1658,6 +1659,161 @@ fn sync_fail_after_changes() -> Option<u32> {
         .filter(|n| *n > 0)
 }
 
+/// Bounded Delivery retries before Poison Change quarantine (ADR-0015 / issue #22).
+fn poison_max_attempts() -> u32 {
+    std::env::var("MIGRALOOP_POISON_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3)
+}
+
+/// Test/Lab fault injection: comma-separated Output Identity keys that always fail Delivery.
+fn delivery_poison_identity_keys() -> BTreeSet<String> {
+    std::env::var("MIGRALOOP_DELIVERY_POISON_IDENTITIES")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_output_identity(identity: &serde_json::Value) -> String {
+    match identity {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn identity_is_poison(
+    identity: &serde_json::Value,
+    poison_keys: &BTreeSet<String>,
+) -> bool {
+    if poison_keys.is_empty() {
+        return false;
+    }
+    poison_keys.contains(&format_output_identity(identity))
+}
+
+fn identity_value_from_change(
+    change: &ChangeEvent,
+    identity_fields: &[String],
+) -> Result<serde_json::Value, CliError> {
+    let identity_map: serde_json::Map<String, serde_json::Value> = change
+        .identity
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    output_identity_from_row(&identity_map, identity_fields)
+}
+
+async fn upsert_with_bounded_retries(
+    mongo: &MongoTargetConnection,
+    collection: &str,
+    document: &DeliveryDocument,
+    max_attempts: u32,
+) -> Result<usize, (u32, String)> {
+    let poison = delivery_poison_identity_keys();
+    let mut last_error = String::new();
+    for attempt in 1..=max_attempts {
+        if identity_is_poison(&document.identity, &poison) {
+            last_error = format!(
+                "injected poison Delivery failure for Output Identity {}",
+                format_output_identity(&document.identity)
+            );
+        } else {
+            match upsert_managed_documents(mongo, collection, std::slice::from_ref(document)).await
+            {
+                Ok(n) => return Ok(n),
+                Err(err) => last_error = err.to_string(),
+            }
+        }
+        if attempt < max_attempts {
+            eprintln!("Delivery retry {attempt}/{max_attempts} failed: {last_error}");
+        }
+    }
+    Err((max_attempts, last_error))
+}
+
+async fn delete_with_bounded_retries(
+    mongo: &MongoTargetConnection,
+    collection: &str,
+    identity: &serde_json::Value,
+    max_attempts: u32,
+) -> Result<usize, (u32, String)> {
+    let poison = delivery_poison_identity_keys();
+    let mut last_error = String::new();
+    for attempt in 1..=max_attempts {
+        if identity_is_poison(identity, &poison) {
+            last_error = format!(
+                "injected poison Delivery failure for Output Identity {}",
+                format_output_identity(identity)
+            );
+        } else {
+            match delete_documents_by_identity(
+                mongo,
+                collection,
+                std::slice::from_ref(identity),
+            )
+            .await
+            {
+                Ok(n) => return Ok(n),
+                Err(err) => last_error = err.to_string(),
+            }
+        }
+        if attempt < max_attempts {
+            eprintln!("Delivery retry {attempt}/{max_attempts} failed: {last_error}");
+        }
+    }
+    Err((max_attempts, last_error))
+}
+
+async fn quarantine_poison_change(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+    schema: &str,
+    table: &str,
+    change: &ChangeEvent,
+    output_identity: serde_json::Value,
+    stage: &str,
+    attempts: u32,
+    last_error: &str,
+) -> Result<(), CliError> {
+    let record = QuarantinedChange {
+        deployment_name: pipeline.deployment_name.clone(),
+        pipeline_name: pipeline.name.clone(),
+        source_schema: schema.to_string(),
+        source_table: table.to_string(),
+        change_id: change.change_id.clone(),
+        capture_position: change.position.as_i64(),
+        output_identity,
+        stage: stage.to_string(),
+        attempts: attempts as i32,
+        last_error: last_error.to_string(),
+        status: "quarantined".to_string(),
+    };
+    let identity_label = format_output_identity(&record.output_identity);
+    upsert_quarantined_change(platform_store_url, &record)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    eprintln!(
+        "ALERT: Poison Change quarantined Pipeline={} identity={} change_id={} \
+         stage={stage} attempts={attempts}: {last_error}",
+        pipeline.name, identity_label, change.change_id
+    );
+    println!(
+        "Quarantine: Pipeline={} identity={} change_id={} stage={stage} \
+         attempts={attempts} unhealthy / not aligned",
+        pipeline.name, identity_label, change.change_id
+    );
+    Ok(())
+}
+
 fn base_with_sync_progress(
     dataset: &BaseDataset,
     status: impl Into<String>,
@@ -1700,6 +1856,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
     let fail_after = sync_fail_after_changes();
+    let max_poison_attempts = poison_max_attempts();
     let mut applied_this_run: u32 = 0;
 
     for deployment in &deployments {
@@ -1903,72 +2060,153 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                                     &dataset.columns,
                                     pipeline,
                                 )?;
-                                let upserted = upsert_managed_documents(
+                                match upsert_with_bounded_retries(
                                     &mongo,
                                     &pipeline.target_collection,
-                                    &[document],
+                                    &document,
+                                    max_poison_attempts,
                                 )
                                 .await
-                                .map_err(|err| CliError::Failed(err.to_string()))?;
-                                update_pipeline_delivery_progress(
-                                    platform_store_url,
-                                    &pipeline.deployment_name,
-                                    &pipeline.name,
-                                    "delivered",
-                                    Some(upserted as i32),
-                                )
-                                .await
-                                .map_err(|err| CliError::Failed(err.to_string()))?;
-                                println!(
-                                    "Delivery complete: Pipeline {} upserts={upserted} deletes=0 \
-                                     (checkpoint-bound)",
-                                    pipeline.name
-                                );
+                                {
+                                    Ok(upserted) => {
+                                        update_pipeline_delivery_progress(
+                                            platform_store_url,
+                                            &pipeline.deployment_name,
+                                            &pipeline.name,
+                                            "delivered",
+                                            Some(upserted as i32),
+                                        )
+                                        .await
+                                        .map_err(|err| CliError::Failed(err.to_string()))?;
+                                        println!(
+                                            "Delivery complete: Pipeline {} upserts={upserted} \
+                                             deletes=0 (checkpoint-bound)",
+                                            pipeline.name
+                                        );
+                                    }
+                                    Err((attempts, last_error)) => {
+                                        quarantine_poison_change(
+                                            platform_store_url,
+                                            pipeline,
+                                            &schema,
+                                            &table,
+                                            change,
+                                            document.identity.clone(),
+                                            "delivery",
+                                            attempts,
+                                            &last_error,
+                                        )
+                                        .await?;
+                                    }
+                                }
                             }
                             ChangeOp::Delete => {
-                                let identity_map: serde_json::Map<String, serde_json::Value> = change
-                                    .identity
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect();
-                                let identity = output_identity_from_row(
-                                    &identity_map,
+                                let identity = identity_value_from_change(
+                                    change,
                                     &dataset.primary_key,
                                 )?;
-                                let deleted = delete_documents_by_identity(
+                                match delete_with_bounded_retries(
                                     &mongo,
                                     &pipeline.target_collection,
-                                    &[identity],
+                                    &identity,
+                                    max_poison_attempts,
                                 )
                                 .await
-                                .map_err(|err| CliError::Failed(err.to_string()))?;
-                                update_pipeline_delivery_progress(
-                                    platform_store_url,
-                                    &pipeline.deployment_name,
-                                    &pipeline.name,
-                                    "delivered",
-                                    Some(deleted as i32),
-                                )
-                                .await
-                                .map_err(|err| CliError::Failed(err.to_string()))?;
-                                println!(
-                                    "Delivery complete: Pipeline {} upserts=0 deletes={deleted} \
-                                     (checkpoint-bound)",
-                                    pipeline.name
-                                );
+                                {
+                                    Ok(deleted) => {
+                                        update_pipeline_delivery_progress(
+                                            platform_store_url,
+                                            &pipeline.deployment_name,
+                                            &pipeline.name,
+                                            "delivered",
+                                            Some(deleted as i32),
+                                        )
+                                        .await
+                                        .map_err(|err| CliError::Failed(err.to_string()))?;
+                                        println!(
+                                            "Delivery complete: Pipeline {} upserts=0 \
+                                             deletes={deleted} (checkpoint-bound)",
+                                            pipeline.name
+                                        );
+                                    }
+                                    Err((attempts, last_error)) => {
+                                        quarantine_poison_change(
+                                            platform_store_url,
+                                            pipeline,
+                                            &schema,
+                                            &table,
+                                            change,
+                                            identity,
+                                            "delivery",
+                                            attempts,
+                                            &last_error,
+                                        )
+                                        .await?;
+                                    }
+                                }
                             }
                         },
                         "transform" => {
-                            maintain_transform_pipeline_for_change(
-                                platform_store_url,
-                                pipeline,
-                                &mongo,
-                                &dataset.columns,
-                                &rows,
-                                change,
-                                pre_apply.as_ref(),
-                            )
-                            .await?;
+                            let mut last_error = String::new();
+                            let mut succeeded = false;
+                            for attempt in 1..=max_poison_attempts {
+                                match maintain_transform_pipeline_for_change(
+                                    platform_store_url,
+                                    pipeline,
+                                    &mongo,
+                                    &dataset.columns,
+                                    &rows,
+                                    change,
+                                    pre_apply.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        succeeded = true;
+                                        break;
+                                    }
+                                    Err(err) => {
+                                        last_error = err.to_string();
+                                        if attempt < max_poison_attempts {
+                                            eprintln!(
+                                                "Delivery retry {attempt}/{max_poison_attempts} \
+                                                 failed: {last_error}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if !succeeded {
+                                let identity = identity_value_from_change(
+                                    change,
+                                    if pipeline.output_identity.is_empty() {
+                                        &dataset.primary_key
+                                    } else {
+                                        &pipeline.output_identity
+                                    },
+                                )
+                                .unwrap_or_else(|_| {
+                                    serde_json::Value::Object(
+                                        change
+                                            .identity
+                                            .iter()
+                                            .map(|(k, v)| (k.clone(), v.clone()))
+                                            .collect(),
+                                    )
+                                });
+                                quarantine_poison_change(
+                                    platform_store_url,
+                                    pipeline,
+                                    &schema,
+                                    &table,
+                                    change,
+                                    identity,
+                                    "delivery",
+                                    max_poison_attempts,
+                                    &last_error,
+                                )
+                                .await?;
+                            }
                         }
                         other => {
                             return Err(CliError::Failed(format!(
@@ -2173,12 +2411,24 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
+    let quarantines = list_quarantined_changes(platform_store_url, None)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
     for pipeline in &pipelines {
         if pipeline.target_collection.is_empty() {
             continue;
         }
+        let pipeline_quarantines: Vec<_> = quarantines
+            .iter()
+            .filter(|q| {
+                q.deployment_name == pipeline.deployment_name && q.pipeline_name == pipeline.name
+            })
+            .collect();
         let delivery_health = if pipeline.paused {
             "paused"
+        } else if !pipeline_quarantines.is_empty() {
+            "unhealthy"
         } else {
             match pipeline.delivery_status.as_str() {
                 "delivered" => "ok",
@@ -2191,13 +2441,37 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         } else {
             pipeline.delivery_status.clone()
         };
-        println!(
-            "  Delivery Health: {} Pipeline={} status={} appliedChanges={}",
-            delivery_health,
-            pipeline.name,
-            status_label,
-            pipeline.delivery_applied_changes
-        );
+        if pipeline_quarantines.is_empty() {
+            println!(
+                "  Delivery Health: {} Pipeline={} status={} appliedChanges={}",
+                delivery_health,
+                pipeline.name,
+                status_label,
+                pipeline.delivery_applied_changes
+            );
+        } else {
+            println!(
+                "  Delivery Health: {} Pipeline={} status={} appliedChanges={} quarantined={}",
+                delivery_health,
+                pipeline.name,
+                status_label,
+                pipeline.delivery_applied_changes,
+                pipeline_quarantines.len()
+            );
+        }
+    }
+
+    if quarantines.is_empty() {
+        println!("Quarantine: (none)");
+    } else {
+        for q in &quarantines {
+            let identity = format_output_identity(&q.output_identity);
+            println!(
+                "  Quarantine: Pipeline={} identity={} change_id={} stage={} attempts={} \
+                 unhealthy / not aligned error={}",
+                q.pipeline_name, identity, q.change_id, q.stage, q.attempts, q.last_error
+            );
+        }
     }
 
     Ok(())

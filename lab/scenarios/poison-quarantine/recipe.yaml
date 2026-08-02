@@ -1,0 +1,28 @@
+# Lab Scenario recipe (ADR-0025 / issue #22 / ADR-0015).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: poison-quarantine
+summary: Quarantine poison Output Identity after bounded retries; Pipeline continues; status unhealthy
+namespace:
+  source_tables:
+    - LAB_PQ_CUSTOMERS
+  target_collections:
+    - lab_pq_customers
+  deployment: lab-poison-quarantine
+  pipelines:
+    - lab-pq-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery)
+    - mutate Source (update identity 1, insert 3, delete 2)
+    - sync Incremental Capture with Lab poison Delivery injection for identity 1
+    - assert quarantine alert, other identities Deliver, status shows unhealthy quarantine
+checks:
+  correctness:
+    - "Poison identity 1 is quarantined after bounded retries (ALERT + Quarantine lines)"
+    - "Pipeline continues: Target Delivers Carol insert and Bob delete; identity 1 stays Alice"
+    - "status Delivery Health unhealthy with quarantined identity=1 (unhealthy / not aligned)"
+    - "Pipeline is not paused for the poison row"
+thresholds: {}

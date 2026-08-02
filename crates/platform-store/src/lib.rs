@@ -1335,3 +1335,163 @@ impl DerivedRowDb {
         })
     }
 }
+
+/// Durable Poison Change quarantine record (ADR-0015 / issue #22).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuarantinedChange {
+    pub deployment_name: String,
+    pub pipeline_name: String,
+    pub source_schema: String,
+    pub source_table: String,
+    pub change_id: String,
+    pub capture_position: i64,
+    pub output_identity: serde_json::Value,
+    pub stage: String,
+    pub attempts: i32,
+    pub last_error: String,
+    pub status: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct QuarantinedChangeRow {
+    deployment_name: String,
+    pipeline_name: String,
+    source_schema: String,
+    source_table: String,
+    change_id: String,
+    capture_position: i64,
+    output_identity_json: String,
+    stage: String,
+    attempts: i32,
+    last_error: String,
+    status: String,
+}
+
+impl QuarantinedChangeRow {
+    fn into_quarantined_change(self) -> Result<QuarantinedChange, PlatformStoreError> {
+        Ok(QuarantinedChange {
+            deployment_name: self.deployment_name,
+            pipeline_name: self.pipeline_name,
+            source_schema: self.source_schema,
+            source_table: self.source_table,
+            change_id: self.change_id,
+            capture_position: self.capture_position,
+            output_identity: serde_json::from_str(&self.output_identity_json)
+                .map_err(PlatformStoreError::InvalidJson)?,
+            stage: self.stage,
+            attempts: self.attempts,
+            last_error: self.last_error,
+            status: self.status,
+        })
+    }
+}
+
+/// Persist or refresh a Poison Change quarantine (ADR-0015).
+pub async fn upsert_quarantined_change(
+    database_url: &str,
+    record: &QuarantinedChange,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let identity_json = serde_json::to_string(&record.output_identity)
+        .map_err(PlatformStoreError::InvalidJson)?;
+    sqlx::query(
+        r#"
+        INSERT INTO poison_quarantine (
+            deployment_name, pipeline_name, source_schema, source_table,
+            change_id, capture_position, output_identity_json, stage,
+            attempts, last_error, status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
+        ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
+            source_schema = EXCLUDED.source_schema,
+            source_table = EXCLUDED.source_table,
+            capture_position = EXCLUDED.capture_position,
+            output_identity_json = EXCLUDED.output_identity_json,
+            stage = EXCLUDED.stage,
+            attempts = EXCLUDED.attempts,
+            last_error = EXCLUDED.last_error,
+            status = EXCLUDED.status,
+            quarantined_at = NOW()
+        "#,
+    )
+    .bind(&record.deployment_name)
+    .bind(&record.pipeline_name)
+    .bind(&record.source_schema)
+    .bind(&record.source_table)
+    .bind(&record.change_id)
+    .bind(record.capture_position)
+    .bind(identity_json)
+    .bind(&record.stage)
+    .bind(record.attempts)
+    .bind(&record.last_error)
+    .bind(&record.status)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+/// List active (status=quarantined) Poison Change records, optionally scoped.
+pub async fn list_quarantined_changes(
+    database_url: &str,
+    deployment_name: Option<&str>,
+) -> Result<Vec<QuarantinedChange>, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let rows = if let Some(deployment) = deployment_name {
+        sqlx::query_as::<_, QuarantinedChangeRow>(
+            r#"
+            SELECT deployment_name, pipeline_name, source_schema, source_table,
+                   change_id, capture_position, output_identity_json::text AS output_identity_json,
+                   stage, attempts, last_error, status
+            FROM poison_quarantine
+            WHERE status = 'quarantined' AND deployment_name = $1
+            ORDER BY deployment_name, pipeline_name, quarantined_at, change_id
+            "#,
+        )
+        .bind(deployment)
+        .fetch_all(&pool)
+        .await
+        .map_err(PlatformStoreError::Load)?
+    } else {
+        sqlx::query_as::<_, QuarantinedChangeRow>(
+            r#"
+            SELECT deployment_name, pipeline_name, source_schema, source_table,
+                   change_id, capture_position, output_identity_json::text AS output_identity_json,
+                   stage, attempts, last_error, status
+            FROM poison_quarantine
+            WHERE status = 'quarantined'
+            ORDER BY deployment_name, pipeline_name, quarantined_at, change_id
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(PlatformStoreError::Load)?
+    };
+
+    rows.into_iter()
+        .map(QuarantinedChangeRow::into_quarantined_change)
+        .collect()
+}
+
+/// Count active quarantines for one Pipeline (Operator-visible Delivery Health).
+pub async fn count_active_quarantines(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+) -> Result<i64, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM poison_quarantine
+        WHERE deployment_name = $1
+          AND pipeline_name = $2
+          AND status = 'quarantined'
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .fetch_one(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+    Ok(count)
+}

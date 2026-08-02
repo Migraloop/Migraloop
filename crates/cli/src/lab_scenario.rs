@@ -112,6 +112,15 @@ const CHANGE_PIPELINE_DEPLOYMENT: &str = "lab-change-pipeline";
 const CHANGE_PIPELINE_SEMANTIC_CONFIG: &str = "deployment-semantic.yaml";
 const CHANGE_PIPELINE_METADATA_CONFIG: &str = "deployment-metadata.yaml";
 
+const POISON_QUARANTINE_ID: &str = "poison-quarantine";
+const POISON_QUARANTINE_TABLE: &str = "LAB_PQ_CUSTOMERS";
+const POISON_QUARANTINE_COLLECTION: &str = "lab_pq_customers";
+const POISON_QUARANTINE_PIPELINE: &str = "lab-pq-customers";
+const POISON_QUARANTINE_DEPLOYMENT: &str = "lab-poison-quarantine";
+/// Lab orchestration: force Delivery failure for Output Identity 1 so quarantine runs.
+const POISON_QUARANTINE_IDENTITY: &str = "1";
+const POISON_QUARANTINE_MAX_ATTEMPTS: &str = "2";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -193,6 +202,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         PAUSE_RESUME_ID,
         REMOVE_PIPELINE_ID,
         CHANGE_PIPELINE_ID,
+        POISON_QUARANTINE_ID,
     ]
 }
 
@@ -228,6 +238,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             CHANGE_PIPELINE_ID,
             "Pipeline revision change via apply (Derived rebuild / metadata-only skip)",
+        ),
+        (
+            POISON_QUARANTINE_ID,
+            "Poison Change quarantine on Operator status",
         ),
     ]
 }
@@ -520,6 +534,7 @@ async fn scenario_run(
         PAUSE_RESUME_ID => run_pause_resume(lab_dir).await,
         REMOVE_PIPELINE_ID => run_remove_pipeline(lab_dir).await,
         CHANGE_PIPELINE_ID => run_change_pipeline(lab_dir).await,
+        POISON_QUARANTINE_ID => run_poison_quarantine(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -609,6 +624,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         PAUSE_RESUME_ID => remove_pause_resume_namespace(lab_dir).await,
         REMOVE_PIPELINE_ID => remove_remove_pipeline_namespace(lab_dir).await,
         CHANGE_PIPELINE_ID => remove_change_pipeline_namespace(lab_dir).await,
+        POISON_QUARANTINE_ID => remove_poison_quarantine_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -3458,6 +3474,256 @@ EXIT;\n"
         })
 }
 
+async fn run_poison_quarantine(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {POISON_QUARANTINE_ID}");
+    println!(
+        "Scenario Namespace: table={POISON_QUARANTINE_TABLE} \
+collection={POISON_QUARANTINE_COLLECTION} deployment={POISON_QUARANTINE_DEPLOYMENT}"
+    );
+
+    prepare_poison_quarantine_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, POISON_QUARANTINE_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !apply_out.to_ascii_lowercase().contains("delivery") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source mutations (update/insert/delete)...");
+    mutate_poison_quarantine_source(lab_dir).await?;
+
+    println!(
+        "Lab Scenario: sync Incremental Capture + Delivery with poison injection \
+         for Output Identity {POISON_QUARANTINE_IDENTITY}..."
+    );
+    let sync_out = run_product_cli_with_env(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[
+            (
+                "MIGRALOOP_DELIVERY_POISON_IDENTITIES",
+                POISON_QUARANTINE_IDENTITY,
+            ),
+            (
+                "MIGRALOOP_POISON_MAX_ATTEMPTS",
+                POISON_QUARANTINE_MAX_ATTEMPTS,
+            ),
+        ],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+    let sync_lower = sync_out.to_ascii_lowercase();
+    if !(sync_lower.contains("quarantine") && sync_lower.contains("alert")) {
+        return Err(CliError::Failed(format!(
+            "sync must quarantine poison identity with an ALERT:\n{sync_out}"
+        )));
+    }
+    if sync_lower
+        .lines()
+        .any(|line| line.contains("paused") && line.contains(POISON_QUARANTINE_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "poison quarantine must not pause the Pipeline:\n{sync_out}"
+        )));
+    }
+
+    let target_out = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            POISON_QUARANTINE_COLLECTION,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&target_out, "Alice")
+        && !managed_name_present(&target_out, "Alicia")
+        && managed_name_present(&target_out, "Carol")
+        && !managed_name_present(&target_out, "Bob"))
+    {
+        return Err(CliError::Failed(format!(
+            "Target must keep Alice for quarantined identity 1, Deliver Carol, delete Bob:\n{target_out}"
+        )));
+    }
+
+    let status_out = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let status_lower = status_out.to_ascii_lowercase();
+    if !(status_out.contains("Delivery Health: unhealthy")
+        && status_out.contains(POISON_QUARANTINE_PIPELINE)
+        && status_lower.contains("quarantine")
+        && (status_out.contains("identity=1") || status_lower.contains("identity=1")))
+    {
+        return Err(CliError::Failed(format!(
+            "status must show Delivery Health unhealthy with quarantined identity=1:\n{status_out}"
+        )));
+    }
+    if !(status_lower.contains("unhealthy") || status_lower.contains("not aligned")) {
+        return Err(CliError::Failed(format!(
+            "quarantined keys must be marked unhealthy/not aligned:\n{status_out}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (poison identity quarantined; Pipeline continued; status unhealthy)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_poison_quarantine_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={POISON_QUARANTINE_TABLE}, collection={POISON_QUARANTINE_COLLECTION}, \
+          deployment={POISON_QUARANTINE_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {POISON_QUARANTINE_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for poison-quarantine:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{POISON_QUARANTINE_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for poison-quarantine:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, POISON_QUARANTINE_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{POISON_QUARANTINE_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_poison_quarantine_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_poison_quarantine_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {POISON_QUARANTINE_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {POISON_QUARANTINE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {POISON_QUARANTINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {POISON_QUARANTINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare poison-quarantine Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_poison_quarantine_source(lab_dir: &Path) -> Result<(), CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {POISON_QUARANTINE_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
+INSERT INTO {POISON_QUARANTINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
+DELETE FROM {POISON_QUARANTINE_TABLE} WHERE ID = 2;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source mutations for poison-quarantine:\n{err}"
+            ))
+        })
+}
+
 async fn run_remove_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
     println!("Lab Scenario: {REMOVE_PIPELINE_ID}");
     println!(
@@ -3883,20 +4149,30 @@ if (r.matchedCount !== 1) {{ throw new Error('expected to match Output Identity 
 }
 
 async fn run_product_cli(bin: &Path, args: &[&str]) -> Result<String, CliError> {
-    let output = Command::new(bin)
+    run_product_cli_with_env(bin, args, &[]).await
+}
+
+async fn run_product_cli_with_env(
+    bin: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<String, CliError> {
+    let mut command = Command::new(bin);
+    command
         .args(args)
         .env(LAB_ORACLE_PASSWORD_ENV, LAB_ORACLE_PASSWORD_DEFAULT)
         .env(LAB_MONGO_PASSWORD_ENV, LAB_MONGO_PASSWORD_DEFAULT)
-        .env("MIGRALOOP_PLATFORM_STORE_URL", LAB_PLATFORM_STORE_URL)
-        .output()
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "failed to run `{} {}`: {err}",
-                bin.display(),
-                args.join(" ")
-            ))
-        })?;
+        .env("MIGRALOOP_PLATFORM_STORE_URL", LAB_PLATFORM_STORE_URL);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command.output().await.map_err(|err| {
+        CliError::Failed(format!(
+            "failed to run `{} {}`: {err}",
+            bin.display(),
+            args.join(" ")
+        ))
+    })?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

@@ -25,6 +25,7 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Dedicated Pipeline pause/resume CLI verbs | `pause-resume` | `cli_pause_resume_pipeline.rs` | Pause stops Delivery for one Pipeline; resume catch-up from durable Base; other Pipelines unaffected |
 | Dedicated Pipeline remove CLI verb | `remove-pipeline` | `cli_remove_pipeline.rs` | Remove ceases Delivery; Shared Base kept when still referenced; status no longer lists Pipeline; Deployment remains |
 | Pipeline revision change via `apply` (Derived rebuild / metadata-only skip) | `change-pipeline` | `cli_change_pipeline_revision.rs` | Semantic transform/binding change pauses old Delivery, rebuilds that Pipeline's Derived, re-Delivers with delete reconciliation, resumes incremental; Shared Bases not rebuilt; metadata-only `description` skips rebuild |
+| Poison Change quarantine on Operator `status` | `poison-quarantine` | `cli_poison_quarantine.rs` | Bounded Delivery retries → quarantine + alert; Pipeline continues other identities; `status` Delivery Health unhealthy / not aligned for quarantined keys |
 
 ## Explicitly not gate evidence
 
