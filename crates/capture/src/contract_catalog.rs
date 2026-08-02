@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Mutex, MutexGuard, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -131,11 +131,22 @@ pub fn load_catalog_file(path: &Path) -> Result<ContractSourceCatalogFile, Captu
 
 static PROCESS_CATALOG_OVERRIDE: RwLock<Option<ContractSourceCatalog>> = RwLock::new(None);
 
+/// Serializes unit tests that mutate the process catalog override or
+/// `MIGRALOOP_CONTRACT_SOURCE_CATALOG` (parallel cargo test races otherwise).
+static CONTRACT_CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn process_catalog_override() -> Option<ContractSourceCatalog> {
     PROCESS_CATALOG_OVERRIDE
         .read()
         .ok()
         .and_then(|guard| guard.clone())
+}
+
+/// Hold across any test that sets/clears the process catalog override or env catalog path.
+pub fn lock_contract_catalog_for_test() -> MutexGuard<'static, ()> {
+    CONTRACT_CATALOG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Install a process-wide catalog override (unit tests). Clear with [`clear_contract_source_catalog_override`].
@@ -225,6 +236,7 @@ mod tests {
 
     #[test]
     fn env_catalog_file_merges_arbitrary_table_into_process_catalog() {
+        let _lock = lock_contract_catalog_for_test();
         clear_contract_source_catalog_override();
         let file = ContractSourceCatalogFile {
             tables: vec![widgets_snapshot()],
