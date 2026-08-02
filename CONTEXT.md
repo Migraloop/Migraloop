@@ -125,8 +125,8 @@ A first-class, human-operated environment for manually verifying the real produc
 _Avoid_: CI pipeline, Release Quality Gate, contract/stub harness as the Lab, “toy” sync that skips real Source/Target engines, requiring BYO Oracle/Mongo to use the Lab, treating Lab databases as production Source/Target Systems, Lab usable only via Scenario commands with no live DB access
 
 **Lab Fixture**:
-The Lab’s ready starting point once engines and the app are up: enough Source schema, privileges/prerequisites, and baseline seed so a Lab Scenario (or manual DB work) can run. It is not a feature-coverage catalog by itself.
-_Avoid_: Release fixture in CI, treating every Scenario as only a Fixture
+The Lab’s ready starting point after Lab bring-up: disposable Source System (with Source Prerequisites satisfied for Lab use), Target System, Platform Store, and running app, plus connection access for live DB work. It does **not** pre-apply a sample Deployment or Pipelines—those come from the Lab Scenario the operator chooses (or from manual configuration). It is not a feature-coverage catalog by itself.
+_Avoid_: Release fixture in CI, treating every Scenario as only a Fixture, Lab bring-up that guesses a default Pipeline before the operator picks a Scenario
 
 **Scenario Namespace**:
 The Lab Scenario’s isolated slice of Lab Source/Target (and related Pipeline names)—its own schema/tables, collections, and identifiers—so leftover data from one Scenario does not collide with another (for example on primary keys). Finishing a Scenario run **leaves** the Scenario Namespace in place for live inspection and manual DB edits. Re-running the **same** Scenario **fully removes** that Scenario Namespace before recreating and running it; a normal completed run does not delete it. Operators can also **manually remove** a Scenario Namespace (or destroy the whole Lab), and Lab setup/run commands accept **parameters that opt into automatic remove** when desired—auto-delete is control-plane opt-in, not the default end-of-run behavior.
