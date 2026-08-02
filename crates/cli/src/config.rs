@@ -406,13 +406,8 @@ fn validate_pipeline(pipeline: &PipelineSpec) -> Result<(), CliError> {
                 "Direct Pipeline must not declare transform; use mode: transform".to_string(),
             ));
         }
-        if pipeline.output_identity.is_some() {
-            return Err(CliError::Failed(
-                "Direct Pipeline Output Identity defaults from the source primary key; \
-                 omit outputIdentity"
-                    .to_string(),
-            ));
-        }
+        // Direct Output Identity defaults from the source primary key; ignore any
+        // explicit outputIdentity rather than failing apply.
         return Ok(());
     }
 
@@ -471,20 +466,7 @@ fn validate_transform_steps(
     pipeline: &PipelineSpec,
     steps: &[serde_json::Value],
 ) -> Result<(), CliError> {
-    use migraloop_transform::{parse_transform_steps, TransformStepSpec};
-
-    let mut parsed = Vec::with_capacity(steps.len());
-    for (index, step) in steps.iter().enumerate() {
-        let spec: TransformStepSpec = serde_json::from_value(step.clone()).map_err(|err| {
-            CliError::Failed(format!(
-                "Transform Pipeline {} has invalid transform step {}: {err}",
-                pipeline.name,
-                index + 1
-            ))
-        })?;
-        parsed.push(spec);
-    }
-    parse_transform_steps(&parsed).map_err(|err| {
+    migraloop_transform::parse_transform_steps(steps).map_err(|err| {
         CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name))
     })?;
     Ok(())

@@ -233,6 +233,93 @@ async fn transform_pipeline_script_transform_fails_apply_clearly() {
 }
 
 #[tokio::test]
+async fn transform_pipeline_malformed_project_fails_as_invalid_not_unsupported() {
+    let url = ephemeral_database_url().await;
+    let mongo_database = unique_mongo_database();
+    let dir = TempDir::new().expect("tempdir");
+    let pipeline = r#"
+    - name: bad-project
+      mode: transform
+      source:
+        table: CUSTOMERS
+      target:
+        collection: bad_project
+      outputIdentity: [ID]
+      transform:
+        - project:
+            fields: []
+"#;
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &deployment_shell(&mongo_database, pipeline),
+    );
+
+    let err = apply_expect_failure(&url, &config);
+    let lower = err.to_ascii_lowercase();
+    assert!(
+        lower.contains("invalid") || lower.contains("project.fields"),
+        "expected invalid project shape error, got:\n{err}"
+    );
+    assert!(
+        !lower.contains("unsupported"),
+        "malformed project must not be reported as unsupported, got:\n{err}"
+    );
+}
+
+#[tokio::test]
+async fn transform_pipeline_filter_matching_no_rows_still_materializes_empty_derived() {
+    let url = ephemeral_database_url().await;
+    let mongo_database = unique_mongo_database();
+    let dir = TempDir::new().expect("tempdir");
+    // ACTIVE==99 matches nothing in stub CUSTOMERS.
+    let pipeline = r#"
+    - name: nobody
+      mode: transform
+      source:
+        table: CUSTOMERS
+      target:
+        collection: nobody
+      outputIdentity: [ID]
+      transform:
+        - project:
+            fields: [ID, NAME, ACTIVE]
+        - filter:
+            field: ACTIVE
+            eq: 99
+"#;
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &deployment_shell(&mongo_database, pipeline),
+    );
+
+    migrate_and_apply(&url, &config);
+
+    let derived = Command::new(bin())
+        .args([
+            "derived",
+            "--platform-store-url",
+            &url,
+            "--pipeline",
+            "nobody",
+        ])
+        .output()
+        .expect("run derived");
+    assert!(
+        derived.status.success(),
+        "derived inspect failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&derived.stdout),
+        String::from_utf8_lossy(&derived.stderr)
+    );
+    let derived_out = String::from_utf8_lossy(&derived.stdout);
+    assert!(
+        derived_out.contains("rows=0") || derived_out.contains("rows = 0"),
+        "empty filter result must materialize Derived with 0 rows, got:\n{derived_out}"
+    );
+}
+
+#[tokio::test]
 async fn transform_pipeline_unsupported_operator_fails_apply_clearly() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();

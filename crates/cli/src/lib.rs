@@ -26,7 +26,7 @@ use migraloop_platform_store::{
     SecretRefKind, SystemConnection,
 };
 use migraloop_transform::{
-    evaluate_transform, parse_transform_steps, TransformOp, TransformStepSpec,
+    derived_projected_fields, evaluate_transform, parse_transform_steps, TransformOp,
 };
 use thiserror::Error;
 
@@ -291,18 +291,7 @@ fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformOp>, 
             pipeline.name
         ))
     })?;
-    let mut parsed = Vec::with_capacity(steps.len());
-    for (index, step) in steps.iter().enumerate() {
-        let spec: TransformStepSpec = serde_json::from_value(step.clone()).map_err(|err| {
-            CliError::Failed(format!(
-                "Transform Pipeline {} has invalid transform step {}: {err}",
-                pipeline.name,
-                index + 1
-            ))
-        })?;
-        parsed.push(spec);
-    }
-    parse_transform_steps(&parsed).map_err(|err| {
+    parse_transform_steps(steps).map_err(|err| {
         CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name))
     })
 }
@@ -898,7 +887,7 @@ async fn deliver_transform_pipeline(
     let derived_rows = evaluate_transform(&ops, &base_maps)
         .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
 
-    let derived_columns = derived_columns_from_base(&base.columns, &derived_rows);
+    let derived_columns = derived_columns_for_ops(&base.columns, &ops, &derived_rows);
     let source_columns = stub_source_columns(&pipeline.source_table)?;
     let managed_names: BTreeSet<String> = derived_columns
         .iter()
@@ -913,9 +902,7 @@ async fn deliver_transform_pipeline(
     validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
 
     for field in &pipeline.output_identity {
-        if !derived_columns.iter().any(|c| c.name == *field)
-            && !derived_rows.iter().any(|row| row.contains_key(field))
-        {
+        if !derived_columns.iter().any(|c| c.name == *field) {
             return Err(CliError::Failed(format!(
                 "Transform Pipeline {} outputIdentity field {field} is not present in Derived output",
                 pipeline.name
@@ -974,16 +961,21 @@ async fn deliver_transform_pipeline(
     Ok(())
 }
 
-/// Columns present in Derived rows, preserving Base schema metadata when available.
-fn derived_columns_from_base(
+/// Columns for a Derived Dataset: project fields when present, else Base columns,
+/// unioned with keys observed in Derived rows. Works for empty Derived results.
+fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
+    ops: &[TransformOp],
     derived_rows: &[serde_json::Map<String, serde_json::Value>],
 ) -> Vec<BaseColumn> {
     let mut names = BTreeSet::new();
+    if let Some(projected) = derived_projected_fields(ops) {
+        names.extend(projected);
+    } else {
+        names.extend(base_columns.iter().map(|c| c.name.clone()));
+    }
     for row in derived_rows {
-        for key in row.keys() {
-            names.insert(key.clone());
-        }
+        names.extend(row.keys().cloned());
     }
     let by_name: BTreeMap<&str, &BaseColumn> = base_columns
         .iter()
