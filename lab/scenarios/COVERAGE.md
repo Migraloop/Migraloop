@@ -2,6 +2,8 @@
 
 Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not a CI Release Quality Gate (ADR-0011).
 
+Contract-path **CI twin** evidence for the same shipped capabilities (Release Quality Gate / `rqg-integration`) lives in [`docs/rqg/CI_TWIN_COVERAGE.md`](../../docs/rqg/CI_TWIN_COVERAGE.md) (ADR-0028 / issue #96)—analogous matrix, not a Lab catalog runner.
+
 ## Catalog status
 
 **Catalog-complete for currently shipped first-class capabilities.**

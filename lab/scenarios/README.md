@@ -2,7 +2,7 @@
 
 Feature-time authoring path for selectable **Lab Scenarios** (ADR-0025 / issues #65–#66).
 
-Shipped-capability coverage (and visible gaps for not-yet-shipped surfaces) lives in [COVERAGE.md](./COVERAGE.md). `migraloop lab scenario list` reports whether the selectable catalog is complete for currently shipped capabilities—operators still pick Scenarios individually; this is not a CI suite.
+Shipped-capability coverage (and visible gaps for not-yet-shipped surfaces) lives in [COVERAGE.md](./COVERAGE.md). `migraloop lab scenario list` reports whether the selectable catalog is complete for currently shipped capabilities—operators still pick Scenarios individually; this is not a CI suite. The Lab↔CI twin completeness ladder (non-ignored contract-path evidence under `rqg-integration`) is tracked in [`docs/rqg/CI_TWIN_COVERAGE.md`](../../docs/rqg/CI_TWIN_COVERAGE.md).
 
 Each Scenario lives under `lab/scenarios/<id>/` with:
 
