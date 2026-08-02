@@ -1436,36 +1436,23 @@ pub async fn list_quarantined_changes(
     deployment_name: Option<&str>,
 ) -> Result<Vec<QuarantinedChange>, PlatformStoreError> {
     let pool = connect(database_url).await?;
-    let rows = if let Some(deployment) = deployment_name {
-        sqlx::query_as::<_, QuarantinedChangeRow>(
-            r#"
-            SELECT deployment_name, pipeline_name, source_schema, source_table,
-                   change_id, capture_position, output_identity_json::text AS output_identity_json,
-                   stage, attempts, last_error, status
-            FROM poison_quarantine
-            WHERE status = 'quarantined' AND deployment_name = $1
-            ORDER BY deployment_name, pipeline_name, quarantined_at, change_id
-            "#,
-        )
-        .bind(deployment)
-        .fetch_all(&pool)
-        .await
-        .map_err(PlatformStoreError::Load)?
-    } else {
-        sqlx::query_as::<_, QuarantinedChangeRow>(
-            r#"
-            SELECT deployment_name, pipeline_name, source_schema, source_table,
-                   change_id, capture_position, output_identity_json::text AS output_identity_json,
-                   stage, attempts, last_error, status
-            FROM poison_quarantine
-            WHERE status = 'quarantined'
-            ORDER BY deployment_name, pipeline_name, quarantined_at, change_id
-            "#,
-        )
-        .fetch_all(&pool)
-        .await
-        .map_err(PlatformStoreError::Load)?
-    };
+    // Optional deployment filter: empty string means "all Deployments".
+    let deployment_filter = deployment_name.unwrap_or("");
+    let rows = sqlx::query_as::<_, QuarantinedChangeRow>(
+        r#"
+        SELECT deployment_name, pipeline_name, source_schema, source_table,
+               change_id, capture_position, output_identity_json::text AS output_identity_json,
+               stage, attempts, last_error, status
+        FROM poison_quarantine
+        WHERE status = 'quarantined'
+          AND ($1 = '' OR deployment_name = $1)
+        ORDER BY deployment_name, pipeline_name, quarantined_at, change_id
+        "#,
+    )
+    .bind(deployment_filter)
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
 
     rows.into_iter()
         .map(QuarantinedChangeRow::into_quarantined_change)

@@ -38,7 +38,7 @@ migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployme
 
 ### `status`
 
-回報 Platform Store 健康、Deployments、Pipelines、Base Datasets、Sync Health、Delivery Health 與 Derived Datasets。
+回報 Platform Store 健康、Deployments、Pipelines、Base Datasets、Sync Health、Delivery Health、Quarantine 列，與 Derived Datasets。當 Poison Change quarantine 作用中時，Delivery Health 為 `unhealthy`，並把每個被 quarantine 的 Output Identity 標為 unhealthy / not aligned（ADR-0015）。
 
 ```bash
 migraloop status --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
@@ -90,6 +90,8 @@ migraloop derived --pipeline orders_by_customer [--deployment oracle-to-mongo]
 Oracle Incremental Capture 一律走 LogMiner：真實 host 使用 **LogMiner (OCI)**；`host: contract` / `stub` 使用行程內 contract harness。真實 host **不會** silent fallback 到 stub catalog。缺少 Instant Client 或 OCI 失敗時會以 LogMiner/OCI 名稱 fail fast。
 
 已 pause 的 Pipelines 在 `sync` 期間會略過 Delivery/processing；共用 Base Dataset 的 Incremental Capture 仍會繼續，讓其他 Pipelines 與之後的 resume catch-up 保持正確。
+
+當單一 Output Identity 的 Delivery 反覆失敗時，`sync` 會重試最多 `MIGRALOOP_POISON_MAX_ATTEMPTS` 次（預設 `3`），然後 quarantine 該 identity、發出 Operator 可見的 **ALERT**、繼續其他 changes，並在 `status` 上顯示 quarantine（ADR-0015 / issue #22）。
 
 ```bash
 migraloop sync --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
@@ -179,6 +181,8 @@ Lab 是手動驗證—不是 Release Quality Gate，也不是 contract/stub LogM
 | 設定中 `fromEnv` 參照的密鑰環境變數名 | 你在 `password.fromEnv` 寫的任何名稱（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply/sync 時必須存在於行程環境 |
 | `LD_LIBRARY_PATH` | 真實 Oracle host：Oracle Instant Client libraries 目錄（apply/sync runtime 需要；`contract`/`stub` 不使用） |
 | `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | 僅 contract/stub host：JSON 檔路徑，merge/override harness catalog 資料表以供 schema discovery + Initial Load（CI／本機切片；不是 production Source 機制） |
+| `MIGRALOOP_POISON_MAX_ATTEMPTS` | Poison Change quarantine 前的有界 Delivery 重試次數（預設 `3`；必須 > 0） |
+| `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | 僅 Test/Lab fault injection：以逗號分隔、一律讓 Delivery 失敗的 Output Identity keys，用來演練 quarantine（不是 production Operator 控制） |
 | Lab disposable defaults | `migraloop lab up` 之後：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`（僅本機 Lab） |
 
 ### Contract-harness Source Prerequisite probes（僅 host `stub` / `contract`）

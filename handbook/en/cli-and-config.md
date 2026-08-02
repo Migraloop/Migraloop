@@ -38,7 +38,7 @@ migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployme
 
 ### `status`
 
-Report Platform Store health, Deployments, Pipelines, Base Datasets, Sync Health, Delivery Health, and Derived Datasets.
+Report Platform Store health, Deployments, Pipelines, Base Datasets, Sync Health, Delivery Health, Quarantine rows, and Derived Datasets. When Poison Change quarantine is active, Delivery Health is `unhealthy` and each quarantined Output Identity is listed as unhealthy / not aligned (ADR-0015).
 
 ```bash
 migraloop status --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
@@ -90,6 +90,8 @@ Run Incremental Capture into Base Datasets, maintain Derived Datasets, then Deli
 Oracle Incremental Capture is always LogMiner-backed: real hosts use **LogMiner (OCI)**; `host: contract` / `stub` use the in-process contract harness. There is no silent fallback from a real host to the stub catalog. Missing Instant Client or OCI failures fail fast naming LogMiner/OCI.
 
 Paused Pipelines skip Delivery/processing during `sync`; shared Base Dataset Incremental Capture continues so other Pipelines and later resume catch-up stay correct.
+
+When a single Output Identity repeatedly fails Delivery, `sync` retries up to `MIGRALOOP_POISON_MAX_ATTEMPTS` (default `3`), then quarantines that identity with an Operator-visible **ALERT**, continues other changes, and leaves quarantine visible on `status` (ADR-0015 / issue #22).
 
 ```bash
 migraloop sync --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
@@ -179,6 +181,8 @@ Lab is manual verification—not the Release Quality Gate and not the contract/s
 | Secret env names referenced from config | Any names you put in `password.fromEnv` (for example `ORACLE_PASSWORD`, `MONGO_PASSWORD`) must be present in the process environment at apply/sync time |
 | `LD_LIBRARY_PATH` | For real Oracle hosts: directory of Oracle Instant Client libraries (required at apply/sync runtime; not used by `contract`/`stub`) |
 | `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Contract/stub hosts only: path to a JSON file that merges/overrides harness catalog tables for schema discovery + Initial Load (CI / local slices; not a production Source mechanism) |
+| `MIGRALOOP_POISON_MAX_ATTEMPTS` | Bounded Delivery retries before Poison Change quarantine (default `3`; must be > 0) |
+| `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | Test/Lab fault injection only: comma-separated Output Identity keys that always fail Delivery so quarantine can be exercised (not a production Operator control) |
 | Lab disposable defaults | After `migraloop lab up`: `ORACLE_PASSWORD=lab_oracle`, `MONGO_PASSWORD=lab_mongo`, Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin` (local Lab only) |
 
 ### Contract-harness Source Prerequisite probes (host `stub` / `contract` only)
