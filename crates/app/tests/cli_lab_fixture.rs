@@ -61,7 +61,7 @@ async fn lab_help_lists_up_status_down() {
         String::from_utf8_lossy(&help.stderr)
     );
     let stdout = String::from_utf8_lossy(&help.stdout);
-    for sub in ["up", "status", "down"] {
+    for sub in ["up", "status", "down", "scenario"] {
         assert!(
             stdout.contains(sub),
             "lab --help should list `{sub}`, got:\n{stdout}"

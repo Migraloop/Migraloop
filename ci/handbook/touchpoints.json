@@ -26,7 +26,11 @@
     },
     {
       "id": "local-sync-lab-fixture",
-      "paths": ["lab/**", "crates/cli/src/lab.rs"],
+      "paths": [
+        "lab/**",
+        "crates/cli/src/lab.rs",
+        "crates/cli/src/lab_scenario.rs"
+      ],
       "handbook_pages": [
         "start-here.md",
         "developer-local-setup.md",

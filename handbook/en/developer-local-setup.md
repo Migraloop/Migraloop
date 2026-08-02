@@ -44,7 +44,10 @@ Disposable Oracle + MongoDB + Platform Store + app for manual Sync→Delivery ve
 cargo build -p migraloop-app
 ./target/debug/migraloop lab up
 ./target/debug/migraloop lab status
-# Inspect/mutate Lab DBs with the printed connection details; apply your own Deployment when ready.
+./target/debug/migraloop lab scenario list
+# Scenario apply/sync needs Instant Client: export LD_LIBRARY_PATH=/path/to/instantclient
+./target/debug/migraloop lab scenario run direct-pipeline
+# Inspect leftover Scenario Namespace with migraloop base / target, or mutate Lab DBs directly.
 ./target/debug/migraloop lab down
 ```
 
@@ -87,6 +90,13 @@ Lab Fixture lifecycle seam (ignored by default; requires Docker Compose + Lab Or
 
 ```bash
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
+```
+
+Lab Scenario Direct Pipeline seam (ignored by default; requires Docker Lab Fixture + Instant Client):
+
+```bash
+export LD_LIBRARY_PATH=/path/to/instantclient
+cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
 ```
 
 See [Source System](source-system.md) for the Operator apply/sync/inspect verification steps.
