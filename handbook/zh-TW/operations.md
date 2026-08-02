@@ -12,7 +12,7 @@ Source DDL 會依每條 Pipeline 的相依性分類（ADR-0009）：
 | 影響 Pipeline 但 apply 仍安全 | 繼續處理 |
 | 阻擋安全 apply（重試無法前進） | **警告並 pause** 受影響的 Pipeline(s) |
 
-此 pause 規則用於 **stream-wide blockers**，不是單一列的 poison data。專用 pause/resume CLI 動詞屬 control-plane 契約（見 [Pipeline](pipeline.md)）；在它們出貨前，把無法解除的 apply 失敗當成 `status` / logs 上的 Operator 可見錯誤，並只在設定中保留可執行的 Pipelines。
+此 pause 規則用於 **stream-wide blockers**，不是單一列的 poison data。Operator 也可主動用 `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>` pause/resume 一條 Pipeline（見 [Pipeline](pipeline.md) 與 [CLI 與 Config](cli-and-config.md)），且不必重啟 Deployment。在自動 DDL-driven pause 接上這些動詞之前，把無法解除的 apply 失敗當成 `status` / logs 上的 Operator 可見錯誤，並明確 pause 或移除受影響的 Pipelines。
 
 ## Poison Change Handling
 

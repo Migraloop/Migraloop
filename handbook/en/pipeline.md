@@ -60,10 +60,11 @@ Product model: add, pause, resume, remove, and change Pipelines without restarti
 
 1. Edit the declarative Deployment document (add/change/remove Pipeline entries).
 2. `migraloop apply -f deployment.yaml` — upserts Deployment + Pipeline set; runs table-level **Initial Load** for newly referenced tables; rebuilds Derived output when a Transform revision requires it; shared Base Datasets are not rebuilt for an unrelated Pipeline change.
-3. `migraloop sync` — Incremental Capture + Delivery for active work.
-4. `migraloop status` / `base` / `target` / `derived` — inspect progress and health.
+3. `migraloop sync` — Incremental Capture + Delivery for active (non-paused) Pipelines.
+4. `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>` — stop or continue Delivery/processing for one Pipeline without restarting the Deployment. Pause is durable in the Platform Store; resume catch-up Delivers from current Base/Derived state. Other Pipelines are unaffected. `status` shows `paused` on the Pipeline and its Delivery Health.
+5. `migraloop status` / `base` / `target` / `derived` — inspect progress and health.
 
-Dedicated pause/resume subcommands remain part of the control-plane contract; until they ship as first-class CLI verbs, treat stream-wide blockers via Operations guidance and keep Pipelines declared only while they should run.
+Stream-wide blockers (for example unblockable DDL) still follow [Operations](operations.md) pause guidance; Operator-driven pause/resume is the first-class control-plane path for intentional stops.
 
 ## Capture scope
 

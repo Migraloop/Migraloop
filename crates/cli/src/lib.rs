@@ -23,7 +23,7 @@ use migraloop_platform_store::{
     base_dataset_exists, delete_base_datasets_not_in, filter_unapplied_change_ids, get_base_rows,
     get_derived_rows, health, list_base_datasets, list_deployments, list_derived_datasets,
     list_pipelines, migrate, record_applied_source_changes, replace_base_dataset,
-    replace_derived_dataset, replace_pipelines, update_base_primary_key,
+    replace_derived_dataset, replace_pipelines, set_pipeline_paused, update_base_primary_key,
     update_pipeline_delivery_progress, upsert_deployment, BaseColumn, BaseDataset, Deployment,
     DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef,
     SecretRefKind, SystemConnection,
@@ -114,6 +114,30 @@ pub enum Command {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
+    },
+    /// Pause a Pipeline: stop further Delivery/processing without restarting the Deployment
+    Pause {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Pipeline name to pause
+        #[arg(long)]
+        pipeline: String,
+        /// Deployment name when multiple Pipelines share a name
+        #[arg(long)]
+        deployment: Option<String>,
+    },
+    /// Resume a paused Pipeline: continue Delivery from durable Platform Store state
+    Resume {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Pipeline name to resume
+        #[arg(long)]
+        pipeline: String,
+        /// Deployment name when multiple Pipelines share a name
+        #[arg(long)]
+        deployment: Option<String>,
     },
     /// Run the app: migrate on startup, then keep the process alive
     Run {
@@ -226,6 +250,7 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
         target_collection,
         delivery_status,
         delivery_applied_changes: 0,
+        paused: false,
         field_mappings,
         output_identity,
         transform_json,
@@ -750,7 +775,7 @@ fn pipeline_declaration_unchanged(previous: &Pipeline, next: &Pipeline) -> bool 
         && previous.transform_json == next.transform_json
 }
 
-/// Preserve Delivery progress for Pipelines whose declaration is unchanged.
+/// Preserve Delivery progress and pause for Pipelines whose declaration is unchanged.
 ///
 /// `pipelines_from_document` always starts at pending/0; without this merge, every
 /// apply would look like a Deployment restart for already-running Pipelines.
@@ -762,6 +787,7 @@ fn preserve_unchanged_pipeline_delivery(existing: &[Pipeline], pipelines: &mut [
         if pipeline_declaration_unchanged(previous, pipeline) {
             pipeline.delivery_status = previous.delivery_status.clone();
             pipeline.delivery_applied_changes = previous.delivery_applied_changes;
+            pipeline.paused = previous.paused;
         }
     }
 }
@@ -773,7 +799,7 @@ fn pipelines_needing_delivery_start<'a>(
     pipelines
         .iter()
         .filter(|pipeline| {
-            if !pipeline_has_target(pipeline) {
+            if !pipeline_has_target(pipeline) || pipeline.paused {
                 return false;
             }
             let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
@@ -796,7 +822,9 @@ async fn deliver_pipelines(
     deployment: &Deployment,
     pipelines: &[&Pipeline],
 ) -> Result<(), CliError> {
-    let needs_delivery = pipelines.iter().any(|p| pipeline_has_target(p));
+    let needs_delivery = pipelines
+        .iter()
+        .any(|p| pipeline_has_target(p) && !p.paused);
     if !needs_delivery {
         return Ok(());
     }
@@ -804,7 +832,7 @@ async fn deliver_pipelines(
     let mongo = mongo_target_from_deployment(deployment)?;
 
     for pipeline in pipelines {
-        if !pipeline_has_target(pipeline) {
+        if !pipeline_has_target(pipeline) || pipeline.paused {
             continue;
         }
 
@@ -832,6 +860,25 @@ async fn deliver_direct_pipeline(
     deployment: &Deployment,
     pipeline: &Pipeline,
     mongo: &MongoTargetConnection,
+) -> Result<(), CliError> {
+    deliver_direct_pipeline_with_options(
+        platform_store_url,
+        deployment,
+        pipeline,
+        mongo,
+        false,
+    )
+    .await
+}
+
+/// Direct Pipeline Delivery. When `reconcile_deletes` is true (resume catch-up),
+/// also remove Target documents whose Output Identity is no longer in Base.
+async fn deliver_direct_pipeline_with_options(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    pipeline: &Pipeline,
+    mongo: &MongoTargetConnection,
+    reconcile_deletes: bool,
 ) -> Result<(), CliError> {
     let (dataset, rows) = get_base_rows(
         platform_store_url,
@@ -866,39 +913,98 @@ async fn deliver_direct_pipeline(
     }
 
     let mut documents = Vec::with_capacity(rows.len());
+    let mut live_identities = BTreeSet::new();
     for row in &rows {
         // Direct Pipeline Managed fields default to all supported Base columns,
         // minus omit mappings; unsafe NUMBER requires string/omit (ADR-0023).
-        documents.push(delivery_document_for_row(
+        let document = delivery_document_for_row(
             &row.data,
             &dataset.primary_key,
             &dataset.columns,
             pipeline,
-        )?);
+        )?;
+        live_identities.insert(identity_key(&document.identity));
+        documents.push(document);
     }
 
     let delivered = upsert_managed_documents(mongo, &pipeline.target_collection, &documents)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
+    let mut deleted = 0usize;
+    if reconcile_deletes {
+        deleted = reconcile_target_deletes(
+            mongo,
+            &pipeline.target_collection,
+            &live_identities,
+        )
+        .await?;
+    }
+
     update_pipeline_delivery_progress(
         platform_store_url,
         &pipeline.deployment_name,
         &pipeline.name,
         "delivered",
-        Some(delivered as i32),
+        Some((delivered + deleted) as i32),
     )
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
 
-    println!(
-        "Delivery complete: Pipeline {} → {}.{} ({} documents)",
-        pipeline.name,
-        deployment.target.database,
-        pipeline.target_collection,
-        delivered
-    );
+    if reconcile_deletes && deleted > 0 {
+        println!(
+            "Delivery complete: Pipeline {} → {}.{} ({} documents, {} deletes)",
+            pipeline.name,
+            deployment.target.database,
+            pipeline.target_collection,
+            delivered,
+            deleted
+        );
+    } else {
+        println!(
+            "Delivery complete: Pipeline {} → {}.{} ({} documents)",
+            pipeline.name,
+            deployment.target.database,
+            pipeline.target_collection,
+            delivered
+        );
+    }
     Ok(())
+}
+
+fn identity_key(identity: &serde_json::Value) -> String {
+    serde_json::to_string(identity).unwrap_or_else(|_| identity.to_string())
+}
+
+fn target_document_identity_key(document: &serde_json::Value) -> Option<String> {
+    document.get("_id").map(identity_key)
+}
+
+async fn reconcile_target_deletes(
+    mongo: &MongoTargetConnection,
+    collection: &str,
+    live_identities: &BTreeSet<String>,
+) -> Result<usize, CliError> {
+    let documents = list_target_documents(mongo, collection)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let mut stale = Vec::new();
+    for document in documents {
+        let Some(key) = target_document_identity_key(&document) else {
+            continue;
+        };
+        if !live_identities.contains(&key) {
+            if let Some(id) = document.get("_id") {
+                stale.push(id.clone());
+            }
+        }
+    }
+    if stale.is_empty() {
+        return Ok(0);
+    }
+    delete_documents_by_identity(mongo, collection, &stale)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))
 }
 
 async fn deliver_transform_pipeline(
@@ -906,6 +1012,23 @@ async fn deliver_transform_pipeline(
     deployment: &Deployment,
     pipeline: &Pipeline,
     mongo: &MongoTargetConnection,
+) -> Result<(), CliError> {
+    deliver_transform_pipeline_with_options(
+        platform_store_url,
+        deployment,
+        pipeline,
+        mongo,
+        false,
+    )
+    .await
+}
+
+async fn deliver_transform_pipeline_with_options(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    pipeline: &Pipeline,
+    mongo: &MongoTargetConnection,
+    reconcile_deletes: bool,
 ) -> Result<(), CliError> {
     if pipeline.output_identity.is_empty() {
         return Err(CliError::Failed(format!(
@@ -972,36 +1095,60 @@ async fn deliver_transform_pipeline(
     );
 
     let mut documents = Vec::with_capacity(derived_rows.len());
+    let mut live_identities = BTreeSet::new();
     for row in &derived_rows {
-        documents.push(delivery_document_for_row(
+        let document = delivery_document_for_row(
             row,
             &pipeline.output_identity,
             &derived_columns,
             pipeline,
-        )?);
+        )?;
+        live_identities.insert(identity_key(&document.identity));
+        documents.push(document);
     }
 
     let delivered = upsert_managed_documents(mongo, &pipeline.target_collection, &documents)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
+    let mut deleted = 0usize;
+    if reconcile_deletes {
+        deleted = reconcile_target_deletes(
+            mongo,
+            &pipeline.target_collection,
+            &live_identities,
+        )
+        .await?;
+    }
+
     update_pipeline_delivery_progress(
         platform_store_url,
         &pipeline.deployment_name,
         &pipeline.name,
         "delivered",
-        Some(delivered as i32),
+        Some((delivered + deleted) as i32),
     )
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
 
-    println!(
-        "Delivery complete: Pipeline {} → {}.{} ({} documents)",
-        pipeline.name,
-        deployment.target.database,
-        pipeline.target_collection,
-        delivered
-    );
+    if reconcile_deletes && deleted > 0 {
+        println!(
+            "Delivery complete: Pipeline {} → {}.{} ({} documents, {} deletes)",
+            pipeline.name,
+            deployment.target.database,
+            pipeline.target_collection,
+            delivered,
+            deleted
+        );
+    } else {
+        println!(
+            "Delivery complete: Pipeline {} → {}.{} ({} documents)",
+            pipeline.name,
+            deployment.target.database,
+            pipeline.target_collection,
+            delivered
+        );
+    }
     Ok(())
 }
 
@@ -1571,6 +1718,18 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             let mut sync_applied = dataset.sync_applied_changes;
             let total_pending = changes.len() as i32;
 
+            for pipeline in &deployment_pipelines {
+                if pipeline.paused
+                    && !pipeline.target_collection.is_empty()
+                    && pipeline.source_table == table
+                {
+                    println!(
+                        "Pipeline {} paused — skipping Delivery/processing for {table}",
+                        pipeline.name
+                    );
+                }
+            }
+
             for (index, change) in changes.iter().enumerate() {
                 // Capture pre-apply Base row for Affect Analysis (unused-field skip / group keys).
                 let pre_apply = rows
@@ -1589,6 +1748,10 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 // Delivery before durable checkpoint so retries prefer duplicate applies.
                 for pipeline in &deployment_pipelines {
                     if pipeline.target_collection.is_empty() || pipeline.source_table != table {
+                        continue;
+                    }
+                    if pipeline.paused {
+                        // Skip Delivery/processing; Base Capture still advances for shared Bases.
                         continue;
                     }
 
@@ -1787,14 +1950,15 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         println!("Pipeline: (none)");
     } else {
         for pipeline in &pipelines {
+            let pause_note = if pipeline.paused { " paused" } else { "" };
             if pipeline.target_collection.is_empty() {
                 println!(
-                    "Pipeline: {} ({}) source={}",
+                    "Pipeline: {} ({}) source={}{pause_note}",
                     pipeline.name, pipeline.mode, pipeline.source_table
                 );
             } else {
                 println!(
-                    "Pipeline: {} ({}) source={} target={} Delivery: {}",
+                    "Pipeline: {} ({}) source={} target={} Delivery: {}{pause_note}",
                     pipeline.name,
                     pipeline.mode,
                     pipeline.source_table,
@@ -1883,16 +2047,25 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         if pipeline.target_collection.is_empty() {
             continue;
         }
-        let delivery_health = match pipeline.delivery_status.as_str() {
-            "delivered" => "ok",
-            "pending" => "pending",
-            _ => "unknown",
+        let delivery_health = if pipeline.paused {
+            "paused"
+        } else {
+            match pipeline.delivery_status.as_str() {
+                "delivered" => "ok",
+                "pending" => "pending",
+                _ => "unknown",
+            }
+        };
+        let status_label = if pipeline.paused {
+            format!("{} (paused)", pipeline.delivery_status)
+        } else {
+            pipeline.delivery_status.clone()
         };
         println!(
             "  Delivery Health: {} Pipeline={} status={} appliedChanges={}",
             delivery_health,
             pipeline.name,
-            pipeline.delivery_status,
+            status_label,
             pipeline.delivery_applied_changes
         );
     }
@@ -2056,6 +2229,150 @@ async fn print_target(
     Ok(())
 }
 
+async fn resolve_named_pipeline(
+    platform_store_url: &str,
+    pipeline_name: &str,
+    deployment_name: Option<&str>,
+) -> Result<Pipeline, CliError> {
+    let pipelines = list_pipelines(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let matching: Vec<_> = pipelines
+        .into_iter()
+        .filter(|p| {
+            p.name == pipeline_name
+                && deployment_name
+                    .map(|name| p.deployment_name == name)
+                    .unwrap_or(true)
+        })
+        .collect();
+    match matching.as_slice() {
+        [] => Err(CliError::Failed(format!(
+            "Pipeline {pipeline_name} not found{}",
+            deployment_name
+                .map(|d| format!(" in Deployment {d}"))
+                .unwrap_or_default()
+        ))),
+        [only] => Ok(only.clone()),
+        many => Err(CliError::Failed(format!(
+            "multiple Pipelines named {pipeline_name} across Deployments {}; \
+             pass --deployment to disambiguate",
+            many.iter()
+                .map(|p| p.deployment_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+async fn pause_pipeline_command(
+    platform_store_url: &str,
+    pipeline_name: &str,
+    deployment_name: Option<&str>,
+) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+    let pipeline =
+        resolve_named_pipeline(platform_store_url, pipeline_name, deployment_name).await?;
+    if pipeline.paused {
+        println!(
+            "Pipeline {} already paused (Deployment {})",
+            pipeline.name, pipeline.deployment_name
+        );
+        return Ok(());
+    }
+    set_pipeline_paused(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
+        true,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+    println!(
+        "Pipeline {} paused (Deployment {}) — Delivery/processing stopped; \
+         durable Base/checkpoint state retained",
+        pipeline.name, pipeline.deployment_name
+    );
+    Ok(())
+}
+
+async fn resume_pipeline_command(
+    platform_store_url: &str,
+    pipeline_name: &str,
+    deployment_name: Option<&str>,
+) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+    let pipeline =
+        resolve_named_pipeline(platform_store_url, pipeline_name, deployment_name).await?;
+    if !pipeline.paused {
+        println!(
+            "Pipeline {} is not paused (Deployment {})",
+            pipeline.name, pipeline.deployment_name
+        );
+        return Ok(());
+    }
+
+    set_pipeline_paused(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
+        false,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let deployments = list_deployments(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let deployment = deployments
+        .into_iter()
+        .find(|d| d.name == pipeline.deployment_name)
+        .ok_or_else(|| {
+            CliError::Failed(format!(
+                "Deployment {} not found for Pipeline resume",
+                pipeline.deployment_name
+            ))
+        })?;
+
+    // Catch up Delivery from durable Base/Derived state accumulated while paused.
+    if pipeline_has_target(&pipeline) {
+        let mongo = mongo_target_from_deployment(&deployment)?;
+        match pipeline.mode.as_str() {
+            "direct" => {
+                deliver_direct_pipeline_with_options(
+                    platform_store_url,
+                    &deployment,
+                    &pipeline,
+                    &mongo,
+                    true,
+                )
+                .await?;
+            }
+            "transform" => {
+                deliver_transform_pipeline_with_options(
+                    platform_store_url,
+                    &deployment,
+                    &pipeline,
+                    &mongo,
+                    true,
+                )
+                .await?;
+            }
+            other => {
+                return Err(CliError::Failed(format!(
+                    "unsupported pipeline.mode {other:?} for resume catch-up Delivery"
+                )));
+            }
+        }
+    }
+
+    println!(
+        "Pipeline {} resumed (Deployment {}) — Delivery continues from durable state",
+        pipeline.name, pipeline.deployment_name
+    );
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Migrate { platform_store_url } => apply_migrations(&platform_store_url).await,
@@ -2080,6 +2397,20 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             deployment,
         } => print_derived(&platform_store_url, &pipeline, deployment.as_deref()).await,
         Command::Sync { platform_store_url } => sync_incremental(&platform_store_url).await,
+        Command::Pause {
+            platform_store_url,
+            pipeline,
+            deployment,
+        } => {
+            pause_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await
+        }
+        Command::Resume {
+            platform_store_url,
+            pipeline,
+            deployment,
+        } => {
+            resume_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await
+        }
         Command::Run { platform_store_url } => {
             apply_migrations(&platform_store_url).await?;
             println!("migraloop is running");

@@ -1,0 +1,31 @@
+# Lab Scenario recipe (ADR-0025 / issue #19 / ADR-0007).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: pause-resume
+summary: Pause and resume Pipeline CLI verbs (stop Delivery; catch-up from durable state)
+namespace:
+  source_tables:
+    - LAB_PR_CUSTOMERS
+    - LAB_PR_ORDERS
+  target_collections:
+    - lab_pr_customers
+    - lab_pr_orders
+  deployment: lab-pause-resume
+  pipelines:
+    - lab-pr-customers
+    - lab-pr-orders
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace tables + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery for both Pipelines)
+    - pause customers Pipeline via CLI
+    - mutate Source for both tables
+    - sync Incremental Capture; paused Pipeline skips Delivery; orders Pipeline Delivers
+    - resume customers Pipeline (catch-up Delivery from durable Base)
+checks:
+  correctness:
+    - "While paused: customers Target retains Initial Load (Alice/Bob); orders Target receives Incremental update"
+    - "After resume: customers Target matches durable Base (Alicia + Carol; Bob deleted)"
+    - "Other Pipeline (orders) remains Delivered throughout"
+thresholds: {}

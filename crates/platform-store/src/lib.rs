@@ -117,6 +117,9 @@ pub struct Pipeline {
     pub delivery_status: String,
     /// Count of Output Identity Delivery applies (upserts + deletes) for progress.
     pub delivery_applied_changes: i32,
+    /// Durable Operator pause (ADR-0007): when true, skip Delivery/processing.
+    #[serde(default)]
+    pub paused: bool,
     /// Per-field Managed mapping overrides (`string` / `omit`) keyed by column name.
     #[serde(default)]
     pub field_mappings: std::collections::BTreeMap<String, FieldMappingAs>,
@@ -369,9 +372,9 @@ pub async fn replace_pipelines(
             r#"
             INSERT INTO pipelines (
                 deployment_name, name, mode, source_table, source_schema,
-                target_collection, delivery_status, delivery_applied_changes,
+                target_collection, delivery_status, delivery_applied_changes, paused,
                 field_mappings_json, output_identity_json, transform_json, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -382,6 +385,7 @@ pub async fn replace_pipelines(
         .bind(&pipeline.target_collection)
         .bind(&pipeline.delivery_status)
         .bind(pipeline.delivery_applied_changes)
+        .bind(pipeline.paused)
         .bind(&field_mappings_json)
         .bind(&output_identity_json)
         .bind(&transform_json)
@@ -515,7 +519,7 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     let rows = sqlx::query_as::<_, PipelineRow>(
         r#"
         SELECT deployment_name, name, mode, source_table, source_schema,
-               target_collection, delivery_status, delivery_applied_changes,
+               target_collection, delivery_status, delivery_applied_changes, paused,
                field_mappings_json, output_identity_json, transform_json
         FROM pipelines
         ORDER BY deployment_name, name
@@ -526,6 +530,36 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     .map_err(PlatformStoreError::Load)?;
 
     rows.into_iter().map(PipelineRow::into_pipeline).collect()
+}
+
+/// Set durable Operator pause for one Pipeline (ADR-0007 / issue #19).
+pub async fn set_pipeline_paused(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+    paused: bool,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let result = sqlx::query(
+        r#"
+        UPDATE pipelines
+        SET paused = $3
+        WHERE deployment_name = $1 AND name = $2
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .bind(paused)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    if result.rows_affected() == 0 {
+        return Err(PlatformStoreError::NotFound(format!(
+            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+        )));
+    }
+    Ok(())
 }
 
 /// Update Delivery status for one Pipeline.
@@ -769,6 +803,7 @@ struct PipelineRow {
     target_collection: String,
     delivery_status: String,
     delivery_applied_changes: i32,
+    paused: bool,
     field_mappings_json: String,
     output_identity_json: String,
     transform_json: String,
@@ -796,6 +831,7 @@ impl PipelineRow {
             target_collection: self.target_collection,
             delivery_status: self.delivery_status,
             delivery_applied_changes: self.delivery_applied_changes,
+            paused: self.paused,
             field_mappings,
             output_identity,
             transform_json,

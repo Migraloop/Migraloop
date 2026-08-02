@@ -20,6 +20,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Intra-Scenario concurrent Source workload | `concurrent-source-workload` |
 | Bulk load (~100k) with fail-able metric thresholds | `bulk-load` |
 | Idempotent re-delivery / duplicate-safe Delivery | `idempotent-redelivery` |
+| Dedicated Pipeline pause/resume CLI verbs | `pause-resume` |
 
 ## Visible gaps (not yet shipped)
 
@@ -28,7 +29,6 @@ These are **not** covered and must stay listed until the capability ships with a
 | Capability | Why gated |
 | --- | --- |
 | Rich Transform rename/remove, equiLookup, unwind, count/min/max/avg, distinct/addToSet, union | Domain roadmap; not accepted by the CLI transform parser yet |
-| Dedicated Pipeline pause/resume CLI verbs | Control-plane contract (ADR-0007); not first-class CLI verbs yet |
 | Dedicated Pipeline revision-change Scenario (pause old → rebuild Derived → resume) | Today Operators change Pipelines via `apply`; every Scenario exercises apply-add, but a change-focused Scenario waits on clearer revision UX |
 | Poison Change quarantine on Operator `status` | Operations model; quarantine surface not Lab-ready yet |
 
