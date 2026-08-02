@@ -114,6 +114,56 @@ spec:
     )
 }
 
+fn transform_and_direct_pipelines(mongo_database: &str) -> String {
+    format!(
+        r#"
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: oracle-to-mongo
+spec:
+  source:
+    kind: oracle
+    host: stub
+    port: 1521
+    database: STUB
+    username: sync_user
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: {host}
+    port: {port}
+    database: {mongo_database}
+    username: deliver_user
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: active_customers
+      mode: transform
+      source:
+        table: CUSTOMERS
+      target:
+        collection: active_customers
+      outputIdentity: [ID]
+      transform:
+        - project:
+            fields: [ID, NAME, ACTIVE]
+        - filter:
+            field: ACTIVE
+            eq: 1
+    - name: orders
+      mode: direct
+      source:
+        table: ORDERS
+      target:
+        collection: orders
+"#,
+        host = mongo_host(),
+        port = mongo_port(),
+    )
+}
+
 fn migrate_and_apply(url: &str, config: &Path) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
@@ -358,5 +408,51 @@ async fn pause_stops_pipeline_delivery_resume_catch_up_other_pipelines_unaffecte
                 .lines()
                 .any(|line| line.contains("customers") && line.contains("paused")),
         "status must not keep customers paused after resume, got:\n{status_resumed}"
+    );
+}
+
+#[tokio::test]
+async fn pause_stops_transform_processing_resume_rebuilds_from_durable_base() {
+    let url = ephemeral_database_url().await;
+    let mongo_database = unique_mongo_database();
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &transform_and_direct_pipelines(&mongo_database),
+    );
+
+    migrate_and_apply(&url, &config);
+    pause_pipeline(&url, "active_customers");
+
+    let sync_out = run_sync(&url);
+    assert!(
+        !sync_out.contains("Delivery complete: Pipeline active_customers")
+            && !sync_out.contains("Affect Analysis: Pipeline active_customers"),
+        "paused Transform Pipeline must skip Delivery/processing, got:\n{sync_out}"
+    );
+    assert!(
+        sync_out.contains("Delivery complete: Pipeline orders")
+            || sync_out.to_ascii_lowercase().contains("orders"),
+        "unaffected Direct Pipeline must still Deliver, got:\n{sync_out}"
+    );
+
+    let target_paused = target_stdout(&url, "active_customers");
+    assert!(
+        target_paused.contains("Alice") && !target_paused.contains("Alicia"),
+        "paused Transform Target must retain pre-pause Derived Delivery, got:\n{target_paused}"
+    );
+
+    let resume_out = resume_pipeline(&url, "active_customers");
+    assert!(
+        resume_out.to_ascii_lowercase().contains("delivery")
+            || resume_out.to_ascii_lowercase().contains("derived"),
+        "resume must catch up Transform Delivery from durable Base, got:\n{resume_out}"
+    );
+
+    let target = target_stdout(&url, "active_customers");
+    assert!(
+        target.contains("Alicia") && target.contains("Carol") && !target.contains("Bob"),
+        "resume must rebuild Derived/Delivery from durable Base, got:\n{target}"
     );
 }
