@@ -6,8 +6,8 @@ mod oracle_types;
 
 pub use oracle_types::{
     aware_temporal_to_utc, classify_number, is_allow_listed_oracle_type, naive_temporal_to_utc,
-    normalize_oracle_type, resolve_temporal_timezone, NumberMongoMapping, TypeError,
-    DECIMAL128_MAX_PRECISION, INT64_SAFE_PRECISION, RAW_SIZE_CAP_BYTES,
+    normalize_oracle_type, resolve_temporal_timezone, NumberMongoMapping, ResolvedTimezone,
+    TypeError, DECIMAL128_MAX_PRECISION, INT64_SAFE_PRECISION, RAW_SIZE_CAP_BYTES,
 };
 
 use std::collections::BTreeMap;
@@ -95,16 +95,18 @@ pub struct SourceColumn {
 
 impl SourceColumn {
     pub fn is_temporal_naive(&self) -> bool {
+        // DATE, TIMESTAMP, and TIMESTAMP WITH LOCAL TIME ZONE are wall-clock /
+        // session-local and need DB or configured timezone (ADR-0022).
         matches!(
             normalize_oracle_type(&self.oracle_type).as_str(),
-            "DATE" | "TIMESTAMP"
+            "DATE" | "TIMESTAMP" | "TIMESTAMP WITH LOCAL TIME ZONE"
         )
     }
 
     pub fn is_temporal_aware(&self) -> bool {
         matches!(
             normalize_oracle_type(&self.oracle_type).as_str(),
-            "TIMESTAMP WITH TIME ZONE" | "TIMESTAMP WITH LOCAL TIME ZONE"
+            "TIMESTAMP WITH TIME ZONE"
         )
     }
 

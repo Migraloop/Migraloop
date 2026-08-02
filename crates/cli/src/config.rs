@@ -52,12 +52,19 @@ pub struct PipelineSpec {
     pub fields: std::collections::BTreeMap<String, FieldMappingSpec>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldMappingAsSpec {
+    String,
+    Omit,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldMappingSpec {
     /// `string` (map to string) or `omit` (remove from Managed output).
     #[serde(rename = "as")]
-    pub map_as: String,
+    pub map_as: FieldMappingAsSpec,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -375,19 +382,11 @@ fn validate_pipeline(pipeline: &PipelineSpec) -> Result<(), CliError> {
             ));
         }
     }
-    for (field, mapping) in &pipeline.fields {
+    for (field, _mapping) in &pipeline.fields {
         if field.trim().is_empty() {
             return Err(CliError::Failed(
                 "pipeline.fields keys must not be empty".to_string(),
             ));
-        }
-        match mapping.map_as.as_str() {
-            "string" | "omit" => {}
-            other => {
-                return Err(CliError::Failed(format!(
-                    "pipeline.fields.{field}.as must be \"string\" or \"omit\", got {other:?}"
-                )));
-            }
         }
     }
     Ok(())

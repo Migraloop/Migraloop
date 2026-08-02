@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use bson::{doc, Bson, Document};
 use chrono::{DateTime, Utc};
-use migraloop_capture::{classify_number, normalize_oracle_type, NumberMongoMapping};
 use mongodb::options::{ClientOptions, UpdateOptions};
 use mongodb::{Client, Collection};
 use serde::{Deserialize, Serialize};
@@ -21,6 +20,45 @@ use thiserror::Error;
 
 /// Module seam marker retained by the single app binary.
 pub const SEAM: &str = "delivery";
+
+/// Delivery-side NUMBER→Mongo mapping (mirrors ADR-0023; kept here so Delivery
+/// does not depend on the capture crate — ADR-0024 seam).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumberMongoMapping {
+    Long,
+    Decimal128,
+    Unsafe,
+}
+
+fn normalize_oracle_type(oracle_type: &str) -> String {
+    let trimmed = oracle_type.trim();
+    let base = trimmed
+        .split_once('(')
+        .map(|(head, _)| head)
+        .unwrap_or(trimmed)
+        .trim();
+    base.to_ascii_uppercase()
+}
+
+fn classify_number(precision: Option<i32>, scale: Option<i32>) -> NumberMongoMapping {
+    let Some(precision) = precision else {
+        return NumberMongoMapping::Unsafe;
+    };
+    if precision <= 0 || precision > 38 {
+        return NumberMongoMapping::Unsafe;
+    }
+    let scale = scale.unwrap_or(0);
+    if scale < 0 || scale > precision {
+        return NumberMongoMapping::Unsafe;
+    }
+    if scale == 0 && precision <= 18 {
+        return NumberMongoMapping::Long;
+    }
+    if precision <= 34 {
+        return NumberMongoMapping::Decimal128;
+    }
+    NumberMongoMapping::Unsafe
+}
 
 #[derive(Debug, Error)]
 pub enum DeliveryError {

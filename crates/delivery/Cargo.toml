@@ -8,7 +8,6 @@ description = "Target System Delivery"
 [dependencies]
 bson = { workspace = true }
 chrono = { workspace = true }
-migraloop-capture = { workspace = true }
 mongodb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

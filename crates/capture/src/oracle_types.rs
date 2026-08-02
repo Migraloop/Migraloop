@@ -2,7 +2,7 @@
 //!
 //! ADR-0018 / ADR-0022 / ADR-0023.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use thiserror::Error;
 
@@ -51,6 +51,69 @@ pub enum NumberMongoMapping {
     Unsafe,
 }
 
+/// Zone used to interpret naive DATE / TIMESTAMP / TIMESTAMP WITH LOCAL TIME ZONE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedTimezone {
+    Iana(Tz),
+    /// Oracle DBTIMEZONE-style fixed offsets (`+09:00`).
+    Fixed(FixedOffset),
+}
+
+impl ResolvedTimezone {
+    pub fn localize(&self, naive: NaiveDateTime) -> Result<DateTime<Utc>, TypeError> {
+        match self {
+            Self::Iana(tz) => tz
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok_or_else(|| {
+                    TypeError::InvalidTemporal(
+                        naive.to_string(),
+                        format!("ambiguous or invalid in timezone {tz}"),
+                    )
+                }),
+            Self::Fixed(offset) => offset
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok_or_else(|| {
+                    TypeError::InvalidTemporal(
+                        naive.to_string(),
+                        format!("invalid in fixed offset {}", offset),
+                    )
+                }),
+        }
+    }
+}
+
+fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
+    let trimmed = value.trim();
+    // Oracle DBTIMEZONE often looks like `+09:00` or `-05:00`.
+    let rest = trimmed.strip_prefix('+').or_else(|| trimmed.strip_prefix('-'))?;
+    let (hours, minutes) = if let Some((h, m)) = rest.split_once(':') {
+        (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?)
+    } else if rest.len() == 4 {
+        (rest[..2].parse::<i32>().ok()?, rest[2..].parse::<i32>().ok()?)
+    } else if rest.len() == 2 {
+        (rest.parse::<i32>().ok()?, 0)
+    } else {
+        return None;
+    };
+    let secs = hours * 3600 + minutes * 60;
+    let secs = if trimmed.starts_with('-') { -secs } else { secs };
+    FixedOffset::east_opt(secs)
+}
+
+fn parse_timezone(value: &str) -> Result<ResolvedTimezone, TypeError> {
+    if let Ok(tz) = value.parse::<Tz>() {
+        return Ok(ResolvedTimezone::Iana(tz));
+    }
+    if let Some(offset) = parse_fixed_offset(value) {
+        return Ok(ResolvedTimezone::Fixed(offset));
+    }
+    Err(TypeError::InvalidTimezone(value.to_string()))
+}
+
 /// Normalize an Oracle type name for allow-list checks (strip length/precision args).
 pub fn normalize_oracle_type(oracle_type: &str) -> String {
     let trimmed = oracle_type.trim();
@@ -68,10 +131,7 @@ pub fn is_allow_listed_oracle_type(oracle_type: &str, size: Option<i32>) -> bool
         "NUMBER" | "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" | "CHAR" | "NCHAR" | "VARCHAR2"
         | "NVARCHAR2" | "DATE" | "TIMESTAMP" | "TIMESTAMP WITH TIME ZONE"
         | "TIMESTAMP WITH LOCAL TIME ZONE" => true,
-        "RAW" => match size {
-            Some(n) if n >= 0 && n <= RAW_SIZE_CAP_BYTES => true,
-            _ => false,
-        },
+        "RAW" => matches!(size, Some(n) if (0..=RAW_SIZE_CAP_BYTES).contains(&n)),
         _ => false,
     }
 }
@@ -101,51 +161,52 @@ pub fn classify_number(precision: Option<i32>, scale: Option<i32>) -> NumberMong
 
 /// Resolve the timezone used to interpret naive DATE/TIMESTAMP (ADR-0022).
 /// Prefers readable Source DB timezone; else user-configured Source/Deployment zone.
+///
+/// Accepts IANA names and Oracle-style fixed offsets (`+09:00`).
 pub fn resolve_temporal_timezone(
     db_timezone: Option<&str>,
     configured_timezone: Option<&str>,
-) -> Result<Tz, TypeError> {
+) -> Result<ResolvedTimezone, TypeError> {
     if let Some(db) = db_timezone.map(str::trim).filter(|s| !s.is_empty()) {
-        return db
-            .parse::<Tz>()
-            .map_err(|_| TypeError::InvalidTimezone(db.to_string()));
+        return parse_timezone(db);
     }
     if let Some(cfg) = configured_timezone.map(str::trim).filter(|s| !s.is_empty()) {
-        return cfg
-            .parse::<Tz>()
-            .map_err(|_| TypeError::InvalidTimezone(cfg.to_string()));
+        return parse_timezone(cfg);
     }
     Err(TypeError::MissingTimezone)
 }
 
-/// Interpret a naive Oracle DATE/TIMESTAMP wall-clock value in `tz`, return UTC.
-///
-/// Accepts `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`, or `YYYY-MM-DD HH:MM:SS`.
-pub fn naive_temporal_to_utc(value: &str, tz: Tz) -> Result<DateTime<Utc>, TypeError> {
+fn parse_naive_date_time(value: &str) -> Result<NaiveDateTime, TypeError> {
     let trimmed = value.trim();
-    let naive = if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
-        dt
-    } else if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
-        dt
-    } else if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        date.and_hms_opt(0, 0, 0)
-            .ok_or_else(|| TypeError::InvalidTemporal(trimmed.to_string(), "bad midnight".into()))?
-    } else {
-        return Err(TypeError::InvalidTemporal(
-            trimmed.to_string(),
-            "expected YYYY-MM-DD[THH:MM:SS]".into(),
-        ));
-    };
+    const PATTERNS: &[&str] = &[
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ];
+    for pattern in PATTERNS {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, pattern) {
+            return Ok(dt);
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return date.and_hms_opt(0, 0, 0).ok_or_else(|| {
+            TypeError::InvalidTemporal(trimmed.to_string(), "bad midnight".into())
+        });
+    }
+    Err(TypeError::InvalidTemporal(
+        trimmed.to_string(),
+        "expected YYYY-MM-DD[THH:MM:SS[.fraction]]".into(),
+    ))
+}
 
-    tz.from_local_datetime(&naive)
-        .single()
-        .map(|dt| dt.with_timezone(&Utc))
-        .ok_or_else(|| {
-            TypeError::InvalidTemporal(
-                trimmed.to_string(),
-                format!("ambiguous or invalid in timezone {tz}"),
-            )
-        })
+/// Interpret a naive Oracle DATE/TIMESTAMP(/LOCAL TZ) wall-clock value in `tz`, return UTC.
+pub fn naive_temporal_to_utc(
+    value: &str,
+    tz: ResolvedTimezone,
+) -> Result<DateTime<Utc>, TypeError> {
+    let naive = parse_naive_date_time(value)?;
+    tz.localize(naive)
 }
 
 /// Parse timezone-aware Oracle TIMESTAMP WITH TIME ZONE into UTC.
@@ -200,5 +261,19 @@ mod tests {
         let tz = resolve_temporal_timezone(Some("Asia/Tokyo"), Some("America/New_York")).unwrap();
         let utc = naive_temporal_to_utc("2024-01-15T10:30:00", tz).unwrap();
         assert_eq!(utc.to_rfc3339(), "2024-01-15T01:30:00+00:00");
+    }
+
+    #[test]
+    fn db_timezone_accepts_oracle_offset_form() {
+        let tz = resolve_temporal_timezone(Some("+09:00"), None).unwrap();
+        let utc = naive_temporal_to_utc("2024-01-15T10:30:00", tz).unwrap();
+        assert_eq!(utc.to_rfc3339(), "2024-01-15T01:30:00+00:00");
+    }
+
+    #[test]
+    fn fractional_timestamp_supported() {
+        let tz = resolve_temporal_timezone(None, Some("UTC")).unwrap();
+        let utc = naive_temporal_to_utc("2024-01-15T10:30:00.123456", tz).unwrap();
+        assert_eq!(utc.timestamp_subsec_micros(), 123456);
     }
 }

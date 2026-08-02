@@ -1418,7 +1418,6 @@ version = "0.1.0"
 dependencies = [
  "bson",
  "chrono",
- "migraloop-capture",
  "mongodb",
  "serde",
  "serde_json",

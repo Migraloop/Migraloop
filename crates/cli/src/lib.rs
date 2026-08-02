@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use migraloop_capture::{
     classify_number, incremental_changes_stub, initial_load_stub, is_allow_listed_oracle_type,
     normalize_change_temporals, source_schema_stub, CapturePosition, ChangeEvent, ChangeOp,
-    NumberMongoMapping, SourceColumn,
+    NumberMongoMapping, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
@@ -174,13 +174,12 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
     let field_mappings = pipeline
         .fields
         .iter()
-        .filter_map(|(name, spec)| {
-            let mapping = match spec.map_as.as_str() {
-                "string" => FieldMappingAs::String,
-                "omit" => FieldMappingAs::Omit,
-                _ => return None,
+        .map(|(name, spec)| {
+            let mapping = match spec.map_as {
+                crate::config::FieldMappingAsSpec::String => FieldMappingAs::String,
+                crate::config::FieldMappingAsSpec::Omit => FieldMappingAs::Omit,
             };
-            Some((name.clone(), mapping))
+            (name.clone(), mapping)
         })
         .collect();
     Pipeline {
@@ -398,10 +397,11 @@ fn validate_pipeline_managed_fields(
             Some(col) if !col.supported || !is_allow_listed_oracle_type(&col.oracle_type, col.size) => {
                 if *mapping != FieldMappingAs::Omit {
                     return Err(CliError::Failed(format!(
-                        "Pipeline {} cannot use unsupported Oracle type {} column {} as \
-                         Managed/transform input; omit it or remove the field mapping \
-                         (allow-list omission only)",
-                        pipeline.name, col.oracle_type, field
+                        "Pipeline {}: {} (column {field})",
+                        pipeline.name,
+                        TypeError::UnsupportedAsManaged {
+                            oracle_type: col.oracle_type.clone(),
+                        }
                     )));
                 }
             }
