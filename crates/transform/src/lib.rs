@@ -1049,4 +1049,51 @@ mod tests {
         assert_eq!(out[0].get("CUSTOMER_ID"), Some(&json!(3)));
         assert_eq!(out[0].get("TOTAL_AMOUNT"), Some(&json!("5.00")));
     }
+
+    #[test]
+    fn evaluate_for_identities_adjusts_old_group_when_sibling_rows_remain() {
+        // Spec "adjusts/removes": when the old group still has other Base rows, recompute
+        // must return an adjusted sum for the old identity (not omit it).
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
+            }
+        })])
+        .unwrap();
+        // Moved order 100 from customer 1 → 3; order 101 remains on customer 1.
+        let base_rows = vec![
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(3)),
+                ("AMOUNT", json!("50.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(200)),
+                ("CUSTOMER_ID", json!(2)),
+                ("AMOUNT", json!("5.00")),
+            ]),
+        ];
+        let identities = vec![
+            row(&[("CUSTOMER_ID", json!(3))]),
+            row(&[("CUSTOMER_ID", json!(1))]),
+        ];
+        let out = evaluate_transform_for_identities(&ops, &base_rows, &identities).unwrap();
+        assert_eq!(out.len(), 2);
+        let c1 = out
+            .iter()
+            .find(|r| r.get("CUSTOMER_ID") == Some(&json!(1)))
+            .expect("old identity customer 1 must be adjusted, not removed");
+        assert_eq!(c1.get("TOTAL_AMOUNT"), Some(&json!("10.00")));
+        let c3 = out
+            .iter()
+            .find(|r| r.get("CUSTOMER_ID") == Some(&json!(3)))
+            .expect("new identity customer 3");
+        assert_eq!(c3.get("TOTAL_AMOUNT"), Some(&json!("50.00")));
+    }
 }

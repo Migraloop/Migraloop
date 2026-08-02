@@ -428,10 +428,10 @@ async fn groupby_key_change_updates_old_and_new_output_identities() {
     );
     assert!(
         key_out.to_ascii_lowercase().contains("affect")
-            && (key_out.contains("identities=2")
-                || key_out.contains("affected identities=2")
-                || key_out.contains("deletes=1")),
-        "group-key change must Affect-analyze both old+new identities (and delete empty old), got:\n{key_out}"
+            && key_out.contains("affected identities=2")
+            && key_out.contains("deletes=1")
+            && key_out.contains("upserts=1"),
+        "group-key change must Affect-analyze both old+new identities and delete empty old, got:\n{key_out}"
     );
 
     let derived_after = derived_stdout(&url);
