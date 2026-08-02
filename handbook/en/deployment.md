@@ -37,10 +37,12 @@ migraloop lab up      # from repo root (or pass --lab-dir)
 migraloop lab status  # Fixture readiness + connection details; no default Pipeline
 migraloop lab scenario list
 migraloop lab scenario run direct-pipeline   # needs host Instant Client (LD_LIBRARY_PATH)
+migraloop lab scenario remove direct-pipeline   # clear Namespace without re-running
+# or: migraloop lab scenario run direct-pipeline --auto-remove
 migraloop lab down    # remove containers and volumes
 ```
 
-Compose definition: `lab/compose.yaml` (project `migraloop-lab`). The Lab `app` image (`lab/Dockerfile`) copies a host-built `migraloop` binary so bring-up does not recompile inside Docker; `migraloop lab up` builds that binary when missing. Lab Oracle init enables ARCHIVELOG and database supplemental logging for LogMiner; it does **not** pre-apply any Deployment or Pipelines—those come from a Lab Scenario or your own `migraloop apply`. The first catalog Scenario (`direct-pipeline`) prepares a Scenario Namespace, applies a Direct Pipeline via the real product path, exercises Source insert/update/delete, and leaves Namespace state for live `base`/`target` inspection. Distinct from the default two-container install above (root `Dockerfile`) and from the contract/stub harness used in CI.
+Compose definition: `lab/compose.yaml` (project `migraloop-lab`). The Lab `app` image (`lab/Dockerfile`) copies a host-built `migraloop` binary so bring-up does not recompile inside Docker; `migraloop lab up` builds that binary when missing. Lab Oracle init enables ARCHIVELOG and database supplemental logging for LogMiner; it does **not** pre-apply any Deployment or Pipelines—those come from a Lab Scenario or your own `migraloop apply`. The first catalog Scenario (`direct-pipeline`) prepares a Scenario Namespace, applies a Direct Pipeline via the real product path, exercises Source insert/update/delete, and leaves Namespace state for live `base`/`target` inspection by default. Re-running the same Scenario fully removes that Namespace before recreate; `scenario remove` and `--auto-remove` cover manual and opt-in cleanup. Distinct from the default two-container install above (root `Dockerfile`) and from the contract/stub harness used in CI.
 
 Resource note: Lab Oracle (Free) typically needs several GB RAM and a few minutes on first image pull/boot. Lab Compose uses `network_mode: host` so the Fixture stays usable in nested Docker environments where bridge networking is blocked. Nested Docker environments that fail image extract on overlay whiteouts may need dockerd `storage-driver: vfs` (with containerd snapshotter disabled).
 

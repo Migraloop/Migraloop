@@ -53,7 +53,7 @@ pub enum LabCommand {
         #[arg(long, default_value = "lab")]
         lab_dir: PathBuf,
     },
-    /// List or run selectable Lab Scenarios (one at a time)
+    /// List, run, or remove selectable Lab Scenarios (one at a time)
     Scenario {
         #[command(subcommand)]
         command: ScenarioCommand,
@@ -510,6 +510,46 @@ pub(crate) async fn sqlplus_in_oracle(
     if !output.status.success() {
         return Err(CliError::Failed(format!(
             "Oracle sqlplus probe failed ({connect}):\n{text}"
+        )));
+    }
+    Ok(text)
+}
+
+/// Run mongosh inside the Lab Mongo container (Scenario Namespace cleanup).
+pub(crate) async fn mongosh_in_mongo(lab_dir: &Path, js: &str) -> Result<String, CliError> {
+    let mut cmd = compose_base(lab_dir)?;
+    cmd.args([
+        "exec",
+        "-T",
+        "mongo",
+        "mongosh",
+        "--quiet",
+        "--host",
+        "127.0.0.1",
+        "-u",
+        LAB_MONGO_USER,
+        "-p",
+        LAB_MONGO_PASSWORD_DEFAULT,
+        "--authenticationDatabase",
+        "admin",
+        LAB_MONGO_DATABASE,
+        "--eval",
+        js,
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    let output = cmd.output().await.map_err(|err| {
+        CliError::Failed(format!("failed to exec mongosh in Lab MongoDB: {err}"))
+    })?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        return Err(CliError::Failed(format!(
+            "Mongo mongosh probe failed:\n{text}"
         )));
     }
     Ok(text)
