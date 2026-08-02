@@ -2,9 +2,10 @@
 //!
 //! Agreed seam (issue #5 / PRD): verify via CLI output and config, not private internals.
 
+mod common;
+
 use std::fs;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
@@ -19,10 +20,7 @@ fn bin() -> String {
 }
 
 async fn ephemeral_database_url() -> String {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let suffix = common::unique_suffix();
     let db_name = format!("migraloop_test_{suffix}");
     let admin = admin_url();
 
