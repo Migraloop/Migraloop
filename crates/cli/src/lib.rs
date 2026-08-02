@@ -1,11 +1,13 @@
 //! Operator-facing CLI for the DB Sync Platform.
 
 mod config;
+mod lab;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use lab::{run_lab, LabCommand};
 use migraloop_capture::{
     check_oracle_source_prerequisites, classify_number, discover_source_schema,
     initial_load_for_source, is_allow_listed_oracle_type, normalize_change_temporals,
@@ -117,6 +119,11 @@ pub enum Command {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
+    },
+    /// Local Sync Lab Fixture (disposable Oracle, MongoDB, Platform Store, app)
+    Lab {
+        #[command(subcommand)]
+        command: LabCommand,
     },
 }
 
@@ -2080,5 +2087,6 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             std::future::pending::<()>().await;
             Ok(())
         }
+        Command::Lab { command } => run_lab(command).await,
     }
 }

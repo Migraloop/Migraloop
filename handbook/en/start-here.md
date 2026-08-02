@@ -19,6 +19,8 @@ docker compose up -d --build
 
 Compose sets `MIGRALOOP_PLATFORM_STORE_URL` for the app. The app entrypoint runs `migraloop run` (migrate on startup, then stay alive).
 
+For a disposable **Local Sync Lab** Fixture (Oracle + MongoDB + Platform Store + app, no default Deployment/Pipelines): `migraloop lab up` / `status` / `down` — see [Deployment](deployment.md) and [CLI & Config reference](cli-and-config.md).
+
 Details: [Deployment](deployment.md) · flags and env: [CLI & Config reference](cli-and-config.md) · secrets/TLS: [Security](security.md)
 
 ## 2. Prepare Source System and Target System

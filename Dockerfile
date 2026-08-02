@@ -2,6 +2,7 @@ FROM rust:1.97-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+COPY ci/handbook ./ci/handbook
 RUN cargo build --release -p migraloop-app
 
 FROM debian:bookworm-slim

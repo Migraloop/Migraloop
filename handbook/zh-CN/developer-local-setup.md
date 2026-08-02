@@ -36,6 +36,20 @@ docker compose up -d --build
 
 Compose 默认凭证（`migraloop` / `migraloop`）仅供本地开发。
 
+## Local Sync Lab Fixture
+
+可丢弃的 Oracle + MongoDB + Platform Store + app，供手动 Sync→Delivery 验证（非 CI）：
+
+```bash
+cargo build -p migraloop-app
+./target/debug/migraloop lab up
+./target/debug/migraloop lab status
+# 用打印的连接细节查看／变更 Lab DB；就绪后自行套用 Deployment。
+./target/debug/migraloop lab down
+```
+
+Bring-up 后默认：Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`、MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`。Lab bring-up 不会套用 sample Deployments/Pipelines。需要 Docker Compose；`lab up` 若缺少 binary 会构建 `target/debug/migraloop`，再由 `lab/Dockerfile` 打包（Ubuntu 24.04 base 以对齐 host glibc）。Lab Compose 使用 `network_mode: host`。第一次 Oracle 开机可能要数分钟。嵌套 Docker whiteout 解压失败时可用 dockerd `storage-driver: vfs`。见 [CLI 与 Config](cli-and-config.md)（`lab`）与 [Deployment](deployment.md)。
+
 ## 测试
 
 Unit/crate 测试：
@@ -67,6 +81,12 @@ export MIGRALOOP_LIVE_ORACLE_SERVICE=FREEPDB1
 export MIGRALOOP_LIVE_ORACLE_USER=SYNC_USER
 export ORACLE_PASSWORD=...
 cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocapture
+```
+
+Lab Fixture lifecycle seam（默认 ignored；需要 Docker Compose + Lab Oracle image）：
+
+```bash
+cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
 Operator 的 apply/sync/inspect 验证步骤见 [Source System](source-system.md)。

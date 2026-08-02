@@ -28,6 +28,20 @@ migraloop apply -f deployment.yaml
 migraloop status
 ```
 
+## Local Sync Lab Fixture
+
+若要在可丢弃的真实堆栈上手动端到端验证（ADR-0025），使用 **Local Sync Lab** Fixture。它在既有 Platform Store + app 安装形态旁，再布署 Lab 用的 Oracle 与 MongoDB：
+
+```bash
+migraloop lab up      # 在 repo 根目录（或传 --lab-dir）
+migraloop lab status  # Fixture 就绪状态 + 连接细节；没有默认 Pipeline
+migraloop lab down    # 移除 containers 与 volumes
+```
+
+Compose 定义：`lab/compose.yaml`（project `migraloop-lab`）。Lab `app` image（`lab/Dockerfile`）会复制 host 建好的 `migraloop` binary，避免在 Docker 内重编；`migraloop lab up` 若缺少 binary 会先构建。Lab Oracle init 会启用 ARCHIVELOG 与 database supplemental logging 以供 LogMiner；**不会**预先套用任何 Deployment 或 Pipelines—那些来自 Lab Scenario 或你自己的 `migraloop apply`。与上方默认双 container 安装（root `Dockerfile`）、以及 CI 使用的 contract/stub harness 都不同。
+
+资源提醒：Lab Oracle（Free）通常需要数 GB RAM，第一次拉 image／开机可能要数分钟。Lab Compose 使用 `network_mode: host`，以便在 bridge 网络被挡的嵌套 Docker 环境仍可运行。若嵌套 Docker 在 overlay whiteout 解压失败，可改用 dockerd `storage-driver: vfs`（并关闭 containerd snapshotter）。
+
 ## Runtime 模型
 
 - v1 以 **一个 active app instance**（内部可并行）加上 Platform Store 运行。

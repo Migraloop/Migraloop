@@ -23,7 +23,8 @@ services:
         condition: service_healthy
     environment:
       MIGRALOOP_PLATFORM_STORE_URL: postgres://migraloop:migraloop@platform-store:5432/migraloop
-    command: ["migraloop", "run"]
+    # ENTRYPOINT is already `migraloop`; only override the subcommand.
+    command: ["run"]
 
 volumes:
   platform_store_data:

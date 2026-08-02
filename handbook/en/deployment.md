@@ -28,6 +28,20 @@ migraloop apply -f deployment.yaml
 migraloop status
 ```
 
+## Local Sync Lab Fixture
+
+For manual end-to-end verification on a disposable real stack (ADR-0025), use the **Local Sync Lab** Fixture. It extends the real install shape with Lab-provisioned Oracle and MongoDB beside Platform Store + app:
+
+```bash
+migraloop lab up      # from repo root (or pass --lab-dir)
+migraloop lab status  # Fixture readiness + connection details; no default Pipeline
+migraloop lab down    # remove containers and volumes
+```
+
+Compose definition: `lab/compose.yaml` (project `migraloop-lab`). The Lab `app` image (`lab/Dockerfile`) copies a host-built `migraloop` binary so bring-up does not recompile inside Docker; `migraloop lab up` builds that binary when missing. Lab Oracle init enables ARCHIVELOG and database supplemental logging for LogMiner; it does **not** pre-apply any Deployment or Pipelines—those come from a Lab Scenario or your own `migraloop apply`. Distinct from the default two-container install above (root `Dockerfile`) and from the contract/stub harness used in CI.
+
+Resource note: Lab Oracle (Free) typically needs several GB RAM and a few minutes on first image pull/boot. Lab Compose uses `network_mode: host` so the Fixture stays usable in nested Docker environments where bridge networking is blocked. Nested Docker environments that fail image extract on overlay whiteouts may need dockerd `storage-driver: vfs` (with containerd snapshotter disabled).
+
 ## Runtime model
 
 - v1 runs **one active app instance** (internally concurrent) plus the Platform Store.
