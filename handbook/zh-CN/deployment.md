@@ -51,6 +51,40 @@ Compose 定义：`lab/compose.yaml`（project `migraloop-lab`）。Lab `app` ima
 
 资源提醒：Lab Oracle（Free）通常需要数 GB RAM，第一次拉 image／开机可能要数分钟。Lab Compose 使用 `network_mode: host`，以便在 bridge 网络被挡的嵌套 Docker 环境仍可运行。若嵌套 Docker 在 overlay whiteout 解压失败，可改用 dockerd `storage-driver: vfs`（并关闭 containerd snapshotter）。
 
+### DB-level restore / load escape hatch
+
+当你需要在 Lab Scenario recipe **之外**加载或还原数据—SQL dump、临时 inserts，或 Mongo seed/restore—请使用可丢弃的 Lab engines，以及 `migraloop lab status`（或 `lab up`）打印的连接细节。这是通往真实堆栈的 escape hatch，**不是**第二套 Scenario 编写模型，也**不是** Release Quality Gate／CI。
+
+示例位于 `lab/escape-hatch/`（`oracle-load.sql`、`mongo-load.js`，以及仅绑定 Lab 的 `deployment.yaml`，以便接回普通 product path）。没有 `recipe.yaml`，此流程也**不要**执行 `migraloop lab scenario …`。
+
+```bash
+migraloop lab up
+migraloop lab status   # 复制 Lab Oracle / Mongo / Platform Store 细节
+
+# 加载 Lab Oracle（compose exec — 不需要 BYO 生产环境 Source）
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T oracle \
+  sqlplus -s SYNC_USER/lab_oracle@FREEPDB1 < lab/escape-hatch/oracle-load.sql
+
+# 加载 Lab Mongo（Target 端 seed／restore 式查看）
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T mongo \
+  mongosh --quiet --host 127.0.0.1 -u migraloop -p lab_mongo \
+  --authenticationDatabase admin lab < lab/escape-hatch/mongo-load.js
+
+# 接回真实 product path（apply / status / base / target / sync）
+export MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
+export ORACLE_PASSWORD=lab_oracle
+export MONGO_PASSWORD=lab_mongo
+# 对 Lab Oracle 做 apply/sync 需要 host Instant Client：
+# export LD_LIBRARY_PATH=/path/to/instantclient
+migraloop apply -f lab/escape-hatch/deployment.yaml
+migraloop status
+migraloop base --table LAB_ESCAPE_CUSTOMERS
+migraloop target --collection lab_escape_customers   # Delivery 跑完后
+migraloop sync                                       # 可选的 Incremental Capture 后续
+```
+
+可选的 dump 工具还原使用**相同**的 Lab 连接细节（对 `127.0.0.1` Lab ports 跑 `impdp`／`mongorestore`／client GUI）。请只在可丢弃 Fixture 上加载—绝不要把此 escape hatch 指向客户／生产环境 engines。若要打包好的 correctness + metrics recipe，请优先用 Lab Scenarios；当你已有 SQL／JS／dumps 要自行放入 Lab 数据库时，再用此路径。
+
 ## Runtime 模型
 
 - v1 以 **一个 active app instance**（内部可并行）加上 Platform Store 运行。

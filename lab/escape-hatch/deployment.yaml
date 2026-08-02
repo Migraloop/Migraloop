@@ -1,0 +1,31 @@
+# Lab DB-level load escape hatch (issue #87).
+# Ordinary product Deployment for data already loaded into Lab Oracle via
+# oracle-load.sql. Not a Lab Scenario recipe — no recipe.yaml / scenario run.
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-escape-hatch
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-escape-customers
+      mode: direct
+      source:
+        table: LAB_ESCAPE_CUSTOMERS
+      target:
+        collection: lab_escape_customers

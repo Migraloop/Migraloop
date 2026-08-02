@@ -59,6 +59,27 @@ cargo build -p migraloop-app
 
 Bring-up 後預設：Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`、MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`。Lab bring-up 不會套用 sample Deployments/Pipelines。需要 Docker Compose；`lab up` 若缺少 binary 會建置 `target/debug/migraloop`，再由 `lab/Dockerfile` 打包（Ubuntu 24.04 base 以對齊 host glibc）。Lab Compose 使用 `network_mode: host`。第一次 Oracle 開機可能要數分鐘。巢狀 Docker whiteout 解壓失敗時可用 dockerd `storage-driver: vfs`。見 [CLI 與 Config](cli-and-config.md)（`lab`）與 [Deployment](deployment.md)。
 
+### DB-level restore / load escape hatch
+
+若要在 Scenario recipes **之外**載入資料（SQL／JS／dumps 進入 Lab Oracle 與／或 Lab Mongo），請用 `lab/escape-hatch/`，並搭配 `migraloop lab status` 的可拋棄 Fixture 連線細節。這不是 Lab Scenario（`recipe.yaml`／`lab scenario run`），也不是 Release Quality Gate。
+
+```bash
+./target/debug/migraloop lab up
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T oracle \
+  sqlplus -s SYNC_USER/lab_oracle@FREEPDB1 < lab/escape-hatch/oracle-load.sql
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T mongo \
+  mongosh --quiet --host 127.0.0.1 -u migraloop -p lab_mongo \
+  --authenticationDatabase admin lab < lab/escape-hatch/mongo-load.js
+export MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
+export ORACLE_PASSWORD=lab_oracle MONGO_PASSWORD=lab_mongo
+export LD_LIBRARY_PATH=/path/to/instantclient
+./target/debug/migraloop apply -f lab/escape-hatch/deployment.yaml
+./target/debug/migraloop status
+./target/debug/migraloop base --table LAB_ESCAPE_CUSTOMERS
+```
+
+Operator 面向細節見 [Deployment](deployment.md)。CLI-seam 覆蓋：always-on package 檢查，以及 `crates/app/tests/cli_lab_escape_hatch.rs` 中預設 ignored 的 Fixture flow。
+
 ### 撰寫 Lab Scenario（feature-time coverage）
 
 第一級 capability 在設計時就要一併規劃 Lab Scenario 覆蓋，否則視為未完成（ADR-0025）。開發 feature 時請走這條可重複路徑：
@@ -116,6 +137,13 @@ Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transf
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
 cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+```
+
+Lab DB-level escape-hatch load 後接 product status/inspect（預設 ignored；需要 Docker Lab Fixture + Instant Client）：
+
+```bash
+export LD_LIBRARY_PATH=/path/to/instantclient
+cargo test -p migraloop-app --test cli_lab_escape_hatch -- --ignored --nocapture
 ```
 
 Operator 的 apply/sync/inspect 驗證步驟見 [Source System](source-system.md)。

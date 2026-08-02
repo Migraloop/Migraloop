@@ -128,7 +128,7 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `--lab-dir` | 含 Lab `compose.yaml` 的目录（默认：`lab`） |
 | `--auto-remove` | 仅用于 `scenario run`：成功结束后完整移除 Scenario Namespace（opt-in；失败时仍保留 Namespace 以便调试） |
 
-Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogMiner harness。可选的 Scenario catalog 是 feature-time 完整度表面（ADR-0025），不是 CI suite：不要新增会跑完整 catalog 的 release-gate job。Scenario recipe 惯例、编写路径，以及已出货 capability 覆盖 gaps 见 [Developer local setup](developer-local-setup.md)、`lab/scenarios/README.md` 与 `lab/scenarios/COVERAGE.md`。另见 [Deployment](deployment.md)。
+Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogMiner harness。可选的 Scenario catalog 是 feature-time 完整度表面（ADR-0025），不是 CI suite：不要新增会跑完整 catalog 的 release-gate job。Scenario recipe 惯例、编写路径，以及已出货 capability 覆盖 gaps 见 [Developer local setup](developer-local-setup.md)、`lab/scenarios/README.md` 与 `lab/scenarios/COVERAGE.md`。若要在 Scenario recipes **之外**做 DB-level restore/load（用 `lab status` 连接细节对 Lab Oracle/Mongo 跑 SQL/mongosh/dumps，再接普通 `apply`／`status`／inspect／`sync`），见 `lab/escape-hatch/` 与 [Deployment](deployment.md)—该 escape hatch 不是第二套 Scenario 模型，也不是 CI。
 
 ## 公开环境变量契约
 

@@ -128,7 +128,7 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `--lab-dir` | Directory containing Lab `compose.yaml` (default: `lab`) |
 | `--auto-remove` | On `scenario run` only: after a successful run, fully remove the Scenario Namespace (opt-in; failures still keep the Namespace for debugging) |
 
-Lab is manual verification—not the Release Quality Gate and not the contract/stub LogMiner harness. The selectable Scenario catalog is a feature-time completeness surface (ADR-0025), not a CI suite: do not add a release-gate job that runs the entire catalog. Scenario recipe conventions, the authoring path, and shipped-capability coverage gaps are in [Developer local setup](developer-local-setup.md), `lab/scenarios/README.md`, and `lab/scenarios/COVERAGE.md`. See also [Deployment](deployment.md).
+Lab is manual verification—not the Release Quality Gate and not the contract/stub LogMiner harness. The selectable Scenario catalog is a feature-time completeness surface (ADR-0025), not a CI suite: do not add a release-gate job that runs the entire catalog. Scenario recipe conventions, the authoring path, and shipped-capability coverage gaps are in [Developer local setup](developer-local-setup.md), `lab/scenarios/README.md`, and `lab/scenarios/COVERAGE.md`. For DB-level restore/load **outside** Scenario recipes (SQL/mongosh/dumps into Lab Oracle/Mongo using `lab status` connection details, then ordinary `apply` / `status` / inspect / `sync`), see `lab/escape-hatch/` and [Deployment](deployment.md)—that escape hatch is not a second Scenario model and not CI.
 
 ## Public environment contract
 

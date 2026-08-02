@@ -59,6 +59,27 @@ cargo build -p migraloop-app
 
 Defaults after bring-up: Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`, MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`. Lab bring-up does not apply sample Deployments/Pipelines. Requires Docker Compose; `lab up` builds `target/debug/migraloop` when missing and packs it via `lab/Dockerfile` (Ubuntu 24.04 base for host glibc). Lab Compose uses `network_mode: host`. First Oracle boot can take several minutes. Nested Docker whiteout extract failures: use dockerd `storage-driver: vfs`. See [CLI & Config](cli-and-config.md) (`lab`) and [Deployment](deployment.md).
 
+### DB-level restore / load escape hatch
+
+For loads **outside** Scenario recipes (SQL/JS/dumps into Lab Oracle and/or Lab Mongo), use `lab/escape-hatch/` against the disposable Fixture connection details from `migraloop lab status`. This is not a Lab Scenario (`recipe.yaml` / `lab scenario run`) and not the Release Quality Gate.
+
+```bash
+./target/debug/migraloop lab up
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T oracle \
+  sqlplus -s SYNC_USER/lab_oracle@FREEPDB1 < lab/escape-hatch/oracle-load.sql
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T mongo \
+  mongosh --quiet --host 127.0.0.1 -u migraloop -p lab_mongo \
+  --authenticationDatabase admin lab < lab/escape-hatch/mongo-load.js
+export MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
+export ORACLE_PASSWORD=lab_oracle MONGO_PASSWORD=lab_mongo
+export LD_LIBRARY_PATH=/path/to/instantclient
+./target/debug/migraloop apply -f lab/escape-hatch/deployment.yaml
+./target/debug/migraloop status
+./target/debug/migraloop base --table LAB_ESCAPE_CUSTOMERS
+```
+
+Operator-facing detail: [Deployment](deployment.md). CLI-seam coverage: always-on package checks plus ignored Fixture flow in `crates/app/tests/cli_lab_escape_hatch.rs`.
+
 ### Authoring a Lab Scenario (feature-time coverage)
 
 A first-class capability is incomplete until Lab Scenario coverage is designed with it (ADR-0025). Use this repeatable path while building a feature:
@@ -116,6 +137,13 @@ Lab Scenario Direct Pipeline, Rich Transform `project`/`filter`, multi-table Tra
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
 cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+```
+
+Lab DB-level escape-hatch load then product status/inspect (ignored by default; requires Docker Lab Fixture + Instant Client):
+
+```bash
+export LD_LIBRARY_PATH=/path/to/instantclient
+cargo test -p migraloop-app --test cli_lab_escape_hatch -- --ignored --nocapture
 ```
 
 See [Source System](source-system.md) for the Operator apply/sync/inspect verification steps.
