@@ -100,8 +100,7 @@ async fn lab_status_names_active_scenario_namespace_from_lock() {
 
     // Fixture may be not ready (stub compose / no Docker stack); active run must still be named.
     assert!(
-        combined.contains("Scenario run: active — direct-pipeline")
-            || combined.contains("Scenario run: active - direct-pipeline"),
+        combined.contains("Scenario run: active — direct-pipeline"),
         "lab status must name the active Scenario Namespace, got:\n{combined}"
     );
     assert!(
