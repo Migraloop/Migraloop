@@ -1,5 +1,5 @@
 //! Lab Scenario catalog, run orchestration, and Namespace cleanup
-//! (issues #60–#66, #63, #85 / ADR-0025).
+//! (issues #60–#66, #63, #85, #86 / ADR-0025).
 //!
 //! Lab-specific machinery: catalog listing from on-disk Scenario recipes
 //! (`lab/scenarios/<id>/recipe.yaml`), Scenario Namespace lifecycle
@@ -9,7 +9,9 @@
 //! bindings before apply/sync (US44), result reporting with equal-weight
 //! correctness and operational metric thresholds (lag, throughput, duration),
 //! and shipped-capability coverage visibility (`lab/scenarios/COVERAGE.md`).
-//! Apply / Sync / inspect use the real product CLI path.
+//! Apply / Sync / inspect use the real product CLI path. Idempotent re-delivery
+//! (#86) resets Pipeline Delivery status in Platform Store so a second real
+//! `apply` re-Delivers the same Output Identities (at-least-once / upsert).
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -29,7 +31,7 @@ use crate::lab::{
     LAB_PLATFORM_STORE_URL,
 };
 use crate::CliError;
-use migraloop_platform_store::delete_deployment;
+use migraloop_platform_store::{delete_deployment, update_pipeline_delivery_status};
 
 const LOCK_FILE_NAME: &str = ".migraloop-scenario.lock";
 
@@ -75,6 +77,14 @@ const RT_FILTER_COLLECTION: &str = "lab_rf_customers";
 const RT_FILTER_PIPELINE: &str = "lab-rf-customers";
 const RT_FILTER_DEPLOYMENT: &str = "lab-rt-filter";
 
+const IDEMPOTENT_REDELIVERY_ID: &str = "idempotent-redelivery";
+const IDEMPOTENT_REDELIVERY_TABLE: &str = "LAB_IR_CUSTOMERS";
+const IDEMPOTENT_REDELIVERY_COLLECTION: &str = "lab_ir_customers";
+const IDEMPOTENT_REDELIVERY_PIPELINE: &str = "lab-ir-customers";
+const IDEMPOTENT_REDELIVERY_DEPLOYMENT: &str = "lab-idempotent-redelivery";
+/// Non-Managed Target field planted before re-Delivery to show Managed-only upsert.
+const IDEMPOTENT_REDELIVERY_OPERATOR_NOTE: &str = "lab-keep-across-redelivery";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -97,7 +107,7 @@ pub enum ScenarioCommand {
     },
     /// Run a Lab Scenario by id (one Scenario at a time)
     Run {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `rt-project`, `rt-filter`, `bulk-load`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `idempotent-redelivery`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -108,7 +118,7 @@ pub enum ScenarioCommand {
     },
     /// Fully remove a Scenario Namespace without starting a run
     Remove {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `rt-project`, `rt-filter`, `bulk-load`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `idempotent-redelivery`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -152,6 +162,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         RT_FILTER_ID,
         CONCURRENT_SOURCE_WORKLOAD_ID,
         BULK_LOAD_ID,
+        IDEMPOTENT_REDELIVERY_ID,
     ]
 }
 
@@ -172,6 +183,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
             "intra-Scenario concurrent Source workload",
         ),
         (BULK_LOAD_ID, "bulk load (~100k) with metric thresholds"),
+        (
+            IDEMPOTENT_REDELIVERY_ID,
+            "idempotent re-delivery / duplicate-safe Delivery",
+        ),
     ]
 }
 
@@ -459,6 +474,7 @@ async fn scenario_run(
         RT_FILTER_ID => run_rt_filter(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
         BULK_LOAD_ID => run_bulk_load(lab_dir).await,
+        IDEMPOTENT_REDELIVERY_ID => run_idempotent_redelivery(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -544,6 +560,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         RT_FILTER_ID => remove_rt_filter_namespace(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
         BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
+        IDEMPOTENT_REDELIVERY_ID => remove_idempotent_redelivery_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -2830,6 +2847,329 @@ EXIT;\n"
         })
 }
 
+/// Issue #86 / PRD #55 US49: exercise at-least-once Delivery via duplicate-safe re-Delivery
+/// on the real product apply path inside a Scenario Namespace.
+async fn run_idempotent_redelivery(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {IDEMPOTENT_REDELIVERY_ID}");
+    println!(
+        "Scenario Namespace: table={IDEMPOTENT_REDELIVERY_TABLE} \
+collection={IDEMPOTENT_REDELIVERY_COLLECTION} deployment={IDEMPOTENT_REDELIVERY_DEPLOYMENT}"
+    );
+
+    prepare_idempotent_redelivery_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, IDEMPOTENT_REDELIVERY_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !apply_out.to_ascii_lowercase().contains("delivery") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source insert/update/delete...");
+    mutate_idempotent_redelivery_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+
+    let target_before = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            IDEMPOTENT_REDELIVERY_COLLECTION,
+        ],
+    )
+    .await?;
+    let docs_before = parse_target_document_count(&target_before).ok_or_else(|| {
+        CliError::Failed(format!(
+            "Lab Scenario could not parse Target document count before re-Delivery:\n{target_before}"
+        ))
+    })?;
+    let before_ok = managed_name_present(&target_before, "Alicia")
+        && managed_name_present(&target_before, "Carol")
+        && !managed_name_present(&target_before, "Bob");
+    if !before_ok || docs_before != 2 {
+        return Err(CliError::Failed(format!(
+            "pre-redelivery Managed Target baseline failed (expected Alicia+Carol, Bob absent, documents=2):\n{target_before}"
+        )));
+    }
+
+    // Plant a non-Managed field so re-Delivery proves Managed-only upsert (US48-adjacent / US49).
+    println!(
+        "Lab Scenario: planting non-Managed Target field before duplicate-safe re-Delivery..."
+    );
+    plant_idempotent_redelivery_operator_note(lab_dir).await?;
+
+    // Lab orchestration only: mark Pipeline Delivery pending so the next real `apply`
+    // re-Delivers current Base Output Identities (at-least-once / upsert-by-identity).
+    println!(
+        "Lab Scenario: resetting Pipeline Delivery status to force duplicate-safe re-Delivery..."
+    );
+    update_pipeline_delivery_status(
+        LAB_PLATFORM_STORE_URL,
+        IDEMPOTENT_REDELIVERY_DEPLOYMENT,
+        IDEMPOTENT_REDELIVERY_PIPELINE,
+        "pending",
+    )
+    .await
+    .map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to reset Pipeline Delivery status for re-Delivery exercise:\n{err}"
+        ))
+    })?;
+
+    println!("Lab Scenario: re-apply via real product path (duplicate-safe re-Delivery)...");
+    let reapply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !reapply_out.to_ascii_lowercase().contains("delivery") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario re-apply must perform Delivery (duplicate-safe re-Delivery):\n{reapply_out}"
+        )));
+    }
+    // Must not reload existing Base on re-apply (ADR-0019) — re-Delivery of current Base only.
+    if reapply_out.contains("Initial Load")
+        || reapply_out.to_ascii_lowercase().contains("initial_load")
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario re-apply must not reload Base (expected Delivery-only re-run):\n{reapply_out}"
+        )));
+    }
+
+    let base_after = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            IDEMPOTENT_REDELIVERY_TABLE,
+        ],
+    )
+    .await?;
+    let target_after = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            IDEMPOTENT_REDELIVERY_COLLECTION,
+        ],
+    )
+    .await?;
+    let docs_after = parse_target_document_count(&target_after).ok_or_else(|| {
+        CliError::Failed(format!(
+            "Lab Scenario could not parse Target document count after re-Delivery:\n{target_after}"
+        ))
+    })?;
+
+    let base_ok = managed_name_present(&base_after, "Alicia")
+        && managed_name_present(&base_after, "Carol")
+        && !managed_name_present(&base_after, "Bob");
+    let target_ok = managed_name_present(&target_after, "Alicia")
+        && managed_name_present(&target_after, "Carol")
+        && !managed_name_present(&target_after, "Bob");
+    let count_ok = docs_after == docs_before && docs_after == 2;
+    let note_ok = target_after.contains(IDEMPOTENT_REDELIVERY_OPERATOR_NOTE);
+
+    let rows_applied = count_delivery_ops(&apply_out)
+        + count_delivery_ops(&sync_out)
+        + count_delivery_ops(&reapply_out);
+
+    if !(base_ok && target_ok && count_ok && note_ok) {
+        return Err(CliError::Failed(format!(
+            "correctness checks failed after duplicate-safe re-Delivery \
+             (base_ok={base_ok} target_ok={target_ok} count_ok={count_ok} \
+             docs_before={docs_before} docs_after={docs_after} note_ok={note_ok}).\n\
+             Base:\n{base_after}\nTarget:\n{target_after}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (Managed outcomes stable; document count={docs_after}; non-Managed field preserved)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
+    }
+    println!("Lab Scenario: duplicate-safe re-Delivery complete on real product apply path");
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_idempotent_redelivery_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={IDEMPOTENT_REDELIVERY_TABLE}, collection={IDEMPOTENT_REDELIVERY_COLLECTION}, \
+          deployment={IDEMPOTENT_REDELIVERY_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {IDEMPOTENT_REDELIVERY_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table {IDEMPOTENT_REDELIVERY_TABLE}:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{IDEMPOTENT_REDELIVERY_COLLECTION}').drop()");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection {IDEMPOTENT_REDELIVERY_COLLECTION}:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, IDEMPOTENT_REDELIVERY_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{IDEMPOTENT_REDELIVERY_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_idempotent_redelivery_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_idempotent_redelivery_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {IDEMPOTENT_REDELIVERY_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {IDEMPOTENT_REDELIVERY_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {IDEMPOTENT_REDELIVERY_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {IDEMPOTENT_REDELIVERY_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare idempotent-redelivery Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_idempotent_redelivery_source(lab_dir: &Path) -> Result<(), CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {IDEMPOTENT_REDELIVERY_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
+INSERT INTO {IDEMPOTENT_REDELIVERY_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
+DELETE FROM {IDEMPOTENT_REDELIVERY_TABLE} WHERE ID = 2;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source insert/update/delete for idempotent-redelivery:\n{err}"
+            ))
+        })
+}
+
+async fn plant_idempotent_redelivery_operator_note(lab_dir: &Path) -> Result<(), CliError> {
+    let js = format!(
+        "const r = db.getCollection('{IDEMPOTENT_REDELIVERY_COLLECTION}').updateOne(\n\
+  {{ _id: 1 }},\n\
+  {{ $set: {{ operatorNote: '{IDEMPOTENT_REDELIVERY_OPERATOR_NOTE}' }} }}\n\
+);\n\
+if (r.matchedCount !== 1) {{ throw new Error('expected to match Output Identity 1, got ' + JSON.stringify(r)); }}\n"
+    );
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to plant non-Managed Target field before re-Delivery:\n{err}"
+        ))
+    })?;
+    Ok(())
+}
+
 async fn run_product_cli(bin: &Path, args: &[&str]) -> Result<String, CliError> {
     let output = Command::new(bin)
         .args(args)
@@ -3018,6 +3358,10 @@ mod tests {
             ids.iter().any(|id| id == RT_FILTER_ID),
             "catalog must include rt-filter for shipped Rich Transform filter"
         );
+        assert!(
+            ids.iter().any(|id| id == IDEMPOTENT_REDELIVERY_ID),
+            "catalog must include idempotent-redelivery for duplicate-safe Delivery"
+        );
         let coverage = lab.join("scenarios/COVERAGE.md");
         let body = fs::read_to_string(&coverage).expect("COVERAGE.md");
         assert!(
@@ -3042,6 +3386,11 @@ mod tests {
         assert!(
             gaps.iter().any(|g| g.contains("Rich Transform filter")),
             "missing rt-filter must be a visible gap; gaps={gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|g| g.contains("idempotent re-delivery") || g.contains("duplicate-safe")),
+            "missing idempotent-redelivery must be a visible gap; gaps={gaps:?}"
         );
     }
 

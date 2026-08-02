@@ -52,6 +52,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run bulk-load
+./target/debug/migraloop lab scenario run idempotent-redelivery
 # keep-on-finish 后 lab status 会标出 leftover Namespace；也可用 base / derived / target 查看。
 # 重跑会先 wipe Namespace；或：lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
@@ -132,7 +133,7 @@ Lab Fixture lifecycle seam（默认 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload 与 bulk-load seams（默认 ignored；需要 Docker Lab Fixture + Instant Client）：
+Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load 与 idempotent-redelivery seams（默认 ignored；需要 Docker Lab Fixture + Instant Client）：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient

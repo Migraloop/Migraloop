@@ -19,6 +19,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Rich Transform `groupBy` / `sum` (also under contention) | `transform-pipeline`, `concurrent-source-workload` |
 | Intra-Scenario concurrent Source workload | `concurrent-source-workload` |
 | Bulk load (~100k) with fail-able metric thresholds | `bulk-load` |
+| Idempotent re-delivery / duplicate-safe Delivery | `idempotent-redelivery` |
 
 ## Visible gaps (not yet shipped)
 

@@ -1,11 +1,11 @@
 //! Operator-visible seam: Lab Scenario list / run / remove (Namespace cleanup).
 //!
-//! Agreed seam (issues #60–#66, #63, #84, #85 / PRD #55): CLI Lab Scenario commands.
+//! Agreed seam (issues #60–#66, #63, #84, #85, #86 / PRD #55): CLI Lab Scenario commands.
 //! Always-on tests cover catalog listing from on-disk `recipe.yaml` packages
-//! (including bulk-load, rt-project, rt-filter), shipped-capability coverage
-//! visibility, help surface, one-at-a-time rejection, refusal of non-Lab /
-//! production engine bindings, Namespace cleanup control surface, and CLI-seam
-//! bulk-load correctness-fail / metrics-fail probes
+//! (including bulk-load, rt-project, rt-filter, idempotent-redelivery),
+//! shipped-capability coverage visibility, help surface, one-at-a-time rejection,
+//! refusal of non-Lab / production engine bindings, Namespace cleanup control
+//! surface, and CLI-seam bulk-load correctness-fail / metrics-fail probes
 //! (`MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE`). Full Scenario run / re-run / remove
 //! against the Lab Fixture (including leftover Namespace naming on `lab status`)
 //! is ignored by default (Docker + Instant Client) — not a Release Quality Gate.
@@ -256,6 +256,29 @@ async fn lab_scenario_list_includes_rt_filter() {
     assert!(
         out.to_ascii_lowercase().contains("filter"),
         "rt-filter summary should mention filter, got:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn lab_scenario_list_includes_idempotent_redelivery() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("idempotent-redelivery"),
+        "catalog must list idempotent-redelivery Lab Scenario (#86), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("idempotent") || lower.contains("duplicate-safe") || lower.contains("re-delivery"),
+        "idempotent-redelivery summary should mention idempotent/duplicate-safe re-delivery, got:\n{out}"
     );
 }
 
@@ -1873,6 +1896,160 @@ async fn lab_scenario_rt_filter_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove rt-filter failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Full idempotent re-delivery Lab Scenario against Docker Lab Fixture + Instant Client
+/// (issue #86 / PRD #55 US49).
+///
+/// ```bash
+/// export LD_LIBRARY_PATH=/path/to/instantclient
+/// cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_idempotent_redelivery_run_and_inspect() {
+    let lab = lab_dir();
+    let store_url = "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop";
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "idempotent-redelivery",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario run idempotent-redelivery");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run idempotent-redelivery failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("correctness=pass") || run_out.contains("correctness checks passed"),
+        "expected correctness pass, got:\n{run_out}"
+    );
+    assert!(
+        run_out.to_ascii_lowercase().contains("logminer")
+            || run_out.contains("Incremental Capture"),
+        "Scenario must use real capture path, got:\n{run_out}"
+    );
+    assert!(
+        run_out.to_ascii_lowercase().contains("re-delivery")
+            || run_out.to_ascii_lowercase().contains("duplicate-safe"),
+        "Scenario must exercise re-Delivery, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("namespace=left in place")
+            || run_out.to_ascii_lowercase().contains("left in place"),
+        "default completed run must keep Namespace, got:\n{run_out}"
+    );
+
+    let target = Command::new(bin())
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "target",
+            "--platform-store-url",
+            store_url,
+            "--collection",
+            "lab_ir_customers",
+        ])
+        .output()
+        .expect("target inspect");
+    let target_out = String::from_utf8_lossy(&target.stdout);
+    assert!(
+        target.status.success(),
+        "target inspect failed: {}",
+        String::from_utf8_lossy(&target.stderr)
+    );
+    assert!(
+        target_out.contains("Alicia")
+            && target_out.contains("Carol")
+            && !target_out.contains("Bob"),
+        "Target Managed outcomes must remain correct after re-Delivery, got:\n{target_out}"
+    );
+    assert!(
+        target_out.contains("lab-keep-across-redelivery"),
+        "non-Managed operatorNote must survive Managed upsert re-Delivery, got:\n{target_out}"
+    );
+    assert!(
+        target_out.contains("documents: 2") || target_out.contains("documents:2"),
+        "Target document count must stay at 2 after duplicate-safe re-Delivery, got:\n{target_out}"
+    );
+
+    let leftover_status = Command::new(bin())
+        .args(["lab", "status", "--lab-dir", &lab])
+        .output()
+        .expect("lab status after scenario keep");
+    let leftover_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&leftover_status.stdout),
+        String::from_utf8_lossy(&leftover_status.stderr)
+    );
+    assert!(
+        leftover_status.status.success(),
+        "lab status after Scenario keep failed:\n{leftover_out}"
+    );
+    assert!(
+        leftover_out.contains("Scenario Namespace leftover: idempotent-redelivery"),
+        "lab status must name leftover Scenario Namespace, got:\n{leftover_out}"
+    );
+
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "idempotent-redelivery",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove idempotent-redelivery");
+    assert!(
+        remove.status.success(),
+        "lab scenario remove idempotent-redelivery failed: {}",
         String::from_utf8_lossy(&remove.stderr)
     );
 
