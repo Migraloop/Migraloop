@@ -27,6 +27,7 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Pipeline revision change via `apply` (Derived rebuild / metadata-only skip) | `change-pipeline` | `cli_change_pipeline_revision.rs` | Semantic transform/binding change pauses old Delivery, rebuilds that Pipeline's Derived, re-Delivers with delete reconciliation, resumes incremental; Shared Bases not rebuilt; metadata-only `description` skips rebuild |
 | Poison Change quarantine on Operator `status` | `poison-quarantine` | `cli_poison_quarantine.rs` | Bounded Delivery retries → quarantine + alert; Pipeline continues other identities; `status` Delivery Health unhealthy / not aligned for quarantined keys |
 | Blocking DDL Schema Change warn+pause | `schema-change-pause` | `cli_schema_change_pause.rs` | Blocking DDL → WARN + pause affected Pipeline; unaffecting ADD continues Delivery; distinct from poison quarantine (`status` paused + Schema Change, not quarantine unhealthy) |
+| Source Alignment Check for Base Datasets | `source-alignment` | `cli_source_alignment.rs` | Detect Base≠Source; repair Base from Source reads (never write Source); resource-gated `--max-rows` (default 1000); `status` shows Source Alignment |
 
 ## Explicitly not gate evidence
 

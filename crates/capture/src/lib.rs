@@ -32,7 +32,9 @@ pub use contract_catalog::{
     set_contract_source_catalog_override, snapshot, ContractSourceCatalog,
     ContractSourceCatalogFile, CONTRACT_SOURCE_CATALOG_ENV,
 };
-pub use oracle_source::{discover_source_schema, initial_load_for_source};
+pub use oracle_source::{
+    alignment_check_read_for_source, discover_source_schema, initial_load_for_source,
+};
 pub use oracle_types::{
     aware_temporal_to_utc, classify_number, is_allow_listed_oracle_type, naive_temporal_to_utc,
     normalize_oracle_type, resolve_temporal_timezone, NumberMongoMapping, ResolvedTimezone,
@@ -165,6 +167,21 @@ pub struct InitialLoadSnapshot {
     pub primary_key: Vec<String>,
     pub columns: Vec<SourceColumn>,
     pub rows: Vec<BTreeMap<String, serde_json::Value>>,
+}
+
+/// Resource-gated Source sample for Source Alignment Check (issue #24).
+///
+/// Never writes Source. `truncated` means the read stopped at the Operator budget
+/// and more Source rows may remain — not a full-table slam.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlignmentCheckSample {
+    pub table: String,
+    pub primary_key: Vec<String>,
+    pub columns: Vec<SourceColumn>,
+    pub rows: Vec<BTreeMap<String, serde_json::Value>>,
+    pub truncated: bool,
+    /// Known Source row count when available (contract catalog / COUNT(*)).
+    pub source_row_count: Option<usize>,
 }
 
 impl InitialLoadSnapshot {

@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use lab::{run_lab, LabCommand};
 use migraloop_capture::{
-    check_oracle_source_prerequisites, classify_number, classify_schema_impact,
-    discover_source_schema, initial_load_for_source, is_allow_listed_oracle_type,
-    load_injected_schema_changes, normalize_change_temporals, open_oracle_incremental_capture,
-    CapturePosition, ChangeEvent, ChangeOp, IncrementalCapture, NumberMongoMapping,
-    OracleSourceConnect, PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn,
-    TypeError,
+    alignment_check_read_for_source, check_oracle_source_prerequisites, classify_number,
+    classify_schema_impact, discover_source_schema, initial_load_for_source,
+    is_allow_listed_oracle_type, load_injected_schema_changes, normalize_change_temporals,
+    open_oracle_incremental_capture, AlignmentCheckSample, CapturePosition, ChangeEvent, ChangeOp,
+    IncrementalCapture, NumberMongoMapping, OracleSourceConnect, PipelineSchemaDeps,
+    SchemaChangeEvent, SchemaImpact, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
@@ -118,6 +118,21 @@ pub enum Command {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
+    },
+    /// Run Source Alignment Check: verify Base matches Source (resource-gated); repair Base only
+    Align {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Source table name of the Base Dataset (default: all Bases)
+        #[arg(long)]
+        table: Option<String>,
+        /// Deployment name when multiple Bases share a table name
+        #[arg(long)]
+        deployment: Option<String>,
+        /// Max Source rows to read per Base (resource gate; default 1000 — not a full slam)
+        #[arg(long, default_value = "1000")]
+        max_rows: u32,
     },
     /// Pause a Pipeline: stop further Delivery/processing without restarting the Deployment
     Pause {
@@ -654,6 +669,9 @@ async fn sync_base_datasets_for_pipelines(
             // via exclusive resume (checkpoint+1 == low-watermark).
             capture_checkpoint: Some(low_watermark.as_i64().saturating_sub(1)),
             sync_lag: 0,
+            source_alignment: "unknown".to_string(),
+            source_alignment_checked_rows: 0,
+            source_alignment_mismatched_rows: 0,
         };
 
         replace_base_dataset(platform_store_url, &dataset, &rows)
@@ -1975,7 +1993,267 @@ fn base_with_sync_progress(
         capture_low_watermark: dataset.capture_low_watermark,
         capture_checkpoint,
         sync_lag,
+        source_alignment: dataset.source_alignment.clone(),
+        source_alignment_checked_rows: dataset.source_alignment_checked_rows,
+        source_alignment_mismatched_rows: dataset.source_alignment_mismatched_rows,
     }
+}
+
+/// Default Source Alignment Check read budget (resource gate; not a full slam).
+const DEFAULT_ALIGNMENT_MAX_ROWS: u32 = 1000;
+
+fn supported_row_projection(
+    row: &serde_json::Map<String, serde_json::Value>,
+    supported: &BTreeSet<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    row.iter()
+        .filter(|(name, _)| supported.contains(name.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+fn base_identity_key(
+    row: &serde_json::Map<String, serde_json::Value>,
+    primary_key: &[String],
+) -> Option<String> {
+    if primary_key.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(primary_key.len());
+    for col in primary_key {
+        let value = row.get(col)?;
+        parts.push(identity_key(value));
+    }
+    Some(parts.join("|"))
+}
+
+fn rows_equal_supported(
+    left: &serde_json::Map<String, serde_json::Value>,
+    right: &serde_json::Map<String, serde_json::Value>,
+    supported: &BTreeSet<String>,
+) -> bool {
+    for name in supported {
+        if left.get(name) != right.get(name) {
+            return false;
+        }
+    }
+    true
+}
+
+async fn source_alignment_check(
+    platform_store_url: &str,
+    table: Option<&str>,
+    deployment: Option<&str>,
+    max_rows: u32,
+) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+    let max_rows = if max_rows == 0 {
+        DEFAULT_ALIGNMENT_MAX_ROWS
+    } else {
+        max_rows
+    };
+
+    let deployments = list_deployments(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    if deployments.is_empty() {
+        return Err(CliError::Failed(
+            "no Deployments applied; run `migraloop apply` first".to_string(),
+        ));
+    }
+
+    let bases = list_base_datasets(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let targets: Vec<BaseDataset> = bases
+        .into_iter()
+        .filter(|base| {
+            table
+                .map(|t| base.source_table.eq_ignore_ascii_case(t))
+                .unwrap_or(true)
+                && deployment
+                    .map(|d| base.deployment_name == d)
+                    .unwrap_or(true)
+        })
+        .collect();
+    if targets.is_empty() {
+        return Err(CliError::Failed(match (table, deployment) {
+            (Some(t), Some(d)) => {
+                format!("no Base Dataset found for table {t} in Deployment {d}")
+            }
+            (Some(t), None) => format!("no Base Dataset found for table {t}"),
+            (None, Some(d)) => format!("no Base Datasets found for Deployment {d}"),
+            (None, None) => "no Base Datasets found; run `migraloop apply` first".to_string(),
+        }));
+    }
+
+    for base in targets {
+        let deployment = deployments
+            .iter()
+            .find(|d| d.name == base.deployment_name)
+            .ok_or_else(|| {
+                CliError::Failed(format!(
+                    "Deployment {} missing for Base Dataset {}",
+                    base.deployment_name, base.source_table
+                ))
+            })?;
+        align_one_base(platform_store_url, deployment, &base, max_rows).await?;
+    }
+    Ok(())
+}
+
+async fn align_one_base(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    base: &BaseDataset,
+    max_rows: u32,
+) -> Result<(), CliError> {
+    if base.primary_key.is_empty() {
+        return Err(CliError::Failed(format!(
+            "Base Dataset {} has no primary key for Source Alignment Check",
+            base.source_table
+        )));
+    }
+
+    let connect = oracle_source_connect(&deployment.source)?;
+    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
+    let configured_tz = source_timezone_opt(deployment);
+    let sample: AlignmentCheckSample = alignment_check_read_for_source(
+        &connect,
+        &password,
+        &base.source_schema,
+        &base.source_table,
+        max_rows,
+        configured_tz,
+    )
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let (_, base_rows) = get_base_rows(
+        platform_store_url,
+        &base.source_table,
+        Some(&base.deployment_name),
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let supported: BTreeSet<String> = if base.columns.is_empty() {
+        sample
+            .columns
+            .iter()
+            .filter(|c| c.supported)
+            .map(|c| c.name.clone())
+            .collect()
+    } else {
+        base.columns.iter().map(|c| c.name.clone()).collect()
+    };
+
+    let mut base_by_id: BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+        BTreeMap::new();
+    for row in &base_rows {
+        let Some(key) = base_identity_key(&row.data, &base.primary_key) else {
+            continue;
+        };
+        base_by_id.insert(key, row.data.clone());
+    }
+
+    let mut repaired: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
+    let mut mismatched = 0i32;
+    let mut repaired_count = 0i32;
+    let mut checked_ids: BTreeSet<String> = BTreeSet::new();
+
+    for source_row in &sample.rows {
+        let source_as_map: serde_json::Map<String, serde_json::Value> = source_row
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let source_map = supported_row_projection(&source_as_map, &supported);
+        let Some(key) = base_identity_key(&source_map, &base.primary_key) else {
+            continue;
+        };
+        checked_ids.insert(key.clone());
+        match base_by_id.get(&key) {
+            Some(existing) if rows_equal_supported(existing, &source_map, &supported) => {
+                repaired.insert(key, existing.clone());
+            }
+            Some(_) | None => {
+                mismatched += 1;
+                repaired_count += 1;
+                repaired.insert(key, source_map);
+            }
+        }
+    }
+
+    // Rows outside the gated Source window: keep when truncated; drop when full read.
+    for (key, row) in &base_by_id {
+        if checked_ids.contains(key) {
+            continue;
+        }
+        if sample.truncated {
+            repaired.insert(key.clone(), row.clone());
+        } else {
+            mismatched += 1;
+            repaired_count += 1;
+            // Source no longer has this identity — remove from Base (never write Source).
+        }
+    }
+
+    let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
+        repaired.into_values().collect();
+    // Stable ordinal order by primary key for inspectability.
+    rows.sort_by(|a, b| {
+        let ka = base_identity_key(a, &base.primary_key).unwrap_or_default();
+        let kb = base_identity_key(b, &base.primary_key).unwrap_or_default();
+        ka.cmp(&kb)
+    });
+
+    let alignment_status = if sample.truncated {
+        "partial"
+    } else {
+        "aligned"
+    };
+    let checked = sample.rows.len() as i32;
+    let updated = BaseDataset {
+        deployment_name: base.deployment_name.clone(),
+        source_table: base.source_table.clone(),
+        source_schema: base.source_schema.clone(),
+        status: base.status.clone(),
+        primary_key: base.primary_key.clone(),
+        columns: base.columns.clone(),
+        omitted_columns: base.omitted_columns.clone(),
+        row_count: rows.len() as i32,
+        sync_applied_changes: base.sync_applied_changes,
+        sync_health: base.sync_health.clone(),
+        capture_low_watermark: base.capture_low_watermark,
+        capture_checkpoint: base.capture_checkpoint,
+        sync_lag: base.sync_lag,
+        source_alignment: alignment_status.to_string(),
+        source_alignment_checked_rows: checked,
+        source_alignment_mismatched_rows: mismatched,
+    };
+
+    replace_base_dataset(platform_store_url, &updated, &rows)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let truncated_note = if sample.truncated {
+        " truncated=true"
+    } else {
+        ""
+    };
+    let detect_status = if mismatched > 0 {
+        "misaligned"
+    } else if sample.truncated {
+        "partial"
+    } else {
+        "aligned"
+    };
+    println!(
+        "Source Alignment Check: {} status={detect_status} checked={checked} \
+         mismatched={mismatched} repaired={repaired_count} maxRows={max_rows}{truncated_note} \
+         (Base repaired from Source reads; Source not written)",
+        base.source_table
+    );
+    Ok(())
 }
 
 async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
@@ -2603,6 +2881,12 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                     .map(|cp| cp.to_string())
                     .unwrap_or_else(|| "(none)".to_string())
             );
+            println!(
+                "  Source Alignment: {} checkedRows={} mismatchedRows={}",
+                base.source_alignment,
+                base.source_alignment_checked_rows,
+                base.source_alignment_mismatched_rows
+            );
         }
     }
 
@@ -3102,6 +3386,20 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             deployment,
         } => print_derived(&platform_store_url, &pipeline, deployment.as_deref()).await,
         Command::Sync { platform_store_url } => sync_incremental(&platform_store_url).await,
+        Command::Align {
+            platform_store_url,
+            table,
+            deployment,
+            max_rows,
+        } => {
+            source_alignment_check(
+                &platform_store_url,
+                table.as_deref(),
+                deployment.as_deref(),
+                max_rows,
+            )
+            .await
+        }
         Command::Pause {
             platform_store_url,
             pipeline,
