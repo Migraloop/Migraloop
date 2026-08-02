@@ -27,6 +27,6 @@ Cloud `install`/`start` (`.cursor/environment.json`) set up nested-friendly Dock
 - `install`: `cargo fetch` plus `.cursor/cloud-dind-install.sh` — installs `docker.io`, Compose v2, and `fuse-overlayfs`; writes `.cursor/daemon.json` (`storage-driver: fuse-overlayfs`, containerd snapshotter disabled); pre-warms Lab images (`postgres:16`, `mongo:7`, `gvenzl/oracle-free:23-slim`).
 - `start`: `.cursor/cloud-dind-start.sh` — starts `dockerd` with that recipe (Cloud VMs have no systemd Docker unit).
 
-Default overlay/overlayfs DinD fails Lab image extract with whiteout `EPERM`. Do not invent session-local storage-driver workarounds; use the baked recipe. After `start`, `migraloop lab up` / `lab status` should yield a ready Lab Fixture. Matrix evidence: GitHub issue #107.
+Default overlay/overlayfs DinD fails Lab image extract with whiteout `EPERM`. Do not invent session-local storage-driver workarounds; use the baked recipe. After `start`, `migraloop lab up` / `lab status` should yield a ready Lab Fixture. Matrix evidence (pass/fail per recipe): implementing PR for GitHub issue #107.
 
 Keep heavy one-off app builds out of `install` (Lab images pre-warm is intentional). Agents can work directly with committed skills under `.agents/skills/`.
