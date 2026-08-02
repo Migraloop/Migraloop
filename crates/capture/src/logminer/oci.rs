@@ -87,15 +87,7 @@ impl OciLogMiner {
         from_position: CapturePosition,
     ) -> Result<Vec<ChangeEvent>, CaptureError> {
         let _sql = oci_logminer_session_sql();
-        let conn = connect_oracle(&self.connect, &self.password)?;
-        let owner = resolve_oracle_schema(&self.connect, "");
-        let contents =
-            fetch_logminer_contents(&conn, &self.connect.host, &owner, table, from_position)?;
-        Ok(change_events_from_logminer_contents(
-            &contents,
-            table,
-            from_position,
-        ))
+        self.fetch_changes_in_schema("", table, from_position)
     }
 
     /// Fetch Incremental Capture changes for a fully-qualified schema.table.
@@ -180,11 +172,13 @@ fn read_mined_contents(
     ];
     for column in columns {
         let name = &column.name;
+        // Oracle requires schema.table.column for MINE_VALUE / COLUMN_PRESENT.
+        let qualified = format!("{owner}.{table}.{name}");
         select_parts.push(format!(
-            "DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, '{name}') AS \"R_{name}\""
+            "DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, '{qualified}') AS \"R_{name}\""
         ));
         select_parts.push(format!(
-            "DBMS_LOGMNR.MINE_VALUE(UNDO_VALUE, '{name}') AS \"U_{name}\""
+            "DBMS_LOGMNR.MINE_VALUE(UNDO_VALUE, '{qualified}') AS \"U_{name}\""
         ));
     }
 
@@ -244,8 +238,16 @@ fn read_mined_contents(
             }
         };
 
-        if identity.values().all(|v| v.is_null()) {
-            continue;
+        if identity.is_empty() || identity.values().all(|v| v.is_null()) {
+            return Err(CaptureError::OciUnavailable {
+                host: host.to_string(),
+                detail: format!(
+                    "LogMiner (OCI) could not reconstruct primary-key identity for {owner}.{table} \
+                     at SCN {scn} ({}); enable PRIMARY KEY or ALL COLUMNS supplemental logging \
+                     and confirm Instant Client can read V$LOGMNR_CONTENTS via DBMS_LOGMNR.MINE_VALUE",
+                    op.as_str()
+                ),
+            });
         }
 
         let after_image = match op {
@@ -317,23 +319,22 @@ fn probe_prerequisites_oci(
         set
     };
 
-    // Retention: prefer span of available archived redo; when ARCHIVELOG is on but
-    // history is still short (fresh Lab DB), treat configured archive mode as meeting
-    // the documented floor so Lab bring-up is not blocked solely by age-of-logs.
+    // Retention probe (ADR-0021): NOARCHIVELOG ⇒ 0 (fail). When ARCHIVELOG is on,
+    // report the available archived-redo span when known. If the span is still
+    // shorter than the floor (fresh Lab DB) but an archive destination is
+    // configured, report the documented floor as "configured retention capacity"
+    // so Lab Fixture bring-up is not blocked solely by age-of-logs. Operators who
+    // disable archive destinations still fail when span < 24h.
     let redo_retention_hours = if !archivelog {
         0
     } else {
-        let span: Option<i64> = conn
-            .query_row_as::<(Option<i64>,)>(
-                "SELECT ROUND((CAST(SYSTIMESTAMP AS DATE) - MIN(FIRST_TIME)) * 24) \
-                 FROM V$ARCHIVED_LOG WHERE DELETED = 'NO'",
-                &[],
-            )
-            .ok()
-            .and_then(|r| r.0);
-        match span {
-            Some(hours) if hours >= MIN_REDO_RETENTION_HOURS as i64 => hours as u32,
-            Some(_) | None => MIN_REDO_RETENTION_HOURS,
+        let span = archived_redo_span_hours(conn).unwrap_or(0);
+        if span >= MIN_REDO_RETENTION_HOURS {
+            span
+        } else if archive_destination_configured(conn, host)? {
+            MIN_REDO_RETENTION_HOURS
+        } else {
+            span
         }
     };
 
@@ -342,6 +343,43 @@ fn probe_prerequisites_oci(
         tables_with_key_supplemental_logging,
         redo_retention_hours,
     })
+}
+
+fn archived_redo_span_hours(conn: &Connection) -> Option<u32> {
+    let span: Option<i64> = conn
+        .query_row_as::<(Option<i64>,)>(
+            "SELECT ROUND((CAST(SYSTIMESTAMP AS DATE) - MIN(FIRST_TIME)) * 24) \
+             FROM V$ARCHIVED_LOG WHERE DELETED = 'NO'",
+            &[],
+        )
+        .ok()
+        .and_then(|r| r.0);
+    span.and_then(|h| if h < 0 { None } else { Some(h as u32) })
+}
+
+fn archive_destination_configured(
+    conn: &Connection,
+    host: &str,
+) -> Result<bool, CaptureError> {
+    // FRA or a non-empty LOG_ARCHIVE_DEST_1 counts as configured retention capacity.
+    let fra: Option<String> = conn
+        .query_row_as::<(Option<String>,)>(
+            "SELECT NULLIF(TRIM(VALUE), '') FROM V$PARAMETER WHERE NAME = 'db_recovery_file_dest'",
+            &[],
+        )
+        .map_err(|err| map_oracle_error(host, err))?
+        .0;
+    if fra.is_some() {
+        return Ok(true);
+    }
+    let dest1: Option<String> = conn
+        .query_row_as::<(Option<String>,)>(
+            "SELECT NULLIF(TRIM(VALUE), '') FROM V$PARAMETER WHERE NAME = 'log_archive_dest_1'",
+            &[],
+        )
+        .map_err(|err| map_oracle_error(host, err))?
+        .0;
+    Ok(dest1.is_some())
 }
 
 #[cfg(test)]

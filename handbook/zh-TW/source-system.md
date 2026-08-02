@@ -50,7 +50,7 @@ ALTER TABLE <schema>.<table> ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
 
 至少保留 **24 小時** redo（online + archived），讓 Initial Load overlap、Incremental Capture lag，以及行程重啟後的 resume 仍能讀到需要的變更歷史。依你的 Oracle edition 設定 archive destination retention / FRA policy。
 
-若 redo 在平台消費前就過期，變更會遺失—平台寧可不跑，也不做不完整 capture。
+Live OCI probe 要求 **ARCHIVELOG** 模式。可讀時會回報可用 archived-redo 時間跨度；若跨度仍短於 24 小時（例如剛備妥的 Lab Source），但已設定 `db_recovery_file_dest` 或 `log_archive_dest_1`，probe 會視為符合文件化底線。**NOARCHIVELOG** 會 fail fast。若 redo 在平台消費前就過期，變更會遺失—平台寧可不跑，也不做不完整 capture。
 
 ### Operator 工作流程
 

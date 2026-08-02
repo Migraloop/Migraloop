@@ -50,7 +50,7 @@ Missing table-level logging leads to incomplete or incorrect Incremental Capture
 
 Retain redo (online + archived) for at least **24 hours** so Initial Load overlap, Incremental Capture lag, and process restart resume can still read needed change history. Configure archive destination retention / FRA policy for your Oracle edition.
 
-If redo is aged out before the platform consumes it, changes are lost—the platform refuses to run rather than capture incompletely.
+Live OCI probes require **ARCHIVELOG** mode. They report the available archived-redo span when known; if that span is still shorter than 24 hours (for example a freshly provisioned Lab Source) but `db_recovery_file_dest` or `log_archive_dest_1` is configured, the probe treats that as meeting the documented floor. **NOARCHIVELOG** fails fast. If redo is aged out before the platform consumes it, changes are lost—the platform refuses to run rather than capture incompletely.
 
 ### Operator workflow
 
