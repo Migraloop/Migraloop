@@ -376,6 +376,30 @@ async fn lab_scenario_list_includes_poison_quarantine() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_schema_change_pause() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("schema-change-pause"),
+        "catalog must list schema-change-pause Lab Scenario (#23), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        (lower.contains("schema") || lower.contains("ddl"))
+            && (lower.contains("pause") || lower.contains("warn")),
+        "schema-change-pause summary should mention schema/DDL warn+pause, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {
@@ -2273,6 +2297,118 @@ async fn lab_scenario_poison_quarantine_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove poison-quarantine failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Manual Lab Scenario seam for blocking DDL Schema Change warn+pause (#23 / ADR-0009 / ADR-0025).
+///
+/// ```bash
+/// export LD_LIBRARY_PATH=/path/to/instantclient
+/// cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_schema_change_pause_run_and_inspect() {
+    let lab = lab_dir();
+    let store_url = "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop";
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "schema-change-pause",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario run schema-change-pause");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run schema-change-pause failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+    let run_lower = run_out.to_ascii_lowercase();
+    assert!(
+        run_lower.contains("warn")
+            && run_lower.contains("schema change")
+            && run_lower.contains("paused"),
+        "Scenario must WARN and pause on blocking DDL, got:\n{run_out}"
+    );
+    assert!(
+        !run_lower.contains("alert: poison")
+            && !run_out.contains("Quarantine:")
+            && run_lower.contains("not poison quarantine"),
+        "Scenario must stay distinct from poison quarantine, got:\n{run_out}"
+    );
+
+    let status = Command::new(bin())
+        .args(["status", "--platform-store-url", store_url])
+        .output()
+        .expect("status after schema-change-pause");
+    let status_out = String::from_utf8_lossy(&status.stdout);
+    assert!(status.status.success());
+    let status_lower = status_out.to_ascii_lowercase();
+    assert!(
+        (status_out.contains("Delivery Health: paused")
+            || status_lower.contains("delivery health: paused"))
+            && status_lower.contains("schema change")
+            && status_lower.contains("blocking"),
+        "status must show paused + Schema Change blocking, got:\n{status_out}"
+    );
+
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "schema-change-pause",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove schema-change-pause");
+    assert!(
+        remove.status.success(),
+        "lab scenario remove schema-change-pause failed: {}",
         String::from_utf8_lossy(&remove.stderr)
     );
 

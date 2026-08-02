@@ -1,0 +1,28 @@
+# Lab Scenario recipe (ADR-0025 / issue #23 / ADR-0009).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: schema-change-pause
+summary: Warn+pause affected Pipeline on blocking DDL schema impact; distinct from poison quarantine
+namespace:
+  source_tables:
+    - LAB_SC_CUSTOMERS
+  target_collections:
+    - lab_sc_customers
+  deployment: lab-schema-change-pause
+  pipelines:
+    - lab-sc-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery)
+    - mutate Source with real blocking DDL (DROP COLUMN NAME)
+    - sync with Schema Change event for that DDL (inject bridges LogMiner DDL capture gap)
+    - assert WARN + pause (not poison quarantine)
+    - assert status Delivery Health paused + Schema Change blocking visibility
+checks:
+  correctness:
+    - "Blocking DDL emits WARN and pauses the affected Pipeline"
+    - "sync does not quarantine / poison-pause the Pipeline"
+    - "status shows Delivery Health paused and Schema Change blocking (not quarantine unhealthy)"
+thresholds: {}

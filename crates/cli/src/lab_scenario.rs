@@ -121,6 +121,12 @@ const POISON_QUARANTINE_DEPLOYMENT: &str = "lab-poison-quarantine";
 const POISON_QUARANTINE_IDENTITY: &str = "1";
 const POISON_QUARANTINE_MAX_ATTEMPTS: &str = "2";
 
+const SCHEMA_CHANGE_PAUSE_ID: &str = "schema-change-pause";
+const SCHEMA_CHANGE_PAUSE_TABLE: &str = "LAB_SC_CUSTOMERS";
+const SCHEMA_CHANGE_PAUSE_COLLECTION: &str = "lab_sc_customers";
+const SCHEMA_CHANGE_PAUSE_PIPELINE: &str = "lab-sc-customers";
+const SCHEMA_CHANGE_PAUSE_DEPLOYMENT: &str = "lab-schema-change-pause";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -203,6 +209,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         REMOVE_PIPELINE_ID,
         CHANGE_PIPELINE_ID,
         POISON_QUARANTINE_ID,
+        SCHEMA_CHANGE_PAUSE_ID,
     ]
 }
 
@@ -242,6 +249,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             POISON_QUARANTINE_ID,
             "Poison Change quarantine on Operator status",
+        ),
+        (
+            SCHEMA_CHANGE_PAUSE_ID,
+            "Blocking DDL Schema Change warn+pause",
         ),
     ]
 }
@@ -535,6 +546,7 @@ async fn scenario_run(
         REMOVE_PIPELINE_ID => run_remove_pipeline(lab_dir).await,
         CHANGE_PIPELINE_ID => run_change_pipeline(lab_dir).await,
         POISON_QUARANTINE_ID => run_poison_quarantine(lab_dir).await,
+        SCHEMA_CHANGE_PAUSE_ID => run_schema_change_pause(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -625,6 +637,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         REMOVE_PIPELINE_ID => remove_remove_pipeline_namespace(lab_dir).await,
         CHANGE_PIPELINE_ID => remove_change_pipeline_namespace(lab_dir).await,
         POISON_QUARANTINE_ID => remove_poison_quarantine_namespace(lab_dir).await,
+        SCHEMA_CHANGE_PAUSE_ID => remove_schema_change_pause_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -3720,6 +3733,298 @@ EXIT;\n"
         .map_err(|err| {
             CliError::Failed(format!(
                 "Failed to drive Source mutations for poison-quarantine:\n{err}"
+            ))
+        })
+}
+
+/// Parse `checkpoint=N` from `migraloop status` Cutover lines.
+fn parse_capture_checkpoint(status_out: &str) -> Option<i64> {
+    for line in status_out.lines() {
+        if let Some(idx) = line.find("checkpoint=") {
+            let rest = &line[idx + "checkpoint=".len()..];
+            let token = rest
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .next()
+                .unwrap_or("");
+            if token == "(none)" {
+                continue;
+            }
+            if let Ok(n) = token.parse::<i64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+async fn run_schema_change_pause(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {SCHEMA_CHANGE_PAUSE_ID}");
+    println!(
+        "Scenario Namespace: table={SCHEMA_CHANGE_PAUSE_TABLE} \
+collection={SCHEMA_CHANGE_PAUSE_COLLECTION} deployment={SCHEMA_CHANGE_PAUSE_DEPLOYMENT}"
+    );
+
+    prepare_schema_change_pause_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, SCHEMA_CHANGE_PAUSE_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !apply_out.to_ascii_lowercase().contains("delivery") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
+        )));
+    }
+
+    let status_before = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let checkpoint = parse_capture_checkpoint(&status_before).ok_or_else(|| {
+        CliError::Failed(format!(
+            "could not parse capture checkpoint from status after apply:\n{status_before}"
+        ))
+    })?;
+    let inject_scn = checkpoint.saturating_add(1) as u64;
+
+    // Real Source DDL workload on the Lab Oracle (ADR-0025 Source-driving seam).
+    // LogMiner DDL contents are not yet reconstructed on the OCI path, so sync also
+    // receives the matching Schema Change event via MIGRALOOP_INJECT_SCHEMA_CHANGES
+    // (same class of test/Lab seam as MIGRALOOP_DELIVERY_POISON_IDENTITIES).
+    println!(
+        "Lab Scenario: driving Source DDL (DROP COLUMN NAME on {SCHEMA_CHANGE_PAUSE_TABLE})..."
+    );
+    mutate_schema_change_pause_source_ddl(lab_dir).await?;
+
+    let inject_path = lab_dir.join(".schema-change-pause-inject.json");
+    let inject_body = format!(
+        r#"{{
+  "changes": [
+    {{
+      "scn": {inject_scn},
+      "table": "{SCHEMA_CHANGE_PAUSE_TABLE}",
+      "schema": "SYNC_USER",
+      "kind": "drop_column",
+      "columns": ["NAME"],
+      "summary": "ALTER TABLE {SCHEMA_CHANGE_PAUSE_TABLE} DROP COLUMN NAME"
+    }}
+  ]
+}}"#
+    );
+    fs::write(&inject_path, inject_body).map_err(|err| {
+        CliError::Failed(format!(
+            "failed to write Schema Change inject file {}: {err}",
+            inject_path.display()
+        ))
+    })?;
+    let inject_str = inject_path.to_str().ok_or_else(|| {
+        CliError::Failed("Schema Change inject path is not valid UTF-8".to_string())
+    })?;
+
+    println!(
+        "Lab Scenario: sync Incremental Capture with Schema Change event for the Source DDL \
+         (drop managed NAME at scn={inject_scn}; inject bridges LogMiner DDL capture gap)..."
+    );
+    let sync_out = run_product_cli_with_env(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[("MIGRALOOP_INJECT_SCHEMA_CHANGES", inject_str)],
+    )
+    .await?;
+    let _ = fs::remove_file(&inject_path);
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+    let sync_lower = sync_out.to_ascii_lowercase();
+    if !(sync_lower.contains("warn")
+        && sync_lower.contains("schema change")
+        && sync_lower.contains("paused"))
+    {
+        return Err(CliError::Failed(format!(
+            "sync must WARN and pause on blocking Schema Change:\n{sync_out}"
+        )));
+    }
+    if sync_lower.contains("alert: poison") || sync_out.contains("Quarantine:") {
+        return Err(CliError::Failed(format!(
+            "blocking DDL pause must be distinct from poison quarantine:\n{sync_out}"
+        )));
+    }
+    if !sync_lower.contains("not poison quarantine") {
+        return Err(CliError::Failed(format!(
+            "blocking DDL pause should explicitly distinguish poison quarantine:\n{sync_out}"
+        )));
+    }
+
+    let status_out = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let status_lower = status_out.to_ascii_lowercase();
+    if !(status_out.contains(SCHEMA_CHANGE_PAUSE_PIPELINE)
+        && (status_out.contains("Delivery Health: paused")
+            || status_lower.contains("delivery health: paused"))
+        && status_lower.contains("schema change")
+        && status_lower.contains("blocking"))
+    {
+        return Err(CliError::Failed(format!(
+            "status must show Delivery Health paused + Schema Change blocking:\n{status_out}"
+        )));
+    }
+    if status_lower.contains("quarantine")
+        && !status_out.contains("Quarantine: (none)")
+        && status_lower.contains("unhealthy / not aligned")
+    {
+        return Err(CliError::Failed(format!(
+            "blocking DDL must not create poison quarantine rows:\n{status_out}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (blocking DDL warn+pause; distinct from poison quarantine)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_schema_change_pause_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={SCHEMA_CHANGE_PAUSE_TABLE}, collection={SCHEMA_CHANGE_PAUSE_COLLECTION}, \
+          deployment={SCHEMA_CHANGE_PAUSE_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {SCHEMA_CHANGE_PAUSE_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for schema-change-pause:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{SCHEMA_CHANGE_PAUSE_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for schema-change-pause:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, SCHEMA_CHANGE_PAUSE_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{SCHEMA_CHANGE_PAUSE_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_schema_change_pause_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_schema_change_pause_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {SCHEMA_CHANGE_PAUSE_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {SCHEMA_CHANGE_PAUSE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {SCHEMA_CHANGE_PAUSE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {SCHEMA_CHANGE_PAUSE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare schema-change-pause Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+/// Drive real blocking Source DDL for the Lab Scenario Namespace table.
+async fn mutate_schema_change_pause_source_ddl(lab_dir: &Path) -> Result<(), CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+ALTER TABLE {SCHEMA_CHANGE_PAUSE_TABLE} DROP COLUMN NAME;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source DDL for schema-change-pause:\n{err}"
             ))
         })
 }

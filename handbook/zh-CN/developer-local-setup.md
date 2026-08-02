@@ -58,6 +58,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run remove-pipeline
 ./target/debug/migraloop lab scenario run change-pipeline
 ./target/debug/migraloop lab scenario run poison-quarantine
+./target/debug/migraloop lab scenario run schema-change-pause
 # keep-on-finish 后 lab status 会标出 leftover Namespace；也可用 base / derived / target 查看。
 # 重跑会先 wipe Namespace；或：lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
@@ -169,7 +170,7 @@ Lab Fixture lifecycle seam（默认 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 与 poison-quarantine seams（默认 ignored；需要 Docker Lab Fixture + Instant Client）。这些是**手动 Lab** seams—不是 Release Quality Gate 证据，也不应接到 CI：
+Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine 与 schema-change-pause seams（默认 ignored；需要 Docker Lab Fixture + Instant Client）。这些是**手动 Lab** seams—不是 Release Quality Gate 证据，也不应接到 CI：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient

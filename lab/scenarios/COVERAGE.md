@@ -24,6 +24,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Dedicated Pipeline remove CLI verb | `remove-pipeline` |
 | Pipeline revision change via `apply` (Derived rebuild / metadata-only skip) | `change-pipeline` |
 | Poison Change quarantine on Operator `status` | `poison-quarantine` |
+| Blocking DDL Schema Change warn+pause | `schema-change-pause` |
 
 ## Visible gaps (not yet shipped)
 

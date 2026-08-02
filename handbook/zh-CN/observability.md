@@ -14,7 +14,7 @@ migraloop status
 - 每个 **Deployment**（Source/Target 标识、LogMiner 机制：contract 或 OCI）
 - 每条 **Pipeline**（mode、source 表、target collection、Delivery status）
 - 每个 **Base Dataset**（status、行数、列、省略的不支持类型、Initial Load / cutover watermarks、含 appliedChanges / lag / checkpoint 的 **Sync Health**）
-- 每条 Pipeline 的 **Delivery Health**（已应用变更 / status；有 Poison Change quarantine 时为 `unhealthy`）
+- 每条 Pipeline 的 **Delivery Health**（已应用变更 / status；有 Poison Change quarantine 时为 `unhealthy`；有 blocking Schema Change pause 时为 `paused`）
 - 作用中的 **Quarantine** 行（Output Identity、change id、attempts、last error — unhealthy / not aligned）
 - Transform Pipelines 的 **Derived Datasets**（若有）
 
@@ -25,6 +25,7 @@ migraloop status
 - Sync Health lag 趋向追上（不是长期单向增长）
 - 已配置 Target Binding 的 Delivery Health 显示成功应用（`ok`，不是 `unhealthy` quarantine）
 - Quarantine：`(none)`（除非刻意留下被 quarantine 的 poison identity）
+- Schema Change：`(none)`（除非刻意留下 blocking DDL pause）
 
 ## 更深的检查命令
 

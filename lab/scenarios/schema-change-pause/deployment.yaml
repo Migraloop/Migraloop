@@ -1,0 +1,31 @@
+# Lab Scenario: schema-change-pause
+# Self-contained Scenario Namespace for Local Sync Lab (ADR-0025 / issue #23).
+# Applied via the real product `migraloop apply` path — not contract/stub.
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-schema-change-pause
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-sc-customers
+      mode: direct
+      source:
+        table: LAB_SC_CUSTOMERS
+      target:
+        collection: lab_sc_customers
