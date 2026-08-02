@@ -51,7 +51,7 @@ fn divergent_locale_page_sets_fail() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("deployment.md") || combined.contains("locale parity"),
-        "expected a clear parity failure reason, got:\n{combined}"
+        combined.contains("missing deployment.md"),
+        "expected a page-set divergence reason naming deployment.md, got:\n{combined}"
     );
 }

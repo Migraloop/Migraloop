@@ -1,5 +1,5 @@
 # 從這裡開始
 
-從安裝到第一個 Pipeline 與健康檢查的精簡路徑。細節見各功能章節。
+從安裝到第一個 Pipeline 與 Sync Health / Delivery Health 檢查的精簡路徑。細節見各功能章節。
 
 _章節 stub — 完整內容於後續 handbook 票據補齊。_

@@ -82,7 +82,11 @@ fn check_locale_parity(handbook: &Path) -> Result<(), Vec<String>> {
 
     if pages_by_locale.len() == REQUIRED_LOCALES.len() {
         let canonical = &pages_by_locale["en"];
-        for locale in ["zh-TW", "zh-CN"] {
+        for locale in REQUIRED_LOCALES
+            .iter()
+            .copied()
+            .filter(|locale| *locale != "en")
+        {
             let pages = &pages_by_locale[locale];
             for missing in canonical.difference(pages) {
                 errors.push(format!(
