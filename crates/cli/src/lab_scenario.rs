@@ -4,7 +4,8 @@
 //! Source workload driving, one-at-a-time lock, and result reporting.
 //! Apply / Sync / inspect use the real product CLI path.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -49,7 +50,15 @@ pub enum ScenarioCommand {
 pub async fn run_scenario_command(command: ScenarioCommand) -> Result<(), CliError> {
     match command {
         ScenarioCommand::List { lab_dir } => {
-            let _ = lab_dir; // catalog is in-tree; lab_dir kept for CLI symmetry / future assets
+            // Validate --lab-dir early so operators get the same path contract as up/status/run.
+            let compose = lab_dir.join("compose.yaml");
+            if !compose.is_file() {
+                return Err(CliError::Failed(format!(
+                    "Lab compose file not found at {} \
+                     (pass --lab-dir pointing at the repo `lab/` directory, or run from the repo root)",
+                    compose.display()
+                )));
+            }
             scenario_list();
             Ok(())
         }
@@ -92,11 +101,13 @@ async fn scenario_run(scenario: &str, lab_dir: &Path) -> Result<(), CliError> {
 
     let lock = ScenarioLock::acquire(&lock_path, scenario)?;
     let started = Instant::now();
-    let result = match scenario {
-        DIRECT_PIPELINE_ID => run_direct_pipeline(lab_dir).await,
-        other => Err(CliError::Failed(format!(
-            "Lab Scenario `{other}` is listed but has no runner"
-        ))),
+    // Catalog membership already validated; dispatch by id.
+    let result = if scenario == DIRECT_PIPELINE_ID {
+        run_direct_pipeline(lab_dir).await
+    } else {
+        Err(CliError::Failed(format!(
+            "Lab Scenario `{scenario}` is listed but has no runner"
+        )))
     };
     let duration = started.elapsed();
     drop(lock);
@@ -250,20 +261,15 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
     )
     .await?;
 
-    let base_ok = base_after.contains("Alicia")
-        && base_after.contains("Carol")
-        && !base_after.contains("\"Bob\"")
-        && !base_after.contains("Bob");
-    // Target JSON may still mention non-managed noise; require Managed outcomes.
-    let target_ok = target_after.contains("Alicia")
-        && target_after.contains("Carol")
-        && !target_after.contains("Bob");
+    let base_ok = managed_name_present(&base_after, "Alicia")
+        && managed_name_present(&base_after, "Carol")
+        && !managed_name_present(&base_after, "Bob");
+    let target_ok = managed_name_present(&target_after, "Alicia")
+        && managed_name_present(&target_after, "Carol")
+        && !managed_name_present(&target_after, "Bob");
 
-    // Seed 2 + insert 1 + update 1 + delete 1 → count applied row operations for throughput.
-    let rows_applied = 2u64 // initial load rows delivered
-        + 1  // insert Carol
-        + 1  // update Alice→Alicia
-        + 1; // delete Bob
+    // Throughput signal from product apply/sync Delivery lines (not a hand-counted recipe).
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
 
     if !(base_ok && target_ok) {
         return Err(CliError::Failed(format!(
@@ -273,7 +279,6 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
 
     println!("Lab Scenario: correctness checks passed (Base + Target Managed outcomes)");
     if !sync_out.trim().is_empty() {
-        // Surface a short operator breadcrumb that the real capture path ran.
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
@@ -283,6 +288,54 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
         detail: String::new(),
         capture_path_note: capture_note,
     })
+}
+
+/// Managed NAME field presence in Base/Target JSON inspect output.
+fn managed_name_present(inspect: &str, name: &str) -> bool {
+    let patterns = [
+        format!("\"NAME\": \"{name}\""),
+        format!("\"NAME\":\"{name}\""),
+        format!("\"name\": \"{name}\""),
+        format!("\"name\":\"{name}\""),
+    ];
+    patterns.iter().any(|p| inspect.contains(p.as_str()))
+}
+
+/// Sum Delivery document ops reported on the product CLI path.
+fn count_delivery_ops(product_out: &str) -> u64 {
+    let mut total = 0u64;
+    for line in product_out.lines() {
+        if let Some(n) = parse_parenthetical_documents(line) {
+            total += n;
+            continue;
+        }
+        total += parse_labeled_u64(line, "upserts=");
+        total += parse_labeled_u64(line, "deletes=");
+    }
+    total
+}
+
+fn parse_parenthetical_documents(line: &str) -> Option<u64> {
+    // Delivery complete: Pipeline … (N documents)
+    let start = line.find('(')?;
+    let rest = &line[start + 1..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || !rest[digits.len()..].starts_with(" documents)") {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn parse_labeled_u64(line: &str, label: &str) -> u64 {
+    let Some(idx) = line.find(label) else {
+        return 0;
+    };
+    line[idx + label.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
 }
 
 fn deployment_config_path(lab_dir: &Path) -> Result<PathBuf, CliError> {
@@ -336,9 +389,9 @@ EXIT;\n"
                 Err(CliError::Failed(format!(
                     "Lab Scenario Namespace for `{DIRECT_PIPELINE_ID}` already present \
                      (table {DIRECT_PIPELINE_TABLE}). Finished runs leave the Namespace for \
-                     inspection; full re-run cleanup is `lab scenario remove` / re-run wipe \
-                     (see issue #61). Tear down with `migraloop lab down` or drop the table \
-                     manually before another run.\n{msg}"
+                     live inspection by default. Re-run wipe / manual Namespace remove are \
+                     tracked separately (issue #61). Until then: `migraloop lab down` or drop \
+                     the Oracle table manually before another run.\n{msg}"
                 )))
             } else {
                 Err(CliError::Failed(format!(
@@ -456,6 +509,7 @@ struct ScenarioLock {
 
 impl ScenarioLock {
     fn acquire(path: &Path, scenario: &str) -> Result<Self, CliError> {
+        // Drop stale locks (dead pid) before exclusive create.
         if let Some(existing) = read_active_lock(path)? {
             return Err(CliError::Failed(format!(
                 "Lab Scenario run rejected: another Scenario is active \
@@ -475,12 +529,33 @@ impl ScenarioLock {
         let json = serde_json::to_string_pretty(&body).map_err(|err| {
             CliError::Failed(format!("failed to serialize Scenario lock: {err}"))
         })?;
-        fs::write(path, format!("{json}\n")).map_err(|err| {
-            CliError::Failed(format!(
-                "failed to write Scenario lock {}: {err}",
-                path.display()
-            ))
-        })?;
+        // Exclusive create closes the TOCTOU race between runners.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    if let Ok(Some(existing)) = read_active_lock(path) {
+                        return CliError::Failed(format!(
+                            "Lab Scenario run rejected: another Scenario is active \
+                             (`{}` since unix {})",
+                            existing.scenario, existing.started_at_unix
+                        ));
+                    }
+                }
+                CliError::Failed(format!(
+                    "failed to acquire Scenario lock {}: {err}",
+                    path.display()
+                ))
+            })?;
+        file.write_all(format!("{json}\n").as_bytes())
+            .map_err(|err| {
+                CliError::Failed(format!(
+                    "failed to write Scenario lock {}: {err}",
+                    path.display()
+                ))
+            })?;
         Ok(Self {
             path: path.to_path_buf(),
         })
