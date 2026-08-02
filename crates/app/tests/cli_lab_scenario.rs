@@ -1,8 +1,9 @@
-//! Operator-visible seam: Lab Scenario list / run (Direct Pipeline MVP).
+//! Operator-visible seam: Lab Scenario list / run / remove (Namespace cleanup).
 //!
-//! Agreed seam (issue #60 / PRD #55): CLI Lab Scenario commands. Always-on tests
-//! cover catalog listing, help surface, and one-at-a-time rejection. Full Scenario
-//! run against the Lab Fixture is ignored by default (Docker + Instant Client).
+//! Agreed seam (issues #60–#61 / PRD #55): CLI Lab Scenario commands. Always-on
+//! tests cover catalog listing, help surface, one-at-a-time rejection, and
+//! Namespace cleanup control surface. Full Scenario run / re-run / remove against
+//! the Lab Fixture is ignored by default (Docker + Instant Client).
 
 use std::fs;
 use std::process::Command;
@@ -15,6 +16,16 @@ fn bin() -> String {
 fn lab_dir() -> String {
     let manifest = env!("CARGO_MANIFEST_DIR");
     format!("{manifest}/../../lab")
+}
+
+/// Isolated `--lab-dir` with a stub `compose.yaml` so parallel lock tests do not
+/// race on `lab/.migraloop-scenario.lock`.
+fn temp_lab_dir() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("temp lab dir");
+    fs::write(dir.path().join("compose.yaml"), "name: migraloop-lab-test\n")
+        .expect("write stub compose.yaml");
+    let path = dir.path().to_string_lossy().into_owned();
+    (dir, path)
 }
 
 #[tokio::test]
@@ -89,7 +100,7 @@ async fn lab_scenario_run_unknown_id_fails() {
 
 #[tokio::test]
 async fn lab_scenario_run_rejects_when_another_is_active() {
-    let lab = lab_dir();
+    let (_tmp, lab) = temp_lab_dir();
     let lock_path = format!("{lab}/.migraloop-scenario.lock");
     let pid = std::process::id();
     let started = SystemTime::now()
@@ -114,8 +125,6 @@ async fn lab_scenario_run_rejects_when_another_is_active() {
         String::from_utf8_lossy(&run.stderr)
     );
 
-    let _ = fs::remove_file(&lock_path);
-
     assert!(
         !run.status.success(),
         "second Scenario run should be rejected while one is active, got:\n{out}"
@@ -127,6 +136,116 @@ async fn lab_scenario_run_rejects_when_another_is_active() {
     assert!(
         out.contains("direct-pipeline"),
         "rejection should name the active Scenario, got:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn lab_scenario_help_lists_remove() {
+    let help = Command::new(bin())
+        .args(["lab", "scenario", "--help"])
+        .output()
+        .expect("run lab scenario --help");
+    assert!(
+        help.status.success(),
+        "lab scenario --help failed: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        stdout.contains("remove"),
+        "lab scenario --help should list `remove`, got:\n{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn lab_scenario_run_help_lists_auto_remove() {
+    let help = Command::new(bin())
+        .args(["lab", "scenario", "run", "--help"])
+        .output()
+        .expect("run lab scenario run --help");
+    assert!(
+        help.status.success(),
+        "lab scenario run --help failed: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        stdout.contains("--auto-remove"),
+        "lab scenario run --help should list --auto-remove, got:\n{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn lab_scenario_remove_unknown_id_fails() {
+    let remove = Command::new(bin())
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "not-a-real-scenario",
+            "--lab-dir",
+            &lab_dir(),
+        ])
+        .output()
+        .expect("remove unknown scenario");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert!(
+        !remove.status.success(),
+        "unknown scenario remove should fail, got success:\n{out}"
+    );
+    assert!(
+        out.to_ascii_lowercase().contains("unknown")
+            || out.contains("not-a-real-scenario")
+            || out.contains("Lab Scenario"),
+        "expected clear unknown-scenario error, got:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn lab_scenario_remove_rejects_when_another_is_active() {
+    let (_tmp, lab) = temp_lab_dir();
+    let lock_path = format!("{lab}/.migraloop-scenario.lock");
+    let pid = std::process::id();
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    fs::write(
+        &lock_path,
+        format!(
+            "{{\"scenario\":\"direct-pipeline\",\"pid\":{pid},\"started_at_unix\":{started}}}\n"
+        ),
+    )
+    .expect("write scenario lock");
+
+    let remove = Command::new(bin())
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "direct-pipeline",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("remove with active lock");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    assert!(
+        !remove.status.success(),
+        "scenario remove should be rejected while a run is active, got:\n{out}"
+    );
+    assert!(
+        out.contains("rejected") || out.to_ascii_lowercase().contains("active"),
+        "expected one-at-a-time rejection message, got:\n{out}"
     );
 }
 
@@ -250,6 +369,137 @@ async fn lab_scenario_direct_pipeline_run_and_inspect() {
     assert!(
         !std::path::Path::new(&lock_path).exists(),
         "finished Scenario must release the active-run lock (Namespace stays)"
+    );
+    assert!(
+        run_out.contains("namespace=left in place")
+            || run_out.to_ascii_lowercase().contains("left in place"),
+        "default completed run must keep Namespace, got:\n{run_out}"
+    );
+
+    // Re-run same Scenario: full Namespace remove before recreate must succeed.
+    let rerun = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args(["lab", "scenario", "run", "direct-pipeline", "--lab-dir", &lab])
+        .output()
+        .expect("lab scenario re-run");
+    let rerun_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rerun.stdout),
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    assert!(
+        rerun.status.success(),
+        "lab scenario re-run should wipe Namespace then succeed:\n{rerun_out}"
+    );
+    assert!(
+        rerun_out.contains("Lab Scenario: PASS"),
+        "expected re-run PASS, got:\n{rerun_out}"
+    );
+
+    // Manual remove clears Namespace without starting a run.
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "direct-pipeline",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove");
+    let remove_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert!(
+        remove.status.success(),
+        "lab scenario remove failed:\n{remove_out}"
+    );
+    assert!(
+        remove_out.to_ascii_lowercase().contains("removed")
+            || remove_out.contains("Namespace"),
+        "manual remove should report Namespace removal, got:\n{remove_out}"
+    );
+
+    let base_gone = Command::new(bin())
+        .args([
+            "base",
+            "--platform-store-url",
+            store_url,
+            "--table",
+            "LAB_DP_CUSTOMERS",
+        ])
+        .output()
+        .expect("base after remove");
+    let base_gone_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&base_gone.stdout),
+        String::from_utf8_lossy(&base_gone.stderr)
+    );
+    assert!(
+        !base_gone.status.success()
+            || (!base_gone_out.contains("Alicia") && !base_gone_out.contains("Carol")),
+        "Base Namespace rows should be gone after manual remove, got:\n{base_gone_out}"
+    );
+
+    // Opt-in auto-remove: completed run deletes Namespace.
+    let auto = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "direct-pipeline",
+            "--auto-remove",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario run --auto-remove");
+    let auto_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&auto.stdout),
+        String::from_utf8_lossy(&auto.stderr)
+    );
+    assert!(
+        auto.status.success(),
+        "lab scenario run --auto-remove failed:\n{auto_out}"
+    );
+    assert!(
+        auto_out.contains("Lab Scenario: PASS"),
+        "expected auto-remove run PASS, got:\n{auto_out}"
+    );
+    assert!(
+        auto_out.contains("namespace=removed")
+            || auto_out.to_ascii_lowercase().contains("auto-remove"),
+        "auto-remove run should report Namespace removed, got:\n{auto_out}"
+    );
+
+    let base_auto = Command::new(bin())
+        .args([
+            "base",
+            "--platform-store-url",
+            store_url,
+            "--table",
+            "LAB_DP_CUSTOMERS",
+        ])
+        .output()
+        .expect("base after auto-remove");
+    let base_auto_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&base_auto.stdout),
+        String::from_utf8_lossy(&base_auto.stderr)
+    );
+    assert!(
+        !base_auto.status.success()
+            || (!base_auto_out.contains("Alicia") && !base_auto_out.contains("Carol")),
+        "Base Namespace rows should be gone after --auto-remove, got:\n{base_auto_out}"
     );
 
     let _ = Command::new(bin())

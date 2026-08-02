@@ -110,7 +110,8 @@ migraloop lab up [--lab-dir lab]
 migraloop lab status [--lab-dir lab]
 migraloop lab down [--lab-dir lab]
 migraloop lab scenario list [--lab-dir lab]
-migraloop lab scenario run <scenario-id> [--lab-dir lab]
+migraloop lab scenario run <scenario-id> [--lab-dir lab] [--auto-remove]
+migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 ```
 
 | Subcommand | Meaning |
@@ -119,11 +120,13 @@ migraloop lab scenario run <scenario-id> [--lab-dir lab]
 | `status` | Report Fixture readiness (engines + Oracle prerequisites + Platform Store). Shows `Deployment: (none)` / `Pipeline: (none)` until you apply config or run a Lab Scenario |
 | `down` | Tear down containers and volumes |
 | `scenario list` | List selectable Lab Scenarios in the catalog (for example `direct-pipeline`) |
-| `scenario run` | Run one Lab Scenario by id. Rejects if another Scenario run is active. Reports pass/fail plus `duration_ms` and rows/throughput. Leaves the Scenario Namespace in place for live `base`/`target` inspection (cleanup/re-run wipe is a separate control) |
+| `scenario run` | Run one Lab Scenario by id. Rejects if another Scenario run is active. Re-running the same Scenario fully removes its Namespace before recreate. Reports pass/fail plus `duration_ms` and rows/throughput. Default keep-on-finish leaves the Namespace for live `base`/`target` inspection; pass `--auto-remove` to delete it after a successful run |
+| `scenario remove` | Fully remove a Scenario Namespace (Source table, Target collection, Platform Store Deployment) without starting a run. Rejects if another Scenario is active. Idempotent when already absent |
 
 | Flag | Meaning |
 | --- | --- |
 | `--lab-dir` | Directory containing Lab `compose.yaml` (default: `lab`) |
+| `--auto-remove` | On `scenario run` only: after a successful run, fully remove the Scenario Namespace (opt-in; failures still keep the Namespace for debugging) |
 
 Lab is manual verification—not the Release Quality Gate and not the contract/stub LogMiner harness. See [Deployment](deployment.md) and [Developer local setup](developer-local-setup.md).
 

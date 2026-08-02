@@ -258,6 +258,23 @@ pub async fn health(database_url: &str) -> PlatformStoreHealth {
     }
 }
 
+/// Delete a Deployment and cascaded Platform Store state (Pipelines, Bases, Derived).
+///
+/// Idempotent: missing Deployments are a no-op success so Lab Namespace cleanup
+/// and re-run wipe can call this unconditionally.
+pub async fn delete_deployment(
+    database_url: &str,
+    deployment_name: &str,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    sqlx::query("DELETE FROM deployments WHERE name = $1")
+        .bind(deployment_name)
+        .execute(&pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
 /// Create or update a Deployment. Secrets are stored only as references.
 pub async fn upsert_deployment(
     database_url: &str,

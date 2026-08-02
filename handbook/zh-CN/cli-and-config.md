@@ -110,7 +110,8 @@ migraloop lab up [--lab-dir lab]
 migraloop lab status [--lab-dir lab]
 migraloop lab down [--lab-dir lab]
 migraloop lab scenario list [--lab-dir lab]
-migraloop lab scenario run <scenario-id> [--lab-dir lab]
+migraloop lab scenario run <scenario-id> [--lab-dir lab] [--auto-remove]
+migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 ```
 
 | Subcommand | 含义 |
@@ -119,11 +120,13 @@ migraloop lab scenario run <scenario-id> [--lab-dir lab]
 | `status` | 报告 Fixture 就绪状态（engines + Oracle prerequisites + Platform Store）。在你套用配置或运行 Lab Scenario 之前显示 `Deployment: (none)` / `Pipeline: (none)` |
 | `down` | 拆除 containers 与 volumes |
 | `scenario list` | 列出 catalog 中可选的 Lab Scenarios（例如 `direct-pipeline`） |
-| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。回报 pass/fail 以及 `duration_ms` 与 rows/throughput。结束后默认保留 Scenario Namespace，供实时 `base`/`target` 检查（cleanup／re-run wipe 为另一组控制） |
+| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms` 与 rows/throughput。默认 keep-on-finish 保留 Namespace 供实时 `base`/`target` 检查；成功后若要删除可传 `--auto-remove` |
+| `scenario remove` | 完整移除 Scenario Namespace（Source table、Target collection、Platform Store Deployment），且不启动 run。若已有 Scenario 作用中则拒绝。已不存在时为 idempotent |
 
 | Flag | 含义 |
 | --- | --- |
 | `--lab-dir` | 含 Lab `compose.yaml` 的目录（默认：`lab`） |
+| `--auto-remove` | 仅用于 `scenario run`：成功结束后完整移除 Scenario Namespace（opt-in；失败时仍保留 Namespace 以便调试） |
 
 Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogMiner harness。见 [Deployment](deployment.md) 与 [Developer local setup](developer-local-setup.md)。
 

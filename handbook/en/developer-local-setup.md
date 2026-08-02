@@ -48,6 +48,7 @@ cargo build -p migraloop-app
 # Scenario apply/sync needs Instant Client: export LD_LIBRARY_PATH=/path/to/instantclient
 ./target/debug/migraloop lab scenario run direct-pipeline
 # Inspect leftover Scenario Namespace with migraloop base / target, or mutate Lab DBs directly.
+# Re-run wipes Namespace first; or: lab scenario remove direct-pipeline / run --auto-remove
 ./target/debug/migraloop lab down
 ```
 

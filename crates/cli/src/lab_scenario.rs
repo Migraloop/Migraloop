@@ -1,7 +1,8 @@
-//! Lab Scenario catalog and run orchestration (issue #60 / ADR-0025).
+//! Lab Scenario catalog, run orchestration, and Namespace cleanup (issues #60–#61 / ADR-0025).
 //!
-//! Lab-specific machinery: catalog listing, Scenario Namespace lifecycle prep,
-//! Source workload driving, one-at-a-time lock, and result reporting.
+//! Lab-specific machinery: catalog listing, Scenario Namespace lifecycle
+//! (prepare / re-run wipe / manual remove / opt-in auto-remove), Source workload
+//! driving, one-at-a-time lock, and result reporting.
 //! Apply / Sync / inspect use the real product CLI path.
 
 use std::fs::{self, OpenOptions};
@@ -14,11 +15,12 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::lab::{
-    ensure_fixture_ready_for_scenario, lab_migraloop_bin, sqlplus_in_oracle, LAB_MONGO_PASSWORD_DEFAULT,
-    LAB_MONGO_PASSWORD_ENV, LAB_ORACLE_PASSWORD_DEFAULT, LAB_ORACLE_PASSWORD_ENV,
-    LAB_ORACLE_USER, LAB_PLATFORM_STORE_URL,
+    ensure_fixture_ready_for_scenario, lab_migraloop_bin, mongosh_in_mongo, sqlplus_in_oracle,
+    LAB_MONGO_PASSWORD_DEFAULT, LAB_MONGO_PASSWORD_ENV, LAB_ORACLE_PASSWORD_DEFAULT,
+    LAB_ORACLE_PASSWORD_ENV, LAB_ORACLE_USER, LAB_PLATFORM_STORE_URL,
 };
 use crate::CliError;
+use migraloop_platform_store::delete_deployment;
 
 const LOCK_FILE_NAME: &str = ".migraloop-scenario.lock";
 
@@ -44,6 +46,17 @@ pub enum ScenarioCommand {
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
         lab_dir: PathBuf,
+        /// After a successful run, fully remove the Scenario Namespace (opt-in; default keep)
+        #[arg(long)]
+        auto_remove: bool,
+    },
+    /// Fully remove a Scenario Namespace without starting a run
+    Remove {
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`)
+        scenario: String,
+        /// Directory containing Lab `compose.yaml` (default: ./lab)
+        #[arg(long, default_value = "lab")]
+        lab_dir: PathBuf,
     },
 }
 
@@ -62,7 +75,14 @@ pub async fn run_scenario_command(command: ScenarioCommand) -> Result<(), CliErr
             scenario_list();
             Ok(())
         }
-        ScenarioCommand::Run { scenario, lab_dir } => scenario_run(&scenario, &lab_dir).await,
+        ScenarioCommand::Run {
+            scenario,
+            lab_dir,
+            auto_remove,
+        } => scenario_run(&scenario, &lab_dir, auto_remove).await,
+        ScenarioCommand::Remove { scenario, lab_dir } => {
+            scenario_remove(&scenario, &lab_dir).await
+        }
     }
 }
 
@@ -77,7 +97,11 @@ fn scenario_list() {
     }
 }
 
-async fn scenario_run(scenario: &str, lab_dir: &Path) -> Result<(), CliError> {
+async fn scenario_run(
+    scenario: &str,
+    lab_dir: &Path,
+    auto_remove: bool,
+) -> Result<(), CliError> {
     let entry = catalog()
         .iter()
         .find(|(id, _)| *id == scenario)
@@ -110,23 +134,69 @@ async fn scenario_run(scenario: &str, lab_dir: &Path) -> Result<(), CliError> {
         )))
     };
     let duration = started.elapsed();
-    drop(lock);
 
     match result {
         Ok(report) => {
-            print_scenario_report(entry.0, true, duration, &report);
+            let mut namespace_removed = false;
+            if auto_remove {
+                // Opt-in cleanup after success only — failures keep Namespace for debug (US35).
+                remove_scenario_namespace(scenario, lab_dir).await?;
+                namespace_removed = true;
+            }
+            drop(lock);
+            print_scenario_report(entry.0, true, duration, &report, namespace_removed);
             Ok(())
         }
         Err(err) => {
+            drop(lock);
             let report = ScenarioReport {
                 correctness: false,
                 rows_applied: 0,
                 detail: err.to_string(),
                 capture_path_note: String::new(),
             };
-            print_scenario_report(entry.0, false, duration, &report);
+            print_scenario_report(entry.0, false, duration, &report, false);
             Err(err)
         }
+    }
+}
+
+async fn scenario_remove(scenario: &str, lab_dir: &Path) -> Result<(), CliError> {
+    catalog()
+        .iter()
+        .find(|(id, _)| *id == scenario)
+        .ok_or_else(|| {
+            CliError::Failed(format!(
+                "Unknown Lab Scenario `{scenario}`. Run `migraloop lab scenario list`."
+            ))
+        })?;
+
+    let lock_path = lab_dir.join(LOCK_FILE_NAME);
+    if let Some(existing) = read_active_lock(&lock_path)? {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario remove rejected: another Scenario is active \
+             (`{}` since unix {})",
+            existing.scenario, existing.started_at_unix
+        )));
+    }
+
+    ensure_fixture_ready_for_scenario(lab_dir).await?;
+
+    let lock = ScenarioLock::acquire(&lock_path, scenario)?;
+    remove_scenario_namespace(scenario, lab_dir).await?;
+    drop(lock);
+
+    println!("Lab Scenario Namespace removed: {scenario}");
+    Ok(())
+}
+
+async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(), CliError> {
+    if scenario == DIRECT_PIPELINE_ID {
+        remove_direct_pipeline_namespace(lab_dir).await
+    } else {
+        Err(CliError::Failed(format!(
+            "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
+        )))
     }
 }
 
@@ -142,6 +212,7 @@ fn print_scenario_report(
     overall_pass: bool,
     duration: Duration,
     report: &ScenarioReport,
+    namespace_removed: bool,
 ) {
     let duration_ms = duration.as_millis();
     let rows_per_s = if duration.as_secs_f64() > 0.0 {
@@ -167,9 +238,13 @@ fn print_scenario_report(
     if !report.detail.is_empty() && outcome == "FAIL" {
         println!("  detail={}", report.detail);
     }
-    println!(
-        "  namespace=left in place (inspect with `migraloop base` / `migraloop target`)"
-    );
+    if namespace_removed {
+        println!("  namespace=removed (--auto-remove)");
+    } else {
+        println!(
+            "  namespace=left in place (inspect with `migraloop base` / `migraloop target`)"
+        );
+    }
 }
 
 async fn run_direct_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
@@ -353,21 +428,62 @@ fn deployment_config_path(lab_dir: &Path) -> Result<PathBuf, CliError> {
     Ok(path)
 }
 
-async fn prepare_direct_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    // Self-contained Namespace prep. Re-run wipe-before-recreate is issue #61;
-    // if leftovers exist, fail with a clear operator message.
+/// Fully remove Direct Pipeline Scenario Namespace (Source table, Target collection,
+/// Platform Store Deployment + cascaded Bases/Pipelines). Idempotent.
+async fn remove_direct_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={DIRECT_PIPELINE_TABLE}, collection={DIRECT_PIPELINE_COLLECTION}, \
+          deployment={DIRECT_PIPELINE_DEPLOYMENT})"
+    );
+
     let sql = format!(
         "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
 WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-DECLARE\n\
-  c NUMBER;\n\
 BEGIN\n\
-  SELECT COUNT(*) INTO c FROM user_tables WHERE table_name = '{DIRECT_PIPELINE_TABLE}';\n\
-  IF c > 0 THEN\n\
-    RAISE_APPLICATION_ERROR(-20001, 'Scenario Namespace table {DIRECT_PIPELINE_TABLE} already exists');\n\
-  END IF;\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {DIRECT_PIPELINE_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
 END;\n\
 /\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table {DIRECT_PIPELINE_TABLE}:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{DIRECT_PIPELINE_COLLECTION}').drop()");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection {DIRECT_PIPELINE_COLLECTION}:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, DIRECT_PIPELINE_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{DIRECT_PIPELINE_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_direct_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    // Re-run wipe-before-recreate: fully remove leftovers, then create fresh Namespace.
+    remove_direct_pipeline_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
 CREATE TABLE {DIRECT_PIPELINE_TABLE} (\n\
   ID NUMBER(10) PRIMARY KEY,\n\
   NAME VARCHAR2(100) NOT NULL,\n\
@@ -381,25 +497,14 @@ COMMIT;\n\
 EXIT;\n"
     );
     let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    match sqlplus_in_oracle(lab_dir, &connect, &sql).await {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            let msg = err.to_string();
-            if msg.contains("ORA-20001") || msg.contains("already exists") {
-                Err(CliError::Failed(format!(
-                    "Lab Scenario Namespace for `{DIRECT_PIPELINE_ID}` already present \
-                     (table {DIRECT_PIPELINE_TABLE}). Finished runs leave the Namespace for \
-                     live inspection by default. Re-run wipe / manual Namespace remove are \
-                     tracked separately (issue #61). Until then: `migraloop lab down` or drop \
-                     the Oracle table manually before another run.\n{msg}"
-                )))
-            } else {
-                Err(CliError::Failed(format!(
-                    "Failed to prepare Direct Pipeline Scenario Namespace:\n{msg}"
-                )))
-            }
-        }
-    }
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare Direct Pipeline Scenario Namespace:\n{err}"
+            ))
+        })
 }
 
 async fn mutate_direct_pipeline_source(lab_dir: &Path) -> Result<(), CliError> {
@@ -512,7 +617,7 @@ impl ScenarioLock {
         // Drop stale locks (dead pid) before exclusive create.
         if let Some(existing) = read_active_lock(path)? {
             return Err(CliError::Failed(format!(
-                "Lab Scenario run rejected: another Scenario is active \
+                "Lab Scenario rejected: another Scenario is active \
                  (`{}` since unix {})",
                 existing.scenario, existing.started_at_unix
             )));
@@ -538,7 +643,7 @@ impl ScenarioLock {
                 if err.kind() == std::io::ErrorKind::AlreadyExists {
                     if let Ok(Some(existing)) = read_active_lock(path) {
                         return CliError::Failed(format!(
-                            "Lab Scenario run rejected: another Scenario is active \
+                            "Lab Scenario rejected: another Scenario is active \
                              (`{}` since unix {})",
                             existing.scenario, existing.started_at_unix
                         ));

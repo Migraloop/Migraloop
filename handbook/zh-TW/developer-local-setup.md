@@ -48,6 +48,7 @@ cargo build -p migraloop-app
 # Scenario apply/sync 需要 Instant Client：export LD_LIBRARY_PATH=/path/to/instantclient
 ./target/debug/migraloop lab scenario run direct-pipeline
 # 用 migraloop base / target 檢視留下的 Scenario Namespace，或直接變更 Lab DB。
+# 重跑會先 wipe Namespace；或：lab scenario remove direct-pipeline / run --auto-remove
 ./target/debug/migraloop lab down
 ```
 
