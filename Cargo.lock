@@ -1405,6 +1405,7 @@ dependencies = [
  "migraloop-capture",
  "migraloop-delivery",
  "migraloop-platform-store",
+ "migraloop-transform",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1440,6 +1441,11 @@ dependencies = [
 [[package]]
 name = "migraloop-transform"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "mio"

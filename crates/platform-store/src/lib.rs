@@ -104,7 +104,7 @@ impl FieldMappingAs {
 }
 
 /// A Pipeline declared inside a Deployment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pipeline {
     pub deployment_name: String,
     pub name: String,
@@ -120,6 +120,30 @@ pub struct Pipeline {
     /// Per-field Managed mapping overrides (`string` / `omit`) keyed by column name.
     #[serde(default)]
     pub field_mappings: std::collections::BTreeMap<String, FieldMappingAs>,
+    /// Transform Pipeline Output Identity field names (empty for Direct).
+    #[serde(default)]
+    pub output_identity: Vec<String>,
+    /// Declarative Rich Transform JSON (null/empty for Direct).
+    #[serde(default)]
+    pub transform_json: Option<serde_json::Value>,
+}
+
+/// Platform-managed Derived Dataset for one Transform Pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedDataset {
+    pub deployment_name: String,
+    pub pipeline_name: String,
+    pub status: String,
+    pub output_identity: Vec<String>,
+    pub columns: Vec<BaseColumn>,
+    pub row_count: i32,
+}
+
+/// One row stored in a Derived Dataset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DerivedRow {
+    pub row_ordinal: i32,
+    pub data: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Supported column kept in a Base Dataset.
@@ -316,13 +340,21 @@ pub async fn replace_pipelines(
     for pipeline in pipelines {
         let field_mappings_json = serde_json::to_string(&pipeline.field_mappings)
             .map_err(PlatformStoreError::InvalidJson)?;
+        let output_identity_json = serde_json::to_string(&pipeline.output_identity)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        let transform_json = match &pipeline.transform_json {
+            Some(value) => {
+                serde_json::to_string(value).map_err(PlatformStoreError::InvalidJson)?
+            }
+            None => "null".to_string(),
+        };
         sqlx::query(
             r#"
             INSERT INTO pipelines (
                 deployment_name, name, mode, source_table, source_schema,
                 target_collection, delivery_status, delivery_applied_changes,
-                field_mappings_json, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+                field_mappings_json, output_identity_json, transform_json, applied_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -334,6 +366,8 @@ pub async fn replace_pipelines(
         .bind(&pipeline.delivery_status)
         .bind(pipeline.delivery_applied_changes)
         .bind(&field_mappings_json)
+        .bind(&output_identity_json)
+        .bind(&transform_json)
         .execute(&mut *tx)
         .await
         .map_err(PlatformStoreError::Persist)?;
@@ -465,7 +499,7 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
         r#"
         SELECT deployment_name, name, mode, source_table, source_schema,
                target_collection, delivery_status, delivery_applied_changes,
-               field_mappings_json
+               field_mappings_json, output_identity_json, transform_json
         FROM pipelines
         ORDER BY deployment_name, name
         "#,
@@ -719,12 +753,23 @@ struct PipelineRow {
     delivery_status: String,
     delivery_applied_changes: i32,
     field_mappings_json: String,
+    output_identity_json: String,
+    transform_json: String,
 }
 
 impl PipelineRow {
     fn into_pipeline(self) -> Result<Pipeline, PlatformStoreError> {
         let field_mappings = serde_json::from_str(&self.field_mappings_json)
             .map_err(PlatformStoreError::InvalidJson)?;
+        let output_identity = serde_json::from_str(&self.output_identity_json)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        let transform_value: serde_json::Value = serde_json::from_str(&self.transform_json)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        let transform_json = if transform_value.is_null() {
+            None
+        } else {
+            Some(transform_value)
+        };
         Ok(Pipeline {
             deployment_name: self.deployment_name,
             name: self.name,
@@ -735,6 +780,8 @@ impl PipelineRow {
             delivery_status: self.delivery_status,
             delivery_applied_changes: self.delivery_applied_changes,
             field_mappings,
+            output_identity,
+            transform_json,
         })
     }
 }
@@ -982,6 +1029,220 @@ impl BaseRowDb {
                 PlatformStoreError::NotFound("stored Base row is not a JSON object".to_string())
             })?;
         Ok(BaseRow {
+            row_ordinal: self.row_ordinal,
+            data,
+        })
+    }
+}
+
+/// Persist a Derived Dataset snapshot (metadata + rows) for a Transform Pipeline.
+pub async fn replace_derived_dataset(
+    database_url: &str,
+    dataset: &DerivedDataset,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM derived_rows
+        WHERE deployment_name = $1 AND pipeline_name = $2
+        "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.pipeline_name)
+    .execute(&mut *tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    let output_identity_json = serde_json::to_string(&dataset.output_identity)
+        .map_err(PlatformStoreError::InvalidJson)?;
+    let columns_json =
+        serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO derived_datasets (
+            deployment_name, pipeline_name, status,
+            output_identity_json, columns_json, row_count, materialized_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, now())
+        ON CONFLICT (deployment_name, pipeline_name) DO UPDATE SET
+            status = EXCLUDED.status,
+            output_identity_json = EXCLUDED.output_identity_json,
+            columns_json = EXCLUDED.columns_json,
+            row_count = EXCLUDED.row_count,
+            materialized_at = now()
+        "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.pipeline_name)
+    .bind(&dataset.status)
+    .bind(&output_identity_json)
+    .bind(&columns_json)
+    .bind(dataset.row_count)
+    .execute(&mut *tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    for (ordinal, row) in rows.iter().enumerate() {
+        let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
+        sqlx::query(
+            r#"
+            INSERT INTO derived_rows (
+                deployment_name, pipeline_name, row_ordinal, row_json
+            ) VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.pipeline_name)
+        .bind(ordinal as i32)
+        .bind(&row_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    }
+
+    tx.commit().await.map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+/// List Derived Datasets ordered by deployment then Pipeline name.
+pub async fn list_derived_datasets(
+    database_url: &str,
+) -> Result<Vec<DerivedDataset>, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let rows = sqlx::query_as::<_, DerivedDatasetRow>(
+        r#"
+        SELECT deployment_name, pipeline_name, status,
+               output_identity_json, columns_json, row_count
+        FROM derived_datasets
+        ORDER BY deployment_name, pipeline_name
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+
+    rows.into_iter()
+        .map(DerivedDatasetRow::into_derived_dataset)
+        .collect()
+}
+
+/// Load Derived Dataset rows for one Pipeline.
+pub async fn get_derived_rows(
+    database_url: &str,
+    pipeline_name: &str,
+    deployment_name: Option<&str>,
+) -> Result<(DerivedDataset, Vec<DerivedRow>), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+
+    let dataset_row = if let Some(deployment) = deployment_name {
+        sqlx::query_as::<_, DerivedDatasetRow>(
+            r#"
+            SELECT deployment_name, pipeline_name, status,
+                   output_identity_json, columns_json, row_count
+            FROM derived_datasets
+            WHERE deployment_name = $1 AND pipeline_name = $2
+            "#,
+        )
+        .bind(deployment)
+        .bind(pipeline_name)
+        .fetch_optional(&pool)
+        .await
+        .map_err(PlatformStoreError::Load)?
+    } else {
+        let matches = sqlx::query_as::<_, DerivedDatasetRow>(
+            r#"
+            SELECT deployment_name, pipeline_name, status,
+                   output_identity_json, columns_json, row_count
+            FROM derived_datasets
+            WHERE pipeline_name = $1
+            ORDER BY deployment_name
+            "#,
+        )
+        .bind(pipeline_name)
+        .fetch_all(&pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+        match matches.len() {
+            0 => None,
+            1 => matches.into_iter().next(),
+            _ => {
+                return Err(PlatformStoreError::NotFound(format!(
+                    "multiple Derived Datasets named {pipeline_name}; pass deployment to disambiguate"
+                )));
+            }
+        }
+    };
+
+    let dataset_row = dataset_row.ok_or_else(|| {
+        PlatformStoreError::NotFound(format!(
+            "no Derived Dataset found for Pipeline {pipeline_name}"
+        ))
+    })?;
+    let dataset = dataset_row.into_derived_dataset()?;
+
+    let row_dbs = sqlx::query_as::<_, DerivedRowDb>(
+        r#"
+        SELECT row_ordinal, row_json
+        FROM derived_rows
+        WHERE deployment_name = $1 AND pipeline_name = $2
+        ORDER BY row_ordinal
+        "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.pipeline_name)
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+
+    let rows = row_dbs
+        .into_iter()
+        .map(DerivedRowDb::into_derived_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((dataset, rows))
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DerivedDatasetRow {
+    deployment_name: String,
+    pipeline_name: String,
+    status: String,
+    output_identity_json: String,
+    columns_json: String,
+    row_count: i32,
+}
+
+impl DerivedDatasetRow {
+    fn into_derived_dataset(self) -> Result<DerivedDataset, PlatformStoreError> {
+        Ok(DerivedDataset {
+            deployment_name: self.deployment_name,
+            pipeline_name: self.pipeline_name,
+            status: self.status,
+            output_identity: serde_json::from_str(&self.output_identity_json)
+                .map_err(PlatformStoreError::InvalidJson)?,
+            columns: serde_json::from_str(&self.columns_json)
+                .map_err(PlatformStoreError::InvalidJson)?,
+            row_count: self.row_count,
+        })
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DerivedRowDb {
+    row_ordinal: i32,
+    row_json: String,
+}
+
+impl DerivedRowDb {
+    fn into_derived_row(self) -> Result<DerivedRow, PlatformStoreError> {
+        let value: serde_json::Value =
+            serde_json::from_str(&self.row_json).map_err(PlatformStoreError::InvalidJson)?;
+        let data = value.as_object().cloned().ok_or_else(|| {
+            PlatformStoreError::NotFound("stored Derived row is not a JSON object".to_string())
+        })?;
+        Ok(DerivedRow {
             row_ordinal: self.row_ordinal,
             data,
         })
