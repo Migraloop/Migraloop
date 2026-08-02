@@ -18,7 +18,7 @@
 
 真實 Oracle host 的 **Initial Load**（schema discovery + snapshot）與 **LogMiner Incremental Capture** 都走 **OCI** 路徑。若 runtime 沒有 Oracle Instant Client / OCI libraries，apply/sync 會以 LogMiner/OCI 名稱 fail fast—不會默默退回 stub catalog。對 live Source 執行前請安裝 Instant Client（Basic 或 Basic Light），並將 `LD_LIBRARY_PATH` 指向其目錄。
 
-在 live Source 上，Pipeline 的 `source.schema` 選擇 Oracle owner；省略時平台以 Source `username`（大寫）作為預設 schema。contract/stub harness 會忽略 schema，僅在 CI 切片使用 fixture catalog—不是 Lab／真實路徑的定義真相。
+在 live Source 上，Pipeline 的 `source.schema` 選擇 Oracle owner；省略時平台以 Source `username`（大寫）作為預設 schema。contract/stub harness 會忽略 schema，僅在 CI 切片使用 **contract Source catalog**（預設命名 fixtures 供情境測試；可選 `MIGRALOOP_CONTRACT_SOURCE_CATALOG` JSON merge 注入任意資料表）—不是 Lab／真實路徑的定義真相，也不是受支援的 production Source 機制。
 
 ## Source Prerequisites（Oracle / LogMiner）
 
@@ -68,8 +68,9 @@ Live OCI probe 要求 **ARCHIVELOG** 模式。可讀時會回報可用 archived-
 | 變數 | 意義 | 預設 |
 | --- | --- | --- |
 | `MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING` | database supplemental logging 的 `on` / `off` | `on` |
-| `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all`、空字串，或已啟用 PK/ALL logging 的逗號分隔資料表 | `all` |
+| `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all`（目前 contract Source catalog 內所有資料表）、空字串，或已啟用 PK/ALL logging 的逗號分隔資料表 | `all` |
 | `MIGRALOOP_STUB_REDO_RETENTION_HOURS` | 回報的 redo retention（小時） | `72` |
+| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | JSON 檔路徑，merge/override contract catalog 資料表以供 schema discovery + Initial Load（僅 CI／本機切片） | 未設定（僅預設命名 fixtures） |
 
 ## Required Privileges
 

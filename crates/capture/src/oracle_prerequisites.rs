@@ -138,10 +138,16 @@ pub fn probe_oracle_source_prerequisites_stub() -> OracleSourcePrerequisiteState
 }
 
 fn stub_all_known_tables() -> BTreeSet<String> {
-    ["CUSTOMERS", "ORDERS", "EVENTS", "ACCOUNTS"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    // "all" follows the process contract catalog so injected tables (issue #40)
+    // satisfy supplemental-logging probes without a hard-coded business list.
+    match crate::load_contract_source_catalog() {
+        Ok(catalog) => catalog.table_names().into_iter().collect(),
+        // Bad env JSON: fall back to default named fixtures only (not a closed match arm).
+        Err(_) => crate::ContractSourceCatalog::with_default_fixtures()
+            .table_names()
+            .into_iter()
+            .collect(),
+    }
 }
 
 #[cfg(test)]

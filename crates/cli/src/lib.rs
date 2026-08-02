@@ -667,7 +667,7 @@ async fn ensure_base_primary_key(
 
 /// Load Source schema metadata for apply-time Managed field validation.
 ///
-/// Real Oracle hosts use OCI discovery; contract/stub hosts use the fixture catalog.
+/// Real Oracle hosts use OCI discovery; contract/stub hosts use the contract catalog.
 fn source_columns_for_pipeline(
     deployment: &Deployment,
     schema: &str,
@@ -1243,7 +1243,7 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
 
     // Apply-time Managed validation before Initial Load / Delivery so unsafe NUMBER
     // and unsupported Managed inputs fail configure-time (ADR-0018 / ADR-0023).
-    // Real Oracle hosts discover schema via OCI; contract/stub use the fixture catalog.
+    // Real Oracle hosts discover schema via OCI; contract/stub use the contract catalog.
     for pipeline in &pipelines {
         let source_columns = source_columns_for_pipeline(
             &deployment,
