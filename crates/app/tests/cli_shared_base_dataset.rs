@@ -3,8 +3,8 @@
 //! Agreed seam (issue #15 / PRD / ADR-0019 / ADR-0007): two Pipelines that
 //! reference the same Source table share one Base Dataset (single Sync), not
 //! per-Pipeline copies. Status/store show a single Base; both Pipelines Deliver
-//! from that shared Base. Verified via CLI config/status/target — not private
-//! module internals.
+//! from that shared Base. Verified via CLI config/status/base/target — not
+//! private module internals.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -116,6 +116,7 @@ fn one_customers_pipeline() -> &'static str {
 "#
 }
 
+/// Two Direct Pipelines → different Target collections, same Source table.
 fn two_pipelines_same_customers_table() -> &'static str {
     r#"    - name: customers
       mode: direct
@@ -123,12 +124,12 @@ fn two_pipelines_same_customers_table() -> &'static str {
         table: CUSTOMERS
       target:
         collection: customers
-    - name: customers_mirror
+    - name: customers_reporting
       mode: direct
       source:
         table: CUSTOMERS
       target:
-        collection: customers_mirror
+        collection: customers_reporting
 "#
 }
 
@@ -189,6 +190,52 @@ fn count_base_dataset_lines(status_out: &str, table: &str) -> usize {
         .count()
 }
 
+fn base_row_count_from_status(status_out: &str, table: &str) -> i32 {
+    let marker = format!("Base Dataset: {table}");
+    for line in status_out.lines() {
+        if !line.contains(&marker) {
+            continue;
+        }
+        for part in line.split_whitespace() {
+            if let Some(rows) = part.strip_prefix("rows=") {
+                return rows
+                    .parse()
+                    .unwrap_or_else(|_| panic!("invalid rows= in status line: {line}"));
+            }
+        }
+        panic!("Base Dataset line missing rows= for {table}: {line}");
+    }
+    panic!("missing Base Dataset line for {table} in:\n{status_out}");
+}
+
+/// Operator-facing Platform Store inspect (`migraloop base`).
+fn inspect_base(url: &str, table: &str) -> String {
+    let base = Command::new(bin())
+        .args(["base", "--platform-store-url", url, "--table", table])
+        .output()
+        .expect("run base");
+    assert!(
+        base.status.success(),
+        "base inspect failed for {table}: stdout={} stderr={}",
+        String::from_utf8_lossy(&base.stdout),
+        String::from_utf8_lossy(&base.stderr)
+    );
+    let out = String::from_utf8_lossy(&base.stdout).into_owned();
+    assert!(
+        !out.to_lowercase().contains("multiple base datasets"),
+        "store must not hold per-Pipeline Base copies for {table}, got:\n{out}"
+    );
+    let header_count = out
+        .lines()
+        .filter(|line| line.contains(&format!("Base Dataset: {table}")))
+        .count();
+    assert_eq!(
+        header_count, 1,
+        "store inspect must return a single Base Dataset for {table}, got:\n{out}"
+    );
+    out
+}
+
 fn inspect_target(url: &str, collection: &str) -> String {
     let target = Command::new(bin())
         .env("MONGO_PASSWORD", "mongo-secret-value")
@@ -222,7 +269,7 @@ fn assert_customers_delivered(collection_out: &str, collection: &str) {
 }
 
 /// Match `Delivery complete: Pipeline <name>` without treating `customers` as a
-/// prefix of `customers_mirror`.
+/// prefix of `customers_reporting`.
 fn delivery_complete_for(stdout: &str, pipeline: &str) -> bool {
     let needle = format!("Delivery complete: Pipeline {pipeline} ");
     stdout.contains(&needle)
@@ -250,11 +297,11 @@ async fn two_pipelines_same_table_share_one_base_and_both_deliver() {
 
     let apply_out = migrate_and_apply(&url, &config);
 
-    let il_count = apply_out
+    let initial_load_count = apply_out
         .matches("Initial Load complete: Base Dataset CUSTOMERS")
         .count();
     assert_eq!(
-        il_count, 1,
+        initial_load_count, 1,
         "same Source table must Initial Load once (shared Base), got:\n{apply_out}"
     );
     assert!(
@@ -262,30 +309,37 @@ async fn two_pipelines_same_table_share_one_base_and_both_deliver() {
         "first Pipeline must Deliver from shared Base, got:\n{apply_out}"
     );
     assert!(
-        delivery_complete_for(&apply_out, "customers_mirror"),
+        delivery_complete_for(&apply_out, "customers_reporting"),
         "second Pipeline must Deliver from shared Base, got:\n{apply_out}"
     );
 
     let status_out = status(&url);
     assert!(
         status_has_pipeline(&status_out, "customers")
-            && status_has_pipeline(&status_out, "customers_mirror"),
+            && status_has_pipeline(&status_out, "customers_reporting"),
         "status must list both Pipelines, got:\n{status_out}"
     );
     assert_eq!(
         count_base_dataset_lines(&status_out, "CUSTOMERS"),
         1,
-        "status/store must show a single Base Dataset for CUSTOMERS, got:\n{status_out}"
+        "status must show a single Base Dataset for CUSTOMERS, got:\n{status_out}"
     );
     assert!(
         !status_out.contains("Base Dataset: ORDERS"),
         "no other Base Datasets expected, got:\n{status_out}"
     );
 
+    // Store seam: operator `base` inspect resolves one Base Dataset for the table.
+    let base_out = inspect_base(&url, "CUSTOMERS");
+    assert!(
+        base_out.contains("Alice") && base_out.contains("alice@example.com"),
+        "shared Base must hold CUSTOMERS fixture rows, got:\n{base_out}"
+    );
+
     let customers = inspect_target(&url, "customers");
-    let mirror = inspect_target(&url, "customers_mirror");
+    let reporting = inspect_target(&url, "customers_reporting");
     assert_customers_delivered(&customers, "customers");
-    assert_customers_delivered(&mirror, "customers_mirror");
+    assert_customers_delivered(&reporting, "customers_reporting");
 }
 
 /// Runtime-add second Pipeline on an already-loaded table: reuse Base, no reload.
@@ -316,9 +370,11 @@ async fn runtime_add_second_pipeline_reuses_existing_base_for_same_table() {
         1,
         "exactly one CUSTOMERS Base before runtime add, got:\n{before}"
     );
+    let rows_before = base_row_count_from_status(&before, "CUSTOMERS");
+    let base_before = inspect_base(&url, "CUSTOMERS");
     assert!(
-        !status_has_pipeline(&before, "customers_mirror"),
-        "mirror Pipeline must not exist yet, got:\n{before}"
+        !status_has_pipeline(&before, "customers_reporting"),
+        "reporting Pipeline must not exist yet, got:\n{before}"
     );
 
     let second = write_config(
@@ -329,36 +385,49 @@ async fn runtime_add_second_pipeline_reuses_existing_base_for_same_table() {
     let second_apply = apply(&url, &second);
 
     assert!(
-        second_apply.contains("Runtime Pipeline add: customers_mirror (source=CUSTOMERS)"),
+        second_apply.contains("Runtime Pipeline add: customers_reporting (source=CUSTOMERS)"),
         "expected runtime add of second Pipeline on shared table, got:\n{second_apply}"
     );
     assert!(
         !second_apply.contains("Initial Load complete: Base Dataset CUSTOMERS"),
         "second Pipeline must reuse existing Base (no Initial Load), got:\n{second_apply}"
     );
+    // ADR-0007: unchanged already-delivered Pipelines keep running without re-Delivery.
     assert!(
         !delivery_complete_for(&second_apply, "customers"),
         "unchanged already-delivered Pipeline must not re-Deliver, got:\n{second_apply}"
     );
     assert!(
-        delivery_complete_for(&second_apply, "customers_mirror"),
+        delivery_complete_for(&second_apply, "customers_reporting"),
         "new Pipeline must Deliver from the shared Base, got:\n{second_apply}"
     );
 
     let after = status(&url);
     assert!(
         status_has_pipeline(&after, "customers")
-            && status_has_pipeline(&after, "customers_mirror"),
+            && status_has_pipeline(&after, "customers_reporting"),
         "both Pipelines must be present after runtime add, got:\n{after}"
     );
     assert_eq!(
         count_base_dataset_lines(&after, "CUSTOMERS"),
         1,
-        "status/store must still show a single Base Dataset for CUSTOMERS, got:\n{after}"
+        "status must still show a single Base Dataset for CUSTOMERS, got:\n{after}"
+    );
+    assert_eq!(
+        base_row_count_from_status(&after, "CUSTOMERS"),
+        rows_before,
+        "shared Base row count must be unchanged after second Pipeline reuses it"
+    );
+
+    let base_after = inspect_base(&url, "CUSTOMERS");
+    assert_eq!(
+        base_before.lines().next(),
+        base_after.lines().next(),
+        "store Base header must be unchanged when second Pipeline reuses it:\nbefore={base_before}\nafter={base_after}"
     );
 
     let customers = inspect_target(&url, "customers");
-    let mirror = inspect_target(&url, "customers_mirror");
+    let reporting = inspect_target(&url, "customers_reporting");
     assert_customers_delivered(&customers, "customers");
-    assert_customers_delivered(&mirror, "customers_mirror");
+    assert_customers_delivered(&reporting, "customers_reporting");
 }
