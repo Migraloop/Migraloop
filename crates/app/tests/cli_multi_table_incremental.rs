@@ -284,15 +284,20 @@ async fn multi_table_customers_and_orders_incremental_settle_to_correct_outcomes
         "customers Target must delete Bob document, got:\n{customers_target}"
     );
 
-    // ORDERS stub batch: ADDRESS-only then AMOUNT 42.50→50.00 for order 100 → sum 60.00.
+    // ORDERS stub batch: ADDRESS-only, AMOUNT 42.50→50.00 (customer 1 → 60.00),
+    // then CUSTOMER_ID group-key move order 200: customer 2 → 3 (sum 5.00).
     let derived_after = inspect_derived(&url, "order-totals");
     assert!(
         derived_after.contains("60.00"),
         "order-totals Derived must settle to customer 1 sum 60.00 after multi-table sync, got:\n{derived_after}"
     );
     assert!(
-        derived_after.contains("5.00"),
-        "customer 2 sum must remain 5.00, got:\n{derived_after}"
+        derived_after.contains("\"CUSTOMER_ID\": 3") && derived_after.contains("5.00"),
+        "group-key move must settle customer 3 sum 5.00, got:\n{derived_after}"
+    );
+    assert!(
+        !derived_after.contains("\"CUSTOMER_ID\": 2"),
+        "old identity customer 2 must be gone after group-key move, got:\n{derived_after}"
     );
     assert!(
         !derived_after.contains("52.50"),
@@ -305,7 +310,11 @@ async fn multi_table_customers_and_orders_incremental_settle_to_correct_outcomes
         "order_totals Target must Deliver settled TOTAL_AMOUNT for customer 1, got:\n{totals_target}"
     );
     assert!(
-        totals_target.contains("5.00") || totals_target.contains("5"),
-        "order_totals Target must keep customer 2 total, got:\n{totals_target}"
+        totals_target.contains("\"_id\": 3"),
+        "order_totals Target must upsert new Output Identity 3, got:\n{totals_target}"
+    );
+    assert!(
+        !totals_target.contains("\"_id\": 2"),
+        "order_totals Target must delete old Output Identity 2, got:\n{totals_target}"
     );
 }
