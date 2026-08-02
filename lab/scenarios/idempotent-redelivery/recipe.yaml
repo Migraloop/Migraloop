@@ -1,0 +1,27 @@
+# Lab Scenario recipe (ADR-0025 / issue #86 / PRD #55 US49).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: idempotent-redelivery
+summary: Idempotent re-delivery / duplicate-safe Delivery (real apply/sync)
+namespace:
+  source_tables:
+    - LAB_IR_CUSTOMERS
+  target_collections:
+    - lab_ir_customers
+  deployment: lab-idempotent-redelivery
+  pipelines:
+    - lab-ir-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery)
+    - mutate Source insert/update/delete
+    - sync Incremental Capture + Delivery via real LogMiner path
+    - plant non-Managed Target field, then force duplicate-safe re-Delivery via real apply path
+checks:
+  correctness:
+    - "After duplicate-safe re-Delivery: Target Managed NAME Alicia and Carol present; Bob absent"
+    - "Target document count unchanged after re-Delivery (no duplicate Output Identities)"
+    - "Non-Managed operatorNote preserved across Managed-field upsert re-Delivery"
+thresholds: {}

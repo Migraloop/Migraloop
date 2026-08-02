@@ -52,6 +52,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run bulk-load
+./target/debug/migraloop lab scenario run idempotent-redelivery
 # lab status names leftover Namespace after keep-on-finish; also inspect with base / derived / target.
 # Re-run wipes Namespace first; or: lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
@@ -132,7 +133,7 @@ Lab Fixture lifecycle seam (ignored by default; requires Docker Compose + Lab Or
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline, Rich Transform `project`/`filter`, multi-table Transform Pipeline, concurrent Source workload, and bulk-load seams (ignored by default; requires Docker Lab Fixture + Instant Client):
+Lab Scenario Direct Pipeline, Rich Transform `project`/`filter`, multi-table Transform Pipeline, concurrent Source workload, bulk-load, and idempotent-redelivery seams (ignored by default; requires Docker Lab Fixture + Instant Client):
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
