@@ -83,7 +83,23 @@ migraloop target --collection lab_escape_customers   # Delivery 跑完後
 migraloop sync                                       # 可選的 Incremental Capture 後續
 ```
 
-可選的 dump 工具還原使用**相同**的 Lab 連線細節（對 `127.0.0.1` Lab ports 跑 `impdp`／`mongorestore`／client GUI）。請只在可拋棄 Fixture 上載入—絕不要把此 escape hatch 指向客戶／正式環境 engines。若要打包好的 correctness + metrics recipe，請優先用 Lab Scenarios；當你已有 SQL／JS／dumps 要自行放入 Lab 資料庫時，再用此路徑。
+**可選的 dump 工具還原**（相同 Lab 連線細節；仍不是 Scenario／不是 CI）。因 Lab Compose 使用 `network_mode: host`，host 工具可連 `127.0.0.1` Lab ports：
+
+```bash
+# MongoDB archive → Lab Mongo（範例；依 dump 路徑／ns 調整）
+mongorestore \
+  --uri 'mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin' \
+  --archive=your-lab-seed.archive
+
+# Oracle Data Pump → Lab Oracle（需能連到 Lab 的 client；
+# 可拋棄 image 的 SYS 密碼為 lab_oracle_sys — 僅供 Lab）
+impdp SYNC_USER/lab_oracle@//127.0.0.1:1521/FREEPDB1 \
+  DUMPFILE=your_lab_seed.dmp DIRECTORY=DATA_PUMP_DIR TABLE_EXISTS_ACTION=REPLACE
+```
+
+若 dump restore 進 Lab Oracle 且之後要 sync，請套用 table-level supplemental logging（同 `oracle-load.sql`），再以綁定 Lab 的 Deployment 走一般 `migraloop apply`／`status`／`base`／`target`／`sync`。非 Delivery-managed 的 Target 端 load/restore 請用 Lab Mongo URI 以 mongosh 檢視；`migraloop target` 用於 product Delivery 之後的 collections。
+
+請只在可拋棄 Fixture 上載入—絕不要把此 escape hatch 指向客戶／正式環境 engines。若要打包好的 correctness + metrics recipe，請優先用 Lab Scenarios；當你已有 SQL／JS／dumps 要自行放入 Lab 資料庫時，再用此路徑。
 
 ## Runtime 模型
 

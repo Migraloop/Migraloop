@@ -15,5 +15,7 @@ Files:
 | File | Role |
 | --- | --- |
 | `oracle-load.sql` | Create/load `LAB_ESCAPE_CUSTOMERS` + table supplemental logging |
-| `mongo-load.js` | Seed `lab_escape_manual` for Target-side inspect |
+| `mongo-load.js` | Seed `lab_escape_manual` for Target-side mongosh inspect |
 | `deployment.yaml` | Lab-only Deployment so product apply/sync/inspect can follow an Oracle load |
+
+Dump-tool restore skeletons (`mongorestore` / `impdp` against Lab `127.0.0.1` ports) are in the handbook Deployment chapter.

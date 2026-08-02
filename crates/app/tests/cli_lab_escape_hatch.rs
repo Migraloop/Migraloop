@@ -25,6 +25,43 @@ fn escape_hatch_dir() -> PathBuf {
     lab_dir().join("escape-hatch")
 }
 
+/// Documented compose-exec with stdin payload (sqlplus / mongosh escape-hatch load).
+fn compose_exec_stdin(lab: &PathBuf, service_args: &[&str], stdin: &[u8]) -> (bool, String) {
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "compose",
+        "-f",
+        lab.join("compose.yaml").to_str().unwrap(),
+        "-p",
+        "migraloop-lab",
+        "exec",
+        "-T",
+    ]);
+    for arg in service_args {
+        cmd.arg(arg);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn compose exec");
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(stdin)
+            .expect("write stdin");
+    }
+    let out = child.wait_with_output().expect("compose exec wait");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
 #[test]
 fn escape_hatch_package_is_not_a_scenario_recipe() {
     let dir = escape_hatch_dir();
@@ -177,57 +214,18 @@ async fn lab_db_level_load_then_product_status_inspect_path() {
 
     // Documented Oracle load: sqlplus inside Lab Oracle (no BYO production engine).
     let oracle_sql = fs::read(escape.join("oracle-load.sql")).expect("oracle-load.sql bytes");
-    let mut oracle = Command::new("docker");
-    oracle
-        .args([
-            "compose",
-            "-f",
-            lab.join("compose.yaml").to_str().unwrap(),
-            "-p",
-            "migraloop-lab",
-            "exec",
-            "-T",
-            "oracle",
-            "sqlplus",
-            "-s",
-            "SYNC_USER/lab_oracle@FREEPDB1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut oracle_child = oracle.spawn().expect("spawn sqlplus load");
-    {
-        use std::io::Write;
-        oracle_child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(&oracle_sql)
-            .expect("write sql");
-    }
-    let oracle_out = oracle_child.wait_with_output().expect("sqlplus wait");
-    let oracle_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&oracle_out.stdout),
-        String::from_utf8_lossy(&oracle_out.stderr)
+    let (oracle_ok, oracle_text) = compose_exec_stdin(
+        &lab,
+        &["oracle", "sqlplus", "-s", "SYNC_USER/lab_oracle@FREEPDB1"],
+        &oracle_sql,
     );
-    assert!(
-        oracle_out.status.success(),
-        "documented Oracle load failed:\n{oracle_text}"
-    );
+    assert!(oracle_ok, "documented Oracle load failed:\n{oracle_text}");
 
     // Documented Mongo load: mongosh inside Lab Mongo (stdin script).
     let mongo_js = fs::read(escape.join("mongo-load.js")).expect("mongo-load.js bytes");
-    let mut mongo = Command::new("docker");
-    mongo
-        .args([
-            "compose",
-            "-f",
-            lab.join("compose.yaml").to_str().unwrap(),
-            "-p",
-            "migraloop-lab",
-            "exec",
-            "-T",
+    let (mongo_ok, mongo_text) = compose_exec_stdin(
+        &lab,
+        &[
             "mongo",
             "mongosh",
             "--quiet",
@@ -240,29 +238,13 @@ async fn lab_db_level_load_then_product_status_inspect_path() {
             "--authenticationDatabase",
             "admin",
             "lab",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut mongo_child = mongo.spawn().expect("spawn mongosh load");
-    {
-        use std::io::Write;
-        mongo_child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(&mongo_js)
-            .expect("write js");
-    }
-    let mongo_out = mongo_child.wait_with_output().expect("mongosh wait");
-    let mongo_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&mongo_out.stdout),
-        String::from_utf8_lossy(&mongo_out.stderr)
+        ],
+        &mongo_js,
     );
+    assert!(mongo_ok, "documented Mongo load failed:\n{mongo_text}");
     assert!(
-        mongo_out.status.success(),
-        "documented Mongo load failed:\n{mongo_text}"
+        mongo_text.contains("lab_escape_manual") || mongo_text.contains("count="),
+        "Mongo load should report seeded collection, got:\n{mongo_text}"
     );
 
     // Continue on the real product path (not a Lab Scenario).
@@ -335,6 +317,46 @@ async fn lab_db_level_load_then_product_status_inspect_path() {
     assert!(
         base_text.contains("Alice") || base_text.contains("alice") || base_text.contains("1"),
         "base inspect should show loaded Source rows, got:\n{base_text}"
+    );
+
+    let target = Command::new(bin())
+        .args([
+            "target",
+            "--collection",
+            "lab_escape_customers",
+            "--platform-store-url",
+            store_url,
+        ])
+        .output()
+        .expect("migraloop target");
+    let target_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&target.stdout),
+        String::from_utf8_lossy(&target.stderr)
+    );
+    assert!(
+        target.status.success(),
+        "product target inspect after escape-hatch Delivery failed:\n{target_text}"
+    );
+    assert!(
+        target_text.contains("Alice") || target_text.contains("alice") || target_text.contains("1"),
+        "target inspect should show Delivered rows from Oracle load, got:\n{target_text}"
+    );
+
+    let sync = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args(["sync", "--platform-store-url", store_url])
+        .output()
+        .expect("migraloop sync");
+    let sync_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&sync.stdout),
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    assert!(
+        sync.status.success(),
+        "product sync after escape-hatch load failed:\n{sync_text}"
     );
 
     // Keep Fixture up for follow-on manual work; do not lab down here.

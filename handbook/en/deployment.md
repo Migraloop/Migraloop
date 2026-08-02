@@ -83,7 +83,23 @@ migraloop target --collection lab_escape_customers   # after Delivery has run
 migraloop sync                                       # optional Incremental Capture follow-up
 ```
 
-Optional dump-tool restores use the **same** Lab connection details (`impdp` / `mongorestore` / client GUI against `127.0.0.1` Lab ports). Keep loads on the disposable Fixture only—never point this escape hatch at customer/production engines. Prefer Lab Scenarios when you want a packaged correctness + metrics recipe; use this path when you already have SQL/JS/dumps to place into Lab databases yourself.
+**Optional dump-tool restore** (same Lab connection details; still not a Scenario / not CI). Host tools talk to Lab ports on `127.0.0.1` because Lab Compose uses `network_mode: host`:
+
+```bash
+# MongoDB archive → Lab Mongo (example; adjust dump path / ns)
+mongorestore \
+  --uri 'mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin' \
+  --archive=your-lab-seed.archive
+
+# Oracle Data Pump → Lab Oracle (run from a client with network access to Lab;
+# SYS password for the disposable image is lab_oracle_sys — Lab-only)
+impdp SYNC_USER/lab_oracle@//127.0.0.1:1521/FREEPDB1 \
+  DUMPFILE=your_lab_seed.dmp DIRECTORY=DATA_PUMP_DIR TABLE_EXISTS_ACTION=REPLACE
+```
+
+After a dump restore into Lab Oracle tables you intend to sync, apply table-level supplemental logging (as `oracle-load.sql` does), then use ordinary `migraloop apply` / `status` / `base` / `target` / `sync` with a Lab-bound Deployment. Target-side loads/restores that are not Delivery-managed are inspected with mongosh against the Lab Mongo URI; `migraloop target` inspects collections after product Delivery.
+
+Keep loads on the disposable Fixture only—never point this escape hatch at customer/production engines. Prefer Lab Scenarios when you want a packaged correctness + metrics recipe; use this path when you already have SQL/JS/dumps to place into Lab databases yourself.
 
 ## Runtime model
 
