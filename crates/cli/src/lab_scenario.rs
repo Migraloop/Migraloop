@@ -2980,6 +2980,13 @@ collection={IDEMPOTENT_REDELIVERY_COLLECTION} deployment={IDEMPOTENT_REDELIVERY_
             "Lab Scenario re-apply must not reload Base (expected Delivery-only re-run):\n{reapply_out}"
         )));
     }
+    let redelivery_ops = count_delivery_ops(&reapply_out);
+    if redelivery_ops < 2 {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario re-apply must re-Deliver current Base Output Identities \
+             (expected ≥2 Delivery ops, got {redelivery_ops}):\n{reapply_out}"
+        )));
+    }
 
     let base_after = run_product_cli(
         &bin,
