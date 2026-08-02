@@ -1,0 +1,45 @@
+# Lab Scenario: transform-pipeline
+# Multi-table Scenario Namespace: customers (Direct) + orders (Transform groupBy/sum).
+# Applied via the real product `migraloop apply` path — not contract/stub.
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-transform-pipeline
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-tp-customers
+      mode: direct
+      source:
+        table: LAB_TP_CUSTOMERS
+      target:
+        collection: lab_tp_customers
+    - name: lab-tp-order-totals
+      mode: transform
+      source:
+        table: LAB_TP_ORDERS
+      target:
+        collection: lab_tp_order_totals
+      outputIdentity: [CUSTOMER_ID]
+      transform:
+        - groupBy:
+            keys: [CUSTOMER_ID]
+            aggregates:
+              - op: sum
+                field: AMOUNT
+                as: TOTAL_AMOUNT

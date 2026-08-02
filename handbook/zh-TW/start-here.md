@@ -19,7 +19,7 @@ docker compose up -d --build
 
 Compose 會為 app 設定 `MIGRALOOP_PLATFORM_STORE_URL`。entrypoint 執行 `migraloop run`（啟動時 migrate，然後維持行程）。
 
-若要可拋棄的 **Local Sync Lab** Fixture（Oracle + MongoDB + Platform Store + app，無預設 Deployment/Pipelines）：`migraloop lab up` / `status` / `down`。可選的 **Lab Scenarios**（例如 `migraloop lab scenario list` / `run direct-pipeline`）會在 Scenario Namespace 內走真實 apply/sync；重跑會先 wipe Namespace，另可用 `scenario remove` / `--auto-remove` 清理 — 見 [Deployment](deployment.md) 與 [CLI 與 Config 參考](cli-and-config.md)。
+若要可拋棄的 **Local Sync Lab** Fixture（Oracle + MongoDB + Platform Store + app，無預設 Deployment/Pipelines）：`migraloop lab up` / `status` / `down`。可選的 **Lab Scenarios**（例如 `migraloop lab scenario list` / `run direct-pipeline` / `run transform-pipeline`）會在 Scenario Namespace 內走真實 apply/sync；重跑會先 wipe Namespace，另可用 `scenario remove` / `--auto-remove` 清理 — 見 [Deployment](deployment.md) 與 [CLI 與 Config 參考](cli-and-config.md)。
 
 細節：[Deployment](deployment.md) · 旗標與環境變數：[CLI 與 Config 參考](cli-and-config.md) · 密鑰/TLS：[Security](security.md)
 

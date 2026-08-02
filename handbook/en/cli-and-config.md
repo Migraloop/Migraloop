@@ -119,9 +119,9 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `up` | Bring up the disposable Fixture; print connection details when ready |
 | `status` | Report Fixture readiness (engines + Oracle prerequisites + Platform Store). Shows `Deployment: (none)` / `Pipeline: (none)` until you apply config or run a Lab Scenario |
 | `down` | Tear down containers and volumes |
-| `scenario list` | List selectable Lab Scenarios in the catalog (for example `direct-pipeline`) |
-| `scenario run` | Run one Lab Scenario by id. Rejects if another Scenario run is active. Re-running the same Scenario fully removes its Namespace before recreate. Reports pass/fail plus `duration_ms` and rows/throughput. Default keep-on-finish leaves the Namespace for live `base`/`target` inspection; pass `--auto-remove` to delete it after a successful run |
-| `scenario remove` | Fully remove a Scenario Namespace (Source table, Target collection, Platform Store Deployment) without starting a run. Rejects if another Scenario is active. Idempotent when already absent |
+| `scenario list` | List selectable Lab Scenarios in the catalog (for example `direct-pipeline`, `transform-pipeline`) |
+| `scenario run` | Run one Lab Scenario by id. Rejects if another Scenario run is active. Re-running the same Scenario fully removes its Namespace before recreate. Reports pass/fail plus `duration_ms` and rows/throughput (correctness and operational metrics with equal weight). Default keep-on-finish leaves the Namespace for live `base`/`derived`/`target` inspection; pass `--auto-remove` to delete it after a successful run |
+| `scenario remove` | Fully remove a Scenario Namespace (Source tables, Target collections, Platform Store Deployment) without starting a run. Rejects if another Scenario is active. Idempotent when already absent |
 
 | Flag | Meaning |
 | --- | --- |
