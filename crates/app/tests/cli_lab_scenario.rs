@@ -1,14 +1,15 @@
 //! Operator-visible seam: Lab Scenario list / run / remove (Namespace cleanup).
 //!
-//! Agreed seam (issues #60–#64, #63 / PRD #55): CLI Lab Scenario commands.
-//! Always-on tests cover catalog listing (including bulk-load), help surface,
-//! one-at-a-time rejection, Namespace cleanup control surface, and CLI-seam
-//! bulk-load correctness-fail / metrics-fail probes
-//! (`MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE`). Full Scenario run / re-run /
-//! remove against the Lab Fixture is ignored by default (Docker + Instant
-//! Client).
+//! Agreed seam (issues #60–#65, #63 / PRD #55): CLI Lab Scenario commands.
+//! Always-on tests cover catalog listing from on-disk `recipe.yaml` packages
+//! (including bulk-load), help surface, one-at-a-time rejection, Namespace
+//! cleanup control surface, and CLI-seam bulk-load correctness-fail /
+//! metrics-fail probes (`MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE`). Full Scenario
+//! run / re-run / remove against the Lab Fixture is ignored by default
+//! (Docker + Instant Client) — not a Release Quality Gate.
 
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,6 +29,51 @@ fn temp_lab_dir() -> (tempfile::TempDir, String) {
     fs::write(dir.path().join("compose.yaml"), "name: migraloop-lab-test\n")
         .expect("write stub compose.yaml");
     let path = dir.path().to_string_lossy().into_owned();
+    (dir, path)
+}
+
+/// Minimal selectable Scenario package (`recipe.yaml` + `deployment.yaml`) for
+/// always-on CLI probes that use an isolated `--lab-dir`.
+fn write_minimal_scenario_package(lab: &Path, id: &str) {
+    let scenario_dir = lab.join("scenarios").join(id);
+    fs::create_dir_all(&scenario_dir).expect("scenario dir");
+    fs::write(
+        scenario_dir.join("deployment.yaml"),
+        format!(
+            "apiVersion: migraloop.dev/v1\nkind: Deployment\nmetadata:\n  name: lab-{id}\n"
+        ),
+    )
+    .expect("deployment.yaml");
+    fs::write(
+        scenario_dir.join("recipe.yaml"),
+        format!(
+            r#"id: {id}
+summary: test recipe for {id}
+namespace:
+  source_tables: [LAB_TEST]
+  target_collections: [lab_test]
+  deployment: lab-{id}
+  pipelines: [lab-test]
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Namespace
+    - apply via real product path
+checks:
+  correctness:
+    - Managed outcomes match recipe expectations
+"#
+        ),
+    )
+    .expect("recipe.yaml");
+}
+
+fn temp_lab_dir_with_recipes(ids: &[&str]) -> (tempfile::TempDir, String) {
+    let (dir, path) = temp_lab_dir();
+    for id in ids {
+        write_minimal_scenario_package(dir.path(), id);
+    }
     (dir, path)
 }
 
@@ -125,10 +171,84 @@ async fn lab_scenario_list_includes_bulk_load() {
     );
 }
 
+/// CLI seam (#65): `scenario list` reflects recipe.yaml packages under `--lab-dir`,
+/// not a hardcoded summary table divorced from the Scenario catalog on disk.
+#[tokio::test]
+async fn lab_scenario_list_reads_recipe_summaries_from_lab_dir() {
+    let dir = tempfile::tempdir().expect("temp lab dir");
+    let lab = dir.path();
+    fs::write(lab.join("compose.yaml"), "name: migraloop-lab-recipe-list\n")
+        .expect("write stub compose.yaml");
+    let scenario_dir = lab.join("scenarios").join("direct-pipeline");
+    fs::create_dir_all(&scenario_dir).expect("scenario dir");
+    fs::write(
+        scenario_dir.join("deployment.yaml"),
+        "apiVersion: migraloop.dev/v1\nkind: Deployment\nmetadata:\n  name: lab-direct-pipeline\n",
+    )
+    .expect("deployment.yaml");
+    fs::write(
+        scenario_dir.join("recipe.yaml"),
+        r#"id: direct-pipeline
+summary: FEATURE-TIME-AUTHORING-PROBE Direct Pipeline recipe
+namespace:
+  source_tables: [LAB_DP_CUSTOMERS]
+  target_collections: [lab_dp_customers]
+  deployment: lab-direct-pipeline
+  pipelines: [lab-dp-customers]
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Namespace schema + seed
+    - apply via real product path
+    - mutate Source insert/update/delete
+    - sync LogMiner Incremental Capture + Delivery
+checks:
+  correctness:
+    - "Base/Target Managed NAME: Alicia + Carol present; Bob absent"
+"#,
+    )
+    .expect("recipe.yaml");
+
+    let list = Command::new(bin())
+        .args([
+            "lab",
+            "scenario",
+            "list",
+            "--lab-dir",
+            &lab.to_string_lossy(),
+        ])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("FEATURE-TIME-AUTHORING-PROBE"),
+        "list must use recipe.yaml summary from --lab-dir, got:\n{out}"
+    );
+    assert!(
+        out.contains("direct-pipeline"),
+        "list must include the recipe id, got:\n{out}"
+    );
+    // Other registered runners without a recipe package under this lab-dir are not selectable.
+    assert!(
+        !out.contains("bulk-load"),
+        "list must not invent catalog entries without recipe.yaml, got:\n{out}"
+    );
+    assert!(
+        !out.contains("transform-pipeline"),
+        "list must not invent catalog entries without recipe.yaml, got:\n{out}"
+    );
+}
+
 /// CLI-seam metrics-fail: threshold failure fails the Scenario while correctness would pass.
 #[tokio::test]
 async fn lab_scenario_bulk_load_threshold_fail_via_cli_probe() {
-    let (_tmp, lab) = temp_lab_dir();
+    let (_tmp, lab) = temp_lab_dir_with_recipes(&["bulk-load"]);
     let run = Command::new(bin())
         .env("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE", "threshold-fail")
         .args(["lab", "scenario", "run", "bulk-load", "--lab-dir", &lab])
@@ -172,7 +292,7 @@ async fn lab_scenario_bulk_load_threshold_fail_via_cli_probe() {
 /// CLI-seam correctness-fail: row-level miss fails even when metrics would pass.
 #[tokio::test]
 async fn lab_scenario_bulk_load_correctness_fail_via_cli_probe() {
-    let (_tmp, lab) = temp_lab_dir();
+    let (_tmp, lab) = temp_lab_dir_with_recipes(&["bulk-load"]);
     let run = Command::new(bin())
         .env("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE", "correctness-fail")
         .args(["lab", "scenario", "run", "bulk-load", "--lab-dir", &lab])
@@ -241,7 +361,7 @@ async fn lab_scenario_run_unknown_id_fails() {
 
 #[tokio::test]
 async fn lab_scenario_run_rejects_when_another_is_active() {
-    let (_tmp, lab) = temp_lab_dir();
+    let (_tmp, lab) = temp_lab_dir_with_recipes(&["direct-pipeline"]);
     let lock_path = format!("{lab}/.migraloop-scenario.lock");
     let pid = std::process::id();
     let started = SystemTime::now()
@@ -348,7 +468,7 @@ async fn lab_scenario_remove_unknown_id_fails() {
 
 #[tokio::test]
 async fn lab_scenario_remove_rejects_when_another_is_active() {
-    let (_tmp, lab) = temp_lab_dir();
+    let (_tmp, lab) = temp_lab_dir_with_recipes(&["direct-pipeline"]);
     let lock_path = format!("{lab}/.migraloop-scenario.lock");
     let pid = std::process::id();
     let started = SystemTime::now()

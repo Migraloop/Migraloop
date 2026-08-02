@@ -1,7 +1,8 @@
 //! Lab Scenario catalog, run orchestration, and Namespace cleanup
-//! (issues #60–#64, #63 / ADR-0025).
+//! (issues #60–#65, #63 / ADR-0025).
 //!
-//! Lab-specific machinery: catalog listing, Scenario Namespace lifecycle
+//! Lab-specific machinery: catalog listing from on-disk Scenario recipes
+//! (`lab/scenarios/<id>/recipe.yaml`), Scenario Namespace lifecycle
 //! (prepare / re-run wipe / manual remove / opt-in auto-remove), Source workload
 //! driving (including recipe-authored intra-Scenario concurrency and ~100k bulk
 //! Source inserts), one-at-a-time lock, and result reporting with equal-weight
@@ -28,15 +29,11 @@ use migraloop_platform_store::delete_deployment;
 const LOCK_FILE_NAME: &str = ".migraloop-scenario.lock";
 
 const DIRECT_PIPELINE_ID: &str = "direct-pipeline";
-const DIRECT_PIPELINE_SUMMARY: &str =
-    "Direct Pipeline Initial Load + insert/update/delete (real apply/sync)";
 const DIRECT_PIPELINE_TABLE: &str = "LAB_DP_CUSTOMERS";
 const DIRECT_PIPELINE_COLLECTION: &str = "lab_dp_customers";
 const DIRECT_PIPELINE_DEPLOYMENT: &str = "lab-direct-pipeline";
 
 const TRANSFORM_PIPELINE_ID: &str = "transform-pipeline";
-const TRANSFORM_PIPELINE_SUMMARY: &str =
-    "Multi-table Transform Pipeline: customers + orders groupBy/sum → Derived → Delivery (real apply/sync)";
 const TRANSFORM_CUSTOMERS_TABLE: &str = "LAB_TP_CUSTOMERS";
 const TRANSFORM_ORDERS_TABLE: &str = "LAB_TP_ORDERS";
 const TRANSFORM_CUSTOMERS_COLLECTION: &str = "lab_tp_customers";
@@ -45,8 +42,6 @@ const TRANSFORM_ORDER_TOTALS_PIPELINE: &str = "lab-tp-order-totals";
 const TRANSFORM_PIPELINE_DEPLOYMENT: &str = "lab-transform-pipeline";
 
 const CONCURRENT_SOURCE_WORKLOAD_ID: &str = "concurrent-source-workload";
-const CONCURRENT_SOURCE_WORKLOAD_SUMMARY: &str =
-    "Intra-Scenario concurrent Source workload: parallel multi-table changes → Target/Derived under contention";
 const CONCURRENT_CUSTOMERS_TABLE: &str = "LAB_CW_CUSTOMERS";
 const CONCURRENT_ORDERS_TABLE: &str = "LAB_CW_ORDERS";
 const CONCURRENT_CUSTOMERS_COLLECTION: &str = "lab_cw_customers";
@@ -54,15 +49,15 @@ const CONCURRENT_ORDER_TOTALS_COLLECTION: &str = "lab_cw_order_totals";
 const CONCURRENT_ORDER_TOTALS_PIPELINE: &str = "lab-cw-order-totals";
 const CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT: &str = "lab-concurrent-source-workload";
 /// Fail-able settle threshold after concurrent Source changes (US21 / US47).
+/// Must stay aligned with `lab/scenarios/concurrent-source-workload/recipe.yaml`.
 const CONCURRENT_MAX_SETTLE_MS: u128 = 300_000;
 const CONCURRENT_SETTLE_POLL: Duration = Duration::from_secs(2);
 
 const BULK_LOAD_ID: &str = "bulk-load";
-const BULK_LOAD_SUMMARY: &str =
-    "Bulk Source load (~100k inserts) with lag/throughput/duration thresholds (real apply Initial Load)";
 const BULK_LOAD_TABLE: &str = "LAB_BL_ITEMS";
 const BULK_LOAD_COLLECTION: &str = "lab_bl_items";
 const BULK_LOAD_DEPLOYMENT: &str = "lab-bulk-load";
+/// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
 /// Fail-able Sync Health lag after Delivery catch-up (US21).
@@ -115,7 +110,7 @@ pub async fn run_scenario_command(command: ScenarioCommand) -> Result<(), CliErr
                     compose.display()
                 )));
             }
-            scenario_list();
+            scenario_list(&lab_dir)?;
             Ok(())
         }
         ScenarioCommand::Run {
@@ -129,20 +124,171 @@ pub async fn run_scenario_command(command: ScenarioCommand) -> Result<(), CliErr
     }
 }
 
-fn catalog() -> &'static [(&'static str, &'static str)] {
+/// Registered Scenario runners (feature-time implementations in this module).
+/// Selectable catalog = these ids ∩ complete on-disk recipe packages.
+fn registered_scenario_ids() -> &'static [&'static str] {
     &[
-        (DIRECT_PIPELINE_ID, DIRECT_PIPELINE_SUMMARY),
-        (TRANSFORM_PIPELINE_ID, TRANSFORM_PIPELINE_SUMMARY),
-        (CONCURRENT_SOURCE_WORKLOAD_ID, CONCURRENT_SOURCE_WORKLOAD_SUMMARY),
-        (BULK_LOAD_ID, BULK_LOAD_SUMMARY),
+        DIRECT_PIPELINE_ID,
+        TRANSFORM_PIPELINE_ID,
+        CONCURRENT_SOURCE_WORKLOAD_ID,
+        BULK_LOAD_ID,
     ]
 }
 
-fn scenario_list() {
-    println!("Lab Scenarios:");
-    for (id, summary) in catalog() {
-        println!("  {id}  {summary}");
+#[derive(Debug, Deserialize)]
+struct ScenarioRecipe {
+    id: String,
+    summary: String,
+    namespace: ScenarioRecipeNamespace,
+    #[serde(default = "default_deployment_config")]
+    deployment_config: String,
+    workload: ScenarioRecipeWorkload,
+    checks: ScenarioRecipeChecks,
+    /// Documented fail-able metric axes (equal weight with correctness). Kept on
+    /// the recipe seam for authoring; runners keep matching constants today.
+    #[serde(default)]
+    #[allow(dead_code)]
+    thresholds: ScenarioRecipeThresholds,
+}
+
+fn default_deployment_config() -> String {
+    "deployment.yaml".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+struct ScenarioRecipeNamespace {
+    source_tables: Vec<String>,
+    target_collections: Vec<String>,
+    deployment: String,
+    /// Pipeline identities inside the Scenario Namespace (authoring metadata).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pipelines: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScenarioRecipeWorkload {
+    concurrency: String,
+    #[serde(default)]
+    steps: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScenarioRecipeChecks {
+    #[serde(default)]
+    correctness: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
+struct ScenarioRecipeThresholds {
+    max_settle_ms: Option<u128>,
+    max_lag: Option<i32>,
+    max_duration_ms: Option<u128>,
+    min_rows_per_s: Option<f64>,
+}
+
+fn load_recipe(path: &Path) -> Result<ScenarioRecipe, CliError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        CliError::Failed(format!(
+            "failed to read Lab Scenario recipe {}: {err}",
+            path.display()
+        ))
+    })?;
+    let recipe: ScenarioRecipe = serde_yaml::from_str(&raw).map_err(|err| {
+        CliError::Failed(format!(
+            "failed to parse Lab Scenario recipe {}: {err}",
+            path.display()
+        ))
+    })?;
+    if recipe.id.is_empty() || recipe.summary.is_empty() {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario recipe {} must set non-empty `id` and `summary`",
+            path.display()
+        )));
     }
+    if recipe.namespace.source_tables.is_empty()
+        || recipe.namespace.target_collections.is_empty()
+        || recipe.namespace.deployment.is_empty()
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario recipe {} must declare namespace.source_tables, \
+             target_collections, and deployment",
+            path.display()
+        )));
+    }
+    match recipe.workload.concurrency.as_str() {
+        "serial" | "parallel" => {}
+        other => {
+            return Err(CliError::Failed(format!(
+                "Lab Scenario recipe {} workload.concurrency must be \
+                 `serial` or `parallel` (got `{other}`)",
+                path.display()
+            )));
+        }
+    }
+    if recipe.workload.steps.is_empty() {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario recipe {} must declare workload.steps",
+            path.display()
+        )));
+    }
+    if recipe.checks.correctness.is_empty() {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario recipe {} must declare checks.correctness",
+            path.display()
+        )));
+    }
+    Ok(recipe)
+}
+
+/// Selectable catalog: registered runners that have `recipe.yaml` + deployment
+/// config under `lab_dir/scenarios/<id>/`. Summaries come from the recipe file.
+fn load_selectable_catalog(lab_dir: &Path) -> Result<Vec<(String, String)>, CliError> {
+    let mut entries = Vec::new();
+    for id in registered_scenario_ids() {
+        let scenario_dir = lab_dir.join("scenarios").join(id);
+        let recipe_path = scenario_dir.join("recipe.yaml");
+        if !recipe_path.is_file() {
+            // Not selectable yet — recipe package incomplete (feature-time authoring in progress).
+            continue;
+        }
+        let recipe = load_recipe(&recipe_path)?;
+        if recipe.id != *id {
+            return Err(CliError::Failed(format!(
+                "Lab Scenario recipe {} has id `{}` but lives under scenarios/{id}/ \
+                 (directory name must match recipe id)",
+                recipe_path.display(),
+                recipe.id
+            )));
+        }
+        let deployment_path = scenario_dir.join(&recipe.deployment_config);
+        if !deployment_path.is_file() {
+            return Err(CliError::Failed(format!(
+                "Lab Scenario `{id}` recipe references missing deployment config {} \
+                 (expected under lab/scenarios/{id}/)",
+                deployment_path.display()
+            )));
+        }
+        entries.push((recipe.id, recipe.summary));
+    }
+    Ok(entries)
+}
+
+fn scenario_list(lab_dir: &Path) -> Result<(), CliError> {
+    let catalog = load_selectable_catalog(lab_dir)?;
+    println!("Lab Scenarios:");
+    if catalog.is_empty() {
+        println!(
+            "  (none — add lab/scenarios/<id>/recipe.yaml + deployment.yaml \
+and register a runner; see lab/scenarios/README.md)"
+        );
+    } else {
+        for (id, summary) in catalog {
+            println!("  {id}  {summary}");
+        }
+    }
+    Ok(())
 }
 
 async fn scenario_run(
@@ -150,13 +296,24 @@ async fn scenario_run(
     lab_dir: &Path,
     auto_remove: bool,
 ) -> Result<(), CliError> {
-    let entry = catalog()
+    let catalog = load_selectable_catalog(lab_dir)?;
+    let entry = catalog
         .iter()
-        .find(|(id, _)| *id == scenario)
+        .find(|(id, _)| id == scenario)
+        .cloned()
         .ok_or_else(|| {
-            CliError::Failed(format!(
-                "Unknown Lab Scenario `{scenario}`. Run `migraloop lab scenario list`."
-            ))
+            if registered_scenario_ids().contains(&scenario) {
+                CliError::Failed(format!(
+                    "Lab Scenario `{scenario}` is not selectable under {}: \
+                     add scenarios/{scenario}/recipe.yaml and deployment.yaml \
+                     (see lab/scenarios/README.md). Run `migraloop lab scenario list`.",
+                    lab_dir.display()
+                ))
+            } else {
+                CliError::Failed(format!(
+                    "Unknown Lab Scenario `{scenario}`. Run `migraloop lab scenario list`."
+                ))
+            }
         })?;
 
     // One-at-a-time check before Fixture probes so CI can assert rejection without Docker.
@@ -172,7 +329,7 @@ async fn scenario_run(
     // Lab-only outcome probe: exercise equal-weight fail axes through the real CLI
     // report/exit path without Docker (issue #63 / PRD #55 metrics tests).
     if let Ok(probe) = std::env::var("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE") {
-        return emit_scenario_outcome_probe(entry.0, &probe);
+        return emit_scenario_outcome_probe(&entry.0, &probe);
     }
 
     ensure_fixture_ready_for_scenario(lab_dir).await?;
@@ -201,7 +358,7 @@ async fn scenario_run(
                 namespace_removed = true;
             }
             drop(lock);
-            print_scenario_report(entry.0, true, duration, &report, namespace_removed);
+            print_scenario_report(&entry.0, true, duration, &report, namespace_removed);
             if passed {
                 Ok(())
             } else {
@@ -230,20 +387,30 @@ async fn scenario_run(
                 measured_duration_ms: None,
                 thresholds_ok: true,
             };
-            print_scenario_report(entry.0, false, duration, &report, false);
+            print_scenario_report(&entry.0, false, duration, &report, false);
             Err(err)
         }
     }
 }
 
 async fn scenario_remove(scenario: &str, lab_dir: &Path) -> Result<(), CliError> {
-    catalog()
+    let catalog = load_selectable_catalog(lab_dir)?;
+    catalog
         .iter()
-        .find(|(id, _)| *id == scenario)
+        .find(|(id, _)| id == scenario)
         .ok_or_else(|| {
-            CliError::Failed(format!(
-                "Unknown Lab Scenario `{scenario}`. Run `migraloop lab scenario list`."
-            ))
+            if registered_scenario_ids().contains(&scenario) {
+                CliError::Failed(format!(
+                    "Lab Scenario `{scenario}` is not selectable under {}: \
+                     add scenarios/{scenario}/recipe.yaml and deployment.yaml \
+                     (see lab/scenarios/README.md). Run `migraloop lab scenario list`.",
+                    lab_dir.display()
+                ))
+            } else {
+                CliError::Failed(format!(
+                    "Unknown Lab Scenario `{scenario}`. Run `migraloop lab scenario list`."
+                ))
+            }
         })?;
 
     let lock_path = lab_dir.join(LOCK_FILE_NAME);
@@ -2109,12 +2276,47 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn catalog_includes_bulk_load() {
+    fn selectable_catalog_loads_bulk_load_recipe_from_repo_lab() {
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab");
+        let catalog = load_selectable_catalog(&lab).expect("load repo Lab catalog");
+        let bulk = catalog
+            .iter()
+            .find(|(id, _)| id == BULK_LOAD_ID)
+            .expect("catalog must include bulk-load");
         assert!(
-            catalog()
-                .iter()
-                .any(|(id, summary)| *id == BULK_LOAD_ID && summary.contains("100k")),
-            "catalog must list bulk-load (~100k) Scenario"
+            bulk.1.contains("100k"),
+            "recipe summary must mention 100k, got {}",
+            bulk.1
+        );
+        assert_eq!(
+            catalog.len(),
+            registered_scenario_ids().len(),
+            "repo Lab recipes must cover every registered Scenario runner"
+        );
+    }
+
+    #[test]
+    fn recipe_loader_requires_namespace_workload_and_checks() {
+        let dir = std::env::temp_dir().join(format!(
+            "migraloop-recipe-validate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("temp recipe dir");
+        let path = dir.join("recipe.yaml");
+        fs::write(
+            &path,
+            "id: demo\nsummary: demo\nnamespace:\n  source_tables: []\n  target_collections: [c]\n  deployment: d\nworkload:\n  concurrency: serial\n  steps: [prepare]\nchecks:\n  correctness: [ok]\n",
+        )
+        .expect("write");
+        let err = load_recipe(&path).expect_err("empty source_tables must fail");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("source_tables"),
+            "err={err}"
         );
     }
 

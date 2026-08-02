@@ -1,0 +1,29 @@
+# Lab Scenario recipe (ADR-0025 / issue #65).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: concurrent-source-workload
+summary: "Intra-Scenario concurrent Source workload: parallel multi-table changes → Target/Derived under contention"
+namespace:
+  source_tables:
+    - LAB_CW_CUSTOMERS
+    - LAB_CW_ORDERS
+  target_collections:
+    - lab_cw_customers
+    - lab_cw_order_totals
+  deployment: lab-concurrent-source-workload
+  pipelines:
+    - lab-cw-customers
+    - lab-cw-order-totals
+deployment_config: deployment.yaml
+workload:
+  concurrency: parallel
+  steps:
+    - prepare multi-table Scenario Namespace + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Derived)
+    - mutate with parallel Source sessions (customers + orders) inside one Scenario
+    - settle sync/Delivery within max_settle_ms before final asserts
+checks:
+  correctness:
+    - "Customers Base/Target Managed NAME: Alicia and Carol present; Bob absent"
+    - "Derived and order-totals Target after contention: totals 35 and 50 (not stale 30)"
+thresholds:
+  max_settle_ms: 300000

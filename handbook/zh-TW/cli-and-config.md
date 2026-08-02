@@ -119,7 +119,7 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `up` | 啟動可拋棄 Fixture；就緒時印出連線細節 |
 | `status` | 回報 Fixture 就緒狀態（engines + Oracle prerequisites + Platform Store）。在你套用設定或執行 Lab Scenario 之前顯示 `Deployment: (none)` / `Pipeline: (none)` |
 | `down` | 拆除 containers 與 volumes |
-| `scenario list` | 列出 catalog 中可選的 Lab Scenarios（例如 `direct-pipeline`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`） |
+| `scenario list` | 依 `--lab-dir` 磁碟上的 recipe 列出可選 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已註冊 runner）。summary 來自各 recipe—例如 `direct-pipeline`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load` |
 | `scenario run` | 依 id 執行一個 Lab Scenario。若已有 Scenario 正在執行則拒絕。重跑同一 Scenario 會先完整移除其 Namespace 再重建。回報 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定義的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 與 operational metrics 等權）。`concurrent-source-workload` 在單一 Scenario 內跑平行 Source sessions；`bulk-load` 會 bulk-insert 約 100k Source rows，且 metric thresholds 可獨立於 correctness 讓 run 失敗。第二個 Scenario run 仍會被拒絕。預設 keep-on-finish 保留 Namespace 供即時 `base`/`derived`/`target` 檢查；成功後若要刪除可傳 `--auto-remove` |
 | `scenario remove` | 完整移除 Scenario Namespace（Source tables、Target collections、Platform Store Deployment），且不啟動 run。若已有 Scenario 作用中則拒絕。已不存在時為 idempotent |
 
@@ -128,7 +128,7 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `--lab-dir` | 含 Lab `compose.yaml` 的目錄（預設：`lab`） |
 | `--auto-remove` | 僅用於 `scenario run`：成功結束後完整移除 Scenario Namespace（opt-in；失敗時仍保留 Namespace 以便除錯） |
 
-Lab 是手動驗證—不是 Release Quality Gate，也不是 contract/stub LogMiner harness。見 [Deployment](deployment.md) 與 [Developer local setup](developer-local-setup.md)。
+Lab 是手動驗證—不是 Release Quality Gate，也不是 contract/stub LogMiner harness。可選的 Scenario catalog 是 feature-time 完整度表面（ADR-0025），不是 CI suite：不要新增會跑完整 catalog 的 release-gate job。Scenario recipe 慣例與撰寫路徑見 [Developer local setup](developer-local-setup.md) 與 `lab/scenarios/README.md`。另見 [Deployment](deployment.md)。
 
 ## 公開環境變數契約
 
