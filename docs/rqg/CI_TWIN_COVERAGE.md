@@ -33,4 +33,4 @@ Do **not** cite these as Release Quality Gate / CI twin proof (they stay `#[igno
 
 Lab catalog control-plane seams that are always-on (list/help/isolation / outcome probes) may appear in `rqg-integration` but are not substitutes for capability behavior twins above.
 
-Performance regression thresholds are owned by `rqg-perf` (separate job; see parent #94 / #97)—not this matrix. Cutover, restart-resume, and other ADR-0011 slices stay covered by existing non-ignored app tests outside this Lab-catalog twin table.
+Performance regression thresholds are owned by `rqg-perf` (separate job; see parent #94 / #97 and `ci/rqg/`)—not this matrix. Cutover, restart-resume, and other ADR-0011 slices stay covered by existing non-ignored app tests outside this Lab-catalog twin table.

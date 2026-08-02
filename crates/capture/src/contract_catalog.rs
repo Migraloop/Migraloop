@@ -5,10 +5,11 @@
 //! business-table match arm. Tests may inject additional tables via
 //! `MIGRALOOP_CONTRACT_SOURCE_CATALOG` (JSON file path).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -99,9 +100,10 @@ impl ContractSourceCatalog {
     }
 }
 
-/// Load the process catalog: optional unit-test override, else defaults + env JSON merge.
+/// Load the harness catalog: optional thread-local unit-test override, else
+/// defaults + env JSON merge.
 pub fn load_contract_source_catalog() -> Result<ContractSourceCatalog, CaptureError> {
-    if let Some(override_catalog) = process_catalog_override() {
+    if let Some(override_catalog) = thread_catalog_override() {
         return Ok(override_catalog);
     }
 
@@ -129,26 +131,36 @@ pub fn load_catalog_file(path: &Path) -> Result<ContractSourceCatalogFile, Captu
     })
 }
 
-static PROCESS_CATALOG_OVERRIDE: RwLock<Option<ContractSourceCatalog>> = RwLock::new(None);
-
-fn process_catalog_override() -> Option<ContractSourceCatalog> {
-    PROCESS_CATALOG_OVERRIDE
-        .read()
-        .ok()
-        .and_then(|guard| guard.clone())
+// Thread-local so parallel unit tests cannot clear each other's override
+// (process-global state previously raced under `cargo test`).
+thread_local! {
+    static THREAD_CATALOG_OVERRIDE: RefCell<Option<ContractSourceCatalog>> = const { RefCell::new(None) };
 }
 
-/// Install a process-wide catalog override (unit tests). Clear with [`clear_contract_source_catalog_override`].
+/// Serializes tests that mutate process-global `MIGRALOOP_CONTRACT_SOURCE_CATALOG`.
+static CONTRACT_CATALOG_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn thread_catalog_override() -> Option<ContractSourceCatalog> {
+    THREAD_CATALOG_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+fn lock_contract_catalog_env_for_test() -> MutexGuard<'static, ()> {
+    CONTRACT_CATALOG_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Install a thread-local catalog override (unit tests). Clear with [`clear_contract_source_catalog_override`].
 pub fn set_contract_source_catalog_override(catalog: ContractSourceCatalog) {
-    if let Ok(mut guard) = PROCESS_CATALOG_OVERRIDE.write() {
-        *guard = Some(catalog);
-    }
+    THREAD_CATALOG_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = Some(catalog);
+    });
 }
 
 pub fn clear_contract_source_catalog_override() {
-    if let Ok(mut guard) = PROCESS_CATALOG_OVERRIDE.write() {
-        *guard = None;
-    }
+    THREAD_CATALOG_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
 }
 
 /// Helper for building snapshots in tests / JSON authors.
@@ -225,6 +237,7 @@ mod tests {
 
     #[test]
     fn env_catalog_file_merges_arbitrary_table_into_process_catalog() {
+        let _lock = lock_contract_catalog_env_for_test();
         clear_contract_source_catalog_override();
         let file = ContractSourceCatalogFile {
             tables: vec![widgets_snapshot()],
