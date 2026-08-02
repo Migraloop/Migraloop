@@ -27,8 +27,8 @@ use migraloop_platform_store::{
 };
 use migraloop_transform::{
     analyze_affect, derived_projected_fields, evaluate_transform,
-    evaluate_transform_for_identities, parse_transform_steps, AffectOutcome, BaseChangeKind,
-    TransformOp,
+    evaluate_transform_for_identities, identity_matches_row, parse_transform_steps, AffectOutcome,
+    BaseChangeKind, TransformOp,
 };
 use thiserror::Error;
 
@@ -1033,33 +1033,6 @@ fn base_change_kind(op: ChangeOp) -> BaseChangeKind {
     }
 }
 
-fn identity_map_matches_row(
-    identity: &serde_json::Map<String, serde_json::Value>,
-    row: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    identity.iter().all(|(key, expected)| {
-        row.get(key).is_some_and(|actual| values_numerically_eq(actual, expected))
-    })
-}
-
-fn values_numerically_eq(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    if left == right {
-        return true;
-    }
-    match (json_as_f64(left), json_as_f64(right)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
-}
-
-fn json_as_f64(value: &serde_json::Value) -> Option<f64> {
-    match value {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
 /// Incremental Transform maintenance for one Base change (Affect Analysis driven).
 async fn maintain_transform_pipeline_for_change(
     platform_store_url: &str,
@@ -1148,7 +1121,7 @@ async fn recompute_and_deliver_affected_identities(
     let mut merged: Vec<serde_json::Map<String, serde_json::Value>> = existing_rows
         .into_iter()
         .map(|r| r.data)
-        .filter(|row| !identities.iter().any(|id| identity_map_matches_row(id, row)))
+        .filter(|row| !identities.iter().any(|id| identity_matches_row(id, row)))
         .collect();
     merged.extend(recomputed.clone());
 
@@ -1173,7 +1146,7 @@ async fn recompute_and_deliver_affected_identities(
     for identity in identities {
         let still_present = recomputed
             .iter()
-            .any(|row| identity_map_matches_row(identity, row));
+            .any(|row| identity_matches_row(identity, row));
         if !still_present {
             deletes.push(output_identity_from_row(identity, &pipeline.output_identity)?);
         }

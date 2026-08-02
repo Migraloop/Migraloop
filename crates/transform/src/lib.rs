@@ -427,12 +427,6 @@ fn row_matches_group_keys(
     })
 }
 
-fn identity_matches_row(identity: &Map<String, Value>, row: &Map<String, Value>) -> bool {
-    identity
-        .iter()
-        .all(|(key, expected)| row.get(key).is_some_and(|v| json_values_eq(v, expected)))
-}
-
 /// Affect Analysis: which Output Identities (if any) need Derived recompute.
 ///
 /// `pre_apply` is the Base row before applying the change (required for Update/Delete).
@@ -613,8 +607,9 @@ fn apply_group_by(
     Ok(out)
 }
 
+/// Precision-preserving sum (ADR-0023): scaled integer arithmetic, never IEEE double.
 fn sum_field(rows: &[Map<String, Value>], field: &str) -> Result<Value, TransformError> {
-    let mut total = 0.0_f64;
+    let mut total_units: i128 = 0;
     let mut max_scale: usize = 0;
     let mut saw_any = false;
     for row in rows {
@@ -624,68 +619,150 @@ fn sum_field(rows: &[Map<String, Value>], field: &str) -> Result<Value, Transfor
         if value.is_null() {
             continue;
         }
-        let Some(number) = as_f64(value) else {
-            return Err(TransformError::Invalid(format!(
+        let (units, scale) = parse_decimal_units(value).ok_or_else(|| {
+            TransformError::Invalid(format!(
                 "groupBy sum field {field} is not numeric: {value}"
-            )));
-        };
+            ))
+        })?;
         saw_any = true;
-        total += number;
-        max_scale = max_scale.max(decimal_scale(value));
+        if scale > max_scale {
+            let factor = ten_pow_i128(scale - max_scale)?;
+            total_units = total_units
+                .checked_mul(factor)
+                .ok_or_else(|| TransformError::Invalid("groupBy sum overflow".into()))?;
+            max_scale = scale;
+        }
+        let aligned = if scale < max_scale {
+            let factor = ten_pow_i128(max_scale - scale)?;
+            units
+                .checked_mul(factor)
+                .ok_or_else(|| TransformError::Invalid("groupBy sum overflow".into()))?
+        } else {
+            units
+        };
+        total_units = total_units
+            .checked_add(aligned)
+            .ok_or_else(|| TransformError::Invalid("groupBy sum overflow".into()))?;
     }
     if !saw_any {
         return Ok(Value::Number(serde_json::Number::from(0)));
     }
-    Ok(json_decimal(total, max_scale))
+    Ok(format_decimal_units(total_units, max_scale))
 }
 
-fn decimal_scale(value: &Value) -> usize {
+fn parse_decimal_units(value: &Value) -> Option<(i128, usize)> {
     match value {
-        Value::String(s) => s
-            .split_once('.')
-            .map(|(_, frac)| frac.len())
-            .unwrap_or(0),
-        Value::Number(n) => n
-            .as_f64()
-            .and_then(|f| {
-                let s = format!("{f}");
-                s.split_once('.').map(|(_, frac)| frac.len())
-            })
-            .unwrap_or(0),
-        _ => 0,
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                return Some((i128::from(i), 0));
+            }
+            if let Some(u) = n.as_u64() {
+                return Some((i128::from(u), 0));
+            }
+            // JSON numbers that are not integers arrive as text via to_string.
+            parse_decimal_text(&n.to_string())
+        }
+        Value::String(s) => parse_decimal_text(s),
+        _ => None,
     }
 }
 
-fn json_decimal(total: f64, scale: usize) -> Value {
-    if scale == 0 {
-        if total.fract() == 0.0 && total >= i64::MIN as f64 && total <= i64::MAX as f64 {
-            return Value::Number((total as i64).into());
-        }
+fn parse_decimal_text(raw: &str) -> Option<(i128, usize)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    let factor = 10_f64.powi(scale as i32);
-    let rounded = (total * factor).round() / factor;
-    let text = format!("{rounded:.scale$}");
+    let negative = trimmed.starts_with('-');
+    let body = trimmed.trim_start_matches(['+', '-']);
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{int_part}{frac_part}");
+    if digits.is_empty() {
+        return None;
+    }
+    let mut units: i128 = digits.parse().ok()?;
+    if negative {
+        units = -units;
+    }
+    Some((units, frac_part.len()))
+}
+
+fn ten_pow_i128(exp: usize) -> Result<i128, TransformError> {
+    let mut result: i128 = 1;
+    for _ in 0..exp {
+        result = result
+            .checked_mul(10)
+            .ok_or_else(|| TransformError::Invalid("groupBy sum scale overflow".into()))?;
+    }
+    Ok(result)
+}
+
+fn format_decimal_units(units: i128, scale: usize) -> Value {
+    if scale == 0 {
+        if units >= i64::MIN as i128 && units <= i64::MAX as i128 {
+            return Value::Number(serde_json::Number::from(units as i64));
+        }
+        return Value::String(units.to_string());
+    }
+    let negative = units < 0;
+    let abs = units.unsigned_abs();
+    let factor = 10_u128.pow(scale as u32);
+    let int_part = abs / factor;
+    let frac_part = abs % factor;
+    let frac = format!("{frac_part:0>scale$}");
+    let text = if negative {
+        format!("-{int_part}.{frac}")
+    } else {
+        format!("{int_part}.{frac}")
+    };
     Value::String(text)
 }
 
 /// Equality that treats JSON numbers with the same numeric value as equal
-/// (e.g. YAML `1` vs platform NUMBER `1`).
-fn json_values_eq(left: &Value, right: &Value) -> bool {
+/// (e.g. YAML `1` vs platform NUMBER `1`). Prefer decimal-unit compare over IEEE.
+pub fn json_values_eq(left: &Value, right: &Value) -> bool {
     if left == right {
         return true;
     }
-    match (as_f64(left), as_f64(right)) {
-        (Some(a), Some(b)) => a == b,
+    match (parse_decimal_units(left), parse_decimal_units(right)) {
+        (Some((a_units, a_scale)), Some((b_units, b_scale))) => {
+            let scale = a_scale.max(b_scale);
+            match (
+                scale_units(a_units, a_scale, scale),
+                scale_units(b_units, b_scale, scale),
+            ) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
 
-fn as_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse().ok(),
-        _ => None,
+fn scale_units(units: i128, from_scale: usize, to_scale: usize) -> Option<i128> {
+    if from_scale > to_scale {
+        return None;
     }
+    let factor = ten_pow_i128(to_scale - from_scale).ok()?;
+    units.checked_mul(factor)
+}
+
+/// Whether every key in `identity` matches the corresponding field on `row`
+/// (numeric-aware).
+pub fn identity_matches_row(identity: &Map<String, Value>, row: &Map<String, Value>) -> bool {
+    identity
+        .iter()
+        .all(|(key, expected)| row.get(key).is_some_and(|v| json_values_eq(v, expected)))
 }
 
 #[derive(Debug, Clone)]
@@ -847,6 +924,24 @@ mod tests {
         ]);
         let outcome = analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after)).unwrap();
         assert_eq!(outcome, AffectOutcome::SkipUnusedFields);
+    }
+
+    #[test]
+    fn group_by_sum_preserves_decimal_precision_without_ieee_double() {
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
+            }
+        })])
+        .unwrap();
+        // Classic binary-float trap: 0.1 + 0.2 != 0.3 in IEEE double.
+        let rows = vec![
+            row(&[("CUSTOMER_ID", json!(1)), ("AMOUNT", json!("0.10"))]),
+            row(&[("CUSTOMER_ID", json!(1)), ("AMOUNT", json!("0.20"))]),
+        ];
+        let out = evaluate_transform(&ops, &rows).unwrap();
+        assert_eq!(out[0].get("TOTAL_AMOUNT"), Some(&json!("0.30")));
     }
 
     #[test]
