@@ -49,3 +49,7 @@ If the concept you need isn't in the glossary yet, that's a signal — either yo
 If your output contradicts an existing ADR, surface it explicitly rather than silently overriding:
 
 > _Contradicts ADR-0007 (event-sourced orders) — but worth reopening because…_
+
+## Operator / Developer-visible behavior
+
+Glossary and ADR accuracy is not enough when a change alters what Operators or Developers see, configure, or run. In that case also follow the handbook contract — three-locale updates, hard-guard vs soft-obligation split, exemption etiquette, and definition of done — in [handbook.md](handbook.md).

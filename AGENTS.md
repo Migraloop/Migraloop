@@ -12,6 +12,10 @@ Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-
 
 Single-context layout (`CONTEXT.md` + `docs/adr/` at repo root). See `docs/agents/domain.md`.
 
+### Handbook
+
+Operator/Developer product handbook duties (three locales, hard guards vs soft obligation). See `docs/agents/handbook.md`.
+
 ## Cursor Cloud specific instructions
 
 This repo currently has no application dependencies. Cloud agents can work directly with the committed skills under `.agents/skills/`.
