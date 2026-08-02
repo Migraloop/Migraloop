@@ -2,8 +2,13 @@
 //!
 //! v1 early slices use a stub/fixture Source; Oracle LogMiner lands in a later ticket.
 
+mod oracle_prerequisites;
 mod oracle_types;
 
+pub use oracle_prerequisites::{
+    check_oracle_source_prerequisites, probe_oracle_source_prerequisites_stub,
+    OracleSourcePrerequisiteState, PrerequisiteError, MIN_REDO_RETENTION_HOURS,
+};
 pub use oracle_types::{
     aware_temporal_to_utc, classify_number, is_allow_listed_oracle_type, naive_temporal_to_utc,
     normalize_oracle_type, resolve_temporal_timezone, NumberMongoMapping, ResolvedTimezone,
