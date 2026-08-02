@@ -209,13 +209,13 @@ fn process_alive(child: &Child) -> bool {
     Path::new(&format!("/proc/{}", child.id())).exists()
 }
 
-fn sync_health_line_for_table(status_out: &str, table: &str) -> String {
+fn base_followup_line(status_out: &str, table: &str, needle: &str) -> String {
     let marker = format!("Base Dataset: {table}");
     let mut lines = status_out.lines();
     while let Some(line) = lines.next() {
         if line.contains(&marker) {
             for follow in lines.by_ref() {
-                if follow.contains("Sync Health:") {
+                if follow.contains(needle) {
                     return follow.to_string();
                 }
                 if follow.starts_with("Base Dataset:") {
@@ -225,26 +225,15 @@ fn sync_health_line_for_table(status_out: &str, table: &str) -> String {
             break;
         }
     }
-    panic!("missing Sync Health for Base Dataset {table} in:\n{status_out}");
+    panic!("missing {needle} for Base Dataset {table} in:\n{status_out}");
+}
+
+fn sync_health_line_for_table(status_out: &str, table: &str) -> String {
+    base_followup_line(status_out, table, "Sync Health:")
 }
 
 fn cutover_line_for_table(status_out: &str, table: &str) -> String {
-    let marker = format!("Base Dataset: {table}");
-    let mut lines = status_out.lines();
-    while let Some(line) = lines.next() {
-        if line.contains(&marker) {
-            for follow in lines.by_ref() {
-                if follow.contains("Cutover:") {
-                    return follow.to_string();
-                }
-                if follow.starts_with("Base Dataset:") {
-                    break;
-                }
-            }
-            break;
-        }
-    }
-    panic!("missing Cutover for Base Dataset {table} in:\n{status_out}");
+    base_followup_line(status_out, table, "Cutover:")
 }
 
 fn delivery_health_line_for_pipeline(status_out: &str, pipeline: &str) -> String {

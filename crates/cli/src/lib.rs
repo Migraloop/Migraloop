@@ -652,11 +652,17 @@ fn pipeline_source_tables(pipelines: &[Pipeline]) -> Vec<String> {
     tables.into_iter().collect()
 }
 
-/// Whether two Pipeline declarations share the same binding (not a revision change).
+/// Whether a Direct Pipeline has a Target Binding configured for Delivery.
+fn direct_pipeline_has_target(pipeline: &Pipeline) -> bool {
+    pipeline.mode == "direct" && !pipeline.target_collection.is_empty()
+}
+
+/// Whether two Pipeline declarations are the same (mode, Source table, Target Binding,
+/// field mappings) — not a revision/Change of that Pipeline.
 ///
 /// Used so runtime Pipeline add can preserve Delivery progress for unchanged Pipelines
-/// (ADR-0007) without treating a binding change as a no-op add.
-fn pipeline_binding_unchanged(previous: &Pipeline, next: &Pipeline) -> bool {
+/// (ADR-0007) without treating a declaration change as a no-op add.
+fn pipeline_declaration_unchanged(previous: &Pipeline, next: &Pipeline) -> bool {
     previous.mode == next.mode
         && previous.source_table == next.source_table
         && previous.source_schema == next.source_schema
@@ -664,7 +670,7 @@ fn pipeline_binding_unchanged(previous: &Pipeline, next: &Pipeline) -> bool {
         && previous.field_mappings == next.field_mappings
 }
 
-/// Preserve Delivery progress for Pipelines whose binding is unchanged.
+/// Preserve Delivery progress for Pipelines whose declaration is unchanged.
 ///
 /// `pipelines_from_document` always starts at pending/0; without this merge, every
 /// apply would look like a Deployment restart for already-running Pipelines.
@@ -673,7 +679,7 @@ fn preserve_unchanged_pipeline_delivery(existing: &[Pipeline], pipelines: &mut [
         let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
             continue;
         };
-        if pipeline_binding_unchanged(previous, pipeline) {
+        if pipeline_declaration_unchanged(previous, pipeline) {
             pipeline.delivery_status = previous.delivery_status.clone();
             pipeline.delivery_applied_changes = previous.delivery_applied_changes;
         }
@@ -687,7 +693,7 @@ fn pipelines_needing_delivery_start<'a>(
     pipelines
         .iter()
         .filter(|pipeline| {
-            if pipeline.mode != "direct" || pipeline.target_collection.is_empty() {
+            if !direct_pipeline_has_target(pipeline) {
                 return false;
             }
             let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
@@ -695,7 +701,7 @@ fn pipelines_needing_delivery_start<'a>(
                 return true;
             };
             // Unchanged, already-delivered Pipelines keep running without re-Delivery.
-            if pipeline_binding_unchanged(previous, pipeline)
+            if pipeline_declaration_unchanged(previous, pipeline)
                 && previous.delivery_status == "delivered"
             {
                 return false;
@@ -710,9 +716,7 @@ async fn deliver_direct_pipelines(
     deployment: &Deployment,
     pipelines: &[&Pipeline],
 ) -> Result<(), CliError> {
-    let needs_delivery = pipelines
-        .iter()
-        .any(|p| p.mode == "direct" && !p.target_collection.is_empty());
+    let needs_delivery = pipelines.iter().any(|p| direct_pipeline_has_target(p));
     if !needs_delivery {
         return Ok(());
     }
@@ -720,7 +724,7 @@ async fn deliver_direct_pipelines(
     let mongo = mongo_target_from_deployment(deployment)?;
 
     for pipeline in pipelines {
-        if pipeline.mode != "direct" || pipeline.target_collection.is_empty() {
+        if !direct_pipeline_has_target(pipeline) {
             continue;
         }
 
@@ -821,7 +825,8 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .iter()
         .map(|p| p.name.clone())
         .collect();
-    let added: Vec<(String, String)> = pipelines
+    // Owned summaries so we can mutate `pipelines` below without overlapping borrows.
+    let added_pipeline_summaries: Vec<(String, String)> = pipelines
         .iter()
         .filter(|p| !existing_names.contains(&p.name))
         .map(|p| (p.name.clone(), p.source_table.clone()))
@@ -842,7 +847,7 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
     sync_base_datasets_for_pipelines(platform_store_url, &deployment, &pipelines).await?;
 
     if !existing_pipelines.is_empty() {
-        for (name, source_table) in &added {
+        for (name, source_table) in &added_pipeline_summaries {
             println!("Runtime Pipeline add: {name} (source={source_table})");
         }
     }
