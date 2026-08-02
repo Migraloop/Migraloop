@@ -120,6 +120,10 @@ _Avoid_: Unlimited user under-provisioning with no product feedback, auto-pausin
 What must pass before a build is production-releasable (see ADR-0011): correctness tests (unit, Affect Analysis, Initial↔CDC hand-off, idempotent Delivery), Oracle→Mongo contract tests, performance/load benchmarks with regression thresholds, and basic fault/error tests (e.g. process restart resume, clear apply failures). Multi-week chaos and full-scale endurance are not v1 release blockers.
 _Avoid_: Manual-only release, requiring long-running chaos programs as the sole v1 bar
 
+**Local Sync Lab**:
+A first-class, human-operated environment for manually verifying the real product end-to-end (Sync through Delivery). The Lab provisions disposable Source System, Target System, Platform Store, and app for Lab use only—operators do not assemble those pieces by hand. It runs the same product path a trusted Deployment would use—not a fake, stub, or simplified substitute for capture/Delivery. Distinct from the Release Quality Gate (automated CI) and from the in-process LogMiner contract/stub harness used only in tests. Connecting a customer’s real databases is out of scope for the Lab; that remains ordinary Deployment configuration.
+_Avoid_: CI pipeline, Release Quality Gate, contract/stub harness as the Lab, “toy” sync that skips real Source/Target engines, requiring BYO Oracle/Mongo to use the Lab, treating Lab databases as production Source/Target Systems
+
 **Upgrade Compatibility**:
 How versions move forward in production (see ADR-0014). Platform Store uses versioned schema migrations applied on startup; configuration is SemVer’d with compatible reads of older configs. Upgrades must be **backward compatible**: a newer app must run existing Deployments and accepted older config/store data without forcing a rebuild or hand-rewriting Pipelines. Breaking changes require an explicit, automated compatibility path—not silent breakage. Short sync pause during single-instance upgrade is allowed; data/checkpoint loss is not.
 _Avoid_: Manual SQL-only upgrades, wipe-and-rebuild as the normal path, breaking existing Pipelines on upgrade without a migration path
