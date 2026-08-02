@@ -13,8 +13,9 @@ use std::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    accounts_fixture, customers_fixture, events_fixture, normalize_snapshot_temporals,
-    orders_fixture, CaptureError, CapturePosition, InitialLoadSnapshot, SourceColumn,
+    accounts_fixture, customers_fixture, events_fixture, is_allow_listed_oracle_type,
+    normalize_snapshot_temporals, orders_fixture, CaptureError, CapturePosition,
+    InitialLoadSnapshot, SourceColumn,
 };
 
 /// Env var: path to a JSON file that merges/overrides harness catalog tables.
@@ -58,6 +59,11 @@ impl ContractSourceCatalog {
         let key = snapshot.table.trim().to_ascii_uppercase();
         let mut snapshot = snapshot;
         snapshot.table = key.clone();
+        // Apply the same allow-list rules as live OCI discovery (ADR-0018).
+        for column in &mut snapshot.columns {
+            column.supported =
+                column.supported && is_allow_listed_oracle_type(&column.oracle_type, column.size);
+        }
         self.tables.insert(key, snapshot);
     }
 
@@ -109,15 +115,13 @@ pub fn load_contract_source_catalog() -> Result<ContractSourceCatalog, CaptureEr
 }
 
 pub fn load_catalog_file(path: &Path) -> Result<ContractSourceCatalogFile, CaptureError> {
-    let raw = fs::read_to_string(path).map_err(|err| CaptureError::OciUnavailable {
-        host: "contract".to_string(),
+    let raw = fs::read_to_string(path).map_err(|err| CaptureError::ContractCatalog {
         detail: format!(
             "failed to read {CONTRACT_SOURCE_CATALOG_ENV} file {}: {err}",
             path.display()
         ),
     })?;
-    serde_json::from_str(&raw).map_err(|err| CaptureError::OciUnavailable {
-        host: "contract".to_string(),
+    serde_json::from_str(&raw).map_err(|err| CaptureError::ContractCatalog {
         detail: format!(
             "invalid {CONTRACT_SOURCE_CATALOG_ENV} JSON {}: {err}",
             path.display()
@@ -242,5 +246,34 @@ mod tests {
         assert!(catalog.schema("CUSTOMERS").is_ok(), "defaults retained");
         let widgets = catalog.initial_load("WIDGETS", None).expect("widgets");
         assert_eq!(widgets.rows[0].get("LABEL"), Some(&json!("alpha")));
+    }
+
+    #[test]
+    fn insert_reapplies_allow_list_so_mis_marked_blob_is_unsupported() {
+        let mut catalog = ContractSourceCatalog::empty();
+        let mut row = BTreeMap::new();
+        row.insert("WID".into(), json!(1));
+        row.insert("PHOTO".into(), json!("blob"));
+        catalog.insert(snapshot(
+            "WIDGETS",
+            1,
+            &["WID"],
+            vec![
+                number_col("WID", 10, 0, true),
+                // Author wrongly claims BLOB is supported — catalog must correct.
+                SourceColumn {
+                    name: "PHOTO".into(),
+                    oracle_type: "BLOB".into(),
+                    supported: true,
+                    precision: None,
+                    scale: None,
+                    size: None,
+                },
+            ],
+            vec![row],
+        ));
+        let columns = catalog.schema("WIDGETS").expect("schema");
+        let photo = columns.iter().find(|c| c.name == "PHOTO").expect("PHOTO");
+        assert!(!photo.supported, "BLOB must remain unsupported after insert");
     }
 }

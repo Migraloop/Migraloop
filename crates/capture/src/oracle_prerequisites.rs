@@ -142,9 +142,10 @@ fn stub_all_known_tables() -> BTreeSet<String> {
     // satisfy supplemental-logging probes without a hard-coded business list.
     match crate::load_contract_source_catalog() {
         Ok(catalog) => catalog.table_names().into_iter().collect(),
-        Err(_) => ["CUSTOMERS", "ORDERS", "EVENTS", "ACCOUNTS"]
+        // Bad env JSON: fall back to default named fixtures only (not a closed match arm).
+        Err(_) => crate::ContractSourceCatalog::with_default_fixtures()
+            .table_names()
             .into_iter()
-            .map(str::to_string)
             .collect(),
     }
 }

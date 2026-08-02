@@ -78,6 +78,8 @@ pub enum CaptureError {
         "Oracle LogMiner (OCI) unavailable for Source host {host}: {detail}"
     )]
     OciUnavailable { host: String, detail: String },
+    #[error("contract Source catalog error: {detail}")]
+    ContractCatalog { detail: String },
     #[error(transparent)]
     Type(#[from] TypeError),
 }
