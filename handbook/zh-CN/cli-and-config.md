@@ -38,7 +38,7 @@ migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployme
 
 ### `status`
 
-报告 Platform Store 健康、Deployments、Pipelines、Base Datasets、Sync Health、Delivery Health 与 Derived Datasets。
+报告 Platform Store 健康、Deployments、Pipelines、Base Datasets、Sync Health、Delivery Health、Quarantine 行，与 Derived Datasets。当 Poison Change quarantine 作用中时，Delivery Health 为 `unhealthy`，并把每个被 quarantine 的 Output Identity 标为 unhealthy / not aligned（ADR-0015）。
 
 ```bash
 migraloop status --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
@@ -90,6 +90,8 @@ migraloop derived --pipeline orders_by_customer [--deployment oracle-to-mongo]
 Oracle Incremental Capture 一律走 LogMiner：真实 host 使用 **LogMiner (OCI)**；`host: contract` / `stub` 使用进程内 contract harness。真实 host **不会** silent fallback 到 stub catalog。缺少 Instant Client 或 OCI 失败时会以 LogMiner/OCI 名称 fail fast。
 
 已 pause 的 Pipelines 在 `sync` 期间会跳过 Delivery/processing；共用 Base Dataset 的 Incremental Capture 仍会继续，让其他 Pipelines 与之后的 resume catch-up 保持正确。
+
+当单个 Output Identity 的 Delivery 反复失败时，`sync` 会重试最多 `MIGRALOOP_POISON_MAX_ATTEMPTS` 次（默认 `3`），然后 quarantine 该 identity、发出 Operator 可见的 **ALERT**、继续其他 changes，并在 `status` 上显示 quarantine（ADR-0015 / issue #22）。
 
 ```bash
 migraloop sync --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
@@ -160,8 +162,8 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `up` | 启动可丢弃 Fixture；就绪时打印连接细节 |
 | `status` | 报告 Fixture 就绪状态（engines + Oracle prerequisites + Platform Store），以及哪个 Scenario Namespace 为 **active**（run 进行中）或 **leftover**（run 结束后保留），或各自为 `(none)`。在你套用配置或运行 Lab Scenario 之前也会显示 `Deployment: (none)` / `Pipeline: (none)` — 请用 Scenario run / leftover 行判断，不必从那些行自行猜测 |
 | `down` | 拆除 containers 与 volumes |
-| `scenario list` | 按 `--lab-dir` 磁盘上的 recipe 列出可选 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已注册 runner）。summary 来自各 recipe—例如 `direct-pipeline`、`rt-project`、`rt-filter`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`、`idempotent-redelivery`、`pause-resume`、`remove-pipeline`、`change-pipeline`。list 也会回报已出货 capability 覆盖（complete vs gaps；见 `lab/scenarios/COVERAGE.md`） |
-| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。若 Source/Target 不是 Lab Fixture engines 也会拒绝（客户／生产数据库不在 Lab 范围—那些请用普通的 `apply`/`sync`）。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定义的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 与 operational metrics 等权）。`rt-project` / `rt-filter` 覆盖已出货 Rich Transform `project` 与 `filter` operators；`concurrent-source-workload` 在单一 Scenario 内跑并行 Source sessions；`bulk-load` 会 bulk-insert 约 100k Source rows，且 metric thresholds 可独立于 correctness 让 run 失败；`idempotent-redelivery` 会强制对同一批 Output Identities 做 duplicate-safe re-Delivery，并检查 Managed Target 结果仍正确；`pause-resume` 覆盖 `pause` / `resume` CLI 动词（一条 Pipeline 停止 Delivery、另一条继续；resume 自耐久 Base catch-up）。`remove-pipeline` 覆盖 `remove`（停止 Delivery；仍被引用的 Shared Base 保留；status 不再列出该 Pipeline）；`change-pipeline` 覆盖通过 `apply` 的 Pipeline revision（暂停旧 Delivery → 重建该 Pipeline 的 Derived／重新 Delivery；Shared Bases 不重建；仅 `description` 的 metadata-only 变更可跳过 rebuild）。第二个 Scenario run 仍会被拒绝。默认 keep-on-finish 保留 Namespace 供实时 `base`/`derived`/`target` 检查；成功后若要删除可传 `--auto-remove` |
+| `scenario list` | 按 `--lab-dir` 磁盘上的 recipe 列出可选 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已注册 runner）。summary 来自各 recipe—例如 `direct-pipeline`、`rt-project`、`rt-filter`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`、`idempotent-redelivery`、`pause-resume`、`remove-pipeline`、`change-pipeline`、`poison-quarantine`、`poison-quarantine`、`poison-quarantine`。list 也会回报已出货 capability 覆盖（complete vs gaps；见 `lab/scenarios/COVERAGE.md`） |
+| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。若 Source/Target 不是 Lab Fixture engines 也会拒绝（客户／生产数据库不在 Lab 范围—那些请用普通的 `apply`/`sync`）。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定义的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 与 operational metrics 等权）。`rt-project` / `rt-filter` 覆盖已出货 Rich Transform `project` 与 `filter` operators；`concurrent-source-workload` 在单一 Scenario 内跑并行 Source sessions；`bulk-load` 会 bulk-insert 约 100k Source rows，且 metric thresholds 可独立于 correctness 让 run 失败；`idempotent-redelivery` 会强制对同一批 Output Identities 做 duplicate-safe re-Delivery，并检查 Managed Target 结果仍正确；`pause-resume` 覆盖 `pause` / `resume` CLI 动词（一条 Pipeline 停止 Delivery、另一条继续；resume 自耐久 Base catch-up）。`remove-pipeline` 覆盖 `remove`（停止 Delivery；仍被引用的 Shared Base 保留；status 不再列出该 Pipeline）；`change-pipeline` 覆盖通过 `apply` 的 Pipeline revision（暂停旧 Delivery → 重建该 Pipeline 的 Derived／重新 Delivery；Shared Bases 不重建；仅 `description` 的 metadata-only 变更可跳过 rebuild）；`poison-quarantine` 在有界重试后 quarantine 单个 poison Output Identity 并 ALERT，Pipeline 继续，且 `status` 显示 unhealthy / not aligned。第二个 Scenario run 仍会被拒绝。默认 keep-on-finish 保留 Namespace 供实时 `base`/`derived`/`target` 检查；成功后若要删除可传 `--auto-remove` |
 | `scenario remove` | 完整移除 Scenario Namespace（Source tables、Target collections、Platform Store Deployment），且不启动 run。若已有 Scenario 作用中则拒绝。已不存在时为 idempotent |
 
 | Flag | 含义 |
@@ -179,6 +181,8 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | 配置中 `fromEnv` 引用的密钥环境变量名 | 你在 `password.fromEnv` 写的任何名称（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply/sync 时必须存在于进程环境 |
 | `LD_LIBRARY_PATH` | 真实 Oracle host：Oracle Instant Client libraries 目录（apply/sync runtime 需要；`contract`/`stub` 不使用） |
 | `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | 仅 contract/stub host：JSON 文件路径，merge/override harness catalog 表以供 schema discovery + Initial Load（CI／本地切片；不是 production Source 机制） |
+| `MIGRALOOP_POISON_MAX_ATTEMPTS` | Poison Change quarantine 前的有界 Delivery 重试次数（默认 `3`；必须 > 0） |
+| `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | 仅 Test/Lab fault injection：以逗号分隔、一律让 Delivery 失败的 Output Identity keys，用来演练 quarantine（不是 production Operator 控制） |
 | Lab disposable defaults | `migraloop lab up` 之后：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`（仅本地 Lab） |
 
 ### Contract-harness Source Prerequisite probes（仅 host `stub` / `contract`）

@@ -23,7 +23,7 @@ Source DDL 會依每條 Pipeline 的相依性分類（ADR-0009）：
 3. **Alert** Operators
 4. **讓 Pipeline 繼續跑**
 
-被 quarantine 的 keys 在修復或重試前保持 unhealthy / not aligned—絕不默默略過。不要預期單列壞資料就 pause 整條 Pipeline。在 quarantine 出現在 `status` 之前，請從 apply 錯誤與 Delivery Health 觀察卡住的 identities。
+被 quarantine 的 keys 在修復或重試前保持 unhealthy / not aligned—絕不默默略過。不要預期單列壞資料就 pause 整條 Pipeline。有界 Delivery 重試後，`migraloop sync` 會持久化 quarantine、發出 Operator 可見的 **ALERT**，並繼續處理其他 changes；`migraloop status` 會顯示 `Delivery Health: unhealthy`，並把每個被 quarantine 的 Output Identity 標為 unhealthy / not aligned。
 
 ## Backpressure
 

@@ -14,7 +14,8 @@ migraloop status
 - 每個 **Deployment**（Source/Target 識別、LogMiner 機制：contract 或 OCI）
 - 每條 **Pipeline**（mode、source 資料表、target collection、Delivery status）
 - 每個 **Base Dataset**（status、列數、欄位、省略的不支援型別、Initial Load / cutover watermarks、含 appliedChanges / lag / checkpoint 的 **Sync Health**）
-- 每條 Pipeline 的 **Delivery Health**（已套用變更 / status）
+- 每條 Pipeline 的 **Delivery Health**（已套用變更 / status；有 Poison Change quarantine 時為 `unhealthy`）
+- 作用中的 **Quarantine** 列（Output Identity、change id、attempts、last error — unhealthy / not aligned）
 - Transform Pipelines 的 **Derived Datasets**（若有）
 
 第一次 sync 後 Operator 常看的健康跡象：
@@ -22,7 +23,8 @@ migraloop status
 - Platform Store：`healthy`
 - Base Dataset status 從 Initial Load 進入 incremental apply
 - Sync Health lag 趨向追上（不是長期單向成長）
-- 已設定 Target Binding 的 Delivery Health 顯示成功套用
+- 已設定 Target Binding 的 Delivery Health 顯示成功套用（`ok`，不是 `unhealthy` quarantine）
+- Quarantine：`(none)`（除非刻意留下被 quarantine 的 poison identity）
 
 ## 更深的檢查指令
 
