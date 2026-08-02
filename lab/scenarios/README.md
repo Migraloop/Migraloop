@@ -1,6 +1,8 @@
 # Lab Scenario recipes
 
-Feature-time authoring path for selectable **Lab Scenarios** (ADR-0025 / issue #65).
+Feature-time authoring path for selectable **Lab Scenarios** (ADR-0025 / issues #65–#66).
+
+Shipped-capability coverage (and visible gaps for not-yet-shipped surfaces) lives in [COVERAGE.md](./COVERAGE.md). `migraloop lab scenario list` reports whether the selectable catalog is complete for currently shipped capabilities—operators still pick Scenarios individually; this is not a CI suite.
 
 Each Scenario lives under `lab/scenarios/<id>/` with:
 

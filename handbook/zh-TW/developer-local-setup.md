@@ -47,6 +47,8 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario list
 # Scenario apply/sync 需要 Instant Client：export LD_LIBRARY_PATH=/path/to/instantclient
 ./target/debug/migraloop lab scenario run direct-pipeline
+./target/debug/migraloop lab scenario run rt-project
+./target/debug/migraloop lab scenario run rt-filter
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run bulk-load
@@ -68,7 +70,7 @@ Bring-up 後預設：Platform Store `postgres://migraloop:migraloop@127.0.0.1:54
 3. 確認 `migraloop lab scenario list` 顯示新 id，且 **summary 來自 `recipe.yaml`**。Selectable catalog = 已註冊 runner，且在 `--lab-dir` 下同時有 recipe + deployment 檔。
 4. 在 Lab Fixture 上手動驗證 `migraloop lab scenario run <id>`。list／控制面行為維持 always-on CLI-seam 測試；完整 Fixture run 維持 `#[ignore]` — 不是 Release Quality Gate。
 
-Recipe 慣例與短清單亦見 `lab/scenarios/README.md`。
+Recipe 慣例與短清單亦見 `lab/scenarios/README.md`。已出貨 capability 覆蓋與可見 gaps：`lab/scenarios/COVERAGE.md`（亦由 `lab scenario list` 摘要）。
 
 ## 測試
 
@@ -109,7 +111,7 @@ Lab Fixture lifecycle seam（預設 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、多表 Transform Pipeline 、concurrent Source workload 與 bulk-load seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）：
+Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload 與 bulk-load seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
