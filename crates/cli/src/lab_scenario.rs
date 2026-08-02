@@ -291,6 +291,21 @@ and register a runner; see lab/scenarios/README.md)"
     Ok(())
 }
 
+fn unknown_or_incomplete_scenario_error(scenario: &str, lab_dir: &Path) -> CliError {
+    if registered_scenario_ids().contains(&scenario) {
+        CliError::Failed(format!(
+            "Lab Scenario `{scenario}` is not selectable under {}: \
+             add scenarios/{scenario}/recipe.yaml and deployment.yaml \
+             (see lab/scenarios/README.md). Run `migraloop lab scenario list`.",
+            lab_dir.display()
+        ))
+    } else {
+        CliError::Failed(format!(
+            "Unknown Lab Scenario `{scenario}`. Run `migraloop lab scenario list`."
+        ))
+    }
+}
+
 async fn scenario_run(
     scenario: &str,
     lab_dir: &Path,
@@ -301,20 +316,7 @@ async fn scenario_run(
         .iter()
         .find(|(id, _)| id == scenario)
         .cloned()
-        .ok_or_else(|| {
-            if registered_scenario_ids().contains(&scenario) {
-                CliError::Failed(format!(
-                    "Lab Scenario `{scenario}` is not selectable under {}: \
-                     add scenarios/{scenario}/recipe.yaml and deployment.yaml \
-                     (see lab/scenarios/README.md). Run `migraloop lab scenario list`.",
-                    lab_dir.display()
-                ))
-            } else {
-                CliError::Failed(format!(
-                    "Unknown Lab Scenario `{scenario}`. Run `migraloop lab scenario list`."
-                ))
-            }
-        })?;
+        .ok_or_else(|| unknown_or_incomplete_scenario_error(scenario, lab_dir))?;
 
     // One-at-a-time check before Fixture probes so CI can assert rejection without Docker.
     let lock_path = lab_dir.join(LOCK_FILE_NAME);
@@ -398,20 +400,7 @@ async fn scenario_remove(scenario: &str, lab_dir: &Path) -> Result<(), CliError>
     catalog
         .iter()
         .find(|(id, _)| id == scenario)
-        .ok_or_else(|| {
-            if registered_scenario_ids().contains(&scenario) {
-                CliError::Failed(format!(
-                    "Lab Scenario `{scenario}` is not selectable under {}: \
-                     add scenarios/{scenario}/recipe.yaml and deployment.yaml \
-                     (see lab/scenarios/README.md). Run `migraloop lab scenario list`.",
-                    lab_dir.display()
-                ))
-            } else {
-                CliError::Failed(format!(
-                    "Unknown Lab Scenario `{scenario}`. Run `migraloop lab scenario list`."
-                ))
-            }
-        })?;
+        .ok_or_else(|| unknown_or_incomplete_scenario_error(scenario, lab_dir))?;
 
     let lock_path = lab_dir.join(LOCK_FILE_NAME);
     if let Some(existing) = read_active_lock(&lock_path)? {

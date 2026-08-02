@@ -35,6 +35,10 @@ fn temp_lab_dir() -> (tempfile::TempDir, String) {
 /// Minimal selectable Scenario package (`recipe.yaml` + `deployment.yaml`) for
 /// always-on CLI probes that use an isolated `--lab-dir`.
 fn write_minimal_scenario_package(lab: &Path, id: &str) {
+    write_scenario_package(lab, id, &format!("test recipe for {id}"));
+}
+
+fn write_scenario_package(lab: &Path, id: &str, summary: &str) {
     let scenario_dir = lab.join("scenarios").join(id);
     fs::create_dir_all(&scenario_dir).expect("scenario dir");
     fs::write(
@@ -48,7 +52,7 @@ fn write_minimal_scenario_package(lab: &Path, id: &str) {
         scenario_dir.join("recipe.yaml"),
         format!(
             r#"id: {id}
-summary: test recipe for {id}
+summary: {summary}
 namespace:
   source_tables: [LAB_TEST]
   target_collections: [lab_test]
@@ -179,36 +183,11 @@ async fn lab_scenario_list_reads_recipe_summaries_from_lab_dir() {
     let lab = dir.path();
     fs::write(lab.join("compose.yaml"), "name: migraloop-lab-recipe-list\n")
         .expect("write stub compose.yaml");
-    let scenario_dir = lab.join("scenarios").join("direct-pipeline");
-    fs::create_dir_all(&scenario_dir).expect("scenario dir");
-    fs::write(
-        scenario_dir.join("deployment.yaml"),
-        "apiVersion: migraloop.dev/v1\nkind: Deployment\nmetadata:\n  name: lab-direct-pipeline\n",
-    )
-    .expect("deployment.yaml");
-    fs::write(
-        scenario_dir.join("recipe.yaml"),
-        r#"id: direct-pipeline
-summary: FEATURE-TIME-AUTHORING-PROBE Direct Pipeline recipe
-namespace:
-  source_tables: [LAB_DP_CUSTOMERS]
-  target_collections: [lab_dp_customers]
-  deployment: lab-direct-pipeline
-  pipelines: [lab-dp-customers]
-deployment_config: deployment.yaml
-workload:
-  concurrency: serial
-  steps:
-    - prepare Namespace schema + seed
-    - apply via real product path
-    - mutate Source insert/update/delete
-    - sync LogMiner Incremental Capture + Delivery
-checks:
-  correctness:
-    - "Base/Target Managed NAME: Alicia + Carol present; Bob absent"
-"#,
-    )
-    .expect("recipe.yaml");
+    write_scenario_package(
+        lab,
+        "direct-pipeline",
+        "FEATURE-TIME-AUTHORING-PROBE Direct Pipeline recipe",
+    );
 
     let list = Command::new(bin())
         .args([
