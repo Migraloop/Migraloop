@@ -1664,13 +1664,15 @@ collection={RT_FILTER_COLLECTION} deployment={RT_FILTER_DEPLOYMENT}"
     )
     .await?;
 
-    // After mutate: Alicia ACTIVE=1, Carol ACTIVE=1, Bob deleted → both active names present.
+    // After mutate: Alicia + flipped Bob + Carol ACTIVE=1; Dana ACTIVE=0 stays filtered out.
     let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+        && managed_field_present(&derived_after, "NAME", "Bob")
         && managed_field_present(&derived_after, "NAME", "Carol")
-        && !managed_field_present(&derived_after, "NAME", "Bob");
+        && !managed_field_present(&derived_after, "NAME", "Dana");
     let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+        && managed_field_present(&target_after, "NAME", "Bob")
         && managed_field_present(&target_after, "NAME", "Carol")
-        && !managed_field_present(&target_after, "NAME", "Bob");
+        && !managed_field_present(&target_after, "NAME", "Dana");
 
     let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
 
@@ -1782,13 +1784,15 @@ EXIT;\n"
 }
 
 async fn mutate_rt_filter_source(lab_dir: &Path) -> Result<(), CliError> {
-    // Alicia stays ACTIVE=1; Carol ACTIVE=1 inserted; inactive Bob deleted.
+    // Alicia stays ACTIVE=1; Bob flips 0→1 (must enter Derived); Carol ACTIVE=1;
+    // Dana ACTIVE=0 must stay filtered out.
     let sql = format!(
         "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
 WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
 UPDATE {RT_FILTER_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
+UPDATE {RT_FILTER_TABLE} SET ACTIVE = 1 WHERE ID = 2;\n\
 INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
-DELETE FROM {RT_FILTER_TABLE} WHERE ID = 2;\n\
+INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (4, 'Dana', 'dana@example.com', 0);\n\
 COMMIT;\n\
 EXIT;\n"
     );

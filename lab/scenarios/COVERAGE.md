@@ -28,6 +28,7 @@ These are **not** covered and must stay listed until the capability ships with a
 | --- | --- |
 | Rich Transform rename/remove, equiLookup, unwind, count/min/max/avg, distinct/addToSet, union | Domain roadmap; not accepted by the CLI transform parser yet |
 | Dedicated Pipeline pause/resume CLI verbs | Control-plane contract (ADR-0007); not first-class CLI verbs yet |
+| Dedicated Pipeline revision-change Scenario (pause old → rebuild Derived → resume) | Today Operators change Pipelines via `apply`; every Scenario exercises apply-add, but a change-focused Scenario waits on clearer revision UX |
 | Poison Change quarantine on Operator `status` | Operations model; quarantine surface not Lab-ready yet |
 
 When shipping any gap above: add `lab/scenarios/<id>/`, register the runner, update this table, and only then restate catalog-complete for the expanded shipped surface.

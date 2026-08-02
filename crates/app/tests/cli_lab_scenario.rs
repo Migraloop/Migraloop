@@ -1657,9 +1657,10 @@ async fn lab_scenario_rt_filter_run_and_inspect() {
     );
     assert!(
         derived_out.contains("Alicia")
+            && derived_out.contains("Bob")
             && derived_out.contains("Carol")
-            && !derived_out.contains("Bob"),
-        "filtered Derived Managed NAME outcomes, got:\n{derived_out}"
+            && !derived_out.contains("Dana"),
+        "filtered Derived Managed NAME outcomes (ACTIVE flip + inactive exclude), got:\n{derived_out}"
     );
 
     let remove = Command::new(bin())
