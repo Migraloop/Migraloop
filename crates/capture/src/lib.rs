@@ -1,10 +1,18 @@
 //! Capture from a Source System into Base Datasets.
 //!
-//! v1 early slices use a stub/fixture Source; Oracle LogMiner lands in a later ticket.
+//! Incremental Capture for Oracle is LogMiner-backed (ADR-0003 / ADR-0013):
+//! contract harness for local/CI slices, OCI adapter for real Oracle hosts.
+//! Initial Load still uses fixture Sources until ticket #40 moves discovery off stub.
 
+mod logminer;
 mod oracle_prerequisites;
 mod oracle_types;
 
+pub use logminer::{
+    change_events_from_logminer_contents, logminer_change_id, open_oracle_incremental_capture,
+    ContractLogMiner, IncrementalCapture, LogMinerContent, LogMinerOperation, OciLogMiner,
+    OracleSourceConnect, DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR, V_LOGMNR_CONTENTS_QUERY,
+};
 pub use oracle_prerequisites::{
     check_oracle_source_prerequisites, probe_oracle_source_prerequisites_stub,
     OracleSourcePrerequisiteState, PrerequisiteError, MIN_REDO_RETENTION_HOURS,
@@ -23,7 +31,7 @@ use thiserror::Error;
 /// Module seam marker retained by the single app binary.
 pub const SEAM: &str = "capture";
 
-/// Stub stand-in for an Oracle SCN / LogMiner capture position.
+/// Oracle SCN / LogMiner capture position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CapturePosition(pub u64);
 
@@ -51,6 +59,10 @@ impl std::fmt::Display for CapturePosition {
 pub enum CaptureError {
     #[error("unknown stub Source table: {0}")]
     UnknownTable(String),
+    #[error(
+        "Oracle LogMiner (OCI) unavailable for Source host {host}: {detail}"
+    )]
+    OciUnavailable { host: String, detail: String },
     #[error(transparent)]
     Type(#[from] TypeError),
 }
@@ -74,7 +86,7 @@ pub struct ChangeEvent {
     /// Full source row for insert/update (may include unsupported columns to omit).
     /// `None` for delete.
     pub row: Option<BTreeMap<String, serde_json::Value>>,
-    /// Capture position of this change (stub SCN).
+    /// Capture position of this change (Oracle SCN from LogMiner).
     pub position: CapturePosition,
     /// Stable id for Platform Store dedupe of overlapping/replayed applies.
     pub change_id: String,
@@ -403,68 +415,21 @@ fn json_num(value: i64) -> serde_json::Value {
     serde_json::Value::Number(value.into())
 }
 
-/// Emit stub Incremental Capture changes at or after `from_position` (inclusive).
+/// Emit Incremental Capture changes via the LogMiner contract harness.
 ///
-/// Cutover starts from the Initial Load low-watermark so the overlap window is
-/// included. Later syncs pass the last applied checkpoint+1 semantics via
-/// exclusive filtering in the caller when desired; this stub filters
-/// `position >= from_position`.
+/// Retained for unit-test convenience. Product CLI uses
+/// [`open_oracle_incremental_capture`] so Incremental Capture is always
+/// LogMiner-backed (contract or OCI).
 pub fn incremental_changes_stub(
     table: &str,
     from_position: CapturePosition,
 ) -> Result<Vec<ChangeEvent>, CaptureError> {
     match table {
-        "CUSTOMERS" => Ok(customers_incremental_fixture()
-            .into_iter()
-            .filter(|change| change.position >= from_position)
-            .collect()),
-        "ORDERS" | "EVENTS" | "ACCOUNTS" => Ok(Vec::new()),
+        "CUSTOMERS" | "ORDERS" | "EVENTS" | "ACCOUNTS" => {
+            ContractLogMiner::default().fetch_changes(table, from_position)
+        }
         other => Err(CaptureError::UnknownTable(other.to_string())),
     }
-}
-
-fn customers_incremental_fixture() -> Vec<ChangeEvent> {
-    // Positions are after CUSTOMERS_LOW_WATERMARK (1000). The Alice→Alicia update at
-    // 1050 is the classic "snapshot saw old value; Incremental Capture overlap must
-    // not gap" case.
-    vec![
-        ChangeEvent {
-            table: "CUSTOMERS".to_string(),
-            op: ChangeOp::Update,
-            identity: row(&[("ID", json_num(1))]),
-            row: Some(row(&[
-                ("ID", json_num(1)),
-                ("NAME", json_str("Alicia")),
-                ("EMAIL", json_str("alicia@example.com")),
-                ("ACTIVE", json_num(1)),
-                ("BIO", json_str("blob-bytes-alicia")),
-            ])),
-            position: CapturePosition(1050),
-            change_id: "customers-scn-1050-update-1".to_string(),
-        },
-        ChangeEvent {
-            table: "CUSTOMERS".to_string(),
-            op: ChangeOp::Insert,
-            identity: row(&[("ID", json_num(3))]),
-            row: Some(row(&[
-                ("ID", json_num(3)),
-                ("NAME", json_str("Carol")),
-                ("EMAIL", json_str("carol@example.com")),
-                ("ACTIVE", json_num(1)),
-                ("BIO", json_str("blob-bytes-carol")),
-            ])),
-            position: CapturePosition(1060),
-            change_id: "customers-scn-1060-insert-3".to_string(),
-        },
-        ChangeEvent {
-            table: "CUSTOMERS".to_string(),
-            op: ChangeOp::Delete,
-            identity: row(&[("ID", json_num(2))]),
-            row: None,
-            position: CapturePosition(1070),
-            change_id: "customers-scn-1070-delete-2".to_string(),
-        },
-    ]
 }
 
 #[cfg(test)]

@@ -41,9 +41,9 @@ If redo is aged out before the platform consumes it, changes are silently lost â
 3. Run `migraloop apply` / `migraloop sync`. Unmet prerequisites produce a pre-run failure naming what is missing.
 4. Fix the named Oracle settings, then re-run. The platform never auto-runs `ALTER DATABASE` / `ALTER TABLE` to "fix" failures.
 
-## Stub Source (tests / early slices)
+## Contract LogMiner harness (tests / local slices)
 
-Until real OCI probes land with LogMiner (#13), the stub Source simulates prerequisite state via environment variables:
+When Source `host` is `contract` or `stub`, Incremental Capture uses the in-process **LogMiner contract harness**. Prerequisite probes for that harness are env-driven (read-only; never mutate a database):
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
@@ -51,4 +51,6 @@ Until real OCI probes land with LogMiner (#13), the stub Source simulates prereq
 | `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all`, empty, or comma-separated tables with PK/ALL logging | `all` |
 | `MIGRALOOP_STUB_REDO_RETENTION_HOURS` | Reported redo retention in hours | `72` |
 
-These are read-only probe inputs for fail-fast coverage; they do not mutate any database.
+## Real Oracle (OCI LogMiner)
+
+Any other Source host selects the **OCI LogMiner** adapter. Prerequisites are probed through that same backend. Without Oracle Instant Client / OCI bindings available in the runtime, apply/sync fail fast naming LogMiner/OCIâ€”there is no silent fallback to a stub change catalog.
