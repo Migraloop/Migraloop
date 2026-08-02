@@ -20,13 +20,13 @@ use migraloop_delivery::{
     DeliveryDocument, ManagedFieldAs, MongoTargetConnection,
 };
 use migraloop_platform_store::{
-    base_dataset_exists, delete_base_datasets_not_in, filter_unapplied_change_ids, get_base_rows,
-    get_derived_rows, health, list_base_datasets, list_deployments, list_derived_datasets,
-    list_pipelines, migrate, record_applied_source_changes, replace_base_dataset,
-    replace_derived_dataset, replace_pipelines, set_pipeline_paused, update_base_primary_key,
-    update_pipeline_delivery_progress, upsert_deployment, BaseColumn, BaseDataset, Deployment,
-    DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef,
-    SecretRefKind, SystemConnection,
+    base_dataset_exists, delete_base_datasets_not_in, delete_pipeline,
+    filter_unapplied_change_ids, get_base_rows, get_derived_rows, health, list_base_datasets,
+    list_deployments, list_derived_datasets, list_pipelines, migrate,
+    record_applied_source_changes, replace_base_dataset, replace_derived_dataset, replace_pipelines,
+    set_pipeline_paused, update_base_primary_key, update_pipeline_delivery_progress,
+    upsert_deployment, BaseColumn, BaseDataset, Deployment, DerivedDataset, FieldMappingAs,
+    OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind, SystemConnection,
 };
 use migraloop_transform::{
     analyze_affect, derived_projected_fields, evaluate_transform,
@@ -133,6 +133,18 @@ pub enum Command {
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
         /// Pipeline name to resume
+        #[arg(long)]
+        pipeline: String,
+        /// Deployment name when multiple Pipelines share a name
+        #[arg(long)]
+        deployment: Option<String>,
+    },
+    /// Remove a Pipeline: stop it and cease Delivery without restarting the Deployment
+    Remove {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Pipeline name to remove
         #[arg(long)]
         pipeline: String,
         /// Deployment name when multiple Pipelines share a name
@@ -2373,6 +2385,55 @@ async fn resume_pipeline_command(
     Ok(())
 }
 
+async fn remove_pipeline_command(
+    platform_store_url: &str,
+    pipeline_name: &str,
+    deployment_name: Option<&str>,
+) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+    let pipeline =
+        resolve_named_pipeline(platform_store_url, pipeline_name, deployment_name).await?;
+
+    delete_pipeline(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    // Keep Shared Bases still referenced by remaining Pipelines; prune only tables
+    // no longer referenced (same capture-scope rule as apply — ADR-0019 / ADR-0007).
+    let remaining = list_pipelines(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?
+        .into_iter()
+        .filter(|p| p.deployment_name == pipeline.deployment_name)
+        .collect::<Vec<_>>();
+    let mut keep = BTreeSet::new();
+    for remaining_pipeline in &remaining {
+        keep.insert((
+            remaining_pipeline.source_schema.clone(),
+            remaining_pipeline.source_table.clone(),
+        ));
+    }
+    let keep_tables: Vec<(String, String)> = keep.into_iter().collect();
+    delete_base_datasets_not_in(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &keep_tables,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    println!(
+        "Pipeline {} removed (Deployment {}) — Delivery/processing stopped; \
+         Shared Bases kept when still referenced",
+        pipeline.name, pipeline.deployment_name
+    );
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Migrate { platform_store_url } => apply_migrations(&platform_store_url).await,
@@ -2410,6 +2471,13 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             deployment,
         } => {
             resume_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await
+        }
+        Command::Remove {
+            platform_store_url,
+            pipeline,
+            deployment,
+        } => {
+            remove_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await
         }
         Command::Run { platform_store_url } => {
             apply_migrations(&platform_store_url).await?;

@@ -1,0 +1,29 @@
+# Lab Scenario recipe (ADR-0025 / issue #20 / ADR-0007).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: remove-pipeline
+summary: Remove Pipeline CLI verb (cease Delivery; Shared Base kept for remaining Pipelines)
+namespace:
+  source_tables:
+    - LAB_RP_CUSTOMERS
+  target_collections:
+    - lab_rp_customers
+    - lab_rp_customers_reporting
+  deployment: lab-remove-pipeline
+  pipelines:
+    - lab-rp-customers
+    - lab-rp-customers-reporting
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery for both Pipelines sharing CUSTOMERS)
+    - remove customers Pipeline via CLI
+    - mutate Source
+    - sync Incremental Capture; removed Pipeline skips Delivery; reporting Pipeline Delivers from Shared Base
+checks:
+  correctness:
+    - "After remove: status no longer lists customers Pipeline; reporting Pipeline remains"
+    - "Shared Base CUSTOMERS remains available after remove"
+    - "While removed: customers Target retains Initial Load (Alice/Bob); reporting Target receives Incremental update"
+thresholds: {}

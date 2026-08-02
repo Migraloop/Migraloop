@@ -121,6 +121,19 @@ migraloop resume --pipeline customers [--deployment oracle-to-mongo]
 | `--pipeline` | Pipeline name (required) |
 | `--deployment` | Disambiguate when multiple Deployments share a Pipeline name |
 
+### `remove`
+
+Remove one Pipeline without restarting the Deployment (ADR-0007). Stops Delivery/processing for that Pipeline. Shared Base Datasets remain when other Pipelines still reference them; Bases no longer referenced are pruned. `status` no longer lists the Pipeline as active. Target documents already Delivered are left in place (cease Delivery, not wipe). To keep the Pipeline omitted across a later `apply`, also remove it from the declarative config.
+
+```bash
+migraloop remove --pipeline customers [--deployment oracle-to-mongo]
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--pipeline` | Pipeline name (required) |
+| `--deployment` | Disambiguate when multiple Deployments share a Pipeline name |
+
 ### `run`
 
 Migrate on startup, then keep the app process alive (compose default command).
@@ -147,8 +160,8 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `up` | Bring up the disposable Fixture; print connection details when ready |
 | `status` | Report Fixture readiness (engines + Oracle prerequisites + Platform Store), plus which Scenario Namespace is **active** (a run in progress) or **leftover** (kept after a finished run), or `(none)` for each. Also shows `Deployment: (none)` / `Pipeline: (none)` until you apply config or run a Lab Scenario — use the Scenario run / leftover lines instead of guessing from those alone |
 | `down` | Tear down containers and volumes |
-| `scenario list` | List selectable Lab Scenarios from on-disk recipes under `--lab-dir` (`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`, plus a registered runner). Summaries come from each recipe—for example `direct-pipeline`, `rt-project`, `rt-filter`, `transform-pipeline`, `concurrent-source-workload`, `bulk-load`, `idempotent-redelivery`, `pause-resume`. The list also reports shipped-capability coverage (complete vs gaps; see `lab/scenarios/COVERAGE.md`) |
-| `scenario run` | Run one Lab Scenario by id. Rejects if another Scenario run is active. Refuses Source/Target bindings that are not Lab Fixture engines (customer/production databases are out of scope for Lab — use ordinary `apply`/`sync` for those). Re-running the same Scenario fully removes its Namespace before recreate. Reports pass/fail plus `duration_ms`, rows/throughput, lag, and Scenario-defined thresholds such as settle time or bulk-load lag/throughput/duration when present (correctness and operational metrics with equal weight). `rt-project` / `rt-filter` exercise shipped Rich Transform `project` and `filter` operators; `concurrent-source-workload` runs parallel Source sessions inside one Scenario; `bulk-load` bulk-inserts ~100k Source rows and can fail on metric thresholds independently of correctness; `idempotent-redelivery` forces duplicate-safe re-Delivery of the same Output Identities and checks Managed Target outcomes stay correct; `pause-resume` exercises `pause` / `resume` CLI verbs (one Pipeline stops Delivery while another continues; resume catch-up from durable Base). A second Scenario run stays rejected. Default keep-on-finish leaves the Namespace for live `base`/`derived`/`target` inspection; pass `--auto-remove` to delete it after a successful run |
+| `scenario list` | List selectable Lab Scenarios from on-disk recipes under `--lab-dir` (`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`, plus a registered runner). Summaries come from each recipe—for example `direct-pipeline`, `rt-project`, `rt-filter`, `transform-pipeline`, `concurrent-source-workload`, `bulk-load`, `idempotent-redelivery`, `pause-resume`, `remove-pipeline`. The list also reports shipped-capability coverage (complete vs gaps; see `lab/scenarios/COVERAGE.md`) |
+| `scenario run` | Run one Lab Scenario by id. Rejects if another Scenario run is active. Refuses Source/Target bindings that are not Lab Fixture engines (customer/production databases are out of scope for Lab — use ordinary `apply`/`sync` for those). Re-running the same Scenario fully removes its Namespace before recreate. Reports pass/fail plus `duration_ms`, rows/throughput, lag, and Scenario-defined thresholds such as settle time or bulk-load lag/throughput/duration when present (correctness and operational metrics with equal weight). `rt-project` / `rt-filter` exercise shipped Rich Transform `project` and `filter` operators; `concurrent-source-workload` runs parallel Source sessions inside one Scenario; `bulk-load` bulk-inserts ~100k Source rows and can fail on metric thresholds independently of correctness; `idempotent-redelivery` forces duplicate-safe re-Delivery of the same Output Identities and checks Managed Target outcomes stay correct; `pause-resume` exercises `pause` / `resume` CLI verbs (one Pipeline stops Delivery while another continues; resume catch-up from durable Base); `remove-pipeline` exercises `remove` (cease Delivery; Shared Base kept for remaining Pipelines; status no longer lists the Pipeline). A second Scenario run stays rejected. Default keep-on-finish leaves the Namespace for live `base`/`derived`/`target` inspection; pass `--auto-remove` to delete it after a successful run |
 | `scenario remove` | Fully remove a Scenario Namespace (Source tables, Target collections, Platform Store Deployment) without starting a run. Rejects if another Scenario is active. Idempotent when already absent |
 
 | Flag | Meaning |

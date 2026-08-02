@@ -94,6 +94,14 @@ const PAUSE_RESUME_CUSTOMERS_PIPELINE: &str = "lab-pr-customers";
 const PAUSE_RESUME_ORDERS_PIPELINE: &str = "lab-pr-orders";
 const PAUSE_RESUME_DEPLOYMENT: &str = "lab-pause-resume";
 
+const REMOVE_PIPELINE_ID: &str = "remove-pipeline";
+const REMOVE_PIPELINE_CUSTOMERS_TABLE: &str = "LAB_RP_CUSTOMERS";
+const REMOVE_PIPELINE_CUSTOMERS_COLLECTION: &str = "lab_rp_customers";
+const REMOVE_PIPELINE_REPORTING_COLLECTION: &str = "lab_rp_customers_reporting";
+const REMOVE_PIPELINE_CUSTOMERS_PIPELINE: &str = "lab-rp-customers";
+const REMOVE_PIPELINE_REPORTING_PIPELINE: &str = "lab-rp-customers-reporting";
+const REMOVE_PIPELINE_DEPLOYMENT: &str = "lab-remove-pipeline";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -116,7 +124,7 @@ pub enum ScenarioCommand {
     },
     /// Run a Lab Scenario by id (one Scenario at a time)
     Run {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `pause-resume`, `bulk-load`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `remove-pipeline`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -127,7 +135,7 @@ pub enum ScenarioCommand {
     },
     /// Fully remove a Scenario Namespace without starting a run
     Remove {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `pause-resume`, `bulk-load`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `remove-pipeline`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -173,6 +181,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         BULK_LOAD_ID,
         IDEMPOTENT_REDELIVERY_ID,
         PAUSE_RESUME_ID,
+        REMOVE_PIPELINE_ID,
     ]
 }
 
@@ -200,6 +209,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             PAUSE_RESUME_ID,
             "Pipeline pause/resume CLI verbs",
+        ),
+        (
+            REMOVE_PIPELINE_ID,
+            "Pipeline remove CLI verb",
         ),
     ]
 }
@@ -490,6 +503,7 @@ async fn scenario_run(
         BULK_LOAD_ID => run_bulk_load(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => run_idempotent_redelivery(lab_dir).await,
         PAUSE_RESUME_ID => run_pause_resume(lab_dir).await,
+        REMOVE_PIPELINE_ID => run_remove_pipeline(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -577,6 +591,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => remove_idempotent_redelivery_namespace(lab_dir).await,
         PAUSE_RESUME_ID => remove_pause_resume_namespace(lab_dir).await,
+        REMOVE_PIPELINE_ID => remove_remove_pipeline_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -3418,6 +3433,317 @@ EXIT;\n"
         })
 }
 
+async fn run_remove_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {REMOVE_PIPELINE_ID}");
+    println!(
+        "Scenario Namespace: table={REMOVE_PIPELINE_CUSTOMERS_TABLE} \
+collections={REMOVE_PIPELINE_CUSTOMERS_COLLECTION},{REMOVE_PIPELINE_REPORTING_COLLECTION} \
+deployment={REMOVE_PIPELINE_DEPLOYMENT}"
+    );
+
+    prepare_remove_pipeline_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, REMOVE_PIPELINE_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !apply_out.to_ascii_lowercase().contains("delivery") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!("Lab Scenario: remove Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} via CLI...");
+    let remove_out = run_product_cli(
+        &bin,
+        &[
+            "remove",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            REMOVE_PIPELINE_CUSTOMERS_PIPELINE,
+            "--deployment",
+            REMOVE_PIPELINE_DEPLOYMENT,
+        ],
+    )
+    .await?;
+    if !remove_out.to_ascii_lowercase().contains("removed") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario remove did not report removed Pipeline:\n{remove_out}"
+        )));
+    }
+
+    let status_after_remove = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if status_after_remove.contains(&format!("Pipeline: {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} (")) {
+        return Err(CliError::Failed(format!(
+            "status must no longer list removed Pipeline as active:\n{status_after_remove}"
+        )));
+    }
+    if !status_after_remove
+        .contains(&format!("Pipeline: {REMOVE_PIPELINE_REPORTING_PIPELINE} ("))
+    {
+        return Err(CliError::Failed(format!(
+            "status must still list remaining Pipeline:\n{status_after_remove}"
+        )));
+    }
+    if !status_after_remove.contains(&format!("Base Dataset: {REMOVE_PIPELINE_CUSTOMERS_TABLE}"))
+    {
+        return Err(CliError::Failed(format!(
+            "Shared Base must remain after remove:\n{status_after_remove}"
+        )));
+    }
+    if !status_after_remove.contains(REMOVE_PIPELINE_DEPLOYMENT) {
+        return Err(CliError::Failed(format!(
+            "Deployment must remain up after Pipeline remove:\n{status_after_remove}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source mutations on Shared Base table...");
+    mutate_remove_pipeline_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+    if sync_out.contains(&format!(
+        "Delivery complete: Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE}"
+    )) {
+        return Err(CliError::Failed(format!(
+            "removed Pipeline must not Deliver during sync:\n{sync_out}"
+        )));
+    }
+    if !(sync_out.contains(&format!(
+        "Delivery complete: Pipeline {REMOVE_PIPELINE_REPORTING_PIPELINE}"
+    )) || sync_out.contains(REMOVE_PIPELINE_REPORTING_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "remaining Pipeline must still Deliver from Shared Base during sync:\n{sync_out}"
+        )));
+    }
+
+    // Removed Pipeline has no Target Binding — inspect Target via Lab mongosh.
+    let customers_target = mongosh_in_mongo(
+        lab_dir,
+        &format!(
+            "JSON.stringify(db.getCollection('{REMOVE_PIPELINE_CUSTOMERS_COLLECTION}').find().toArray())"
+        ),
+    )
+    .await
+    .map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to inspect removed Pipeline Target via mongosh:\n{err}"
+        ))
+    })?;
+    if !(managed_name_present(&customers_target, "Alice")
+        && managed_name_present(&customers_target, "Bob")
+        && !managed_name_present(&customers_target, "Alicia"))
+    {
+        return Err(CliError::Failed(format!(
+            "removed Pipeline Target must retain Initial Load (Alice/Bob, not Alicia):\n{customers_target}"
+        )));
+    }
+
+    let reporting_target = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            REMOVE_PIPELINE_REPORTING_COLLECTION,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&reporting_target, "Alicia")
+        && managed_name_present(&reporting_target, "Carol")
+        && !managed_name_present(&reporting_target, "Bob"))
+    {
+        return Err(CliError::Failed(format!(
+            "remaining Pipeline must Deliver Incremental updates from Shared Base:\n{reporting_target}"
+        )));
+    }
+
+    let base_out = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            REMOVE_PIPELINE_CUSTOMERS_TABLE,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&base_out, "Alicia") && managed_name_present(&base_out, "Carol")) {
+        return Err(CliError::Failed(format!(
+            "Shared Base must continue Incremental Capture for remaining Pipeline:\n{base_out}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out)
+        + count_delivery_ops(&sync_out)
+        + count_delivery_ops(&remove_out);
+
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (remove ceased customers Delivery; Shared Base kept; reporting Delivered)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_remove_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={REMOVE_PIPELINE_CUSTOMERS_TABLE}, \
+          collections={REMOVE_PIPELINE_CUSTOMERS_COLLECTION},{REMOVE_PIPELINE_REPORTING_COLLECTION}, \
+          deployment={REMOVE_PIPELINE_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {REMOVE_PIPELINE_CUSTOMERS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for remove-pipeline:\n{err}"
+            ))
+        })?;
+
+    let js = format!(
+        "db.getCollection('{REMOVE_PIPELINE_CUSTOMERS_COLLECTION}').drop();\n\
+db.getCollection('{REMOVE_PIPELINE_REPORTING_COLLECTION}').drop();"
+    );
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collections for remove-pipeline:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, REMOVE_PIPELINE_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{REMOVE_PIPELINE_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_remove_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_remove_pipeline_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {REMOVE_PIPELINE_CUSTOMERS_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {REMOVE_PIPELINE_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {REMOVE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {REMOVE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare remove-pipeline Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_remove_pipeline_source(lab_dir: &Path) -> Result<(), CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {REMOVE_PIPELINE_CUSTOMERS_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
+INSERT INTO {REMOVE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
+DELETE FROM {REMOVE_PIPELINE_CUSTOMERS_TABLE} WHERE ID = 2;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source mutations for remove-pipeline:\n{err}"
+            ))
+        })
+}
+
 async fn remove_idempotent_redelivery_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
         "Lab Scenario: removing Namespace \
@@ -3726,6 +4052,10 @@ mod tests {
         assert!(
             ids.iter().any(|id| id == PAUSE_RESUME_ID),
             "catalog must include pause-resume for Pipeline pause/resume CLI verbs"
+        );
+        assert!(
+            ids.iter().any(|id| id == REMOVE_PIPELINE_ID),
+            "catalog must include remove-pipeline for Pipeline remove CLI verb"
         );
         let coverage = lab.join("scenarios/COVERAGE.md");
         let body = fs::read_to_string(&coverage).expect("COVERAGE.md");
