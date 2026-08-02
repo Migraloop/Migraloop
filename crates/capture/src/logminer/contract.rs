@@ -32,9 +32,9 @@ impl Default for ContractLogMiner {
 
 impl ContractLogMiner {
     pub fn with_default_fixtures() -> Self {
-        Self {
-            contents: customers_logminer_fixture(),
-        }
+        let mut contents = customers_logminer_fixture();
+        contents.extend(orders_logminer_fixture());
+        Self { contents }
     }
 
     pub fn with_contents(contents: Vec<LogMinerContent>) -> Self {
@@ -105,6 +105,40 @@ fn customers_logminer_fixture() -> Vec<LogMinerContent> {
             table_name: "CUSTOMERS".to_string(),
             identity: row(&[("ID", json_num(2))]),
             after_image: None,
+        },
+    ]
+}
+
+fn orders_logminer_fixture() -> Vec<LogMinerContent> {
+    // After ORDERS low-watermark (500):
+    // 1) ADDRESS-only update (unused by sum(AMOUNT) Affect Analysis)
+    // 2) AMOUNT update for customer 1 (used field → recompute that Output Identity)
+    vec![
+        LogMinerContent {
+            scn: 510,
+            operation: LogMinerOperation::Update,
+            seg_owner: "APP".to_string(),
+            table_name: "ORDERS".to_string(),
+            identity: row(&[("ORDER_ID", json_num(100))]),
+            after_image: Some(row(&[
+                ("ORDER_ID", json_num(100)),
+                ("CUSTOMER_ID", json_num(1)),
+                ("AMOUNT", json_str("42.50")),
+                ("ADDRESS", json_str("1 Main Ave")),
+            ])),
+        },
+        LogMinerContent {
+            scn: 520,
+            operation: LogMinerOperation::Update,
+            seg_owner: "APP".to_string(),
+            table_name: "ORDERS".to_string(),
+            identity: row(&[("ORDER_ID", json_num(100))]),
+            after_image: Some(row(&[
+                ("ORDER_ID", json_num(100)),
+                ("CUSTOMER_ID", json_num(1)),
+                ("AMOUNT", json_str("50.00")),
+                ("ADDRESS", json_str("1 Main Ave")),
+            ])),
         },
     ]
 }
