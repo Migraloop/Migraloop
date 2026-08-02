@@ -85,6 +85,15 @@ const IDEMPOTENT_REDELIVERY_DEPLOYMENT: &str = "lab-idempotent-redelivery";
 /// Non-Managed Target field planted before re-Delivery to show Managed-only upsert.
 const IDEMPOTENT_REDELIVERY_OPERATOR_NOTE: &str = "lab-keep-across-redelivery";
 
+const PAUSE_RESUME_ID: &str = "pause-resume";
+const PAUSE_RESUME_CUSTOMERS_TABLE: &str = "LAB_PR_CUSTOMERS";
+const PAUSE_RESUME_ORDERS_TABLE: &str = "LAB_PR_ORDERS";
+const PAUSE_RESUME_CUSTOMERS_COLLECTION: &str = "lab_pr_customers";
+const PAUSE_RESUME_ORDERS_COLLECTION: &str = "lab_pr_orders";
+const PAUSE_RESUME_CUSTOMERS_PIPELINE: &str = "lab-pr-customers";
+const PAUSE_RESUME_ORDERS_PIPELINE: &str = "lab-pr-orders";
+const PAUSE_RESUME_DEPLOYMENT: &str = "lab-pause-resume";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -107,7 +116,7 @@ pub enum ScenarioCommand {
     },
     /// Run a Lab Scenario by id (one Scenario at a time)
     Run {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `idempotent-redelivery`, `bulk-load`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `pause-resume`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -118,7 +127,7 @@ pub enum ScenarioCommand {
     },
     /// Fully remove a Scenario Namespace without starting a run
     Remove {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `idempotent-redelivery`, `bulk-load`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `pause-resume`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -163,6 +172,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         CONCURRENT_SOURCE_WORKLOAD_ID,
         BULK_LOAD_ID,
         IDEMPOTENT_REDELIVERY_ID,
+        PAUSE_RESUME_ID,
     ]
 }
 
@@ -186,6 +196,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             IDEMPOTENT_REDELIVERY_ID,
             "idempotent re-delivery / duplicate-safe Delivery",
+        ),
+        (
+            PAUSE_RESUME_ID,
+            "Pipeline pause/resume CLI verbs",
         ),
     ]
 }
@@ -475,6 +489,7 @@ async fn scenario_run(
         CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
         BULK_LOAD_ID => run_bulk_load(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => run_idempotent_redelivery(lab_dir).await,
+        PAUSE_RESUME_ID => run_pause_resume(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -561,6 +576,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
         BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => remove_idempotent_redelivery_namespace(lab_dir).await,
+        PAUSE_RESUME_ID => remove_pause_resume_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -3064,6 +3080,344 @@ collection={IDEMPOTENT_REDELIVERY_COLLECTION} deployment={IDEMPOTENT_REDELIVERY_
     })
 }
 
+/// Issue #19 / ADR-0007: pause stops Delivery for one Pipeline; resume catch-up
+/// from durable Base; other Pipelines keep Delivering on the real product path.
+async fn run_pause_resume(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {PAUSE_RESUME_ID}");
+    println!(
+        "Scenario Namespace: tables={PAUSE_RESUME_CUSTOMERS_TABLE},{PAUSE_RESUME_ORDERS_TABLE} \
+collections={PAUSE_RESUME_CUSTOMERS_COLLECTION},{PAUSE_RESUME_ORDERS_COLLECTION} \
+deployment={PAUSE_RESUME_DEPLOYMENT}"
+    );
+
+    prepare_pause_resume_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, PAUSE_RESUME_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !apply_out.to_ascii_lowercase().contains("delivery") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!("Lab Scenario: pause Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE} via CLI...");
+    let pause_out = run_product_cli(
+        &bin,
+        &[
+            "pause",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            PAUSE_RESUME_CUSTOMERS_PIPELINE,
+            "--deployment",
+            PAUSE_RESUME_DEPLOYMENT,
+        ],
+    )
+    .await?;
+    if !pause_out.to_ascii_lowercase().contains("paused") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario pause did not report paused Pipeline:\n{pause_out}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source mutations on both Namespace tables...");
+    mutate_pause_resume_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+    if sync_out.contains(&format!("Delivery complete: Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE}"))
+    {
+        return Err(CliError::Failed(format!(
+            "paused Pipeline must not Deliver during sync:\n{sync_out}"
+        )));
+    }
+    if !(sync_out.contains(&format!("Delivery complete: Pipeline {PAUSE_RESUME_ORDERS_PIPELINE}"))
+        || sync_out.contains(PAUSE_RESUME_ORDERS_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "unaffected Pipeline must still Deliver during sync:\n{sync_out}"
+        )));
+    }
+
+    let customers_target_paused = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            PAUSE_RESUME_CUSTOMERS_COLLECTION,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&customers_target_paused, "Alice")
+        && managed_name_present(&customers_target_paused, "Bob")
+        && !managed_name_present(&customers_target_paused, "Alicia"))
+    {
+        return Err(CliError::Failed(format!(
+            "while paused, customers Target must retain Initial Load (Alice/Bob, not Alicia):\n{customers_target_paused}"
+        )));
+    }
+
+    let orders_target = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            PAUSE_RESUME_ORDERS_COLLECTION,
+        ],
+    )
+    .await?;
+    if !(orders_target.contains("50.00") || orders_target.contains("\"50\"")) {
+        return Err(CliError::Failed(format!(
+            "unaffected orders Pipeline must Deliver Incremental update:\n{orders_target}"
+        )));
+    }
+
+    println!("Lab Scenario: resume Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE} (catch-up Delivery)...");
+    let resume_out = run_product_cli(
+        &bin,
+        &[
+            "resume",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            PAUSE_RESUME_CUSTOMERS_PIPELINE,
+            "--deployment",
+            PAUSE_RESUME_DEPLOYMENT,
+        ],
+    )
+    .await?;
+    if !(resume_out.to_ascii_lowercase().contains("resum")
+        && resume_out.to_ascii_lowercase().contains("delivery"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario resume must catch up Delivery from durable state:\n{resume_out}"
+        )));
+    }
+
+    let customers_target = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            PAUSE_RESUME_CUSTOMERS_COLLECTION,
+        ],
+    )
+    .await?;
+    let customers_ok = managed_name_present(&customers_target, "Alicia")
+        && managed_name_present(&customers_target, "Carol")
+        && !managed_name_present(&customers_target, "Bob");
+    if !customers_ok {
+        return Err(CliError::Failed(format!(
+            "after resume, customers Target must match durable Base (Alicia+Carol, Bob absent):\n{customers_target}"
+        )));
+    }
+
+    let status_out = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if status_out
+        .lines()
+        .any(|line| line.contains(PAUSE_RESUME_CUSTOMERS_PIPELINE) && line.contains("paused"))
+    {
+        return Err(CliError::Failed(format!(
+            "status must not keep customers Pipeline paused after resume:\n{status_out}"
+        )));
+    }
+    if !status_out.contains(PAUSE_RESUME_ORDERS_PIPELINE) {
+        return Err(CliError::Failed(format!(
+            "status must still list unaffected orders Pipeline:\n{status_out}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out)
+        + count_delivery_ops(&sync_out)
+        + count_delivery_ops(&resume_out);
+
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (pause stopped customers Delivery; resume catch-up; orders unaffected)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_pause_resume_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (tables={PAUSE_RESUME_CUSTOMERS_TABLE},{PAUSE_RESUME_ORDERS_TABLE}, \
+          collections={PAUSE_RESUME_CUSTOMERS_COLLECTION},{PAUSE_RESUME_ORDERS_COLLECTION}, \
+          deployment={PAUSE_RESUME_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {PAUSE_RESUME_CUSTOMERS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {PAUSE_RESUME_ORDERS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace tables for pause-resume:\n{err}"
+            ))
+        })?;
+
+    let js = format!(
+        "db.getCollection('{PAUSE_RESUME_CUSTOMERS_COLLECTION}').drop();\n\
+db.getCollection('{PAUSE_RESUME_ORDERS_COLLECTION}').drop();"
+    );
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collections for pause-resume:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, PAUSE_RESUME_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{PAUSE_RESUME_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_pause_resume_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_pause_resume_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {PAUSE_RESUME_CUSTOMERS_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {PAUSE_RESUME_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {PAUSE_RESUME_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {PAUSE_RESUME_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+CREATE TABLE {PAUSE_RESUME_ORDERS_TABLE} (\n\
+  ORDER_ID NUMBER(10) PRIMARY KEY,\n\
+  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
+  AMOUNT NUMBER(12,2) NOT NULL,\n\
+  ADDRESS VARCHAR2(200)\n\
+);\n\
+ALTER TABLE {PAUSE_RESUME_ORDERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {PAUSE_RESUME_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
+VALUES (100, 1, 42.50, '1 Main St');\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare pause-resume Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_pause_resume_source(lab_dir: &Path) -> Result<(), CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {PAUSE_RESUME_CUSTOMERS_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
+INSERT INTO {PAUSE_RESUME_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
+DELETE FROM {PAUSE_RESUME_CUSTOMERS_TABLE} WHERE ID = 2;\n\
+UPDATE {PAUSE_RESUME_ORDERS_TABLE} SET AMOUNT = 50.00, ADDRESS = '1 Main Ave' WHERE ORDER_ID = 100;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source mutations for pause-resume:\n{err}"
+            ))
+        })
+}
+
 async fn remove_idempotent_redelivery_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
         "Lab Scenario: removing Namespace \
@@ -3368,6 +3722,10 @@ mod tests {
         assert!(
             ids.iter().any(|id| id == IDEMPOTENT_REDELIVERY_ID),
             "catalog must include idempotent-redelivery for duplicate-safe Delivery"
+        );
+        assert!(
+            ids.iter().any(|id| id == PAUSE_RESUME_ID),
+            "catalog must include pause-resume for Pipeline pause/resume CLI verbs"
         );
         let coverage = lab.join("scenarios/COVERAGE.md");
         let body = fs::read_to_string(&coverage).expect("COVERAGE.md");

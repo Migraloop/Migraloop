@@ -89,9 +89,37 @@ migraloop derived --pipeline orders_by_customer [--deployment oracle-to-mongo]
 
 Oracle Incremental Capture 一律走 LogMiner：真實 host 使用 **LogMiner (OCI)**；`host: contract` / `stub` 使用行程內 contract harness。真實 host **不會** silent fallback 到 stub catalog。缺少 Instant Client 或 OCI 失敗時會以 LogMiner/OCI 名稱 fail fast。
 
+已 pause 的 Pipelines 在 `sync` 期間會略過 Delivery/processing；共用 Base Dataset 的 Incremental Capture 仍會繼續，讓其他 Pipelines 與之後的 resume catch-up 保持正確。
+
 ```bash
 migraloop sync --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 ```
+
+### `pause`
+
+暫停一條 Pipeline，且不重啟 Deployment（ADR-0007）。停止該 Pipeline 後續的 Delivery/processing；耐久的 Base/checkpoint 狀態會保留。其他 Pipelines 繼續執行。
+
+```bash
+migraloop pause --pipeline customers [--deployment oracle-to-mongo]
+```
+
+| Flag | 意義 |
+| --- | --- |
+| `--pipeline` | Pipeline 名稱（必填） |
+| `--deployment` | 多個 Deployments 共用同名 Pipeline 時用以消歧 |
+
+### `resume`
+
+恢復已 pause 的 Pipeline。清除耐久 pause 旗標，並依目前 Platform Store 的 Base/Derived 狀態做 catch-up Delivery（含 pause 期間消失的 identities 的 deletes），之後的 `sync` 再繼續 Incremental Delivery。
+
+```bash
+migraloop resume --pipeline customers [--deployment oracle-to-mongo]
+```
+
+| Flag | 意義 |
+| --- | --- |
+| `--pipeline` | Pipeline 名稱（必填） |
+| `--deployment` | 多個 Deployments 共用同名 Pipeline 時用以消歧 |
 
 ### `run`
 
@@ -119,8 +147,8 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `up` | 啟動可拋棄 Fixture；就緒時印出連線細節 |
 | `status` | 回報 Fixture 就緒狀態（engines + Oracle prerequisites + Platform Store），以及哪個 Scenario Namespace 為 **active**（run 進行中）或 **leftover**（run 結束後保留），或各自為 `(none)`。在你套用設定或執行 Lab Scenario 之前也會顯示 `Deployment: (none)` / `Pipeline: (none)` — 請用 Scenario run / leftover 列判斷，不必從那些行自行猜測 |
 | `down` | 拆除 containers 與 volumes |
-| `scenario list` | 依 `--lab-dir` 磁碟上的 recipe 列出可選 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已註冊 runner）。summary 來自各 recipe—例如 `direct-pipeline`、`rt-project`、`rt-filter`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`、`idempotent-redelivery`。list 也會回報已出貨 capability 覆蓋（complete vs gaps；見 `lab/scenarios/COVERAGE.md`） |
-| `scenario run` | 依 id 執行一個 Lab Scenario。若已有 Scenario 正在執行則拒絕。若 Source/Target 不是 Lab Fixture engines 也會拒絕（客戶／正式環境資料庫不在 Lab 範圍—那些請用一般的 `apply`/`sync`）。重跑同一 Scenario 會先完整移除其 Namespace 再重建。回報 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定義的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 與 operational metrics 等權）。`rt-project` / `rt-filter` 覆蓋已出貨 Rich Transform `project` 與 `filter` operators；`concurrent-source-workload` 在單一 Scenario 內跑平行 Source sessions；`bulk-load` 會 bulk-insert 約 100k Source rows，且 metric thresholds 可獨立於 correctness 讓 run 失敗；`idempotent-redelivery` 會強制對同一批 Output Identities 做 duplicate-safe re-Delivery，並檢查 Managed Target 結果仍正確。第二個 Scenario run 仍會被拒絕。預設 keep-on-finish 保留 Namespace 供即時 `base`/`derived`/`target` 檢查；成功後若要刪除可傳 `--auto-remove` |
+| `scenario list` | 依 `--lab-dir` 磁碟上的 recipe 列出可選 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已註冊 runner）。summary 來自各 recipe—例如 `direct-pipeline`、`rt-project`、`rt-filter`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`、`idempotent-redelivery`、`pause-resume`。list 也會回報已出貨 capability 覆蓋（complete vs gaps；見 `lab/scenarios/COVERAGE.md`） |
+| `scenario run` | 依 id 執行一個 Lab Scenario。若已有 Scenario 正在執行則拒絕。若 Source/Target 不是 Lab Fixture engines 也會拒絕（客戶／正式環境資料庫不在 Lab 範圍—那些請用一般的 `apply`/`sync`）。重跑同一 Scenario 會先完整移除其 Namespace 再重建。回報 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定義的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 與 operational metrics 等權）。`rt-project` / `rt-filter` 覆蓋已出貨 Rich Transform `project` 與 `filter` operators；`concurrent-source-workload` 在單一 Scenario 內跑平行 Source sessions；`bulk-load` 會 bulk-insert 約 100k Source rows，且 metric thresholds 可獨立於 correctness 讓 run 失敗；`idempotent-redelivery` 會強制對同一批 Output Identities 做 duplicate-safe re-Delivery，並檢查 Managed Target 結果仍正確；`pause-resume` 覆蓋 `pause` / `resume` CLI 動詞（一條 Pipeline 停止 Delivery、另一條繼續；resume 自耐久 Base catch-up）。第二個 Scenario run 仍會被拒絕。預設 keep-on-finish 保留 Namespace 供即時 `base`/`derived`/`target` 檢查；成功後若要刪除可傳 `--auto-remove` |
 | `scenario remove` | 完整移除 Scenario Namespace（Source tables、Target collections、Platform Store Deployment），且不啟動 run。若已有 Scenario 作用中則拒絕。已不存在時為 idempotent |
 
 | Flag | 意義 |

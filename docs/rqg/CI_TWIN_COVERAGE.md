@@ -22,6 +22,7 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Intra-Scenario concurrent Source workload | `concurrent-source-workload` | `cli_multi_table_incremental.rs` | CI twin = same multi-table Pipeline shape settling after Incremental on both tables (correctness where sensible). Parallel sqlplus / contention timing stay Lab-manual |
 | Bulk load (~100k) with fail-able metric thresholds | `bulk-load` | `cli_direct_pipeline_initial_load.rs`, `cli_contract_catalog_initial_load.rs`, `cli_direct_pipeline_delivery.rs` | CI twin = Initial Load + Delivery correctness on contract/stub. ~100k volume and lag/throughput/duration **thresholds stay Lab-manual** (ADR-0025 / ADR-0028)—never RQG evidence |
 | Idempotent re-delivery / duplicate-safe Delivery | `idempotent-redelivery` | `cli_idempotent_redelivery.rs` (also overlap absorb: `cli_cutover_no_gap.rs`; Managed-only upsert: `cli_direct_pipeline_delivery.rs`, `cli_stub_incremental.rs`) | Force re-Delivery via Platform Store Delivery status + product `apply` |
+| Dedicated Pipeline pause/resume CLI verbs | `pause-resume` | `cli_pause_resume_pipeline.rs` | Pause stops Delivery for one Pipeline; resume catch-up from durable Base; other Pipelines unaffected |
 
 ## Explicitly not gate evidence
 

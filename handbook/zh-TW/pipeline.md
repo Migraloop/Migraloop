@@ -60,10 +60,11 @@ Operator 形狀見 [Rich Transform](rich-transform.md)。
 
 1. 編輯宣告式 Deployment 文件（新增/變更/移除 Pipeline 項目）。
 2. `migraloop apply -f deployment.yaml` — upsert Deployment + Pipeline 集合；對新參照的資料表做 table-level **Initial Load**；當 Transform 修訂需要時重建 Derived 輸出；無關的 Pipeline 變更不會重建共用 Base Datasets。
-3. `migraloop sync` — 對活躍工作做 Incremental Capture + Delivery。
-4. `migraloop status` / `base` / `target` / `derived` — 檢查進度與健康。
+3. `migraloop sync` — 對活躍（未 pause）的 Pipelines 做 Incremental Capture + Delivery。
+4. `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>` — 在不重啟 Deployment 的前提下，停止或繼續單一 Pipeline 的 Delivery/processing。Pause 會耐久寫入 Platform Store；resume 會依目前 Base/Derived 狀態做 catch-up Delivery。其他 Pipelines 不受影響。`status` 會在該 Pipeline 與其 Delivery Health 上顯示 `paused`。
+5. `migraloop status` / `base` / `target` / `derived` — 檢查進度與健康。
 
-專用的 pause/resume 子指令仍屬 control-plane 契約；在它們成為一等 CLI 動詞之前，stream-wide blocker 請依 Operations 指引處理，並只在應該執行時把 Pipelines 留在宣告中。
+Stream-wide blockers（例如無法解除的 DDL）仍依 [Operations](operations.md) 的 pause 指引；Operator 主動 pause/resume 則是刻意停止的一等 control-plane 路徑。
 
 ## Capture 範圍
 

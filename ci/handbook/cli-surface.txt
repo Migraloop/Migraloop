@@ -6,6 +6,8 @@ base
 derived
 lab
 migrate
+pause
+resume
 run
 status
 sync
