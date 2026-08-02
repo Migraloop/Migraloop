@@ -359,8 +359,10 @@ async fn sync_base_datasets_for_pipelines(
             sync_applied_changes: 0,
             sync_health: "unknown".to_string(),
             capture_low_watermark: Some(low_watermark.as_i64()),
-            // Checkpoint starts at watermark-1 so first Incremental includes the overlap window.
+            // Checkpoint starts at watermark-1 so first Incremental includes the overlap window
+            // via exclusive resume (checkpoint+1 == low-watermark).
             capture_checkpoint: Some(low_watermark.as_i64().saturating_sub(1)),
+            sync_lag: 0,
         };
 
         replace_base_dataset(platform_store_url, &dataset, &rows)
@@ -544,6 +546,40 @@ fn apply_change_events_to_base_rows(
     Ok(())
 }
 
+/// Test-only fault injection for restart-resume coverage (ADR-0011).
+/// When set, sync exits after N durable checkpoints to simulate mid-incremental process kill.
+fn sync_fail_after_changes() -> Option<u32> {
+    std::env::var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+}
+
+fn base_with_sync_progress(
+    dataset: &BaseDataset,
+    status: impl Into<String>,
+    row_count: i32,
+    sync_applied_changes: i32,
+    capture_checkpoint: Option<i64>,
+    sync_lag: i32,
+) -> BaseDataset {
+    BaseDataset {
+        deployment_name: dataset.deployment_name.clone(),
+        source_table: dataset.source_table.clone(),
+        source_schema: dataset.source_schema.clone(),
+        status: status.into(),
+        primary_key: dataset.primary_key.clone(),
+        columns: dataset.columns.clone(),
+        omitted_columns: dataset.omitted_columns.clone(),
+        row_count,
+        sync_applied_changes,
+        sync_health: "ok".to_string(),
+        capture_low_watermark: dataset.capture_low_watermark,
+        capture_checkpoint,
+        sync_lag,
+    }
+}
+
 async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
     ensure_store_healthy(platform_store_url).await?;
 
@@ -559,6 +595,9 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
     let pipelines = list_pipelines(platform_store_url)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let fail_after = sync_fail_after_changes();
+    let mut applied_this_run: u32 = 0;
 
     for deployment in &deployments {
         let deployment_pipelines: Vec<_> = pipelines
@@ -578,9 +617,10 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             ));
         }
 
-        // Prefer duplicates over gaps (ADR-0004): always read Incremental Capture from the
-        // cutover low-watermark, absorb already-applied change_ids via Platform Store dedupe,
-        // Deliver first, then durable-ize Base/checkpoint so a Delivery failure can retry.
+        // Resume from durable Platform Store checkpoint (exclusive). Initial Load sets
+        // checkpoint = low-watermark-1 so the first Incremental still covers the ADR-0004
+        // overlap window. Prefer duplicates over gaps: Deliver each change before durable
+        // Base/checkpoint/change-id persistence so a Delivery failure can retry.
         let mongo = mongo_target_from_deployment(deployment)?;
 
         for (schema, table) in tables {
@@ -601,7 +641,19 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 ))
             })?;
 
-            let candidate_changes = incremental_changes_stub(&table, low_watermark)
+            let resume_from = match dataset.capture_checkpoint {
+                Some(cp) => {
+                    let next = cp.saturating_add(1);
+                    CapturePosition::from_i64(next).ok_or_else(|| {
+                        CliError::Failed(format!(
+                            "invalid capture checkpoint for Base Dataset {table}: {cp}"
+                        ))
+                    })?
+                }
+                None => low_watermark,
+            };
+
+            let candidate_changes = incremental_changes_stub(&table, resume_from)
                 .map_err(|err| CliError::Failed(err.to_string()))?;
             let candidate_ids: Vec<String> = candidate_changes
                 .iter()
@@ -623,32 +675,64 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 .collect();
 
             if changes.is_empty() {
+                let status = if dataset.status == "initial_load_complete" {
+                    dataset.status.clone()
+                } else {
+                    "incremental".to_string()
+                };
+                let caught_up = base_with_sync_progress(
+                    &dataset,
+                    status,
+                    dataset.row_count,
+                    dataset.sync_applied_changes,
+                    dataset.capture_checkpoint,
+                    0,
+                );
+                let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+                    base_rows.into_iter().map(|r| r.data).collect();
+                replace_base_dataset(platform_store_url, &caught_up, &rows)
+                    .await
+                    .map_err(|err| CliError::Failed(err.to_string()))?;
                 println!(
-                    "Incremental Capture: Base Dataset {table} overlap dedupe — 0 new changes \
-                     (already applied from low-watermark={low_watermark})"
+                    "Incremental Capture: Base Dataset {table} resume from checkpoint — \
+                     0 new changes (already applied; lag=0)"
                 );
                 continue;
             }
+
+            let checkpoint_before = dataset
+                .capture_checkpoint
+                .unwrap_or(low_watermark_i64.saturating_sub(1));
+            println!(
+                "Incremental Capture: resuming Base Dataset {table} from checkpoint={checkpoint_before} \
+                 (exclusive next={}, pending={}, low-watermark={low_watermark})",
+                resume_from,
+                changes.len()
+            );
 
             let supported_names: BTreeSet<String> =
                 dataset.columns.iter().map(|c| c.name.clone()).collect();
             let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
                 base_rows.into_iter().map(|r| r.data).collect();
+            let mut sync_applied = dataset.sync_applied_changes;
+            let total_pending = changes.len() as i32;
 
-            apply_change_events_to_base_rows(&mut rows, &changes, &supported_names)?;
+            for (index, change) in changes.iter().enumerate() {
+                apply_change_events_to_base_rows(
+                    &mut rows,
+                    std::slice::from_ref(change),
+                    &supported_names,
+                )?;
 
-            // Delivery before durable checkpoint so cutover retries prefer duplicate applies.
-            for pipeline in &deployment_pipelines {
-                if pipeline.mode != "direct"
-                    || pipeline.target_collection.is_empty()
-                    || pipeline.source_table != table
-                {
-                    continue;
-                }
+                // Delivery before durable checkpoint so retries prefer duplicate applies.
+                for pipeline in &deployment_pipelines {
+                    if pipeline.mode != "direct"
+                        || pipeline.target_collection.is_empty()
+                        || pipeline.source_table != table
+                    {
+                        continue;
+                    }
 
-                let mut upserts = Vec::new();
-                let mut deletes = Vec::new();
-                for change in &changes {
                     match change.op {
                         ChangeOp::Insert | ChangeOp::Update => {
                             let Some(base_row) = rows
@@ -662,10 +746,30 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                             };
                             let identity =
                                 output_identity_from_row(base_row, &dataset.primary_key)?;
-                            upserts.push(DeliveryDocument {
-                                identity,
-                                managed_fields: base_row.clone(),
-                            });
+                            let upserted = upsert_managed_documents(
+                                &mongo,
+                                &pipeline.target_collection,
+                                &[DeliveryDocument {
+                                    identity,
+                                    managed_fields: base_row.clone(),
+                                }],
+                            )
+                            .await
+                            .map_err(|err| CliError::Failed(err.to_string()))?;
+                            update_pipeline_delivery_progress(
+                                platform_store_url,
+                                &pipeline.deployment_name,
+                                &pipeline.name,
+                                "delivered",
+                                Some(upserted as i32),
+                            )
+                            .await
+                            .map_err(|err| CliError::Failed(err.to_string()))?;
+                            println!(
+                                "Delivery complete: Pipeline {} upserts={upserted} deletes=0 \
+                                 (checkpoint-bound)",
+                                pipeline.name
+                            );
                         }
                         ChangeOp::Delete => {
                             let identity_map: serde_json::Map<String, serde_json::Value> = change
@@ -673,85 +777,78 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                                 .iter()
                                 .map(|(k, v)| (k.clone(), v.clone()))
                                 .collect();
-                            deletes.push(output_identity_from_row(
+                            let identity = output_identity_from_row(
                                 &identity_map,
                                 &dataset.primary_key,
-                            )?);
+                            )?;
+                            let deleted = delete_documents_by_identity(
+                                &mongo,
+                                &pipeline.target_collection,
+                                &[identity],
+                            )
+                            .await
+                            .map_err(|err| CliError::Failed(err.to_string()))?;
+                            update_pipeline_delivery_progress(
+                                platform_store_url,
+                                &pipeline.deployment_name,
+                                &pipeline.name,
+                                "delivered",
+                                Some(deleted as i32),
+                            )
+                            .await
+                            .map_err(|err| CliError::Failed(err.to_string()))?;
+                            println!(
+                                "Delivery complete: Pipeline {} upserts=0 deletes={deleted} \
+                                 (checkpoint-bound)",
+                                pipeline.name
+                            );
                         }
                     }
                 }
 
-                let upserted =
-                    upsert_managed_documents(&mongo, &pipeline.target_collection, &upserts)
-                        .await
-                        .map_err(|err| CliError::Failed(err.to_string()))?;
-                let deleted =
-                    delete_documents_by_identity(&mongo, &pipeline.target_collection, &deletes)
-                        .await
-                        .map_err(|err| CliError::Failed(err.to_string()))?;
+                sync_applied += 1;
+                let current_checkpoint = change.position.as_i64();
+                let remaining = total_pending - (index as i32 + 1);
+                let updated = base_with_sync_progress(
+                    &dataset,
+                    "incremental",
+                    rows.len() as i32,
+                    sync_applied,
+                    Some(current_checkpoint),
+                    remaining,
+                );
 
-                let applied = (upserted + deleted) as i32;
-                update_pipeline_delivery_progress(
+                replace_base_dataset(platform_store_url, &updated, &rows)
+                    .await
+                    .map_err(|err| CliError::Failed(err.to_string()))?;
+                record_applied_source_changes(
                     platform_store_url,
-                    &pipeline.deployment_name,
-                    &pipeline.name,
-                    "delivered",
-                    Some(applied),
+                    &deployment.name,
+                    &schema,
+                    &table,
+                    &[(change.change_id.clone(), change.position.as_i64())],
                 )
                 .await
                 .map_err(|err| CliError::Failed(err.to_string()))?;
 
+                applied_this_run += 1;
                 println!(
-                    "Delivery complete: Pipeline {} upserts={} deletes={} (from Base)",
-                    pipeline.name, upserted, deleted
+                    "Incremental Capture: Base Dataset {table} applied change_id={} \
+                     checkpoint={current_checkpoint} lag={remaining} rows={}",
+                    change.change_id,
+                    updated.row_count
                 );
+
+                if let Some(limit) = fail_after {
+                    if applied_this_run >= limit {
+                        return Err(CliError::Failed(format!(
+                            "simulated process kill after {limit} durable checkpoint(s) \
+                             (MIGRALOOP_SYNC_FAIL_AFTER_CHANGES); resume from Platform Store \
+                             checkpoint={current_checkpoint}"
+                        )));
+                    }
+                }
             }
-
-            let max_position = changes
-                .iter()
-                .map(|c| c.position.as_i64())
-                .max()
-                .unwrap_or(low_watermark_i64);
-
-            let updated = BaseDataset {
-                deployment_name: deployment.name.clone(),
-                source_table: table.clone(),
-                source_schema: schema.clone(),
-                status: "incremental".to_string(),
-                primary_key: dataset.primary_key.clone(),
-                columns: dataset.columns.clone(),
-                omitted_columns: dataset.omitted_columns.clone(),
-                row_count: rows.len() as i32,
-                sync_applied_changes: dataset.sync_applied_changes + changes.len() as i32,
-                sync_health: "ok".to_string(),
-                capture_low_watermark: Some(low_watermark_i64),
-                capture_checkpoint: Some(max_position),
-            };
-
-            replace_base_dataset(platform_store_url, &updated, &rows)
-                .await
-                .map_err(|err| CliError::Failed(err.to_string()))?;
-
-            let applied_records: Vec<(String, i64)> = changes
-                .iter()
-                .map(|c| (c.change_id.clone(), c.position.as_i64()))
-                .collect();
-            record_applied_source_changes(
-                platform_store_url,
-                &deployment.name,
-                &schema,
-                &table,
-                &applied_records,
-            )
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-
-            println!(
-                "Incremental Capture: Base Dataset {table} applied {} changes from \
-                 low-watermark overlap (rows={}, checkpoint={max_position})",
-                changes.len(),
-                updated.row_count
-            );
         }
     }
 
@@ -860,9 +957,15 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                     println!("  Cutover: low-watermark=(missing)");
                 }
             }
+            // Sync Health stays unknown|ok; lag + checkpoint make resume state coherent after restart.
             println!(
-                "  Sync Health: {} appliedChanges={}",
-                base.sync_health, base.sync_applied_changes
+                "  Sync Health: {} appliedChanges={} lag={} checkpoint={}",
+                base.sync_health,
+                base.sync_applied_changes,
+                base.sync_lag,
+                base.capture_checkpoint
+                    .map(|cp| cp.to_string())
+                    .unwrap_or_else(|| "(none)".to_string())
             );
         }
     }

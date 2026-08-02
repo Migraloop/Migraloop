@@ -133,6 +133,9 @@ pub struct BaseDataset {
     pub capture_low_watermark: Option<i64>,
     /// Highest capture position successfully applied into this Base (checkpoint).
     pub capture_checkpoint: Option<i64>,
+    /// Remaining unapplied Incremental Capture changes after the last sync (lag).
+    /// Durable so status after process restart stays coherent without local-only state.
+    pub sync_lag: i32,
 }
 
 /// One row stored in a Base Dataset (supported columns only).
@@ -341,8 +344,8 @@ pub async fn replace_base_dataset(
             deployment_name, source_table, source_schema, status,
             primary_key_json, columns_json, omitted_columns_json, row_count,
             sync_applied_changes, sync_health,
-            capture_low_watermark, capture_checkpoint, loaded_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+            capture_low_watermark, capture_checkpoint, sync_lag, loaded_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
         ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
             status = EXCLUDED.status,
             primary_key_json = EXCLUDED.primary_key_json,
@@ -353,6 +356,7 @@ pub async fn replace_base_dataset(
             sync_health = EXCLUDED.sync_health,
             capture_low_watermark = EXCLUDED.capture_low_watermark,
             capture_checkpoint = EXCLUDED.capture_checkpoint,
+            sync_lag = EXCLUDED.sync_lag,
             loaded_at = now()
         "#,
     )
@@ -368,6 +372,7 @@ pub async fn replace_base_dataset(
     .bind(&dataset.sync_health)
     .bind(dataset.capture_low_watermark)
     .bind(dataset.capture_checkpoint)
+    .bind(dataset.sync_lag)
     .execute(&mut *tx)
     .await
     .map_err(PlatformStoreError::Persist)?;
@@ -514,7 +519,7 @@ pub async fn list_base_datasets(
             deployment_name, source_table, source_schema, status,
             primary_key_json, columns_json, omitted_columns_json, row_count,
             sync_applied_changes, sync_health,
-            capture_low_watermark, capture_checkpoint
+            capture_low_watermark, capture_checkpoint, sync_lag
         FROM base_datasets
         ORDER BY deployment_name, source_schema, source_table
         "#,
@@ -544,7 +549,7 @@ pub async fn get_base_rows(
                 deployment_name, source_table, source_schema, status,
                 primary_key_json, columns_json, omitted_columns_json, row_count,
                 sync_applied_changes, sync_health,
-                capture_low_watermark, capture_checkpoint
+                capture_low_watermark, capture_checkpoint, sync_lag
             FROM base_datasets
             WHERE source_table = $1 AND deployment_name = $2
             ORDER BY source_schema
@@ -562,7 +567,7 @@ pub async fn get_base_rows(
                 deployment_name, source_table, source_schema, status,
                 primary_key_json, columns_json, omitted_columns_json, row_count,
                 sync_applied_changes, sync_health,
-                capture_low_watermark, capture_checkpoint
+                capture_low_watermark, capture_checkpoint, sync_lag
             FROM base_datasets
             WHERE source_table = $1
             ORDER BY deployment_name, source_schema
@@ -706,6 +711,7 @@ struct BaseDatasetRow {
     sync_health: String,
     capture_low_watermark: Option<i64>,
     capture_checkpoint: Option<i64>,
+    sync_lag: i32,
 }
 
 /// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
@@ -839,6 +845,7 @@ impl BaseDatasetRow {
             sync_health: self.sync_health,
             capture_low_watermark: self.capture_low_watermark,
             capture_checkpoint: self.capture_checkpoint,
+            sync_lag: self.sync_lag,
         })
     }
 }
