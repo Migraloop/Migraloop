@@ -202,8 +202,9 @@ async fn lab_up(lab_dir: &Path) -> Result<(), CliError> {
             || out.contains("operation not permitted")
         {
             "\nHint: nested Docker/overlay environments often need a non-overlay storage \
-             driver (for example dockerd with `\"storage-driver\": \"vfs\"` and \
-             `\"features\": { \"containerd-snapshotter\": false }`)."
+             driver (for example dockerd with `\"storage-driver\": \"fuse-overlayfs\"` \
+             or `\"vfs\"`, and `\"features\": { \"containerd-snapshotter\": false }`). \
+             On Cursor Cloud, environment install/start already applies fuse-overlayfs."
         } else {
             ""
         };
