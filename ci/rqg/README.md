@@ -6,8 +6,8 @@ and throughput to the committed baseline below.
 
 | Artifact | Purpose |
 | --- | --- |
-| `direct_pipeline_microbench_baseline.json` | Committed `seed_rows`, `duration_ms`, `rows_per_s`, `allowed_regression_pct` (~20) |
-| `run_direct_pipeline_microbench.sh` | CI entry: runs the ignored microbench test; **one retry** on failure |
+| `direct_pipeline_microbench_baseline.json` | Committed `seed_rows`, `duration_ms`, `rows_per_s`, `allowed_regression_pct` (~55 for GHA noise) |
+| `run_direct_pipeline_microbench.sh` | CI entry: runs the ignored microbench test; **up to 3 attempts** on failure |
 
 Lab Scenario `bulk-load` (~100k + metric thresholds) stays **manual** and is never
 invoked by this job (ADR-0025 / ADR-0028).
@@ -25,6 +25,9 @@ invoked by this job (ADR-0025 / ADR-0028).
 
 2. Copy the printed timed-run `duration_ms` / `rows_per_s` (the `seed_rows=N`
    line after warmup) into `direct_pipeline_microbench_baseline.json`. Prefer
-   values measured on `ubuntu-latest` CI so the ~20% band is real, not padded.
+   a representative (not best-case) `ubuntu-latest` measurement.
 
-3. Keep `allowed_regression_pct` at ~20 unless intentionally retuning the gate.
+3. Keep `allowed_regression_pct` at ~55 unless intentionally retuning the gate.
+   Hosted runners spike well beyond 20% (merge of #102: 4309–5137ms vs a
+   2802ms green PR run on the same docs-only tree). The runner script also
+   retries up to 3 attempts so a single noisy neighbor does not red `main`.

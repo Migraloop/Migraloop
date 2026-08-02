@@ -4,10 +4,11 @@
 //! Named scenario fixtures remain for other tests; this case injects an arbitrary
 //! schema via `MIGRALOOP_CONTRACT_SOURCE_CATALOG` and drives apply → Base → Delivery.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
@@ -33,10 +34,7 @@ fn bin() -> String {
 }
 
 async fn ephemeral_database_url() -> String {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let suffix = common::unique_suffix();
     let db_name = format!("migraloop_test_{suffix}");
     let admin = admin_url();
 
@@ -65,10 +63,7 @@ fn write_config(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
 }
 
 fn unique_mongo_database() -> String {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let suffix = common::unique_suffix();
     format!("appdb_{suffix}")
 }
 

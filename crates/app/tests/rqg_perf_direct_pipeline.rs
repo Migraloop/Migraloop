@@ -9,10 +9,12 @@
 //! runs this binary with `--ignored`. Pure regression-budget unit tests below
 //! stay always-on.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -197,10 +199,7 @@ fn load_committed_baseline() -> PerfBaseline {
 }
 
 async fn ephemeral_database_url() -> String {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let suffix = common::unique_suffix();
     let db_name = format!("migraloop_rqg_perf_{suffix}");
     let admin = admin_url();
 
@@ -229,10 +228,7 @@ fn write_config(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
 }
 
 fn unique_mongo_database() -> String {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let suffix = common::unique_suffix();
     format!("rqg_perf_{suffix}")
 }
 
@@ -491,7 +487,7 @@ async fn direct_pipeline_microbench_meets_committed_baseline() {
     );
     assert!(
         baseline.allowed_regression_pct > 0.0,
-        "allowed_regression_pct must be positive (default ~20)"
+        "allowed_regression_pct must be positive (committed baseline uses ~55 for GHA noise)"
     );
 
     // Warmup pass (discarded) to reduce cold-start noise on shared runners.

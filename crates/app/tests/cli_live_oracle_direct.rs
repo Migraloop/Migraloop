@@ -14,6 +14,8 @@
 //!
 //! Agreed seam (issue #58): CLI apply / sync / inspect — not mocked capture.
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -60,10 +62,7 @@ fn require_live_oracle() -> (String, u16, String, String, String) {
 }
 
 async fn ephemeral_database_url() -> String {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let suffix = common::unique_suffix();
     let db_name = format!("migraloop_test_{suffix}");
     let admin = admin_url();
 
@@ -92,10 +91,7 @@ fn write_config(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
 }
 
 fn unique_mongo_database() -> String {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let suffix = common::unique_suffix();
     format!("appdb_{suffix}")
 }
 

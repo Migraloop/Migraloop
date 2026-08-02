@@ -136,5 +136,5 @@ jobs:
           prefix-key: rqg-perf
 
       - name: Direct Pipeline microbench vs baseline
-        # Contract/stub only. One retry on failure. Never runs Lab bulk-load.
+        # Contract/stub only. Up to 3 attempts on failure. Never runs Lab bulk-load.
         run: bash ci/rqg/run_direct_pipeline_microbench.sh
