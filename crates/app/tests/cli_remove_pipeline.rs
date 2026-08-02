@@ -336,6 +336,10 @@ async fn remove_stops_pipeline_delivery_status_inactive_deployment_remains() {
             && remove_out.contains("customers"),
         "remove must report removed Pipeline customers, got:\n{remove_out}"
     );
+    assert!(
+        remove_out.contains("Shared Base"),
+        "remove should mention Shared Base retention, got:\n{remove_out}"
+    );
 
     let status_after = status(&url);
     assert!(

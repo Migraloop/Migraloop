@@ -2428,7 +2428,7 @@ async fn remove_pipeline_command(
 
     println!(
         "Pipeline {} removed (Deployment {}) — Delivery/processing stopped; \
-         Shared Bases kept when still referenced",
+         Shared Base Datasets kept when still referenced",
         pipeline.name, pipeline.deployment_name
     );
     Ok(())
