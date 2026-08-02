@@ -263,6 +263,12 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
         delivery_status,
         delivery_applied_changes: 0,
         paused: false,
+        description: pipeline
+            .description
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         field_mappings,
         output_identity,
         transform_json,
@@ -772,12 +778,13 @@ fn pipeline_has_target(pipeline: &Pipeline) -> bool {
         && !pipeline.target_collection.is_empty()
 }
 
-/// Whether two Pipeline declarations are the same (mode, Source table, Target Binding,
-/// field mappings, transform) — not a revision/Change of that Pipeline.
+/// Whether two Pipeline declarations are semantically the same (mode, Source table,
+/// Target Binding, field mappings, transform / Output Identity) — excluding metadata
+/// such as `description`. A semantic difference is a Pipeline revision/Change.
 ///
 /// Used so runtime Pipeline add can preserve Delivery progress for unchanged Pipelines
 /// (ADR-0007) without treating a declaration change as a no-op add.
-fn pipeline_declaration_unchanged(previous: &Pipeline, next: &Pipeline) -> bool {
+fn pipeline_semantic_unchanged(previous: &Pipeline, next: &Pipeline) -> bool {
     previous.mode == next.mode
         && previous.source_table == next.source_table
         && previous.source_schema == next.source_schema
@@ -787,7 +794,12 @@ fn pipeline_declaration_unchanged(previous: &Pipeline, next: &Pipeline) -> bool 
         && previous.transform_json == next.transform_json
 }
 
-/// Preserve Delivery progress and pause for Pipelines whose declaration is unchanged.
+fn pipeline_metadata_only_change(previous: &Pipeline, next: &Pipeline) -> bool {
+    pipeline_semantic_unchanged(previous, next) && previous.description != next.description
+}
+
+/// Preserve Delivery progress and pause for Pipelines whose semantic declaration is
+/// unchanged (including metadata-only description edits).
 ///
 /// `pipelines_from_document` always starts at pending/0; without this merge, every
 /// apply would look like a Deployment restart for already-running Pipelines.
@@ -796,7 +808,7 @@ fn preserve_unchanged_pipeline_delivery(existing: &[Pipeline], pipelines: &mut [
         let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
             continue;
         };
-        if pipeline_declaration_unchanged(previous, pipeline) {
+        if pipeline_semantic_unchanged(previous, pipeline) {
             pipeline.delivery_status = previous.delivery_status.clone();
             pipeline.delivery_applied_changes = previous.delivery_applied_changes;
             pipeline.paused = previous.paused;
@@ -804,6 +816,8 @@ fn preserve_unchanged_pipeline_delivery(existing: &[Pipeline], pipelines: &mut [
     }
 }
 
+/// Pipelines that need ordinary Delivery start: newly added, or semantically
+/// unchanged but not yet delivered. Semantic revisions use the revision path.
 fn pipelines_needing_delivery_start<'a>(
     existing: &[Pipeline],
     pipelines: &'a [Pipeline],
@@ -818,13 +832,46 @@ fn pipelines_needing_delivery_start<'a>(
                 // Newly added Pipeline — start Delivery after Initial Load as needed.
                 return true;
             };
-            // Unchanged, already-delivered Pipelines keep running without re-Delivery.
-            if pipeline_declaration_unchanged(previous, pipeline)
-                && previous.delivery_status == "delivered"
-            {
+            if !pipeline_semantic_unchanged(previous, pipeline) {
+                // Semantic revision — handled by pause → rebuild → re-Deliver.
                 return false;
             }
-            true
+            // Unchanged, already-delivered Pipelines keep running without re-Delivery.
+            previous.delivery_status != "delivered"
+        })
+        .collect()
+}
+
+/// Existing Pipelines whose semantic declaration changed (revision rebuild path).
+fn pipelines_needing_revision_rebuild<'a>(
+    existing: &[Pipeline],
+    pipelines: &'a [Pipeline],
+) -> Vec<&'a Pipeline> {
+    pipelines
+        .iter()
+        .filter(|pipeline| {
+            if !pipeline_has_target(pipeline) {
+                return false;
+            }
+            let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
+                return false;
+            };
+            !pipeline_semantic_unchanged(previous, pipeline)
+        })
+        .collect()
+}
+
+fn pipelines_with_metadata_only_change<'a>(
+    existing: &[Pipeline],
+    pipelines: &'a [Pipeline],
+) -> Vec<&'a Pipeline> {
+    pipelines
+        .iter()
+        .filter(|pipeline| {
+            let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
+                return false;
+            };
+            pipeline_metadata_only_change(previous, pipeline)
         })
         .collect()
 }
@@ -834,9 +881,22 @@ async fn deliver_pipelines(
     deployment: &Deployment,
     pipelines: &[&Pipeline],
 ) -> Result<(), CliError> {
-    let needs_delivery = pipelines
-        .iter()
-        .any(|p| pipeline_has_target(p) && !p.paused);
+    deliver_pipelines_with_options(platform_store_url, deployment, pipelines, false, false).await
+}
+
+/// Deliver Pipelines. `reconcile_deletes` removes Target identities that disappeared
+/// (used for revision rebuild and resume catch-up). When `ignore_paused` is true,
+/// Delivery runs even if the Pipeline is still marked paused (revision transition).
+async fn deliver_pipelines_with_options(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    pipelines: &[&Pipeline],
+    reconcile_deletes: bool,
+    ignore_paused: bool,
+) -> Result<(), CliError> {
+    let needs_delivery = pipelines.iter().any(|p| {
+        pipeline_has_target(p) && (ignore_paused || !p.paused)
+    });
     if !needs_delivery {
         return Ok(());
     }
@@ -844,17 +904,30 @@ async fn deliver_pipelines(
     let mongo = mongo_target_from_deployment(deployment)?;
 
     for pipeline in pipelines {
-        if !pipeline_has_target(pipeline) || pipeline.paused {
+        if !pipeline_has_target(pipeline) || (!ignore_paused && pipeline.paused) {
             continue;
         }
 
         match pipeline.mode.as_str() {
             "direct" => {
-                deliver_direct_pipeline(platform_store_url, deployment, pipeline, &mongo).await?;
+                deliver_direct_pipeline_with_options(
+                    platform_store_url,
+                    deployment,
+                    pipeline,
+                    &mongo,
+                    reconcile_deletes,
+                )
+                .await?;
             }
             "transform" => {
-                deliver_transform_pipeline(platform_store_url, deployment, pipeline, &mongo)
-                    .await?;
+                deliver_transform_pipeline_with_options(
+                    platform_store_url,
+                    deployment,
+                    pipeline,
+                    &mongo,
+                    reconcile_deletes,
+                )
+                .await?;
             }
             other => {
                 return Err(CliError::Failed(format!(
@@ -867,23 +940,7 @@ async fn deliver_pipelines(
     Ok(())
 }
 
-async fn deliver_direct_pipeline(
-    platform_store_url: &str,
-    deployment: &Deployment,
-    pipeline: &Pipeline,
-    mongo: &MongoTargetConnection,
-) -> Result<(), CliError> {
-    deliver_direct_pipeline_with_options(
-        platform_store_url,
-        deployment,
-        pipeline,
-        mongo,
-        false,
-    )
-    .await
-}
-
-/// Direct Pipeline Delivery. When `reconcile_deletes` is true (resume catch-up),
+/// Direct Pipeline Delivery. When `reconcile_deletes` is true (resume / revision),
 /// also remove Target documents whose Output Identity is no longer in Base.
 async fn deliver_direct_pipeline_with_options(
     platform_store_url: &str,
@@ -1017,22 +1074,6 @@ async fn reconcile_target_deletes(
     delete_documents_by_identity(mongo, collection, &stale)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))
-}
-
-async fn deliver_transform_pipeline(
-    platform_store_url: &str,
-    deployment: &Deployment,
-    pipeline: &Pipeline,
-    mongo: &MongoTargetConnection,
-) -> Result<(), CliError> {
-    deliver_transform_pipeline_with_options(
-        platform_store_url,
-        deployment,
-        pipeline,
-        mongo,
-        false,
-    )
-    .await
 }
 
 async fn deliver_transform_pipeline_with_options(
@@ -1440,8 +1481,47 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .map(|p| (p.name.clone(), p.source_table.clone()))
         .collect();
 
-    // Runtime add (ADR-0007): keep already-running Pipelines' Delivery progress.
+    // Runtime add (ADR-0007): keep already-running Pipelines' Delivery progress
+    // (and Operator pause) when the semantic declaration is unchanged.
     preserve_unchanged_pipeline_delivery(&existing_pipelines, &mut pipelines);
+
+    let revision_names: BTreeSet<String> = pipelines_needing_revision_rebuild(
+        &existing_pipelines,
+        &pipelines,
+    )
+    .into_iter()
+    .map(|p| p.name.clone())
+    .collect();
+    let metadata_only_names: BTreeSet<String> = pipelines_with_metadata_only_change(
+        &existing_pipelines,
+        &pipelines,
+    )
+    .into_iter()
+    .map(|p| p.name.clone())
+    .collect();
+
+    // Change (ADR-0007): pause old Delivery before swapping the revision so a
+    // concurrent sync cannot Deliver under the previous transform/binding.
+    for name in &revision_names {
+        if let Some(previous) = existing_pipelines.iter().find(|p| p.name == *name) {
+            if !previous.paused {
+                set_pipeline_paused(platform_store_url, &deployment.name, name, true)
+                    .await
+                    .map_err(|err| CliError::Failed(err.to_string()))?;
+            }
+            println!("Pipeline revision: {name} — paused old Delivery");
+        }
+        if let Some(pipeline) = pipelines.iter_mut().find(|p| p.name == *name) {
+            // Hold pause through replace until rebuild/re-Deliver finishes.
+            pipeline.paused = true;
+            pipeline.delivery_status = if pipeline_has_target(pipeline) {
+                "pending".to_string()
+            } else {
+                "not_configured".to_string()
+            };
+            pipeline.delivery_applied_changes = 0;
+        }
+    }
 
     upsert_deployment(platform_store_url, &deployment)
         .await
@@ -1451,7 +1531,8 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
     // Table-level Initial Load only for newly referenced tables; existing Bases stay
-    // on their incremental path (ADR-0019).
+    // on their incremental path (ADR-0019). Shared Bases are never rebuilt for a
+    // Pipeline revision (ADR-0007 Change).
     sync_base_datasets_for_pipelines(platform_store_url, &deployment, &pipelines).await?;
 
     if !existing_pipelines.is_empty() {
@@ -1460,8 +1541,43 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         }
     }
 
-    // Start Delivery only for Pipelines that need it; do not re-Deliver unchanged
-    // already-delivered Pipelines (others keep running — ADR-0007 Add).
+    for name in &metadata_only_names {
+        println!("Pipeline revision: {name} (metadata-only; rebuild skipped)");
+    }
+
+    // Semantic revisions: rebuild Derived / re-Deliver with delete reconciliation,
+    // then clear the transition pause so incremental work continues.
+    let to_revise: Vec<&Pipeline> = pipelines
+        .iter()
+        .filter(|p| revision_names.contains(&p.name))
+        .collect();
+    if !to_revise.is_empty() {
+        deliver_pipelines_with_options(
+            platform_store_url,
+            &deployment,
+            &to_revise,
+            true,
+            true,
+        )
+        .await?;
+        for pipeline in &to_revise {
+            set_pipeline_paused(
+                platform_store_url,
+                &deployment.name,
+                &pipeline.name,
+                false,
+            )
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+            println!(
+                "Pipeline revision: {} — rebuilt and re-Delivered; incremental resumed",
+                pipeline.name
+            );
+        }
+    }
+
+    // Start Delivery only for Pipelines that need ordinary first Delivery; do not
+    // re-Deliver unchanged already-delivered Pipelines (others keep running — ADR-0007 Add).
     let to_deliver = pipelines_needing_delivery_start(&existing_pipelines, &pipelines);
     deliver_pipelines(platform_store_url, &deployment, &to_deliver).await?;
 

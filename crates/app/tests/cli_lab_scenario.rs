@@ -328,6 +328,30 @@ async fn lab_scenario_list_includes_remove_pipeline() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_change_pipeline() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("change-pipeline"),
+        "catalog must list change-pipeline Lab Scenario (#21), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("revision")
+            && (lower.contains("rebuild") || lower.contains("metadata")),
+        "change-pipeline summary should mention revision rebuild / metadata-only, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {

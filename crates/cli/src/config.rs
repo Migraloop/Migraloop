@@ -42,6 +42,9 @@ pub struct Spec {
 pub struct PipelineSpec {
     pub name: String,
     pub mode: String,
+    /// Optional Operator-facing description (metadata-only; does not rebuild Derived).
+    #[serde(default)]
+    pub description: Option<String>,
     pub source: PipelineSourceSpec,
     /// Target Binding for Delivery. Optional so Deployment/Base-only apply still works.
     #[serde(default)]

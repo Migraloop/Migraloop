@@ -120,6 +120,9 @@ pub struct Pipeline {
     /// Durable Operator pause (ADR-0007): when true, skip Delivery/processing.
     #[serde(default)]
     pub paused: bool,
+    /// Optional Operator-facing description (metadata-only; ADR-0007 / issue #21).
+    #[serde(default)]
+    pub description: String,
     /// Per-field Managed mapping overrides (`string` / `omit`) keyed by column name.
     #[serde(default)]
     pub field_mappings: std::collections::BTreeMap<String, FieldMappingAs>,
@@ -373,8 +376,8 @@ pub async fn replace_pipelines(
             INSERT INTO pipelines (
                 deployment_name, name, mode, source_table, source_schema,
                 target_collection, delivery_status, delivery_applied_changes, paused,
-                field_mappings_json, output_identity_json, transform_json, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+                description, field_mappings_json, output_identity_json, transform_json, applied_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -386,6 +389,7 @@ pub async fn replace_pipelines(
         .bind(&pipeline.delivery_status)
         .bind(pipeline.delivery_applied_changes)
         .bind(pipeline.paused)
+        .bind(&pipeline.description)
         .bind(&field_mappings_json)
         .bind(&output_identity_json)
         .bind(&transform_json)
@@ -520,7 +524,7 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
         r#"
         SELECT deployment_name, name, mode, source_table, source_schema,
                target_collection, delivery_status, delivery_applied_changes, paused,
-               field_mappings_json, output_identity_json, transform_json
+               description, field_mappings_json, output_identity_json, transform_json
         FROM pipelines
         ORDER BY deployment_name, name
         "#,
@@ -832,6 +836,7 @@ struct PipelineRow {
     delivery_status: String,
     delivery_applied_changes: i32,
     paused: bool,
+    description: String,
     field_mappings_json: String,
     output_identity_json: String,
     transform_json: String,
@@ -860,6 +865,7 @@ impl PipelineRow {
             delivery_status: self.delivery_status,
             delivery_applied_changes: self.delivery_applied_changes,
             paused: self.paused,
+            description: self.description,
             field_mappings,
             output_identity,
             transform_json,

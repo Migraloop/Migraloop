@@ -24,6 +24,7 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Idempotent re-delivery / duplicate-safe Delivery | `idempotent-redelivery` | `cli_idempotent_redelivery.rs` (also overlap absorb: `cli_cutover_no_gap.rs`; Managed-only upsert: `cli_direct_pipeline_delivery.rs`, `cli_stub_incremental.rs`) | Force re-Delivery via Platform Store Delivery status + product `apply` |
 | Dedicated Pipeline pause/resume CLI verbs | `pause-resume` | `cli_pause_resume_pipeline.rs` | Pause stops Delivery for one Pipeline; resume catch-up from durable Base; other Pipelines unaffected |
 | Dedicated Pipeline remove CLI verb | `remove-pipeline` | `cli_remove_pipeline.rs` | Remove ceases Delivery; Shared Base kept when still referenced; status no longer lists Pipeline; Deployment remains |
+| Pipeline revision change via `apply` (Derived rebuild / metadata-only skip) | `change-pipeline` | `cli_change_pipeline_revision.rs` | Semantic transform/binding change pauses old Delivery, rebuilds that Pipeline's Derived, re-Delivers with delete reconciliation, resumes incremental; Shared Bases not rebuilt; metadata-only `description` skips rebuild |
 
 ## Explicitly not gate evidence
 
