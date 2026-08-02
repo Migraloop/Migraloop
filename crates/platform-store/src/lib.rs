@@ -128,6 +128,11 @@ pub struct BaseDataset {
     pub sync_applied_changes: i32,
     /// Operator-visible Sync Health for this Base: unknown | ok.
     pub sync_health: String,
+    /// Low-watermark capture position established before Initial Load (ADR-0004).
+    /// Required before Incremental Capture may start.
+    pub capture_low_watermark: Option<i64>,
+    /// Highest capture position successfully applied into this Base (checkpoint).
+    pub capture_checkpoint: Option<i64>,
 }
 
 /// One row stored in a Base Dataset (supported columns only).
@@ -335,8 +340,9 @@ pub async fn replace_base_dataset(
         INSERT INTO base_datasets (
             deployment_name, source_table, source_schema, status,
             primary_key_json, columns_json, omitted_columns_json, row_count,
-            sync_applied_changes, sync_health, loaded_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+            sync_applied_changes, sync_health,
+            capture_low_watermark, capture_checkpoint, loaded_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
         ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
             status = EXCLUDED.status,
             primary_key_json = EXCLUDED.primary_key_json,
@@ -345,6 +351,8 @@ pub async fn replace_base_dataset(
             row_count = EXCLUDED.row_count,
             sync_applied_changes = EXCLUDED.sync_applied_changes,
             sync_health = EXCLUDED.sync_health,
+            capture_low_watermark = EXCLUDED.capture_low_watermark,
+            capture_checkpoint = EXCLUDED.capture_checkpoint,
             loaded_at = now()
         "#,
     )
@@ -358,6 +366,8 @@ pub async fn replace_base_dataset(
     .bind(dataset.row_count)
     .bind(dataset.sync_applied_changes)
     .bind(&dataset.sync_health)
+    .bind(dataset.capture_low_watermark)
+    .bind(dataset.capture_checkpoint)
     .execute(&mut *tx)
     .await
     .map_err(PlatformStoreError::Persist)?;
@@ -503,7 +513,8 @@ pub async fn list_base_datasets(
         SELECT
             deployment_name, source_table, source_schema, status,
             primary_key_json, columns_json, omitted_columns_json, row_count,
-            sync_applied_changes, sync_health
+            sync_applied_changes, sync_health,
+            capture_low_watermark, capture_checkpoint
         FROM base_datasets
         ORDER BY deployment_name, source_schema, source_table
         "#,
@@ -532,7 +543,8 @@ pub async fn get_base_rows(
             SELECT
                 deployment_name, source_table, source_schema, status,
                 primary_key_json, columns_json, omitted_columns_json, row_count,
-                sync_applied_changes, sync_health
+                sync_applied_changes, sync_health,
+                capture_low_watermark, capture_checkpoint
             FROM base_datasets
             WHERE source_table = $1 AND deployment_name = $2
             ORDER BY source_schema
@@ -549,7 +561,8 @@ pub async fn get_base_rows(
             SELECT
                 deployment_name, source_table, source_schema, status,
                 primary_key_json, columns_json, omitted_columns_json, row_count,
-                sync_applied_changes, sync_health
+                sync_applied_changes, sync_health,
+                capture_low_watermark, capture_checkpoint
             FROM base_datasets
             WHERE source_table = $1
             ORDER BY deployment_name, source_schema
@@ -691,6 +704,8 @@ struct BaseDatasetRow {
     row_count: i32,
     sync_applied_changes: i32,
     sync_health: String,
+    capture_low_watermark: Option<i64>,
+    capture_checkpoint: Option<i64>,
 }
 
 /// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
@@ -822,8 +837,83 @@ impl BaseDatasetRow {
             row_count: self.row_count,
             sync_applied_changes: self.sync_applied_changes,
             sync_health: self.sync_health,
+            capture_low_watermark: self.capture_low_watermark,
+            capture_checkpoint: self.capture_checkpoint,
         })
     }
+}
+
+/// Filter `change_ids` down to those not yet applied into this Base Dataset.
+pub async fn filter_unapplied_change_ids(
+    database_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    change_ids: &[String],
+) -> Result<Vec<String>, PlatformStoreError> {
+    if change_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = connect(database_url).await?;
+    let existing = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT change_id
+        FROM applied_source_changes
+        WHERE deployment_name = $1
+          AND source_schema = $2
+          AND source_table = $3
+          AND change_id = ANY($4)
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(change_ids)
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+
+    let existing_set: std::collections::BTreeSet<_> = existing.into_iter().collect();
+    Ok(change_ids
+        .iter()
+        .filter(|id| !existing_set.contains(*id))
+        .cloned()
+        .collect())
+}
+
+/// Record applied source change ids for cutover/replay dedupe.
+pub async fn record_applied_source_changes(
+    database_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    changes: &[(String, i64)],
+) -> Result<(), PlatformStoreError> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let pool = connect(database_url).await?;
+    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
+    for (change_id, position) in changes {
+        sqlx::query(
+            r#"
+            INSERT INTO applied_source_changes (
+                deployment_name, source_schema, source_table, change_id, position
+            ) VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (deployment_name, source_schema, source_table, change_id) DO NOTHING
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(source_schema)
+        .bind(source_table)
+        .bind(change_id)
+        .bind(position)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    }
+    tx.commit().await.map_err(PlatformStoreError::Persist)?;
+    Ok(())
 }
 
 #[derive(Debug, sqlx::FromRow)]
