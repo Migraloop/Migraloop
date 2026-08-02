@@ -20,10 +20,12 @@ workload:
     - apply Deployment via real product path (Transform ACTIVE==1 + shared Direct reporting)
     - apply semantic revision (ACTIVE==0) via real product path
     - assert Derived/Target rebuilt with delete reconciliation; Shared Base not Initial-Loaded again
+    - sync Incremental Capture under the new revision (Pipeline not left paused)
     - apply metadata-only description change; assert rebuild skipped
 checks:
   correctness:
     - "Semantic revision: Derived/Target match ACTIVE==0 (Bob only); Alice/Carol reconciled away"
     - "Shared Base CUSTOMERS not rebuilt on revision (no Initial Load for that table)"
+    - "After revision: sync continues incremental; Pipeline is not left paused"
     - "Metadata-only description change skips Derived rebuild and re-Delivery"
 thresholds: {}

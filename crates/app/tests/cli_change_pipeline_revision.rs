@@ -104,7 +104,11 @@ spec:
     )
 }
 
-fn active_customers_and_reporting(active_eq: i32, description: &str) -> String {
+fn active_customers_and_reporting(
+    active_eq: i32,
+    description: &str,
+    reporting_collection: &str,
+) -> String {
     format!(
         r#"    - name: active_customers
       mode: transform
@@ -125,7 +129,7 @@ fn active_customers_and_reporting(active_eq: i32, description: &str) -> String {
       source:
         table: CUSTOMERS
       target:
-        collection: customers_reporting
+        collection: {reporting_collection}
 "#
     )
 }
@@ -249,7 +253,7 @@ fn status(url: &str) -> String {
 }
 
 #[tokio::test]
-async fn semantic_transform_change_rebuilds_derived_redeploys_without_base_reload() {
+async fn semantic_transform_change_rebuilds_derived_re_delivers_without_base_reload() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
@@ -257,7 +261,10 @@ async fn semantic_transform_change_rebuilds_derived_redeploys_without_base_reloa
     let v1 = write_config(
         &dir,
         "v1.yaml",
-        &deployment_with_pipelines(&mongo_database, &active_customers_and_reporting(1, "active")),
+        &deployment_with_pipelines(
+            &mongo_database,
+            &active_customers_and_reporting(1, "active", "customers_reporting"),
+        ),
     );
     migrate(&url);
     let first = apply(&url, &v1);
@@ -284,7 +291,10 @@ async fn semantic_transform_change_rebuilds_derived_redeploys_without_base_reloa
     let v2 = write_config(
         &dir,
         "v2.yaml",
-        &deployment_with_pipelines(&mongo_database, &active_customers_and_reporting(0, "active")),
+        &deployment_with_pipelines(
+            &mongo_database,
+            &active_customers_and_reporting(0, "active", "customers_reporting"),
+        ),
     );
     let revision = apply(&url, &v2);
     let revision_lower = revision.to_ascii_lowercase();
@@ -374,7 +384,7 @@ async fn metadata_only_description_change_skips_derived_rebuild() {
         "v1.yaml",
         &deployment_with_pipelines(
             &mongo_database,
-            &active_customers_and_reporting(1, "initial comment"),
+            &active_customers_and_reporting(1, "initial comment", "customers_reporting"),
         ),
     );
     migrate(&url);
@@ -391,7 +401,7 @@ async fn metadata_only_description_change_skips_derived_rebuild() {
         "v2.yaml",
         &deployment_with_pipelines(
             &mongo_database,
-            &active_customers_and_reporting(1, "renamed comment"),
+            &active_customers_and_reporting(1, "renamed comment", "customers_reporting"),
         ),
     );
     let revision = apply(&url, &v2);
@@ -419,5 +429,70 @@ async fn metadata_only_description_change_skips_derived_rebuild() {
     assert_eq!(
         target_before, target_after,
         "metadata-only change must leave Target Managed documents unchanged"
+    );
+}
+
+#[tokio::test]
+async fn semantic_binding_change_re_delivers_to_new_collection_without_base_reload() {
+    let url = ephemeral_database_url().await;
+    let mongo_database = unique_mongo_database();
+    let dir = TempDir::new().expect("tempdir");
+
+    let v1 = write_config(
+        &dir,
+        "v1.yaml",
+        &deployment_with_pipelines(
+            &mongo_database,
+            &active_customers_and_reporting(1, "active", "customers_reporting"),
+        ),
+    );
+    migrate(&url);
+    apply(&url, &v1);
+
+    let reporting_v1 = target_stdout(&url, "customers_reporting");
+    assert!(
+        reporting_v1.contains("Alice") && reporting_v1.contains("Bob"),
+        "baseline Direct Target must be Delivered, got:\n{reporting_v1}"
+    );
+
+    let v2 = write_config(
+        &dir,
+        "v2.yaml",
+        &deployment_with_pipelines(
+            &mongo_database,
+            &active_customers_and_reporting(1, "active", "customers_reporting_v2"),
+        ),
+    );
+    let revision = apply(&url, &v2);
+    let revision_lower = revision.to_ascii_lowercase();
+    assert!(
+        revision_lower.contains("revision") && revision.contains("customers_reporting"),
+        "binding change must report Pipeline revision, got:\n{revision}"
+    );
+    assert!(
+        revision.contains("Delivery complete: Pipeline customers_reporting"),
+        "binding change must re-Deliver Direct Pipeline, got:\n{revision}"
+    );
+    assert!(
+        !revision.contains("Initial Load complete: Base Dataset CUSTOMERS"),
+        "binding change must not rebuild Shared Base, got:\n{revision}"
+    );
+    assert!(
+        !revision.contains("Derived Dataset materialized: Pipeline active_customers"),
+        "unchanged Transform sibling must not rebuild Derived, got:\n{revision}"
+    );
+
+    let reporting_v2 = target_stdout(&url, "customers_reporting_v2");
+    assert!(
+        reporting_v2.contains("Alice")
+            && reporting_v2.contains("Bob")
+            && reporting_v2.contains("Carol"),
+        "new Target Binding must receive re-Delivery from Shared Base, got:\n{reporting_v2}"
+    );
+
+    let transform_target = target_stdout(&url, "active_customers");
+    assert!(
+        transform_target.contains("Alice") && transform_target.contains("Carol"),
+        "unchanged Transform Target must remain, got:\n{transform_target}"
     );
 }

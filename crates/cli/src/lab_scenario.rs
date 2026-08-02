@@ -4214,6 +4214,34 @@ deployment={CHANGE_PIPELINE_DEPLOYMENT}"
         )));
     }
 
+    println!("Lab Scenario: sync Incremental Capture under the new revision...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if sync_out.to_ascii_lowercase().contains("error")
+        && !sync_out.to_ascii_lowercase().contains("no changes")
+    {
+        return Err(CliError::Failed(format!(
+            "Incremental sync after Pipeline revision must succeed:\n{sync_out}"
+        )));
+    }
+    let status_after_sync = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if status_after_sync
+        .to_ascii_lowercase()
+        .lines()
+        .any(|line| line.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE) && line.contains("paused"))
+    {
+        return Err(CliError::Failed(format!(
+            "Pipeline must not remain paused after revision when continuing incremental:\n{status_after_sync}"
+        )));
+    }
+
     println!("Lab Scenario: apply metadata-only description change...");
     let apply_meta = run_product_cli(
         &bin,
@@ -4266,11 +4294,13 @@ deployment={CHANGE_PIPELINE_DEPLOYMENT}"
 
     let rows_applied = count_delivery_ops(&apply_v1)
         + count_delivery_ops(&apply_v2)
+        + count_delivery_ops(&sync_out)
         + count_delivery_ops(&apply_meta);
 
     println!(
         "Lab Scenario: correctness checks passed \
-         (semantic revision rebuilt Derived/re-Delivered; Shared Base kept; metadata-only skipped)"
+         (semantic revision rebuilt Derived/re-Delivered; incremental continued; \
+Shared Base kept; metadata-only skipped)"
     );
 
     Ok(ScenarioReport {

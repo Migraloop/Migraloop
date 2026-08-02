@@ -1552,12 +1552,14 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .filter(|p| revision_names.contains(&p.name))
         .collect();
     if !to_revise.is_empty() {
+        let reconcile_deletes = true;
+        let ignore_paused = true;
         deliver_pipelines_with_options(
             platform_store_url,
             &deployment,
             &to_revise,
-            true,
-            true,
+            reconcile_deletes,
+            ignore_paused,
         )
         .await?;
         for pipeline in &to_revise {
