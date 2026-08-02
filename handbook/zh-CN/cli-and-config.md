@@ -24,7 +24,9 @@ migraloop migrate --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 ### `apply`
 
-应用声明式 Deployment 配置（YAML 或 JSON）。验证 secrets-by-reference、Source/Target kinds、Pipeline specs、（当 Pipelines 引用表时）Source Prerequisites，视需要执行 Initial Load，并 upsert Deployment/Pipeline 状态。
+应用声明式 Deployment 配置（YAML 或 JSON）。验证 secrets-by-reference、Source/Target kinds、Pipeline specs、（当 Pipelines 引用表时）Source Prerequisites，视需要执行 schema discovery + Initial Load，并 upsert Deployment/Pipeline 状态。
+
+在真实 Oracle Source host（非 `contract`/`stub`）上，apply 会通过 OCI 从 live Source 做 schema discovery 与 Initial Load（需要 Instant Client；见 [Source System](source-system.md)）。contract/stub host 仍使用进程内 fixture catalog（CI 切片）。
 
 ```bash
 migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployment.yaml
@@ -85,6 +87,8 @@ migraloop derived --pipeline orders_by_customer [--deployment oracle-to-mongo]
 
 运行 Incremental Capture 写入 Base Datasets、维护 Derived Datasets，然后 Delivery。
 
+Oracle Incremental Capture 一律走 LogMiner：真实 host 使用 **LogMiner (OCI)**；`host: contract` / `stub` 使用进程内 contract harness。真实 host **不会** silent fallback 到 stub catalog。缺少 Instant Client 或 OCI 失败时会以 LogMiner/OCI 名称 fail fast。
+
 ```bash
 migraloop sync --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 ```
@@ -103,6 +107,7 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 | --- | --- |
 | `MIGRALOOP_PLATFORM_STORE_URL` | Operator CLI 与 compose `app` 使用的 Platform Store 连接 URL（`postgres://...`） |
 | 配置中 `fromEnv` 引用的密钥环境变量名 | 你在 `password.fromEnv` 写的任何名称（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply/sync 时必须存在于进程环境 |
+| `LD_LIBRARY_PATH` | 真实 Oracle host：Oracle Instant Client libraries 目录（apply/sync runtime 需要；`contract`/`stub` 不使用） |
 
 ### Contract-harness Source Prerequisite probes（仅 host `stub` / `contract`）
 
@@ -124,10 +129,10 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 | 字段 | Source | Target | 说明 |
 | --- | --- | --- | --- |
 | `kind` | `oracle` | `mongodb` | v1 固定配对 |
-| `host` | 是 | 是 | Source `stub`/`contract` → LogMiner harness |
+| `host` | 是 | 是 | Source `stub`/`contract` → LogMiner harness + fixture Initial Load；其他 host → live OCI Initial Load + LogMiner |
 | `port` | 是 | 是 | 有效 TCP port |
 | `database` | 是 | 是 | |
-| `username` | 是 | 是 | |
+| `username` | 是 | 是 | 省略 Pipeline `source.schema` 时，也作为默认 Oracle schema/owner |
 | `password` | 是 | 是 | 恰好一个 `fromEnv`、`fromFile`、`fromDockerSecret` |
 | `timezone` | 可选 | n/a | IANA 或 `±HH:MM`，供 naive 时间 |
 
@@ -139,7 +144,7 @@ Docker secrets 从 `/run/secrets/<name>` 解析。
 | --- | --- |
 | `name` | 非空 |
 | `mode` | `direct` 或 `transform` |
-| `source.table` | 必要；可选 `source.schema` |
+| `source.table` | 必要；可选 `source.schema`（live Oracle owner；默认为 Source `username`） |
 | `target.collection` | Target Binding；仅 Base-only 实验可省略 |
 | `fields` | 字段 → `{ as: string \| omit }` 的映射 |
 | `outputIdentity` | `transform` 必要 |

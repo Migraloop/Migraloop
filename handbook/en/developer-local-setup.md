@@ -7,6 +7,7 @@ Clone, build, run the Platform Store, and exercise tests in this modular Rust mo
 - Rust toolchain matching `rust-toolchain.toml` (stable)
 - Docker / Docker Compose (Platform Store and optional integration dependencies)
 - Git
+- **Optional (live Oracle Source):** Oracle Instant Client Basic or Basic Light on the machine that runs `migraloop`, with `LD_LIBRARY_PATH` pointing at the Instant Client directory. Required for real-host Initial Load and LogMiner (OCI); not needed for `host: contract` / `stub` CI slices.
 
 ## Clone and build
 
@@ -55,6 +56,20 @@ App integration tests under `crates/app/tests` expect a reachable Postgres (and 
 ```bash
 cargo test -p migraloop-app
 ```
+
+Live Oracle Direct Pipeline seam (ignored by default; requires Instant Client + a prepared Source with Prerequisites):
+
+```bash
+export LD_LIBRARY_PATH=/path/to/instantclient
+export MIGRALOOP_LIVE_ORACLE_HOST=...
+export MIGRALOOP_LIVE_ORACLE_PORT=1521
+export MIGRALOOP_LIVE_ORACLE_SERVICE=FREEPDB1
+export MIGRALOOP_LIVE_ORACLE_USER=SYNC_USER
+export ORACLE_PASSWORD=...
+cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocapture
+```
+
+See [Source System](source-system.md) for the Operator apply/sync/inspect verification steps.
 
 ## Handbook guard (docs CI seam)
 

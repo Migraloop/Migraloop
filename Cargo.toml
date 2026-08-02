@@ -35,3 +35,4 @@ bson = "2.15"
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
+oracle = "0.6"

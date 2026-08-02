@@ -7,6 +7,7 @@
 - 符合 `rust-toolchain.toml` 的 Rust toolchain（stable）
 - Docker / Docker Compose（Platform Store 與可選的整合測試相依）
 - Git
+- **可選（live Oracle Source）：** 在執行 `migraloop` 的機器上安裝 Oracle Instant Client Basic 或 Basic Light，並將 `LD_LIBRARY_PATH` 指向 Instant Client 目錄。真實 host 的 Initial Load 與 LogMiner (OCI) 需要它；`host: contract` / `stub` 的 CI 切片不需要。
 
 ## Clone 與 build
 
@@ -55,6 +56,20 @@ cargo test -p migraloop-cli
 ```bash
 cargo test -p migraloop-app
 ```
+
+Live Oracle Direct Pipeline seam（預設 ignored；需要 Instant Client + 已備妥 Prerequisites 的 Source）：
+
+```bash
+export LD_LIBRARY_PATH=/path/to/instantclient
+export MIGRALOOP_LIVE_ORACLE_HOST=...
+export MIGRALOOP_LIVE_ORACLE_PORT=1521
+export MIGRALOOP_LIVE_ORACLE_SERVICE=FREEPDB1
+export MIGRALOOP_LIVE_ORACLE_USER=SYNC_USER
+export ORACLE_PASSWORD=...
+cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocapture
+```
+
+Operator 的 apply/sync/inspect 驗證步驟見 [Source System](source-system.md)。
 
 ## Handbook guard（文件 CI seam）
 

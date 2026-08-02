@@ -16,7 +16,9 @@ Under `spec.source` in the Deployment config:
 | `password` | Secret reference: `fromEnv`, `fromFile`, or `fromDockerSecret` |
 | `timezone` | Optional IANA name or Oracle-style offset (`+09:00`). Used when naive DATE/TIMESTAMP must be interpreted and the Source DB timezone is unreadable |
 
-Real Oracle hosts use the **OCI LogMiner** adapter. Without Oracle Instant Client / OCI bindings in the runtime, apply/sync fail fast naming LogMiner/OCI—there is no silent fallback to the stub catalog.
+Real Oracle hosts use the **OCI** path for both **Initial Load** (schema discovery + snapshot) and **LogMiner Incremental Capture**. Without Oracle Instant Client / OCI libraries in the runtime, apply/sync fail fast naming LogMiner/OCI—there is no silent fallback to the stub catalog. Install Instant Client (Basic or Basic Light) and set `LD_LIBRARY_PATH` to its directory before running the app against a live Source.
+
+On a live Source, Pipeline `source.schema` selects the Oracle owner; when omitted, the platform uses the Source `username` (uppercased) as the default schema. The contract/stub harness ignores schema and continues to use its fixture catalog for CI slices only—not as the Lab/real-path definition of truth.
 
 ## Source Prerequisites (Oracle / LogMiner)
 
@@ -48,7 +50,7 @@ Missing table-level logging leads to incomplete or incorrect Incremental Capture
 
 Retain redo (online + archived) for at least **24 hours** so Initial Load overlap, Incremental Capture lag, and process restart resume can still read needed change history. Configure archive destination retention / FRA policy for your Oracle edition.
 
-If redo is aged out before the platform consumes it, changes are lost—the platform refuses to run rather than capture incompletely.
+Live OCI probes require **ARCHIVELOG** mode. They report the available archived-redo span when known; if that span is still shorter than 24 hours (for example a freshly provisioned Lab Source) but `db_recovery_file_dest` or `log_archive_dest_1` is configured, the probe treats that as meeting the documented floor. **NOARCHIVELOG** fails fast. If redo is aged out before the platform consumes it, changes are lost—the platform refuses to run rather than capture incompletely.
 
 ### Operator workflow
 
@@ -96,8 +98,31 @@ Unsupported columns are **omitted** from the Base Dataset (the table still syncs
 
 Sync selects tables by **Pipeline references**—not whole-schema mirror. Each included table gets one shared **Base Dataset** (full supported-type row) reused by every Pipeline that needs it. Adding a newly referenced table runs **table-level Initial Load** for that table only.
 
+## Live Oracle verification (CLI operator seam)
+
+Against a real Oracle Source (with Instant Client installed and Source Prerequisites satisfied), operators verify Sync→Delivery without mocks:
+
+1. Point `spec.source.host` / `port` / `database` / `username` at the live Source (not `contract`/`stub`).
+2. `migraloop apply -f deployment.yaml` — Initial Load reads live tables into Base Datasets and Delivers Direct Pipelines to MongoDB.
+3. Mutate Source rows (`INSERT` / `UPDATE` / `DELETE`) with supplemental logging enabled.
+4. `migraloop sync` — LogMiner (OCI) Incremental Capture applies changes; Managed fields on MongoDB reflect them.
+5. Inspect with `migraloop status`, `migraloop base --table <TABLE>`, and `migraloop target --collection <NAME>`.
+
+Developers can also run the gated seam test when a live Oracle is available:
+
+```bash
+export LD_LIBRARY_PATH=/path/to/instantclient
+export MIGRALOOP_LIVE_ORACLE_HOST=127.0.0.1
+export MIGRALOOP_LIVE_ORACLE_PORT=1521
+export MIGRALOOP_LIVE_ORACLE_SERVICE=FREEPDB1
+export MIGRALOOP_LIVE_ORACLE_USER=SYNC_USER
+export ORACLE_PASSWORD=...
+cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocapture
+```
+
 ## Related chapters
 
 - Pairing with Target: [Deployment](deployment.md)
 - Pipelines that reference tables: [Pipeline](pipeline.md)
 - Secrets and TLS: [Security](security.md)
+- Instant Client on a Developer machine: [Developer local setup](developer-local-setup.md)
