@@ -3809,6 +3809,16 @@ collection={SCHEMA_CHANGE_PAUSE_COLLECTION} deployment={SCHEMA_CHANGE_PAUSE_DEPL
         ))
     })?;
     let inject_scn = checkpoint.saturating_add(1) as u64;
+
+    // Real Source DDL workload on the Lab Oracle (ADR-0025 Source-driving seam).
+    // LogMiner DDL contents are not yet reconstructed on the OCI path, so sync also
+    // receives the matching Schema Change event via MIGRALOOP_INJECT_SCHEMA_CHANGES
+    // (same class of test/Lab seam as MIGRALOOP_DELIVERY_POISON_IDENTITIES).
+    println!(
+        "Lab Scenario: driving Source DDL (DROP COLUMN NAME on {SCHEMA_CHANGE_PAUSE_TABLE})..."
+    );
+    mutate_schema_change_pause_source_ddl(lab_dir).await?;
+
     let inject_path = lab_dir.join(".schema-change-pause-inject.json");
     let inject_body = format!(
         r#"{{
@@ -3835,8 +3845,8 @@ collection={SCHEMA_CHANGE_PAUSE_COLLECTION} deployment={SCHEMA_CHANGE_PAUSE_DEPL
     })?;
 
     println!(
-        "Lab Scenario: sync Incremental Capture with blocking Schema Change inject \
-         (drop managed NAME at scn={inject_scn})..."
+        "Lab Scenario: sync Incremental Capture with Schema Change event for the Source DDL \
+         (drop managed NAME at scn={inject_scn}; inject bridges LogMiner DDL capture gap)..."
     );
     let sync_out = run_product_cli_with_env(
         &bin,
@@ -3995,6 +4005,26 @@ EXIT;\n"
         .map_err(|err| {
             CliError::Failed(format!(
                 "Failed to prepare schema-change-pause Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+/// Drive real blocking Source DDL for the Lab Scenario Namespace table.
+async fn mutate_schema_change_pause_source_ddl(lab_dir: &Path) -> Result<(), CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+ALTER TABLE {SCHEMA_CHANGE_PAUSE_TABLE} DROP COLUMN NAME;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source DDL for schema-change-pause:\n{err}"
             ))
         })
 }

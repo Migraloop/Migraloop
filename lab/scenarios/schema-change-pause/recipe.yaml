@@ -16,8 +16,9 @@ workload:
   steps:
     - prepare Scenario Namespace table + seed + table-level supplemental logging
     - apply Deployment via real product path (Initial Load + Delivery)
-    - inject blocking Schema Change (drop managed NAME) at next capture position
-    - sync Incremental Capture; assert WARN + pause (not poison quarantine)
+    - mutate Source with real blocking DDL (DROP COLUMN NAME)
+    - sync with Schema Change event for that DDL (inject bridges LogMiner DDL capture gap)
+    - assert WARN + pause (not poison quarantine)
     - assert status Delivery Health paused + Schema Change blocking visibility
 checks:
   correctness:
