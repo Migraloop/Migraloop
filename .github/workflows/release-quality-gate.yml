@@ -1,0 +1,87 @@
+name: Release Quality Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rqg-unit:
+    name: rqg-unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          prefix-key: rqg-unit
+
+      - name: Crate unit tests (no Postgres/Mongo)
+        run: >
+          cargo test --workspace
+          --exclude migraloop-app
+          --exclude handbook-guard
+
+  rqg-integration:
+    name: rqg-integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: migraloop
+          POSTGRES_PASSWORD: migraloop
+          POSTGRES_DB: migraloop
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U migraloop -d migraloop"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mongo:
+        # Auth matches existing app integration test defaults
+        # (deliver_user / mongo-secret-value, authSource=admin).
+        image: mongo:7
+        env:
+          MONGO_INITDB_ROOT_USERNAME: deliver_user
+          MONGO_INITDB_ROOT_PASSWORD: mongo-secret-value
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh -u deliver_user -p mongo-secret-value --authenticationDatabase admin --quiet --eval \"db.runCommand({ ping: 1 }).ok\""
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MIGRALOOP_TEST_ADMIN_URL: postgres://migraloop:migraloop@127.0.0.1:5432/postgres
+      MIGRALOOP_TEST_MONGO_HOST: 127.0.0.1
+      MIGRALOOP_TEST_MONGO_PORT: "27017"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          prefix-key: rqg-integration
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pymongo
+        run: pip install pymongo
+
+      - name: App integration tests (non-ignored)
+        # Default cargo test skips #[ignore] Lab Fixture / Lab Scenario / live Oracle.
+        run: cargo test -p migraloop-app
