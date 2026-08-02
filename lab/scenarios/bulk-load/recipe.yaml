@@ -1,0 +1,26 @@
+# Lab Scenario recipe (ADR-0025 / issue #65).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: bulk-load
+summary: Bulk Source load (~100k inserts) with lag/throughput/duration thresholds (real apply Initial Load)
+namespace:
+  source_tables:
+    - LAB_BL_ITEMS
+  target_collections:
+    - lab_bl_items
+  deployment: lab-bulk-load
+  pipelines:
+    - lab-bl-items
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + ~100k Source inserts + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load of bulk volume)
+    - settle Delivery / Sync Health within max_duration_ms before final asserts
+checks:
+  correctness:
+    - Base and Target Managed row counts equal bulk volume (100000)
+thresholds:
+  max_lag: 0
+  max_duration_ms: 600000
+  min_rows_per_s: 50.0

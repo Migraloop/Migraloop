@@ -19,7 +19,7 @@ docker compose up -d --build
 
 Compose sets `MIGRALOOP_PLATFORM_STORE_URL` for the app. The app entrypoint runs `migraloop run` (migrate on startup, then stay alive).
 
-For a disposable **Local Sync Lab** Fixture (Oracle + MongoDB + Platform Store + app, no default Deployment/Pipelines): `migraloop lab up` / `status` / `down`. Selectable **Lab Scenarios** (for example `migraloop lab scenario list` / `run direct-pipeline` / `run transform-pipeline` / `run concurrent-source-workload` / `run bulk-load`) exercise real apply/sync inside a Scenario Namespace; re-run wipes that Namespace first, and `scenario remove` / `--auto-remove` cover cleanup — see [Deployment](deployment.md) and [CLI & Config reference](cli-and-config.md).
+For a disposable **Local Sync Lab** Fixture (Oracle + MongoDB + Platform Store + app, no default Deployment/Pipelines): `migraloop lab up` / `status` / `down`. Selectable **Lab Scenarios** (catalogued via `lab/scenarios/<id>/recipe.yaml`; for example `migraloop lab scenario list` / `run direct-pipeline` / `run transform-pipeline` / `run concurrent-source-workload` / `run bulk-load`) exercise real apply/sync inside a Scenario Namespace; re-run wipes that Namespace first, and `scenario remove` / `--auto-remove` cover cleanup. Manual verification (ADR-0025)—not the Release Quality Gate. See [Deployment](deployment.md), [CLI & Config reference](cli-and-config.md), and [Developer local setup](developer-local-setup.md) (feature-time authoring path).
 
 Details: [Deployment](deployment.md) · flags and env: [CLI & Config reference](cli-and-config.md) · secrets/TLS: [Security](security.md)
 

@@ -1,0 +1,24 @@
+# Lab Scenario recipe (ADR-0025 / issue #65).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: direct-pipeline
+summary: Direct Pipeline Initial Load + insert/update/delete (real apply/sync)
+namespace:
+  source_tables:
+    - LAB_DP_CUSTOMERS
+  target_collections:
+    - lab_dp_customers
+  deployment: lab-direct-pipeline
+  pipelines:
+    - lab-dp-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load)
+    - mutate Source insert/update/delete
+    - sync Incremental Capture + Delivery via real LogMiner path
+checks:
+  correctness:
+    - "Base and Target Managed NAME after mutate: Alicia and Carol present; Bob absent"
+thresholds: {}

@@ -38,7 +38,7 @@ Compose 預設憑證（`migraloop` / `migraloop`）僅供本機開發。
 
 ## Local Sync Lab Fixture
 
-可拋棄的 Oracle + MongoDB + Platform Store + app，供手動 Sync→Delivery 驗證（非 CI）：
+可拋棄的 Oracle + MongoDB + Platform Store + app，供**手動** Sync→Delivery 驗證（ADR-0025）。與 **Release Quality Gate**／CI contract-stub harness 不同：由 operator 選擇 Lab Scenarios；**不要**把 Scenario catalog 當成 CI suite，也不要新增會跑完整 catalog 的 release-gate job。
 
 ```bash
 cargo build -p migraloop-app
@@ -56,6 +56,19 @@ cargo build -p migraloop-app
 ```
 
 Bring-up 後預設：Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`、MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`。Lab bring-up 不會套用 sample Deployments/Pipelines。需要 Docker Compose；`lab up` 若缺少 binary 會建置 `target/debug/migraloop`，再由 `lab/Dockerfile` 打包（Ubuntu 24.04 base 以對齊 host glibc）。Lab Compose 使用 `network_mode: host`。第一次 Oracle 開機可能要數分鐘。巢狀 Docker whiteout 解壓失敗時可用 dockerd `storage-driver: vfs`。見 [CLI 與 Config](cli-and-config.md)（`lab`）與 [Deployment](deployment.md)。
+
+### 撰寫 Lab Scenario（feature-time coverage）
+
+第一級 capability 在設計時就要一併規劃 Lab Scenario 覆蓋，否則視為未完成（ADR-0025）。開發 feature 時請走這條可重複路徑：
+
+1. 建立 `lab/scenarios/<id>/`，包含：
+   - `recipe.yaml` — catalog metadata：`id`、`summary`、**Scenario Namespace**（`source_tables`、`target_collections`、`deployment`、`pipelines`）、`workload`（`concurrency`：`serial`|`parallel`、有序 `steps`）、`checks.correctness`、可選的等權 `thresholds`（`max_settle_ms`、`max_lag`、`max_duration_ms`、`min_rows_per_s`）
+   - `deployment.yaml` — 真實 product Deployment config（與 Operator `apply` 相同格式）
+2. 在 `crates/cli/src/lab_scenario.rs` 實作 Namespace prepare/remove、Source workload、checks 與 thresholds，並向其他 runners 註冊 Scenario id。
+3. 確認 `migraloop lab scenario list` 顯示新 id，且 **summary 來自 `recipe.yaml`**。Selectable catalog = 已註冊 runner，且在 `--lab-dir` 下同時有 recipe + deployment 檔。
+4. 在 Lab Fixture 上手動驗證 `migraloop lab scenario run <id>`。list／控制面行為維持 always-on CLI-seam 測試；完整 Fixture run 維持 `#[ignore]` — 不是 Release Quality Gate。
+
+Recipe 慣例與短清單亦見 `lab/scenarios/README.md`。
 
 ## 測試
 

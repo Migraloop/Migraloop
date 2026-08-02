@@ -1,0 +1,28 @@
+# Lab Scenario recipe (ADR-0025 / issue #65).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: transform-pipeline
+summary: "Multi-table Transform Pipeline: customers + orders groupBy/sum → Derived → Delivery (real apply/sync)"
+namespace:
+  source_tables:
+    - LAB_TP_CUSTOMERS
+    - LAB_TP_ORDERS
+  target_collections:
+    - lab_tp_customers
+    - lab_tp_order_totals
+  deployment: lab-transform-pipeline
+  pipelines:
+    - lab-tp-customers
+    - lab-tp-order-totals
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare multi-table Scenario Namespace + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Derived)
+    - mutate multi-table Source insert/update/delete
+    - sync Incremental Capture + Delivery via real LogMiner path
+checks:
+  correctness:
+    - "Customers Base/Target Managed NAME: Alicia and Carol present; Bob absent"
+    - "Derived and order-totals Target: totals 35 and 50 (not stale 30)"
+thresholds: {}
