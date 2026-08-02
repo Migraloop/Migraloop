@@ -1,0 +1,94 @@
+# Local Sync Lab Fixture: disposable Oracle Source, MongoDB Target,
+# Platform Store, and app. No sample Deployment/Pipelines are applied.
+#
+# Project name is forced by `migraloop lab` (`migraloop-lab`).
+# Run via: migraloop lab up
+
+name: migraloop-lab
+
+services:
+  platform-store:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: migraloop
+      POSTGRES_PASSWORD: migraloop
+      POSTGRES_DB: migraloop
+    volumes:
+      - lab_platform_store_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U migraloop -d migraloop"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    environment:
+      ORACLE_PASSWORD: lab_oracle_sys
+      APP_USER: SYNC_USER
+      APP_USER_PASSWORD: lab_oracle
+    volumes:
+      - lab_oracle_data:/opt/oracle/oradata
+      - ./oracle/init:/container-entrypoint-initdb.d:ro
+    ports:
+      - "1521:1521"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "healthcheck.sh",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: migraloop
+      MONGO_INITDB_ROOT_PASSWORD: lab_mongo
+      MONGO_INITDB_DATABASE: lab
+    volumes:
+      - lab_mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "-u",
+          "migraloop",
+          "-p",
+          "lab_mongo",
+          "--authenticationDatabase",
+          "admin",
+          "--eval",
+          "db.adminCommand('ping')",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      platform-store:
+        condition: service_healthy
+      oracle:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    environment:
+      MIGRALOOP_PLATFORM_STORE_URL: postgres://migraloop:migraloop@platform-store:5432/migraloop
+    command: ["migraloop", "run"]
+
+volumes:
+  lab_platform_store_data:
+  lab_oracle_data:
+  lab_mongo_data:

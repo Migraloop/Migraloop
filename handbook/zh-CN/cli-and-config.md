@@ -101,6 +101,28 @@ migraloop sync --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 ```
 
+### `lab`
+
+Local Sync Lab Fixture 生命周期（ADR-0025）。布署可丢弃的真实堆栈—Oracle Source（Lab 已满足的 Source Prerequisites）、MongoDB Target、Platform Store 与 app。Bring-up **不会**套用 sample Deployment 或 Pipelines。需要 Docker Compose 与 repo 的 `lab/` 目录（或 `--lab-dir`）。
+
+```bash
+migraloop lab up [--lab-dir lab]
+migraloop lab status [--lab-dir lab]
+migraloop lab down [--lab-dir lab]
+```
+
+| Subcommand | 含义 |
+| --- | --- |
+| `up` | 启动可丢弃 Fixture；就绪时打印连接细节 |
+| `status` | 报告 Fixture 就绪状态（engines + Oracle prerequisites + Platform Store）。在你套用配置或运行 Lab Scenario 之前显示 `Deployment: (none)` / `Pipeline: (none)` |
+| `down` | 拆除 containers 与 volumes |
+
+| Flag | 含义 |
+| --- | --- |
+| `--lab-dir` | 含 Lab `compose.yaml` 的目录（默认：`lab`） |
+
+Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogMiner harness。见 [Deployment](deployment.md) 与 [Developer local setup](developer-local-setup.md)。
+
 ## 公开环境变量契约
 
 | 变量 | 含义 |
@@ -108,6 +130,7 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 | `MIGRALOOP_PLATFORM_STORE_URL` | Operator CLI 与 compose `app` 使用的 Platform Store 连接 URL（`postgres://...`） |
 | 配置中 `fromEnv` 引用的密钥环境变量名 | 你在 `password.fromEnv` 写的任何名称（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply/sync 时必须存在于进程环境 |
 | `LD_LIBRARY_PATH` | 真实 Oracle host：Oracle Instant Client libraries 目录（apply/sync runtime 需要；`contract`/`stub` 不使用） |
+| Lab disposable defaults | `migraloop lab up` 之后：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`（仅本地 Lab） |
 
 ### Contract-harness Source Prerequisite probes（仅 host `stub` / `contract`）
 

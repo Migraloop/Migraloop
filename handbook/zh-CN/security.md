@@ -25,6 +25,8 @@ password:
 
 Compose 中的 Platform Store URL 可能为随附 lab 风格 store 内嵌本地密码—生产环境的 store 凭证请用与任何 Postgres DSN 相同的方式保护（env / orchestrator secrets），且不要把 Source/Target 密码贴进 YAML。
 
+**Local Sync Lab** 可丢弃默认（`migraloop lab up`）刻意方便本地开发，并在 bring-up 后打印（`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store `migraloop`/`migraloop`）。仅供 Lab 使用；绝不要把 Lab 命令指向客户生产环境数据库。
+
 ## TLS / Connection Security
 
 TLS **支持** Source、Target 与 Platform Store 连接，并在生产环境 **建议启用**（ADR-0017）。本地/开发或明确选择的环境仍允许 cleartext—v1 不会对每个非 TLS 连接硬性失败。

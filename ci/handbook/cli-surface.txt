@@ -4,6 +4,7 @@
 apply
 base
 derived
+lab
 migrate
 run
 status

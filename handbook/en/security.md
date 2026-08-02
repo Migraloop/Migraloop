@@ -25,6 +25,8 @@ External secret managers (Vault / cloud KMS) can be added later; they are not re
 
 Platform Store URL in compose may embed a local password for the bundled lab-style store—treat production store credentials the same way you protect any Postgres DSN (env / orchestrator secrets), and do not paste Source/Target passwords into YAML.
 
+**Local Sync Lab** disposable defaults (`migraloop lab up`) are intentionally local-dev friendly and printed after bring-up (`ORACLE_PASSWORD=lab_oracle`, `MONGO_PASSWORD=lab_mongo`, Platform Store `migraloop`/`migraloop`). Use them only for Lab; never point Lab commands at customer production databases.
+
 ## TLS / Connection Security
 
 TLS is **supported** for Source, Target, and Platform Store connections and **recommended in production** (ADR-0017). Cleartext remains allowed for local/dev or explicitly chosen setups in v1—the product does not hard-fail every non-TLS connection.

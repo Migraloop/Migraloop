@@ -36,6 +36,20 @@ docker compose up -d --build
 
 Default compose credentials (`migraloop` / `migraloop`) are for local development only.
 
+## Local Sync Lab Fixture
+
+Disposable Oracle + MongoDB + Platform Store + app for manual Sync→Delivery verification (not CI):
+
+```bash
+cargo build -p migraloop-app
+./target/debug/migraloop lab up
+./target/debug/migraloop lab status
+# Inspect/mutate Lab DBs with the printed connection details; apply your own Deployment when ready.
+./target/debug/migraloop lab down
+```
+
+Defaults after bring-up: Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`, MongoDB `migraloop` / `lab_mongo` database `lab`. Lab bring-up does not apply sample Deployments/Pipelines. Requires Docker Compose; first Oracle boot can take several minutes. See [CLI & Config](cli-and-config.md) (`lab`) and [Deployment](deployment.md).
+
 ## Tests
 
 Unit/crate tests:
@@ -67,6 +81,12 @@ export MIGRALOOP_LIVE_ORACLE_SERVICE=FREEPDB1
 export MIGRALOOP_LIVE_ORACLE_USER=SYNC_USER
 export ORACLE_PASSWORD=...
 cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocapture
+```
+
+Lab Fixture lifecycle seam (ignored by default; requires Docker Compose + Lab Oracle image):
+
+```bash
+cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
 See [Source System](source-system.md) for the Operator apply/sync/inspect verification steps.

@@ -101,6 +101,28 @@ Migrate on startup, then keep the app process alive (compose default command).
 migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 ```
 
+### `lab`
+
+Local Sync Lab Fixture lifecycle (ADR-0025). Provisions a disposable real stack—Oracle Source (Lab-satisfied Source Prerequisites), MongoDB Target, Platform Store, and app. Bring-up does **not** apply a sample Deployment or Pipelines. Requires Docker Compose and the repo `lab/` directory (or `--lab-dir`).
+
+```bash
+migraloop lab up [--lab-dir lab]
+migraloop lab status [--lab-dir lab]
+migraloop lab down [--lab-dir lab]
+```
+
+| Subcommand | Meaning |
+| --- | --- |
+| `up` | Bring up the disposable Fixture; print connection details when ready |
+| `status` | Report Fixture readiness (engines + Oracle prerequisites + Platform Store). Shows `Deployment: (none)` / `Pipeline: (none)` until you apply config or run a Lab Scenario |
+| `down` | Tear down containers and volumes |
+
+| Flag | Meaning |
+| --- | --- |
+| `--lab-dir` | Directory containing Lab `compose.yaml` (default: `lab`) |
+
+Lab is manual verification—not the Release Quality Gate and not the contract/stub LogMiner harness. See [Deployment](deployment.md) and [Developer local setup](developer-local-setup.md).
+
 ## Public environment contract
 
 | Variable | Meaning |
@@ -108,6 +130,7 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 | `MIGRALOOP_PLATFORM_STORE_URL` | Platform Store connection URL (`postgres://...`) used by Operator CLI commands and compose `app` |
 | Secret env names referenced from config | Any names you put in `password.fromEnv` (for example `ORACLE_PASSWORD`, `MONGO_PASSWORD`) must be present in the process environment at apply/sync time |
 | `LD_LIBRARY_PATH` | For real Oracle hosts: directory of Oracle Instant Client libraries (required at apply/sync runtime; not used by `contract`/`stub`) |
+| Lab disposable defaults | After `migraloop lab up`: `ORACLE_PASSWORD=lab_oracle`, `MONGO_PASSWORD=lab_mongo`, Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop` (local Lab only) |
 
 ### Contract-harness Source Prerequisite probes (host `stub` / `contract` only)
 
