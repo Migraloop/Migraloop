@@ -47,6 +47,8 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario list
 # Scenario apply/sync needs Instant Client: export LD_LIBRARY_PATH=/path/to/instantclient
 ./target/debug/migraloop lab scenario run direct-pipeline
+./target/debug/migraloop lab scenario run rt-project
+./target/debug/migraloop lab scenario run rt-filter
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run bulk-load
@@ -68,7 +70,7 @@ A first-class capability is incomplete until Lab Scenario coverage is designed w
 3. Confirm `migraloop lab scenario list` shows the new id and **summary from `recipe.yaml`**. Selectable catalog = registered runners that have both recipe + deployment files under `--lab-dir`.
 4. Manually verify with `migraloop lab scenario run <id>` on a Lab Fixture. Keep always-on CLI-seam tests for list/control-plane behavior; full Fixture runs stay `#[ignore]` — not Release Quality Gate.
 
-Recipe conventions and a short checklist also live in `lab/scenarios/README.md`.
+Recipe conventions and a short checklist also live in `lab/scenarios/README.md`. Shipped-capability coverage and visible gaps: `lab/scenarios/COVERAGE.md` (also summarized by `lab scenario list`).
 
 ## Tests
 
@@ -109,7 +111,7 @@ Lab Fixture lifecycle seam (ignored by default; requires Docker Compose + Lab Or
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline, multi-table Transform Pipeline, concurrent Source workload, and bulk-load seams (ignored by default; requires Docker Lab Fixture + Instant Client):
+Lab Scenario Direct Pipeline, Rich Transform `project`/`filter`, multi-table Transform Pipeline, concurrent Source workload, and bulk-load seams (ignored by default; requires Docker Lab Fixture + Instant Client):
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient

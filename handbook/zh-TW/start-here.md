@@ -19,7 +19,7 @@ docker compose up -d --build
 
 Compose 會為 app 設定 `MIGRALOOP_PLATFORM_STORE_URL`。entrypoint 執行 `migraloop run`（啟動時 migrate，然後維持行程）。
 
-若要可拋棄的 **Local Sync Lab** Fixture（Oracle + MongoDB + Platform Store + app，無預設 Deployment/Pipelines）：`migraloop lab up` / `status` / `down`。可選的 **Lab Scenarios**（catalog 來自 `lab/scenarios/<id>/recipe.yaml`；例如 `migraloop lab scenario list` / `run direct-pipeline` / `run transform-pipeline` / `run concurrent-source-workload` / `run bulk-load`）會在 Scenario Namespace 內走真實 apply/sync；重跑會先 wipe Namespace，另可用 `scenario remove` / `--auto-remove` 清理。手動驗證（ADR-0025）—不是 Release Quality Gate。見 [Deployment](deployment.md)、[CLI 與 Config 參考](cli-and-config.md)，以及 [Developer local setup](developer-local-setup.md)（feature-time 撰寫路徑）。
+若要可拋棄的 **Local Sync Lab** Fixture（Oracle + MongoDB + Platform Store + app，無預設 Deployment/Pipelines）：`migraloop lab up` / `status` / `down`。可選的 **Lab Scenarios**（catalog 來自 `lab/scenarios/<id>/recipe.yaml`；例如 `migraloop lab scenario list` / `run direct-pipeline` / `run rt-project` / `run rt-filter` / `run transform-pipeline` / `run concurrent-source-workload` / `run bulk-load`）會在 Scenario Namespace 內走真實 apply/sync；重跑會先 wipe Namespace，另可用 `scenario remove` / `--auto-remove` 清理。手動驗證（ADR-0025）—不是 Release Quality Gate。見 [Deployment](deployment.md)、[CLI 與 Config 參考](cli-and-config.md)，以及 [Developer local setup](developer-local-setup.md)（feature-time 撰寫路徑）。
 
 細節：[Deployment](deployment.md) · 旗標與環境變數：[CLI 與 Config 參考](cli-and-config.md) · 密鑰/TLS：[Security](security.md)
 

@@ -1,12 +1,13 @@
 //! Lab Scenario catalog, run orchestration, and Namespace cleanup
-//! (issues #60–#65, #63 / ADR-0025).
+//! (issues #60–#66, #63 / ADR-0025).
 //!
 //! Lab-specific machinery: catalog listing from on-disk Scenario recipes
 //! (`lab/scenarios/<id>/recipe.yaml`), Scenario Namespace lifecycle
 //! (prepare / re-run wipe / manual remove / opt-in auto-remove), Source workload
 //! driving (including recipe-authored intra-Scenario concurrency and ~100k bulk
-//! Source inserts), one-at-a-time lock, and result reporting with equal-weight
-//! correctness and operational metric thresholds (lag, throughput, duration).
+//! Source inserts), one-at-a-time lock, result reporting with equal-weight
+//! correctness and operational metric thresholds (lag, throughput, duration),
+//! and shipped-capability coverage visibility (`lab/scenarios/COVERAGE.md`).
 //! Apply / Sync / inspect use the real product CLI path.
 
 use std::fs::{self, OpenOptions};
@@ -57,6 +58,19 @@ const BULK_LOAD_ID: &str = "bulk-load";
 const BULK_LOAD_TABLE: &str = "LAB_BL_ITEMS";
 const BULK_LOAD_COLLECTION: &str = "lab_bl_items";
 const BULK_LOAD_DEPLOYMENT: &str = "lab-bulk-load";
+
+const RT_PROJECT_ID: &str = "rt-project";
+const RT_PROJECT_TABLE: &str = "LAB_RP_CUSTOMERS";
+const RT_PROJECT_COLLECTION: &str = "lab_rp_customers";
+const RT_PROJECT_PIPELINE: &str = "lab-rp-customers";
+const RT_PROJECT_DEPLOYMENT: &str = "lab-rt-project";
+
+const RT_FILTER_ID: &str = "rt-filter";
+const RT_FILTER_TABLE: &str = "LAB_RF_CUSTOMERS";
+const RT_FILTER_COLLECTION: &str = "lab_rf_customers";
+const RT_FILTER_PIPELINE: &str = "lab-rf-customers";
+const RT_FILTER_DEPLOYMENT: &str = "lab-rt-filter";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -79,7 +93,7 @@ pub enum ScenarioCommand {
     },
     /// Run a Lab Scenario by id (one Scenario at a time)
     Run {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`, `concurrent-source-workload`, `bulk-load`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `rt-project`, `rt-filter`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -90,7 +104,7 @@ pub enum ScenarioCommand {
     },
     /// Fully remove a Scenario Namespace without starting a run
     Remove {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`, `concurrent-source-workload`, `bulk-load`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `rt-project`, `rt-filter`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -130,9 +144,40 @@ fn registered_scenario_ids() -> &'static [&'static str] {
     &[
         DIRECT_PIPELINE_ID,
         TRANSFORM_PIPELINE_ID,
+        RT_PROJECT_ID,
+        RT_FILTER_ID,
         CONCURRENT_SOURCE_WORKLOAD_ID,
         BULK_LOAD_ID,
     ]
+}
+
+/// Shipped first-class capabilities that must have a selectable Scenario before
+/// the Lab may claim catalog-complete (ADR-0025 / issue #66). Keep aligned with
+/// `lab/scenarios/COVERAGE.md`.
+fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'static str)] {
+    &[
+        (DIRECT_PIPELINE_ID, "Direct Pipeline Initial Load + insert/update/delete"),
+        (
+            TRANSFORM_PIPELINE_ID,
+            "multi-table Transform Pipeline (groupBy/sum)",
+        ),
+        (RT_PROJECT_ID, "Rich Transform project"),
+        (RT_FILTER_ID, "Rich Transform filter"),
+        (
+            CONCURRENT_SOURCE_WORKLOAD_ID,
+            "intra-Scenario concurrent Source workload",
+        ),
+        (BULK_LOAD_ID, "bulk load (~100k) with metric thresholds"),
+    ]
+}
+
+/// Gaps among shipped capabilities that lack a selectable Scenario in `catalog`.
+fn shipped_capability_coverage_gaps(catalog_ids: &[String]) -> Vec<&'static str> {
+    shipped_capability_scenario_requirements()
+        .iter()
+        .filter(|(id, _)| !catalog_ids.iter().any(|listed| listed == *id))
+        .map(|(_, label)| *label)
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,9 +329,29 @@ fn scenario_list(lab_dir: &Path) -> Result<(), CliError> {
 and register a runner; see lab/scenarios/README.md)"
         );
     } else {
-        for (id, summary) in catalog {
+        for (id, summary) in &catalog {
             println!("  {id}  {summary}");
         }
+    }
+    let ids: Vec<String> = catalog.iter().map(|(id, _)| id.clone()).collect();
+    let gaps = shipped_capability_coverage_gaps(&ids);
+    if gaps.is_empty() {
+        println!(
+            "Catalog coverage: complete for shipped capabilities \
+(see lab/scenarios/COVERAGE.md). Not a CI suite — pick Scenarios individually (ADR-0025)."
+        );
+    } else {
+        println!(
+            "Catalog coverage: incomplete for shipped capabilities \
+(see lab/scenarios/COVERAGE.md):"
+        );
+        for gap in gaps {
+            println!("  missing: {gap}");
+        }
+        println!(
+            "Do not claim catalog-complete until every shipped capability has a \
+selectable Scenario (ADR-0025)."
+        );
     }
     Ok(())
 }
@@ -342,6 +407,8 @@ async fn scenario_run(
     let result = match scenario {
         DIRECT_PIPELINE_ID => run_direct_pipeline(lab_dir).await,
         TRANSFORM_PIPELINE_ID => run_transform_pipeline(lab_dir).await,
+        RT_PROJECT_ID => run_rt_project(lab_dir).await,
+        RT_FILTER_ID => run_rt_filter(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
         BULK_LOAD_ID => run_bulk_load(lab_dir).await,
         _ => Err(CliError::Failed(format!(
@@ -425,6 +492,8 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
     match scenario {
         DIRECT_PIPELINE_ID => remove_direct_pipeline_namespace(lab_dir).await,
         TRANSFORM_PIPELINE_ID => remove_transform_pipeline_namespace(lab_dir).await,
+        RT_PROJECT_ID => remove_rt_project_namespace(lab_dir).await,
+        RT_FILTER_ID => remove_rt_filter_namespace(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
         BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
@@ -1241,6 +1310,495 @@ EXIT;\n"
         .map_err(|err| {
             CliError::Failed(format!(
                 "Failed to drive multi-table Source insert/update/delete for Lab Scenario:\n{err}"
+            ))
+        })
+}
+
+async fn run_rt_project(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {RT_PROJECT_ID}");
+    println!(
+        "Scenario Namespace: table={RT_PROJECT_TABLE} \
+collection={RT_PROJECT_COLLECTION} deployment={RT_PROJECT_DEPLOYMENT}"
+    );
+
+    prepare_rt_project_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, RT_PROJECT_ID)?;
+    let bin = lab_migraloop_bin();
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_path.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !(apply_out.to_ascii_lowercase().contains("derived")
+        || apply_out.contains(RT_PROJECT_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+        )));
+    }
+
+    let derived_after_apply = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_PROJECT_PIPELINE,
+        ],
+    )
+    .await?;
+    // project keeps ID/NAME only — EMAIL must not appear as Managed Derived field.
+    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+        && managed_field_present(&derived_after_apply, "NAME", "Bob")
+        && !inspect_mentions_email_field(&derived_after_apply))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load project Derived check failed \
+(expected Alice/Bob NAME, no EMAIL Managed field):\n{derived_after_apply}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source insert/update/delete...");
+    mutate_rt_project_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+
+    let derived_after = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_PROJECT_PIPELINE,
+        ],
+    )
+    .await?;
+    let target_after = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            RT_PROJECT_COLLECTION,
+        ],
+    )
+    .await?;
+
+    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+        && managed_field_present(&derived_after, "NAME", "Carol")
+        && !managed_field_present(&derived_after, "NAME", "Bob")
+        && !inspect_mentions_email_field(&derived_after);
+    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+        && managed_field_present(&target_after, "NAME", "Carol")
+        && !managed_field_present(&target_after, "NAME", "Bob")
+        && !inspect_mentions_email_field(&target_after);
+
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+
+    if !(derived_ok && target_ok) {
+        return Err(CliError::Failed(format!(
+            "correctness checks failed after project insert/update/delete.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: correctness checks passed (projected Derived + Target Managed outcomes)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+/// True when inspect output exposes an EMAIL Managed field key (not merely the substring).
+fn inspect_mentions_email_field(inspect: &str) -> bool {
+    inspect.contains("\"EMAIL\"")
+        || inspect.contains("\"email\"")
+        || inspect.contains("'EMAIL'")
+        || inspect.contains("'email'")
+}
+
+async fn remove_rt_project_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={RT_PROJECT_TABLE}, collection={RT_PROJECT_COLLECTION}, \
+          deployment={RT_PROJECT_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {RT_PROJECT_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table {RT_PROJECT_TABLE}:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{RT_PROJECT_COLLECTION}').drop()");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection {RT_PROJECT_COLLECTION}:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, RT_PROJECT_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{RT_PROJECT_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_rt_project_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_rt_project_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {RT_PROJECT_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200)\n\
+);\n\
+ALTER TABLE {RT_PROJECT_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {RT_PROJECT_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
+INSERT INTO {RT_PROJECT_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare rt-project Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_rt_project_source(lab_dir: &Path) -> Result<(), CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {RT_PROJECT_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
+INSERT INTO {RT_PROJECT_TABLE} (ID, NAME, EMAIL) VALUES (3, 'Carol', 'carol@example.com');\n\
+DELETE FROM {RT_PROJECT_TABLE} WHERE ID = 2;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source insert/update/delete for rt-project Lab Scenario:\n{err}"
+            ))
+        })
+}
+
+async fn run_rt_filter(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {RT_FILTER_ID}");
+    println!(
+        "Scenario Namespace: table={RT_FILTER_TABLE} \
+collection={RT_FILTER_COLLECTION} deployment={RT_FILTER_DEPLOYMENT}"
+    );
+
+    prepare_rt_filter_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, RT_FILTER_ID)?;
+    let bin = lab_migraloop_bin();
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_path.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !(apply_out.to_ascii_lowercase().contains("derived")
+        || apply_out.contains(RT_FILTER_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+        )));
+    }
+
+    let derived_after_apply = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_FILTER_PIPELINE,
+        ],
+    )
+    .await?;
+    // filter ACTIVE==1: Alice only (Bob ACTIVE=0 excluded).
+    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+        && !managed_field_present(&derived_after_apply, "NAME", "Bob"))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load filter Derived check failed (expected Alice only):\n{derived_after_apply}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source insert/update/delete...");
+    mutate_rt_filter_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+
+    let derived_after = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_FILTER_PIPELINE,
+        ],
+    )
+    .await?;
+    let target_after = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            RT_FILTER_COLLECTION,
+        ],
+    )
+    .await?;
+
+    // After mutate: Alicia ACTIVE=1, Carol ACTIVE=1, Bob deleted → both active names present.
+    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+        && managed_field_present(&derived_after, "NAME", "Carol")
+        && !managed_field_present(&derived_after, "NAME", "Bob");
+    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+        && managed_field_present(&target_after, "NAME", "Carol")
+        && !managed_field_present(&target_after, "NAME", "Bob");
+
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+
+    if !(derived_ok && target_ok) {
+        return Err(CliError::Failed(format!(
+            "correctness checks failed after filter insert/update/delete.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: correctness checks passed (filtered Derived + Target Managed outcomes)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_rt_filter_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={RT_FILTER_TABLE}, collection={RT_FILTER_COLLECTION}, \
+          deployment={RT_FILTER_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {RT_FILTER_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table {RT_FILTER_TABLE}:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{RT_FILTER_COLLECTION}').drop()");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection {RT_FILTER_COLLECTION}:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, RT_FILTER_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{RT_FILTER_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_rt_filter_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_rt_filter_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {RT_FILTER_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1) NOT NULL\n\
+);\n\
+ALTER TABLE {RT_FILTER_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare rt-filter Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_rt_filter_source(lab_dir: &Path) -> Result<(), CliError> {
+    // Alicia stays ACTIVE=1; Carol ACTIVE=1 inserted; inactive Bob deleted.
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {RT_FILTER_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
+INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
+DELETE FROM {RT_FILTER_TABLE} WHERE ID = 2;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source insert/update/delete for rt-filter Lab Scenario:\n{err}"
             ))
         })
 }
@@ -2281,6 +2839,51 @@ mod tests {
             catalog.len(),
             registered_scenario_ids().len(),
             "repo Lab recipes must cover every registered Scenario runner"
+        );
+    }
+
+    #[test]
+    fn repo_lab_catalog_is_complete_for_shipped_capabilities() {
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab");
+        let catalog = load_selectable_catalog(&lab).expect("load repo Lab catalog");
+        let ids: Vec<String> = catalog.iter().map(|(id, _)| id.clone()).collect();
+        let gaps = shipped_capability_coverage_gaps(&ids);
+        assert!(
+            gaps.is_empty(),
+            "shipped capability gaps must be empty before catalog-complete claim; gaps={gaps:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == RT_PROJECT_ID),
+            "catalog must include rt-project for shipped Rich Transform project"
+        );
+        assert!(
+            ids.iter().any(|id| id == RT_FILTER_ID),
+            "catalog must include rt-filter for shipped Rich Transform filter"
+        );
+        let coverage = lab.join("scenarios/COVERAGE.md");
+        let body = fs::read_to_string(&coverage).expect("COVERAGE.md");
+        assert!(
+            body.contains("Catalog-complete for currently shipped"),
+            "COVERAGE.md must state catalog-complete only when shipped surface is covered"
+        );
+        for (id, _) in shipped_capability_scenario_requirements() {
+            assert!(
+                body.contains(id),
+                "COVERAGE.md must document Scenario `{id}`"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_gaps_surface_missing_shipped_scenarios() {
+        let gaps = shipped_capability_coverage_gaps(&[DIRECT_PIPELINE_ID.to_string()]);
+        assert!(
+            gaps.iter().any(|g| g.contains("Rich Transform project")),
+            "missing rt-project must be a visible gap; gaps={gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.contains("Rich Transform filter")),
+            "missing rt-filter must be a visible gap; gaps={gaps:?}"
         );
     }
 

@@ -1,0 +1,36 @@
+# Lab Scenario: rt-filter
+# Operator-specific Rich Transform `filter` coverage (ADR-0025 / issue #66).
+# Applied via the real product `migraloop apply` path — not contract/stub.
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-rt-filter
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-rf-customers
+      mode: transform
+      source:
+        table: LAB_RF_CUSTOMERS
+      target:
+        collection: lab_rf_customers
+      outputIdentity: [ID]
+      transform:
+        - filter:
+            field: ACTIVE
+            eq: 1
