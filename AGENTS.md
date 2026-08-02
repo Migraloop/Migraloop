@@ -16,6 +16,10 @@ Single-context layout (`CONTEXT.md` + `docs/adr/` at repo root). See `docs/agent
 
 Operator/Developer product handbook duties (three locales, hard guards vs soft obligation). See `docs/agents/handbook.md`.
 
+### Implement closeout (repo overlay)
+
+When closing out **`/implement`**, if a PR already exists for the branch: work is not done until **every** check on that PR is green. Attribute reds before retrying; do not claim success without an explicit `CI: pass` / `CI: fail` / `CI: blocked` / `CI: pending-timeout` line. No PR → skip this gate. Do **not** patch upstream `.agents/skills/implement`. See `docs/agents/implement-ci-gate.md`.
+
 ## Cursor Cloud specific instructions
 
 This repo currently has no application dependencies. Cloud agents can work directly with the committed skills under `.agents/skills/`.
