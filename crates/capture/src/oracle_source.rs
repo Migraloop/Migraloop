@@ -1,7 +1,9 @@
 //! Live Oracle schema discovery and Initial Load (OCI).
 //!
-//! Contract/stub hosts keep the in-process fixture catalog for CI. Real hosts
-//! always read the Source System over OCI — never the stub business-table catalog.
+//! Contract/stub hosts use the process [`crate::ContractSourceCatalog`] (default
+//! named fixtures for scenario tests; injectable tables for arbitrary schemas).
+//! Real hosts always read the Source System over OCI — never a hard-coded
+//! business-table catalog.
 
 use std::collections::BTreeMap;
 
@@ -11,13 +13,13 @@ use serde_json::Value;
 use crate::oracle_connect::{connect_oracle, map_oracle_error, resolve_oracle_schema};
 use crate::oracle_types::{is_allow_listed_oracle_type, normalize_oracle_type};
 use crate::{
-    initial_load_stub, normalize_snapshot_temporals, source_schema_stub, CaptureError,
-    CapturePosition, InitialLoadSnapshot, OracleSourceConnect, SourceColumn,
+    load_contract_source_catalog, normalize_snapshot_temporals, CaptureError, CapturePosition,
+    InitialLoadSnapshot, OracleSourceConnect, SourceColumn,
 };
 
 /// Discover Source columns for a Pipeline-referenced table.
 ///
-/// - `host: contract` / `stub` → fixture catalog (tests / local slices)
+/// - `host: contract` / `stub` → contract Source catalog (CI / local slices)
 /// - any other host → live Oracle data dictionary via OCI
 pub fn discover_source_schema(
     source: &OracleSourceConnect,
@@ -26,7 +28,7 @@ pub fn discover_source_schema(
     table: &str,
 ) -> Result<Vec<SourceColumn>, CaptureError> {
     if source.is_contract_harness() {
-        return source_schema_stub(table);
+        return load_contract_source_catalog()?.schema(table);
     }
     let conn = connect_oracle(source, password)?;
     let owner = resolve_oracle_schema(source, schema);
@@ -42,7 +44,7 @@ pub fn initial_load_for_source(
     configured_timezone: Option<&str>,
 ) -> Result<InitialLoadSnapshot, CaptureError> {
     if source.is_contract_harness() {
-        return initial_load_stub(table, configured_timezone);
+        return load_contract_source_catalog()?.initial_load(table, configured_timezone);
     }
     let conn = connect_oracle(source, password)?;
     let owner = resolve_oracle_schema(source, schema);
@@ -267,9 +269,15 @@ pub(crate) fn mined_value_to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        clear_contract_source_catalog_override, col, number_col, set_contract_source_catalog_override,
+        snapshot, ContractSourceCatalog,
+    };
+    use serde_json::json;
 
     #[test]
-    fn contract_host_initial_load_still_uses_fixture_catalog() {
+    fn contract_host_initial_load_uses_default_named_fixtures() {
+        clear_contract_source_catalog_override();
         let source = OracleSourceConnect {
             host: "contract".into(),
             port: 1521,
@@ -283,7 +291,49 @@ mod tests {
     }
 
     #[test]
+    fn contract_host_discovers_and_loads_injected_non_fixture_table() {
+        clear_contract_source_catalog_override();
+        let mut catalog = ContractSourceCatalog::with_default_fixtures();
+        let mut row = BTreeMap::new();
+        row.insert("WID".into(), json!(7));
+        row.insert("LABEL".into(), json!("gamma"));
+        row.insert("PHOTO".into(), json!("blob"));
+        catalog.insert(snapshot(
+            "WIDGETS",
+            9000,
+            &["WID"],
+            vec![
+                number_col("WID", 10, 0, true),
+                col("LABEL", "VARCHAR2", true),
+                col("PHOTO", "BLOB", false),
+            ],
+            vec![row],
+        ));
+        set_contract_source_catalog_override(catalog);
+
+        let source = OracleSourceConnect {
+            host: "contract".into(),
+            port: 1521,
+            database: "ORCL".into(),
+            username: "sync_user".into(),
+        };
+        let columns = discover_source_schema(&source, "unused", "APP", "WIDGETS")
+            .expect("discover injected table");
+        assert!(columns.iter().any(|c| c.name == "LABEL" && c.supported));
+        assert!(columns.iter().any(|c| c.name == "PHOTO" && !c.supported));
+
+        let loaded = initial_load_for_source(&source, "unused", "APP", "WIDGETS", None)
+            .expect("initial load injected table");
+        assert_eq!(loaded.table, "WIDGETS");
+        assert_eq!(loaded.rows[0].get("LABEL"), Some(&json!("gamma")));
+        assert_eq!(loaded.omitted_columns()[0].name, "PHOTO");
+
+        clear_contract_source_catalog_override();
+    }
+
+    #[test]
     fn real_host_without_reachable_oracle_names_oci_or_instant_client() {
+        clear_contract_source_catalog_override();
         let source = OracleSourceConnect {
             host: "127.0.0.1".into(),
             port: 1,
@@ -298,8 +348,8 @@ mod tests {
             "expected OCI/LogMiner failure, got: {msg}"
         );
         assert!(
-            !msg.contains("unknown stub"),
-            "must not silently use stub catalog: {msg}"
+            !msg.contains("unknown source table"),
+            "must not silently use contract catalog: {msg}"
         );
     }
 }

@@ -2,9 +2,11 @@
 //!
 //! Incremental Capture for Oracle is LogMiner-backed (ADR-0003 / ADR-0013):
 //! contract harness for local/CI slices, OCI adapter for real Oracle hosts.
-//! Initial Load / schema discovery use the live Oracle Source on real hosts
-//! (fixture catalog remains for `host: contract` / `stub` only).
+//! Initial Load / schema discovery use the live Oracle Source on real hosts.
+//! Contract/stub hosts use [`contract_catalog`] (default named fixtures for
+//! scenario tests; injectable tables via `MIGRALOOP_CONTRACT_SOURCE_CATALOG`).
 
+mod contract_catalog;
 mod logminer;
 mod oracle_connect;
 mod oracle_prerequisites;
@@ -23,6 +25,11 @@ pub use oracle_connect::{oracle_connect_string, resolve_oracle_schema};
 pub use oracle_prerequisites::{
     check_oracle_source_prerequisites, probe_oracle_source_prerequisites_stub,
     OracleSourcePrerequisiteState, PrerequisiteError, MIN_REDO_RETENTION_HOURS,
+};
+pub use contract_catalog::{
+    clear_contract_source_catalog_override, load_contract_source_catalog,
+    set_contract_source_catalog_override, snapshot, ContractSourceCatalog,
+    ContractSourceCatalogFile, CONTRACT_SOURCE_CATALOG_ENV,
 };
 pub use oracle_source::{discover_source_schema, initial_load_for_source};
 pub use oracle_types::{
@@ -65,7 +72,7 @@ impl std::fmt::Display for CapturePosition {
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
-    #[error("unknown stub Source table: {0}")]
+    #[error("unknown Source table: {0}")]
     UnknownTable(String),
     #[error(
         "Oracle LogMiner (OCI) unavailable for Source host {host}: {detail}"
@@ -177,22 +184,14 @@ pub fn stub_db_timezone() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Discover stub Source schema for a table (no temporal normalization).
+/// Discover contract/stub Source schema for a table (no temporal normalization).
+///
+/// Uses the process contract catalog (default named fixtures + optional env merge).
 pub fn source_schema_stub(table: &str) -> Result<Vec<SourceColumn>, CaptureError> {
-    Ok(raw_fixture(table)?.columns)
+    load_contract_source_catalog()?.schema(table)
 }
 
-fn raw_fixture(table: &str) -> Result<InitialLoadSnapshot, CaptureError> {
-    match table {
-        "CUSTOMERS" => Ok(customers_fixture()),
-        "ORDERS" => Ok(orders_fixture()),
-        "EVENTS" => Ok(events_fixture()),
-        "ACCOUNTS" => Ok(accounts_fixture()),
-        other => Err(CaptureError::UnknownTable(other.to_string())),
-    }
-}
-
-/// Perform Initial Load for a table from the stub/fixture Source.
+/// Perform Initial Load for a table from the contract/stub Source catalog.
 ///
 /// Establishes a low-watermark capture position first, then reads the snapshot.
 /// Incremental Capture must start from that watermark so cutover overlaps
@@ -204,9 +203,7 @@ pub fn initial_load_stub(
     table: &str,
     configured_timezone: Option<&str>,
 ) -> Result<InitialLoadSnapshot, CaptureError> {
-    let mut snapshot = raw_fixture(table)?;
-    normalize_snapshot_temporals(&mut snapshot, configured_timezone)?;
-    Ok(snapshot)
+    load_contract_source_catalog()?.initial_load(table, configured_timezone)
 }
 
 /// Normalize temporal fields in an Incremental change row to UTC (ADR-0022).
@@ -265,7 +262,7 @@ pub(crate) fn normalize_snapshot_temporals(
     Ok(())
 }
 
-fn customers_fixture() -> InitialLoadSnapshot {
+pub(crate) fn customers_fixture() -> InitialLoadSnapshot {
     InitialLoadSnapshot {
         table: "CUSTOMERS".to_string(),
         // Watermark first: Incremental from 1000 will include the Alice→Alicia update
@@ -308,7 +305,7 @@ fn customers_fixture() -> InitialLoadSnapshot {
     }
 }
 
-fn orders_fixture() -> InitialLoadSnapshot {
+pub(crate) fn orders_fixture() -> InitialLoadSnapshot {
     InitialLoadSnapshot {
         table: "ORDERS".to_string(),
         low_watermark: CapturePosition(500),
@@ -344,7 +341,7 @@ fn orders_fixture() -> InitialLoadSnapshot {
     }
 }
 
-fn events_fixture() -> InitialLoadSnapshot {
+pub(crate) fn events_fixture() -> InitialLoadSnapshot {
     InitialLoadSnapshot {
         table: "EVENTS".to_string(),
         low_watermark: CapturePosition(2000),
@@ -366,7 +363,7 @@ fn events_fixture() -> InitialLoadSnapshot {
     }
 }
 
-fn accounts_fixture() -> InitialLoadSnapshot {
+pub(crate) fn accounts_fixture() -> InitialLoadSnapshot {
     InitialLoadSnapshot {
         table: "ACCOUNTS".to_string(),
         low_watermark: CapturePosition(3000),
@@ -401,7 +398,7 @@ fn accounts_fixture() -> InitialLoadSnapshot {
     }
 }
 
-fn col(name: &str, oracle_type: &str, supported: bool) -> SourceColumn {
+pub(crate) fn col(name: &str, oracle_type: &str, supported: bool) -> SourceColumn {
     let size = None;
     let supported = supported && is_allow_listed_oracle_type(oracle_type, size);
     SourceColumn {
@@ -414,7 +411,7 @@ fn col(name: &str, oracle_type: &str, supported: bool) -> SourceColumn {
     }
 }
 
-fn number_col(name: &str, precision: i32, scale: i32, supported: bool) -> SourceColumn {
+pub(crate) fn number_col(name: &str, precision: i32, scale: i32, supported: bool) -> SourceColumn {
     SourceColumn {
         name: name.to_string(),
         oracle_type: "NUMBER".to_string(),

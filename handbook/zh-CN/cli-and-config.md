@@ -26,7 +26,7 @@ migraloop migrate --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 应用声明式 Deployment 配置（YAML 或 JSON）。验证 secrets-by-reference、Source/Target kinds、Pipeline specs、（当 Pipelines 引用表时）Source Prerequisites，视需要执行 schema discovery + Initial Load，并 upsert Deployment/Pipeline 状态。
 
-在真实 Oracle Source host（非 `contract`/`stub`）上，apply 会通过 OCI 从 live Source 做 schema discovery 与 Initial Load（需要 Instant Client；见 [Source System](source-system.md)）。contract/stub host 仍使用进程内 fixture catalog（CI 切片）。
+在真实 Oracle Source host（非 `contract`/`stub`）上，apply 会通过 OCI 从 live Source 做 schema discovery 与 Initial Load（需要 Instant Client；见 [Source System](source-system.md)）。contract/stub host 使用进程内 **contract Source catalog**（CI 切片；默认命名 fixtures 供场景可读性；可用 `MIGRALOOP_CONTRACT_SOURCE_CATALOG` 注入额外表—不是受支持的 production Source 机制）。
 
 ```bash
 migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployment.yaml
@@ -137,6 +137,7 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | `MIGRALOOP_PLATFORM_STORE_URL` | Operator CLI 与 compose `app` 使用的 Platform Store 连接 URL（`postgres://...`） |
 | 配置中 `fromEnv` 引用的密钥环境变量名 | 你在 `password.fromEnv` 写的任何名称（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply/sync 时必须存在于进程环境 |
 | `LD_LIBRARY_PATH` | 真实 Oracle host：Oracle Instant Client libraries 目录（apply/sync runtime 需要；`contract`/`stub` 不使用） |
+| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | 仅 contract/stub host：JSON 文件路径，merge/override harness catalog 表以供 schema discovery + Initial Load（CI／本地切片；不是 production Source 机制） |
 | Lab disposable defaults | `migraloop lab up` 之后：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`（仅本地 Lab） |
 
 ### Contract-harness Source Prerequisite probes（仅 host `stub` / `contract`）
@@ -159,7 +160,7 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | 字段 | Source | Target | 说明 |
 | --- | --- | --- | --- |
 | `kind` | `oracle` | `mongodb` | v1 固定配对 |
-| `host` | 是 | 是 | Source `stub`/`contract` → LogMiner harness + fixture Initial Load；其他 host → live OCI Initial Load + LogMiner |
+| `host` | 是 | 是 | Source `stub`/`contract` → LogMiner harness + contract-catalog Initial Load；其他 host → live OCI Initial Load + LogMiner |
 | `port` | 是 | 是 | 有效 TCP port |
 | `database` | 是 | 是 | |
 | `username` | 是 | 是 | 省略 Pipeline `source.schema` 时，也作为默认 Oracle schema/owner |

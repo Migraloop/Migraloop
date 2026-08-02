@@ -26,7 +26,7 @@ migraloop migrate --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 Apply a declarative Deployment config (YAML or JSON). Validates secrets-by-reference, Source/Target kinds, Pipeline specs, Source Prerequisites (when Pipelines reference tables), runs schema discovery + Initial Load as needed, and upserts Deployment/Pipeline state.
 
-On a real Oracle Source host (not `contract`/`stub`), apply discovers columns and Initial Loads from the live Source over OCI (requires Instant Client; see [Source System](source-system.md)). Contract/stub hosts keep the in-process fixture catalog for CI slices.
+On a real Oracle Source host (not `contract`/`stub`), apply discovers columns and Initial Loads from the live Source over OCI (requires Instant Client; see [Source System](source-system.md)). Contract/stub hosts use the in-process **contract Source catalog** for CI slices (default named fixtures for scenario readability; injectable tables via `MIGRALOOP_CONTRACT_SOURCE_CATALOG`—not a supported production Source mechanism).
 
 ```bash
 migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployment.yaml
@@ -137,6 +137,7 @@ Lab is manual verification—not the Release Quality Gate and not the contract/s
 | `MIGRALOOP_PLATFORM_STORE_URL` | Platform Store connection URL (`postgres://...`) used by Operator CLI commands and compose `app` |
 | Secret env names referenced from config | Any names you put in `password.fromEnv` (for example `ORACLE_PASSWORD`, `MONGO_PASSWORD`) must be present in the process environment at apply/sync time |
 | `LD_LIBRARY_PATH` | For real Oracle hosts: directory of Oracle Instant Client libraries (required at apply/sync runtime; not used by `contract`/`stub`) |
+| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Contract/stub hosts only: path to a JSON file that merges/overrides harness catalog tables for schema discovery + Initial Load (CI / local slices; not a production Source mechanism) |
 | Lab disposable defaults | After `migraloop lab up`: `ORACLE_PASSWORD=lab_oracle`, `MONGO_PASSWORD=lab_mongo`, Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin` (local Lab only) |
 
 ### Contract-harness Source Prerequisite probes (host `stub` / `contract` only)
@@ -159,7 +160,7 @@ Env names and defaults for the in-process LogMiner harness live in [Source Syste
 | Field | Source | Target | Notes |
 | --- | --- | --- | --- |
 | `kind` | `oracle` | `mongodb` | v1 fixed pair |
-| `host` | yes | yes | Source `stub`/`contract` → LogMiner harness + fixture Initial Load; any other host → live OCI Initial Load + LogMiner |
+| `host` | yes | yes | Source `stub`/`contract` → LogMiner harness + contract-catalog Initial Load; any other host → live OCI Initial Load + LogMiner |
 | `port` | yes | yes | Valid TCP port |
 | `database` | yes | yes | |
 | `username` | yes | yes | Also the default Oracle schema/owner when Pipeline `source.schema` is omitted |

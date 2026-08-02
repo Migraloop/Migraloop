@@ -18,7 +18,7 @@ Under `spec.source` in the Deployment config:
 
 Real Oracle hosts use the **OCI** path for both **Initial Load** (schema discovery + snapshot) and **LogMiner Incremental Capture**. Without Oracle Instant Client / OCI libraries in the runtime, apply/sync fail fast naming LogMiner/OCI—there is no silent fallback to the stub catalog. Install Instant Client (Basic or Basic Light) and set `LD_LIBRARY_PATH` to its directory before running the app against a live Source.
 
-On a live Source, Pipeline `source.schema` selects the Oracle owner; when omitted, the platform uses the Source `username` (uppercased) as the default schema. The contract/stub harness ignores schema and continues to use its fixture catalog for CI slices only—not as the Lab/real-path definition of truth.
+On a live Source, Pipeline `source.schema` selects the Oracle owner; when omitted, the platform uses the Source `username` (uppercased) as the default schema. The contract/stub harness ignores schema and uses its **contract Source catalog** for CI slices only (default named fixtures for scenario tests; optional `MIGRALOOP_CONTRACT_SOURCE_CATALOG` JSON merge for arbitrary tables)—not as the Lab/real-path definition of truth, and not a supported production Source mechanism.
 
 ## Source Prerequisites (Oracle / LogMiner)
 
@@ -68,8 +68,9 @@ When Source `host` is `contract` or `stub`, Incremental Capture uses the in-proc
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING` | `on` / `off` for database supplemental logging | `on` |
-| `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all`, empty, or comma-separated tables with PK/ALL logging | `all` |
+| `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all` (every table currently in the contract Source catalog), empty, or comma-separated tables with PK/ALL logging | `all` |
 | `MIGRALOOP_STUB_REDO_RETENTION_HOURS` | Reported redo retention in hours | `72` |
+| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Path to a JSON file that merges/overrides contract catalog tables for schema discovery + Initial Load (CI / local slices only) | unset (named default fixtures only) |
 
 ## Required Privileges
 
