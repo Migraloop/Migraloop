@@ -221,6 +221,21 @@ fn assert_customers_delivered(collection_out: &str, collection: &str) {
     );
 }
 
+/// Match `Delivery complete: Pipeline <name>` without treating `customers` as a
+/// prefix of `customers_mirror`.
+fn delivery_complete_for(stdout: &str, pipeline: &str) -> bool {
+    let needle = format!("Delivery complete: Pipeline {pipeline} ");
+    stdout.contains(&needle)
+        || stdout.lines().any(|line| {
+            line.trim_end() == format!("Delivery complete: Pipeline {pipeline}")
+        })
+}
+
+/// Match `Pipeline: <name> (` in status without prefix collisions.
+fn status_has_pipeline(status_out: &str, pipeline: &str) -> bool {
+    status_out.contains(&format!("Pipeline: {pipeline} ("))
+}
+
 /// Both Pipelines applied together: one Initial Load, one Base, both Deliver.
 #[tokio::test]
 async fn two_pipelines_same_table_share_one_base_and_both_deliver() {
@@ -243,18 +258,18 @@ async fn two_pipelines_same_table_share_one_base_and_both_deliver() {
         "same Source table must Initial Load once (shared Base), got:\n{apply_out}"
     );
     assert!(
-        apply_out.contains("Delivery complete: Pipeline customers"),
+        delivery_complete_for(&apply_out, "customers"),
         "first Pipeline must Deliver from shared Base, got:\n{apply_out}"
     );
     assert!(
-        apply_out.contains("Delivery complete: Pipeline customers_mirror"),
+        delivery_complete_for(&apply_out, "customers_mirror"),
         "second Pipeline must Deliver from shared Base, got:\n{apply_out}"
     );
 
     let status_out = status(&url);
     assert!(
-        status_out.contains("Pipeline: customers")
-            && status_out.contains("Pipeline: customers_mirror"),
+        status_has_pipeline(&status_out, "customers")
+            && status_has_pipeline(&status_out, "customers_mirror"),
         "status must list both Pipelines, got:\n{status_out}"
     );
     assert_eq!(
@@ -291,7 +306,7 @@ async fn runtime_add_second_pipeline_reuses_existing_base_for_same_table() {
         "first apply must Initial Load CUSTOMERS, got:\n{first_apply}"
     );
     assert!(
-        first_apply.contains("Delivery complete: Pipeline customers"),
+        delivery_complete_for(&first_apply, "customers"),
         "first apply must Deliver customers, got:\n{first_apply}"
     );
 
@@ -302,7 +317,7 @@ async fn runtime_add_second_pipeline_reuses_existing_base_for_same_table() {
         "exactly one CUSTOMERS Base before runtime add, got:\n{before}"
     );
     assert!(
-        !before.contains("Pipeline: customers_mirror"),
+        !status_has_pipeline(&before, "customers_mirror"),
         "mirror Pipeline must not exist yet, got:\n{before}"
     );
 
@@ -322,17 +337,18 @@ async fn runtime_add_second_pipeline_reuses_existing_base_for_same_table() {
         "second Pipeline must reuse existing Base (no Initial Load), got:\n{second_apply}"
     );
     assert!(
-        !second_apply.contains("Delivery complete: Pipeline customers"),
+        !delivery_complete_for(&second_apply, "customers"),
         "unchanged already-delivered Pipeline must not re-Deliver, got:\n{second_apply}"
     );
     assert!(
-        second_apply.contains("Delivery complete: Pipeline customers_mirror"),
+        delivery_complete_for(&second_apply, "customers_mirror"),
         "new Pipeline must Deliver from the shared Base, got:\n{second_apply}"
     );
 
     let after = status(&url);
     assert!(
-        after.contains("Pipeline: customers") && after.contains("Pipeline: customers_mirror"),
+        status_has_pipeline(&after, "customers")
+            && status_has_pipeline(&after, "customers_mirror"),
         "both Pipelines must be present after runtime add, got:\n{after}"
     );
     assert_eq!(
