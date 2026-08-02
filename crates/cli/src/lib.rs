@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use migraloop_capture::{
-    classify_number, incremental_changes_stub, initial_load_stub, is_allow_listed_oracle_type,
-    normalize_change_temporals, source_schema_stub, CapturePosition, ChangeEvent, ChangeOp,
-    NumberMongoMapping, SourceColumn, TypeError,
+    check_oracle_source_prerequisites, classify_number, incremental_changes_stub,
+    initial_load_stub, is_allow_listed_oracle_type, normalize_change_temporals,
+    probe_oracle_source_prerequisites_stub, source_schema_stub, CapturePosition, ChangeEvent,
+    ChangeOp, NumberMongoMapping, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
@@ -601,6 +602,25 @@ fn stub_source_columns(table: &str) -> Result<Vec<SourceColumn>, CliError> {
     source_schema_stub(table).map_err(|err| CliError::Failed(err.to_string()))
 }
 
+/// Fail-fast Oracle Source Prerequisites before capture runs (ADR-0021).
+///
+/// Probes Source settings read-only; never auto-alters customer Oracle config.
+fn ensure_oracle_source_prerequisites(source_tables: &[String]) -> Result<(), CliError> {
+    let state = probe_oracle_source_prerequisites_stub();
+    check_oracle_source_prerequisites(&state, source_tables)
+        .map_err(|err| CliError::Failed(err.to_string()))
+}
+
+fn pipeline_source_tables(pipelines: &[Pipeline]) -> Vec<String> {
+    let mut tables = BTreeSet::new();
+    for pipeline in pipelines {
+        if !pipeline.source_table.is_empty() {
+            tables.insert(pipeline.source_table.clone());
+        }
+    }
+    tables.into_iter().collect()
+}
+
 async fn deliver_direct_pipelines(
     platform_store_url: &str,
     deployment: &Deployment,
@@ -698,6 +718,11 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
             })
             .collect();
         validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
+    }
+
+    // ADR-0021: fail-fast Source Prerequisites before any capture (Initial Load).
+    if deployment.source.kind.eq_ignore_ascii_case("oracle") {
+        ensure_oracle_source_prerequisites(&pipeline_source_tables(&pipelines))?;
     }
 
     upsert_deployment(platform_store_url, &deployment)
@@ -845,6 +870,12 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 pipeline.source_schema.clone(),
                 pipeline.source_table.clone(),
             ));
+        }
+
+        // ADR-0021: fail-fast Source Prerequisites before Incremental Capture.
+        if deployment.source.kind.eq_ignore_ascii_case("oracle") {
+            let source_tables: Vec<String> = tables.iter().map(|(_, t)| t.clone()).collect();
+            ensure_oracle_source_prerequisites(&source_tables)?;
         }
 
         // Resume from durable Platform Store checkpoint (exclusive). Initial Load sets
