@@ -2,6 +2,7 @@
 
 mod config;
 mod lab;
+mod lab_scenario;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -120,7 +121,7 @@ pub enum Command {
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
     },
-    /// Local Sync Lab Fixture (disposable Oracle, MongoDB, Platform Store, app)
+    /// Local Sync Lab Fixture and Lab Scenarios (disposable Oracle, MongoDB, Platform Store, app)
     Lab {
         #[command(subcommand)]
         command: LabCommand,

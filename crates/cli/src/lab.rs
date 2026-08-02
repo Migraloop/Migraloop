@@ -1,7 +1,8 @@
 //! Local Sync Lab Fixture orchestration (issue #59 / ADR-0025).
 //!
-//! Lab-specific machinery only: disposable stack bring-up / status / tear-down.
-//! Does not apply Deployments or Pipelines.
+//! Lab-specific machinery only: disposable stack bring-up / status / tear-down,
+//! plus shared helpers for Lab Scenario runners. Fixture bring-up does not apply
+//! Deployments or Pipelines.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,6 +12,7 @@ use clap::Subcommand;
 use tokio::process::Command;
 use tokio::time::sleep;
 
+use crate::lab_scenario::{run_scenario_command, ScenarioCommand};
 use crate::CliError;
 
 pub const LAB_COMPOSE_PROJECT: &str = "migraloop-lab";
@@ -51,6 +53,11 @@ pub enum LabCommand {
         #[arg(long, default_value = "lab")]
         lab_dir: PathBuf,
     },
+    /// List or run selectable Lab Scenarios (one at a time)
+    Scenario {
+        #[command(subcommand)]
+        command: ScenarioCommand,
+    },
 }
 
 pub async fn run_lab(command: LabCommand) -> Result<(), CliError> {
@@ -58,6 +65,7 @@ pub async fn run_lab(command: LabCommand) -> Result<(), CliError> {
         LabCommand::Up { lab_dir } => lab_up(&lab_dir).await,
         LabCommand::Status { lab_dir } => lab_status(&lab_dir).await,
         LabCommand::Down { lab_dir } => lab_down(&lab_dir).await,
+        LabCommand::Scenario { command } => run_scenario_command(command).await,
     }
 }
 
@@ -466,7 +474,8 @@ EXIT;\n";
     Ok(())
 }
 
-async fn sqlplus_in_oracle(
+/// Run sqlplus inside the Lab Oracle container (Scenario Namespace / workload driver).
+pub(crate) async fn sqlplus_in_oracle(
     lab_dir: &Path,
     connect: &str,
     sql: &str,
@@ -580,7 +589,49 @@ fn print_connection_details() {
     println!("  export {LAB_ORACLE_PASSWORD_ENV}={LAB_ORACLE_PASSWORD_DEFAULT}");
     println!("  export {LAB_MONGO_PASSWORD_ENV}={LAB_MONGO_PASSWORD_DEFAULT}");
     println!("  migraloop status");
-    println!("  # Apply a Deployment yourself, or run a Lab Scenario when available.");
+    println!("  migraloop lab scenario list");
+    println!("  # Scenario apply/sync needs host Oracle Instant Client (LD_LIBRARY_PATH).");
+    println!("  migraloop lab scenario run direct-pipeline");
+}
+
+/// Path to the `migraloop` binary used for real product apply/sync/inspect from Lab.
+pub(crate) fn lab_migraloop_bin() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("migraloop"))
+}
+
+/// Fixture readiness gate for Scenario runs (engines + Oracle prerequisites + Platform Store).
+pub(crate) async fn ensure_fixture_ready_for_scenario(lab_dir: &Path) -> Result<(), CliError> {
+    let _ = compose_file(lab_dir)?;
+    if !docker_available() {
+        return Err(CliError::Failed(
+            "Lab Scenario requires a ready Lab Fixture (Docker Compose unavailable). \
+             Run `migraloop lab up` first."
+                .to_string(),
+        ));
+    }
+    let services = service_readiness(lab_dir).await?;
+    if !services.iter().all(|(_, ready)| *ready) {
+        let detail = services
+            .iter()
+            .map(|(n, r)| format!("{n}={}", if *r { "ready" } else { "not-ready" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::Failed(format!(
+            "Lab Scenario requires a ready Lab Fixture ({detail}). Run `migraloop lab up` first."
+        )));
+    }
+    probe_oracle_prerequisites(lab_dir).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Lab Scenario requires Lab Oracle Source Prerequisites: {err}"
+        ))
+    })?;
+    if !platform_store_reports_healthy().await {
+        return Err(CliError::Failed(
+            "Lab Scenario requires a healthy Lab Platform Store. Run `migraloop lab up` first."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn print_deployment_pipeline_state() {

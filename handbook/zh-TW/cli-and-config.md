@@ -103,12 +103,14 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 ### `lab`
 
-Local Sync Lab Fixture 生命週期（ADR-0025）。佈建可拋棄的真實堆疊—Oracle Source（Lab 已滿足的 Source Prerequisites）、MongoDB Target、Platform Store 與 app。Bring-up **不會**套用 sample Deployment 或 Pipelines。需要 Docker Compose 與 repo 的 `lab/` 目錄（或 `--lab-dir`）。
+Local Sync Lab Fixture 與 Lab Scenarios（ADR-0025）。佈建可拋棄的真實堆疊—Oracle Source（Lab 已滿足的 Source Prerequisites）、MongoDB Target、Platform Store 與 app。Bring-up **不會**套用 sample Deployment 或 Pipelines。Operator 接著可 list/run 可選的 **Lab Scenarios**，在 **Scenario Namespace** 內以真實 product path 套用 Deployment 並驅動 Sync/Delivery。需要 Docker Compose 與 repo 的 `lab/` 目錄（或 `--lab-dir`）。Scenario 的 `apply`/`sync` 需要 host 上的 Oracle Instant Client（`LD_LIBRARY_PATH`）。
 
 ```bash
 migraloop lab up [--lab-dir lab]
 migraloop lab status [--lab-dir lab]
 migraloop lab down [--lab-dir lab]
+migraloop lab scenario list [--lab-dir lab]
+migraloop lab scenario run <scenario-id> [--lab-dir lab]
 ```
 
 | Subcommand | 意義 |
@@ -116,6 +118,8 @@ migraloop lab down [--lab-dir lab]
 | `up` | 啟動可拋棄 Fixture；就緒時印出連線細節 |
 | `status` | 回報 Fixture 就緒狀態（engines + Oracle prerequisites + Platform Store）。在你套用設定或執行 Lab Scenario 之前顯示 `Deployment: (none)` / `Pipeline: (none)` |
 | `down` | 拆除 containers 與 volumes |
+| `scenario list` | 列出 catalog 中可選的 Lab Scenarios（例如 `direct-pipeline`） |
+| `scenario run` | 依 id 執行一個 Lab Scenario。若已有 Scenario 正在執行則拒絕。回報 pass/fail 以及 `duration_ms` 與 rows/throughput。結束後預設保留 Scenario Namespace，供即時 `base`/`target` 檢查（cleanup／re-run wipe 為另一組控制） |
 
 | Flag | 意義 |
 | --- | --- |

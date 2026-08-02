@@ -44,7 +44,10 @@ Compose 預設憑證（`migraloop` / `migraloop`）僅供本機開發。
 cargo build -p migraloop-app
 ./target/debug/migraloop lab up
 ./target/debug/migraloop lab status
-# 用印出的連線細節檢視／變更 Lab DB；就緒後自行套用 Deployment。
+./target/debug/migraloop lab scenario list
+# Scenario apply/sync 需要 Instant Client：export LD_LIBRARY_PATH=/path/to/instantclient
+./target/debug/migraloop lab scenario run direct-pipeline
+# 用 migraloop base / target 檢視留下的 Scenario Namespace，或直接變更 Lab DB。
 ./target/debug/migraloop lab down
 ```
 
@@ -87,6 +90,13 @@ Lab Fixture lifecycle seam（預設 ignored；需要 Docker Compose + Lab Oracle
 
 ```bash
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
+```
+
+Lab Scenario Direct Pipeline seam（預設 ignored；需要 Docker Lab Fixture + Instant Client）：
+
+```bash
+export LD_LIBRARY_PATH=/path/to/instantclient
+cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
 ```
 
 Operator 的 apply/sync/inspect 驗證步驟見 [Source System](source-system.md)。

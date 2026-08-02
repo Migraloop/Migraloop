@@ -103,12 +103,14 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 ### `lab`
 
-Local Sync Lab Fixture lifecycle (ADR-0025). Provisions a disposable real stack—Oracle Source (Lab-satisfied Source Prerequisites), MongoDB Target, Platform Store, and app. Bring-up does **not** apply a sample Deployment or Pipelines. Requires Docker Compose and the repo `lab/` directory (or `--lab-dir`).
+Local Sync Lab Fixture and Lab Scenarios (ADR-0025). Provisions a disposable real stack—Oracle Source (Lab-satisfied Source Prerequisites), MongoDB Target, Platform Store, and app. Bring-up does **not** apply a sample Deployment or Pipelines. Operators then list/run selectable **Lab Scenarios** that apply Deployments and drive Sync/Delivery on the real product path inside a **Scenario Namespace**. Requires Docker Compose and the repo `lab/` directory (or `--lab-dir`). Scenario `apply`/`sync` need host Oracle Instant Client (`LD_LIBRARY_PATH`).
 
 ```bash
 migraloop lab up [--lab-dir lab]
 migraloop lab status [--lab-dir lab]
 migraloop lab down [--lab-dir lab]
+migraloop lab scenario list [--lab-dir lab]
+migraloop lab scenario run <scenario-id> [--lab-dir lab]
 ```
 
 | Subcommand | Meaning |
@@ -116,6 +118,8 @@ migraloop lab down [--lab-dir lab]
 | `up` | Bring up the disposable Fixture; print connection details when ready |
 | `status` | Report Fixture readiness (engines + Oracle prerequisites + Platform Store). Shows `Deployment: (none)` / `Pipeline: (none)` until you apply config or run a Lab Scenario |
 | `down` | Tear down containers and volumes |
+| `scenario list` | List selectable Lab Scenarios in the catalog (for example `direct-pipeline`) |
+| `scenario run` | Run one Lab Scenario by id. Rejects if another Scenario run is active. Reports pass/fail plus `duration_ms` and rows/throughput. Leaves the Scenario Namespace in place for live `base`/`target` inspection (cleanup/re-run wipe is a separate control) |
 
 | Flag | Meaning |
 | --- | --- |
