@@ -6,17 +6,19 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use migraloop_capture::{incremental_changes_stub, initial_load_stub, ChangeEvent, ChangeOp};
+use migraloop_capture::{
+    incremental_changes_stub, initial_load_stub, CapturePosition, ChangeEvent, ChangeOp,
+};
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryDocument,
     MongoTargetConnection,
 };
 use migraloop_platform_store::{
-    base_dataset_exists, delete_base_datasets_not_in, get_base_rows, health, list_base_datasets,
-    list_deployments, list_pipelines, migrate, replace_base_dataset, replace_pipelines,
-    update_base_primary_key, update_pipeline_delivery_progress, upsert_deployment, BaseColumn,
-    BaseDataset, Deployment, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef,
-    SecretRefKind, SystemConnection,
+    base_dataset_exists, delete_base_datasets_not_in, filter_unapplied_change_ids, get_base_rows,
+    health, list_base_datasets, list_deployments, list_pipelines, migrate,
+    record_applied_source_changes, replace_base_dataset, replace_pipelines, update_base_primary_key,
+    update_pipeline_delivery_progress, upsert_deployment, BaseColumn, BaseDataset, Deployment,
+    OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind, SystemConnection,
 };
 use thiserror::Error;
 
@@ -312,7 +314,9 @@ async fn sync_base_datasets_for_pipelines(
             continue;
         }
 
+        // ADR-0004: establish low-watermark first, then snapshot (stub does both).
         let snapshot = initial_load_stub(&table).map_err(|err| CliError::Failed(err.to_string()))?;
+        let low_watermark = snapshot.low_watermark;
 
         let columns: Vec<BaseColumn> = snapshot
             .supported_columns()
@@ -354,6 +358,9 @@ async fn sync_base_datasets_for_pipelines(
             row_count: rows.len() as i32,
             sync_applied_changes: 0,
             sync_health: "unknown".to_string(),
+            capture_low_watermark: Some(low_watermark.as_i64()),
+            // Checkpoint starts at watermark-1 so first Incremental includes the overlap window.
+            capture_checkpoint: Some(low_watermark.as_i64().saturating_sub(1)),
         };
 
         replace_base_dataset(platform_store_url, &dataset, &rows)
@@ -361,8 +368,8 @@ async fn sync_base_datasets_for_pipelines(
             .map_err(|err| CliError::Failed(err.to_string()))?;
 
         println!(
-            "Initial Load complete: Base Dataset {table} ({} rows)",
-            dataset.row_count
+            "Initial Load complete: Base Dataset {table} ({} rows) low-watermark={}",
+            dataset.row_count, low_watermark
         );
     }
 
@@ -575,16 +582,64 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
         let mut captured_by_table: Vec<(String, Vec<ChangeEvent>)> = Vec::new();
 
         for (schema, table) in tables {
-            let changes = incremental_changes_stub(&table)
-                .map_err(|err| CliError::Failed(err.to_string()))?;
-            if changes.is_empty() {
-                continue;
-            }
-
             let (dataset, base_rows) =
                 get_base_rows(platform_store_url, &table, Some(&deployment.name))
                     .await
                     .map_err(|err| CliError::Failed(err.to_string()))?;
+
+            let Some(low_watermark_i64) = dataset.capture_low_watermark else {
+                return Err(CliError::Failed(format!(
+                    "cannot start Incremental Capture for {table} without low-watermark overlap \
+                     (cutover watermark missing; re-run Initial Load via `migraloop apply`)"
+                )));
+            };
+            let low_watermark = CapturePosition::from_i64(low_watermark_i64).ok_or_else(|| {
+                CliError::Failed(format!(
+                    "invalid low-watermark for Base Dataset {table}: {low_watermark_i64}"
+                ))
+            })?;
+
+            // Resume from checkpoint when present; otherwise start at low-watermark (overlap).
+            let from_position = match dataset.capture_checkpoint {
+                Some(checkpoint) => CapturePosition::from_i64(checkpoint.saturating_add(1))
+                    .unwrap_or(low_watermark),
+                None => low_watermark,
+            };
+            if from_position < low_watermark {
+                return Err(CliError::Failed(format!(
+                    "Incremental Capture for {table} cannot start before cutover low-watermark \
+                     {low_watermark} (from_position={from_position})"
+                )));
+            }
+
+            let candidate_changes = incremental_changes_stub(&table, from_position)
+                .map_err(|err| CliError::Failed(err.to_string()))?;
+            let candidate_ids: Vec<String> = candidate_changes
+                .iter()
+                .map(|c| c.change_id.clone())
+                .collect();
+            let unapplied_ids = filter_unapplied_change_ids(
+                platform_store_url,
+                &deployment.name,
+                &schema,
+                &table,
+                &candidate_ids,
+            )
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+            let unapplied_set: BTreeSet<_> = unapplied_ids.into_iter().collect();
+            let changes: Vec<ChangeEvent> = candidate_changes
+                .into_iter()
+                .filter(|c| unapplied_set.contains(&c.change_id))
+                .collect();
+
+            if changes.is_empty() {
+                println!(
+                    "Incremental Capture: Base Dataset {table} overlap dedupe — 0 new changes \
+                     (already applied from low-watermark={low_watermark})"
+                );
+                continue;
+            }
 
             let supported_names: BTreeSet<String> =
                 dataset.columns.iter().map(|c| c.name.clone()).collect();
@@ -593,10 +648,16 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 
             apply_change_events_to_base_rows(&mut rows, &changes, &supported_names)?;
 
+            let max_position = changes
+                .iter()
+                .map(|c| c.position.as_i64())
+                .max()
+                .unwrap_or(low_watermark_i64);
+
             let updated = BaseDataset {
                 deployment_name: deployment.name.clone(),
                 source_table: table.clone(),
-                source_schema: schema,
+                source_schema: schema.clone(),
                 status: "incremental".to_string(),
                 primary_key: dataset.primary_key.clone(),
                 columns: dataset.columns.clone(),
@@ -604,14 +665,31 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 row_count: rows.len() as i32,
                 sync_applied_changes: dataset.sync_applied_changes + changes.len() as i32,
                 sync_health: "ok".to_string(),
+                capture_low_watermark: Some(low_watermark_i64),
+                capture_checkpoint: Some(max_position),
             };
 
             replace_base_dataset(platform_store_url, &updated, &rows)
                 .await
                 .map_err(|err| CliError::Failed(err.to_string()))?;
 
+            let applied_records: Vec<(String, i64)> = changes
+                .iter()
+                .map(|c| (c.change_id.clone(), c.position.as_i64()))
+                .collect();
+            record_applied_source_changes(
+                platform_store_url,
+                &deployment.name,
+                &schema,
+                &table,
+                &applied_records,
+            )
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+
             println!(
-                "Incremental Capture: Base Dataset {table} applied {} changes (rows={})",
+                "Incremental Capture: Base Dataset {table} applied {} changes from \
+                 low-watermark overlap (rows={}, checkpoint={max_position})",
                 changes.len(),
                 updated.row_count
             );
@@ -796,6 +874,17 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             if base.status == "initial_load_complete" {
                 println!("  Initial Load complete");
             }
+            match (base.capture_low_watermark, base.capture_checkpoint) {
+                (Some(wm), Some(cp)) => {
+                    println!("  Cutover: lowWatermark={wm} checkpoint={cp}");
+                }
+                (Some(wm), None) => {
+                    println!("  Cutover: lowWatermark={wm} checkpoint=(none)");
+                }
+                _ => {
+                    println!("  Cutover: lowWatermark=(missing)");
+                }
+            }
             println!(
                 "  Sync Health: {} appliedChanges={}",
                 base.sync_health, base.sync_applied_changes
@@ -839,6 +928,17 @@ async fn print_base(
         "Base Dataset: {} status={} rows={}",
         dataset.source_table, dataset.status, dataset.row_count
     );
+    match (dataset.capture_low_watermark, dataset.capture_checkpoint) {
+        (Some(wm), Some(cp)) => {
+            println!("cutover: lowWatermark={wm} checkpoint={cp}");
+        }
+        (Some(wm), None) => {
+            println!("cutover: lowWatermark={wm} checkpoint=(none)");
+        }
+        _ => {
+            println!("cutover: lowWatermark=(missing)");
+        }
+    }
     let columns = dataset
         .columns
         .iter()
