@@ -24,6 +24,10 @@ _Avoid_: Destination database
 One running configuration that pairs exactly one Source System with exactly one Target System and hosts one or more Pipelines between them.
 _Avoid_: Cluster (infra-flavored), pipeline (a Deployment contains many Pipelines)
 
+**Operator**:
+The person who installs and runs a Deployment, authors Pipeline config, and monitors Sync Health / Delivery Health (and related operational signals). The primary audience for product usage documentation.
+_Avoid_: End user (implies a business consumer of synced data), customer (ambiguous—may mean the organization, not the person operating the platform)
+
 **Platform Store**:
 The independent database dedicated to platform-managed data (Base Datasets, Derived Datasets, Maintenance State, checkpoints). It exists so Sync, Rich Transform, and Affect Analysis never use the user's Source or Target System as their data plane. The store's engine is a product-locked choice, not configured per user preference (see ADR-0001). Default installation ships the Platform Store with the app as a separate container beside the app (one install, two containers): engine locked, Postgres settings/volumes/resources user-tunable; not BYO alternate engines. Connection configuration may be stored; **secrets (passwords, keys) are not stored in plaintext** in the Platform Store or Pipeline definitions—they are supplied via environment variables, Docker secrets, or mounted secret files, referenced by name (see ADR-0006).
 _Avoid_: Using source/target as platform storage, user-pluggable store engine, BYO database for the platform data plane, single-process “DB inside the app container” as the default, plaintext passwords in Pipeline config
