@@ -16,7 +16,9 @@
 | `password` | Secret reference：`fromEnv`、`fromFile` 或 `fromDockerSecret` |
 | `timezone` | 可选 IANA 名称或 Oracle 风格 offset（`+09:00`）。在 naive DATE/TIMESTAMP 需要解读且 Source DB timezone 不可读时使用 |
 
-真实 Oracle host 使用 **OCI LogMiner** adapter。若 runtime 没有 Oracle Instant Client / OCI bindings，apply/sync 会以 LogMiner/OCI 名称 fail fast—不会默默退回 stub catalog。
+真实 Oracle host 的 **Initial Load**（schema discovery + snapshot）与 **LogMiner Incremental Capture** 都走 **OCI** 路径。若 runtime 没有 Oracle Instant Client / OCI libraries，apply/sync 会以 LogMiner/OCI 名称 fail fast—不会默默退回 stub catalog。对 live Source 执行前请安装 Instant Client（Basic 或 Basic Light），并将 `LD_LIBRARY_PATH` 指向其目录。
+
+在 live Source 上，Pipeline 的 `source.schema` 选择 Oracle owner；省略时平台以 Source `username`（大写）作为默认 schema。contract/stub harness 会忽略 schema，仅在 CI 切片使用 fixture catalog—不是 Lab／真实路径的定义真相。
 
 ## Source Prerequisites（Oracle / LogMiner）
 
@@ -96,8 +98,31 @@ Schema discovery 之后，Sync 只把 allow-list 内的 Oracle 类型转入 Plat
 
 Sync 按 **Pipeline 引用** 选择表—不是整 schema mirror。每张纳入的表在 Deployment 内至多一个共用 **Base Dataset**（完整 supported-type 行），供所有需要它的 Pipeline 重用。新增被引用的表只对该表做 **table-level Initial Load**。
 
+## Live Oracle 验证（CLI operator seam）
+
+在真实 Oracle Source 上（已安装 Instant Client，且 Source Prerequisites 已满足），Operator 可不经 mock 验证 Sync→Delivery：
+
+1. 将 `spec.source.host` / `port` / `database` / `username` 指向 live Source（不要用 `contract`/`stub`）。
+2. `migraloop apply -f deployment.yaml` — Initial Load 从 live 表读入 Base Datasets，并把 Direct Pipeline Deliver 到 MongoDB。
+3. 在已启用 supplemental logging 的情况下变更 Source 行（`INSERT` / `UPDATE` / `DELETE`）。
+4. `migraloop sync` — LogMiner (OCI) Incremental Capture 套用变更；MongoDB 上的 Managed 字段会反映这些变更。
+5. 用 `migraloop status`、`migraloop base --table <TABLE>`、`migraloop target --collection <NAME>` 检视。
+
+若有可用的 live Oracle，Developer 也可跑 gated seam test：
+
+```bash
+export LD_LIBRARY_PATH=/path/to/instantclient
+export MIGRALOOP_LIVE_ORACLE_HOST=127.0.0.1
+export MIGRALOOP_LIVE_ORACLE_PORT=1521
+export MIGRALOOP_LIVE_ORACLE_SERVICE=FREEPDB1
+export MIGRALOOP_LIVE_ORACLE_USER=SYNC_USER
+export ORACLE_PASSWORD=...
+cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocapture
+```
+
 ## 相关章节
 
 - 与 Target 配对：[Deployment](deployment.md)
 - 引用表的 Pipelines：[Pipeline](pipeline.md)
 - Secrets 与 TLS：[Security](security.md)
+- Developer 机器上的 Instant Client：[Developer 本地设置](developer-local-setup.md)

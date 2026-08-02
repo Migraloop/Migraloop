@@ -30,6 +30,18 @@
       "handbook_pages": ["source-system.md"]
     },
     {
+      "id": "oracle-oci-live-source",
+      "paths": [
+        "crates/capture/src/oracle_connect.rs",
+        "crates/capture/src/oracle_source.rs",
+        "crates/capture/src/logminer/oci.rs"
+      ],
+      "handbook_pages": [
+        "source-system.md",
+        "developer-local-setup.md"
+      ]
+    },
+    {
       "id": "supported-source-type-contracts",
       "paths": ["crates/capture/src/oracle_types.rs"],
       "handbook_pages": [

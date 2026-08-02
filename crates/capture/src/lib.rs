@@ -2,10 +2,13 @@
 //!
 //! Incremental Capture for Oracle is LogMiner-backed (ADR-0003 / ADR-0013):
 //! contract harness for local/CI slices, OCI adapter for real Oracle hosts.
-//! Initial Load still uses fixture Sources until ticket #40 moves discovery off stub.
+//! Initial Load / schema discovery use the live Oracle Source on real hosts
+//! (fixture catalog remains for `host: contract` / `stub` only).
 
 mod logminer;
+mod oracle_connect;
 mod oracle_prerequisites;
+mod oracle_source;
 mod oracle_types;
 
 pub use logminer::{
@@ -16,10 +19,12 @@ pub use logminer::{
 
 // Re-export session helper used by the OCI adapter surface.
 pub use logminer::oci_logminer_session_sql;
+pub use oracle_connect::{oracle_connect_string, resolve_oracle_schema};
 pub use oracle_prerequisites::{
     check_oracle_source_prerequisites, probe_oracle_source_prerequisites_stub,
     OracleSourcePrerequisiteState, PrerequisiteError, MIN_REDO_RETENTION_HOURS,
 };
+pub use oracle_source::{discover_source_schema, initial_load_for_source};
 pub use oracle_types::{
     aware_temporal_to_utc, classify_number, is_allow_listed_oracle_type, naive_temporal_to_utc,
     normalize_oracle_type, resolve_temporal_timezone, NumberMongoMapping, ResolvedTimezone,
@@ -250,7 +255,7 @@ pub fn normalize_change_temporals(
     Ok(())
 }
 
-fn normalize_snapshot_temporals(
+pub(crate) fn normalize_snapshot_temporals(
     snapshot: &mut InitialLoadSnapshot,
     configured_timezone: Option<&str>,
 ) -> Result<(), CaptureError> {

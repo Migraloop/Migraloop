@@ -48,9 +48,19 @@ impl IncrementalCapture {
         table: &str,
         from_position: CapturePosition,
     ) -> Result<Vec<ChangeEvent>, CaptureError> {
+        self.fetch_changes_in_schema("", table, from_position)
+    }
+
+    /// Schema-aware Incremental Capture fetch (empty schema → username default on OCI).
+    pub fn fetch_changes_in_schema(
+        &self,
+        schema: &str,
+        table: &str,
+        from_position: CapturePosition,
+    ) -> Result<Vec<ChangeEvent>, CaptureError> {
         match self {
             Self::Contract(c) => c.fetch_changes(table, from_position),
-            Self::Oci(o) => o.fetch_changes(table, from_position),
+            Self::Oci(o) => o.fetch_changes_in_schema(schema, table, from_position),
         }
     }
 

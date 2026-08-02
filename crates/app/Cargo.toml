@@ -21,3 +21,4 @@ tokio = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
 tempfile = "3.14"
+oracle = { workspace = true }

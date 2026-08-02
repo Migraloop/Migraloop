@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use migraloop_capture::{
-    check_oracle_source_prerequisites, classify_number, initial_load_stub,
-    is_allow_listed_oracle_type, normalize_change_temporals, open_oracle_incremental_capture,
-    source_schema_stub, CapturePosition, ChangeEvent, ChangeOp, IncrementalCapture,
+    check_oracle_source_prerequisites, classify_number, discover_source_schema,
+    initial_load_for_source, is_allow_listed_oracle_type, normalize_change_temporals,
+    open_oracle_incremental_capture, CapturePosition, ChangeEvent, ChangeOp, IncrementalCapture,
     NumberMongoMapping, OracleSourceConnect, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
@@ -538,7 +538,7 @@ async fn sync_base_datasets_for_pipelines(
             // Backfill Output Identity PK metadata when an older Base predates Delivery.
             ensure_base_primary_key(
                 platform_store_url,
-                deployment_name,
+                deployment,
                 &schema,
                 &table,
                 configured_tz,
@@ -547,9 +547,17 @@ async fn sync_base_datasets_for_pipelines(
             continue;
         }
 
-        // ADR-0004: establish low-watermark first, then snapshot (stub does both).
-        let snapshot = initial_load_stub(&table, configured_tz)
-            .map_err(|err| CliError::Failed(err.to_string()))?;
+        // ADR-0004: establish low-watermark first, then snapshot (live Oracle or contract).
+        let connect = oracle_source_connect(&deployment.source)?;
+        let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
+        let snapshot = initial_load_for_source(
+            &connect,
+            &password,
+            &schema,
+            &table,
+            configured_tz,
+        )
+        .map_err(|err| CliError::Failed(err.to_string()))?;
         let low_watermark = snapshot.low_watermark;
 
         let supported = snapshot.supported_columns();
@@ -608,11 +616,12 @@ async fn sync_base_datasets_for_pipelines(
 
 async fn ensure_base_primary_key(
     platform_store_url: &str,
-    deployment_name: &str,
+    deployment: &Deployment,
     source_schema: &str,
     source_table: &str,
     configured_timezone: Option<&str>,
 ) -> Result<(), CliError> {
+    let deployment_name = &deployment.name;
     let (dataset, _) = get_base_rows(platform_store_url, source_table, Some(deployment_name))
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
@@ -620,11 +629,19 @@ async fn ensure_base_primary_key(
         return Ok(());
     }
 
-    let snapshot = initial_load_stub(source_table, configured_timezone)
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let connect = oracle_source_connect(&deployment.source)?;
+    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
+    let snapshot = initial_load_for_source(
+        &connect,
+        &password,
+        source_schema,
+        source_table,
+        configured_timezone,
+    )
+    .map_err(|err| CliError::Failed(err.to_string()))?;
     if snapshot.primary_key.is_empty() {
         return Err(CliError::Failed(format!(
-            "stub Source table {source_table} has no primary key for Output Identity"
+            "Source table {source_table} has no primary key for Output Identity"
         )));
     }
 
@@ -640,9 +657,18 @@ async fn ensure_base_primary_key(
     Ok(())
 }
 
-/// Load stub Source schema metadata for apply-time Managed field validation.
-fn stub_source_columns(table: &str) -> Result<Vec<SourceColumn>, CliError> {
-    source_schema_stub(table).map_err(|err| CliError::Failed(err.to_string()))
+/// Load Source schema metadata for apply-time Managed field validation.
+///
+/// Real Oracle hosts use OCI discovery; contract/stub hosts use the fixture catalog.
+fn source_columns_for_pipeline(
+    deployment: &Deployment,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<SourceColumn>, CliError> {
+    let connect = oracle_source_connect(&deployment.source)?;
+    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
+    discover_source_schema(&connect, &password, schema, table)
+        .map_err(|err| CliError::Failed(err.to_string()))
 }
 
 fn oracle_source_connect(source: &SystemConnection) -> Result<OracleSourceConnect, CliError> {
@@ -807,7 +833,11 @@ async fn deliver_direct_pipeline(
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
 
-    let source_columns = stub_source_columns(&pipeline.source_table)?;
+    let source_columns = source_columns_for_pipeline(
+        deployment,
+        &pipeline.source_schema,
+        &pipeline.source_table,
+    )?;
     let managed_names: BTreeSet<String> = dataset
         .columns
         .iter()
@@ -890,7 +920,11 @@ async fn deliver_transform_pipeline(
         .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
 
     let derived_columns = derived_columns_for_ops(&base.columns, &ops, &derived_rows);
-    let source_columns = stub_source_columns(&pipeline.source_table)?;
+    let source_columns = source_columns_for_pipeline(
+        deployment,
+        &pipeline.source_schema,
+        &pipeline.source_table,
+    )?;
     let managed_names: BTreeSet<String> = derived_columns
         .iter()
         .map(|c| c.name.clone())
@@ -1192,10 +1226,22 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
     let deployment = document_to_deployment(&doc)?;
     let mut pipelines = pipelines_from_document(&doc);
 
+    // ADR-0021: fail-fast Source Prerequisites before discovery / Initial Load.
+    // Deployment-only apply (no Pipeline tables) does not open LogMiner yet.
+    let source_tables = pipeline_source_tables(&pipelines);
+    if deployment.source.kind.eq_ignore_ascii_case("oracle") && !source_tables.is_empty() {
+        ensure_oracle_source_prerequisites(&deployment.source, &source_tables)?;
+    }
+
     // Apply-time Managed validation before Initial Load / Delivery so unsafe NUMBER
     // and unsupported Managed inputs fail configure-time (ADR-0018 / ADR-0023).
+    // Real Oracle hosts discover schema via OCI; contract/stub use the fixture catalog.
     for pipeline in &pipelines {
-        let source_columns = stub_source_columns(&pipeline.source_table)?;
+        let source_columns = source_columns_for_pipeline(
+            &deployment,
+            &pipeline.source_schema,
+            &pipeline.source_table,
+        )?;
         let managed_names: BTreeSet<String> = source_columns
             .iter()
             .filter(|c| c.supported)
@@ -1208,13 +1254,6 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
             })
             .collect();
         validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
-    }
-
-    // ADR-0021: fail-fast Source Prerequisites before any capture (Initial Load).
-    // Deployment-only apply (no Pipeline tables) does not open LogMiner yet.
-    let source_tables = pipeline_source_tables(&pipelines);
-    if deployment.source.kind.eq_ignore_ascii_case("oracle") && !source_tables.is_empty() {
-        ensure_oracle_source_prerequisites(&deployment.source, &source_tables)?;
     }
 
     let existing_pipelines = list_pipelines(platform_store_url)
@@ -1450,7 +1489,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 
             let candidate_changes = match &capture {
                 Some(capture) => capture
-                    .fetch_changes(&table, resume_from)
+                    .fetch_changes_in_schema(&schema, &table, resume_from)
                     .map_err(|err| CliError::Failed(err.to_string()))?,
                 None => {
                     return Err(CliError::Failed(format!(
@@ -1517,7 +1556,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 
             let supported_names: BTreeSet<String> =
                 dataset.columns.iter().map(|c| c.name.clone()).collect();
-            let source_columns = stub_source_columns(&table)?;
+            let source_columns = source_columns_for_pipeline(deployment, &schema, &table)?;
             let configured_tz = source_timezone_opt(deployment);
             let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
                 base_rows.into_iter().map(|r| r.data).collect();
