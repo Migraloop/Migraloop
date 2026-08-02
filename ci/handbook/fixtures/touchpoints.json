@@ -1,0 +1,9 @@
+{
+  "touchpoints": [
+    {
+      "id": "gated-cli",
+      "paths": ["src/gated.rs"],
+      "handbook_pages": ["cli-and-config.md"]
+    }
+  ]
+}

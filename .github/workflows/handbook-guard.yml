@@ -6,11 +6,13 @@ on:
   pull_request:
 
 jobs:
-  locale-parity:
-    name: Locale parity
+  handbook-guard:
+    name: Handbook guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -21,7 +23,38 @@ jobs:
           workspaces: ". -> target"
 
       - name: Handbook guard tests (black-box fixtures)
-        run: cargo test -p handbook-guard --test locale_parity
+        run: cargo test -p handbook-guard
+
+      - name: Collect changed paths
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            git diff --name-only "origin/${{ github.base_ref }}...HEAD" > /tmp/handbook-changed-paths.txt
+          elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+            git diff --name-only HEAD~1 HEAD > /tmp/handbook-changed-paths.txt
+          else
+            : > /tmp/handbook-changed-paths.txt
+          fi
+          echo "Wrote $(wc -l < /tmp/handbook-changed-paths.txt) changed path(s)"
 
       - name: Handbook guard entrypoint (repo handbook tree)
-        run: cargo run -p handbook-guard -- check --handbook handbook
+        env:
+          PR_HAS_DOCS_NOT_NEEDED_LABEL: ${{ contains(join(github.event.pull_request.labels.*.name, ','), 'docs-not-needed') }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+        run: |
+          set -euo pipefail
+          extra_args=()
+          if [ "${PR_HAS_DOCS_NOT_NEEDED_LABEL}" = "true" ]; then
+            rationale="$(printf '%s\n' "${PR_BODY}" | sed -n 's/^docs-not-needed:[[:space:]]*//p' | head -n 1)"
+            extra_args+=(--docs-not-needed --docs-not-needed-rationale "${rationale}")
+          fi
+          cargo run -p handbook-guard -- check \
+            --handbook handbook \
+            --touchpoints ci/handbook/touchpoints.json \
+            --cli-source crates/cli/src/lib.rs \
+            --cli-surface ci/handbook/cli-surface.txt \
+            --changed-paths-file /tmp/handbook-changed-paths.txt \
+            "${extra_args[@]}"

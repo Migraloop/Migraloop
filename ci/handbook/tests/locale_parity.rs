@@ -17,9 +17,21 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn run_check(handbook: &Path) -> std::process::Output {
+    let touchpoints = fixture("touchpoints.json");
+    let cli_source = fixture("cli-source/lib.rs");
+    let cli_surface = fixture("cli-source/surface.txt");
     Command::new(bin())
-        .args(["check", "--handbook"])
-        .arg(handbook)
+        .args([
+            "check",
+            "--handbook",
+            handbook.to_str().unwrap(),
+            "--touchpoints",
+            touchpoints.to_str().unwrap(),
+            "--cli-source",
+            cli_source.to_str().unwrap(),
+            "--cli-surface",
+            cli_surface.to_str().unwrap(),
+        ])
         .output()
         .expect("run handbook-guard")
 }

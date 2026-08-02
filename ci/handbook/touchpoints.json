@@ -1,0 +1,51 @@
+{
+  "touchpoints": [
+    {
+      "id": "cli-command-surface",
+      "paths": ["crates/cli/src/**"],
+      "handbook_pages": ["cli-and-config.md"]
+    },
+    {
+      "id": "deployment-pipeline-config",
+      "paths": ["crates/cli/src/config.rs"],
+      "handbook_pages": [
+        "deployment.md",
+        "pipeline.md",
+        "cli-and-config.md"
+      ]
+    },
+    {
+      "id": "compose-dockerfile-install",
+      "paths": ["compose.yaml", "Dockerfile"],
+      "handbook_pages": [
+        "start-here.md",
+        "developer-local-setup.md",
+        "deployment.md",
+        "cli-and-config.md"
+      ]
+    },
+    {
+      "id": "oracle-source-prerequisites",
+      "paths": ["crates/capture/src/oracle_prerequisites.rs"],
+      "handbook_pages": ["source-system.md"]
+    },
+    {
+      "id": "supported-source-type-contracts",
+      "paths": ["crates/capture/src/oracle_types.rs"],
+      "handbook_pages": [
+        "source-system.md",
+        "target-system.md",
+        "pipeline.md"
+      ]
+    },
+    {
+      "id": "public-env-contract",
+      "paths": ["compose.yaml"],
+      "handbook_pages": [
+        "cli-and-config.md",
+        "security.md",
+        "developer-local-setup.md"
+      ]
+    }
+  ]
+}
