@@ -1,11 +1,12 @@
 //! Lab Scenario catalog, run orchestration, and Namespace cleanup
-//! (issues #60–#66, #63 / ADR-0025).
+//! (issues #60–#66, #63, #85 / ADR-0025).
 //!
 //! Lab-specific machinery: catalog listing from on-disk Scenario recipes
 //! (`lab/scenarios/<id>/recipe.yaml`), Scenario Namespace lifecycle
 //! (prepare / re-run wipe / manual remove / opt-in auto-remove), Source workload
 //! driving (including recipe-authored intra-Scenario concurrency and ~100k bulk
-//! Source inserts), one-at-a-time lock, result reporting with equal-weight
+//! Source inserts), one-at-a-time lock, refusal of non-Lab / production engine
+//! bindings before apply/sync (US44), result reporting with equal-weight
 //! correctness and operational metric thresholds (lag, throughput, duration),
 //! and shipped-capability coverage visibility (`lab/scenarios/COVERAGE.md`).
 //! Apply / Sync / inspect use the real product CLI path.
@@ -19,10 +20,13 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::config::load_deployment_config;
 use crate::lab::{
     ensure_fixture_ready_for_scenario, lab_migraloop_bin, mongosh_in_mongo, sqlplus_in_oracle,
-    LAB_MONGO_PASSWORD_DEFAULT, LAB_MONGO_PASSWORD_ENV, LAB_ORACLE_PASSWORD_DEFAULT,
-    LAB_ORACLE_PASSWORD_ENV, LAB_ORACLE_USER, LAB_PLATFORM_STORE_URL,
+    LAB_MONGO_DATABASE, LAB_MONGO_HOST, LAB_MONGO_PASSWORD_DEFAULT, LAB_MONGO_PASSWORD_ENV,
+    LAB_MONGO_PORT, LAB_MONGO_USER, LAB_ORACLE_HOST, LAB_ORACLE_PASSWORD_DEFAULT,
+    LAB_ORACLE_PASSWORD_ENV, LAB_ORACLE_PORT, LAB_ORACLE_SERVICE, LAB_ORACLE_USER,
+    LAB_PLATFORM_STORE_URL,
 };
 use crate::CliError;
 use migraloop_platform_store::delete_deployment;
@@ -438,6 +442,10 @@ async fn scenario_run(
     if let Ok(probe) = std::env::var("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE") {
         return emit_scenario_outcome_probe(&entry.0, &probe);
     }
+
+    // US44 / issue #85: refuse non-Lab / production engine bindings before apply/sync.
+    // Runs before Fixture probes so CI can assert isolation without Docker.
+    ensure_lab_fixture_engines_for_scenario(lab_dir, scenario)?;
 
     ensure_fixture_ready_for_scenario(lab_dir).await?;
 
@@ -964,6 +972,112 @@ fn deployment_config_path(lab_dir: &Path, scenario_id: &str) -> Result<PathBuf, 
         )));
     }
     Ok(path)
+}
+
+/// Loopback hostnames that identify Lab Fixture engines on the operator machine.
+fn is_lab_loopback_host(host: &str) -> bool {
+    matches!(
+        host.trim().to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost"
+    )
+}
+
+/// Enforce that Scenario Source/Target bindings are Lab Fixture engines only (US44 / #85).
+///
+/// Lab Scenario apply/sync must never drive customer/production databases. Ordinary
+/// `migraloop apply` / `sync` remains the path for real Deployments.
+fn ensure_lab_fixture_engines_for_scenario(
+    lab_dir: &Path,
+    scenario: &str,
+) -> Result<(), CliError> {
+    let recipe = load_selectable_recipes(lab_dir)?
+        .into_iter()
+        .find(|recipe| recipe.id == scenario)
+        .ok_or_else(|| unknown_or_incomplete_scenario_error(scenario, lab_dir))?;
+    let config_path = lab_dir
+        .join("scenarios")
+        .join(scenario)
+        .join(&recipe.deployment_config);
+    let doc = load_deployment_config(&config_path)?;
+
+    let source = &doc.spec.source;
+    let target = &doc.spec.target;
+    let mut mismatches = Vec::new();
+
+    if source.kind != "oracle" {
+        mismatches.push(format!(
+            "source.kind=`{}` (Lab Fixture Source is oracle)",
+            source.kind
+        ));
+    }
+    if !is_lab_loopback_host(&source.host) {
+        mismatches.push(format!(
+            "source.host=`{}` (Lab Fixture Source is {LAB_ORACLE_HOST} / localhost)",
+            source.host
+        ));
+    }
+    if source.port != i32::from(LAB_ORACLE_PORT) {
+        mismatches.push(format!(
+            "source.port={} (Lab Fixture Source is {LAB_ORACLE_PORT})",
+            source.port
+        ));
+    }
+    if source.database != LAB_ORACLE_SERVICE {
+        mismatches.push(format!(
+            "source.database=`{}` (Lab Fixture Source is {LAB_ORACLE_SERVICE})",
+            source.database
+        ));
+    }
+    if source.username != LAB_ORACLE_USER {
+        mismatches.push(format!(
+            "source.username=`{}` (Lab Fixture Source is {LAB_ORACLE_USER})",
+            source.username
+        ));
+    }
+
+    if target.kind != "mongodb" {
+        mismatches.push(format!(
+            "target.kind=`{}` (Lab Fixture Target is mongodb)",
+            target.kind
+        ));
+    }
+    if !is_lab_loopback_host(&target.host) {
+        mismatches.push(format!(
+            "target.host=`{}` (Lab Fixture Target is {LAB_MONGO_HOST} / localhost)",
+            target.host
+        ));
+    }
+    if target.port != i32::from(LAB_MONGO_PORT) {
+        mismatches.push(format!(
+            "target.port={} (Lab Fixture Target is {LAB_MONGO_PORT})",
+            target.port
+        ));
+    }
+    if target.database != LAB_MONGO_DATABASE {
+        mismatches.push(format!(
+            "target.database=`{}` (Lab Fixture Target is {LAB_MONGO_DATABASE})",
+            target.database
+        ));
+    }
+    if target.username != LAB_MONGO_USER {
+        mismatches.push(format!(
+            "target.username=`{}` (Lab Fixture Target is {LAB_MONGO_USER})",
+            target.username
+        ));
+    }
+
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+
+    Err(CliError::Failed(format!(
+        "Lab Scenario run refused: Source/Target must be Lab-provisioned Fixture engines only \
+         (Local Sync Lab will not apply/sync against customer or production databases). \
+         Non-Lab engine binding(s): {}. \
+         Restore Scenario configs to Lab Fixture endpoints (`migraloop lab status`), \
+         or use ordinary `migraloop apply` / `migraloop sync` for real Deployments.",
+        mismatches.join("; ")
+    )))
 }
 
 async fn run_transform_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {

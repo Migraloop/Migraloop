@@ -65,7 +65,7 @@ Bring-up 后默认：Platform Store `postgres://migraloop:migraloop@127.0.0.1:54
 
 1. 创建 `lab/scenarios/<id>/`，包含：
    - `recipe.yaml` — catalog metadata：`id`、`summary`、**Scenario Namespace**（`source_tables`、`target_collections`、`deployment`、`pipelines`）、`workload`（`concurrency`：`serial`|`parallel`、有序 `steps`）、`checks.correctness`、可选的等权 `thresholds`（`max_settle_ms`、`max_lag`、`max_duration_ms`、`min_rows_per_s`）
-   - `deployment.yaml` — 真实 product Deployment config（与 Operator `apply` 相同格式）
+   - `deployment.yaml` — 真实 product Deployment config（与 Operator `apply` 相同格式），且只能绑定 Lab Fixture engines（`migraloop lab status` 所示的 `127.0.0.1` / `localhost` Oracle + Mongo endpoints）。Scenario `run` 会在 apply/sync 前拒绝非 Lab／生产环境 engine targets。
 2. 在 `crates/cli/src/lab_scenario.rs` 实现 Namespace prepare/remove、Source workload、checks 与 thresholds，并向其他 runners 注册 Scenario id。
 3. 确认 `migraloop lab scenario list` 显示新 id，且 **summary 来自 `recipe.yaml`**。Selectable catalog = 已注册 runner，且在 `--lab-dir` 下同时有 recipe + deployment 文件。
 4. 在 Lab Fixture 上手动验证 `migraloop lab scenario run <id>`。list／控制面行为保持 always-on CLI-seam 测试；完整 Fixture run 保持 `#[ignore]` — 不是 Release Quality Gate。
