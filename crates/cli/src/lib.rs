@@ -652,10 +652,63 @@ fn pipeline_source_tables(pipelines: &[Pipeline]) -> Vec<String> {
     tables.into_iter().collect()
 }
 
+/// Whether two Pipeline declarations share the same binding (not a revision change).
+///
+/// Used so runtime Pipeline add can preserve Delivery progress for unchanged Pipelines
+/// (ADR-0007) without treating a binding change as a no-op add.
+fn pipeline_binding_unchanged(previous: &Pipeline, next: &Pipeline) -> bool {
+    previous.mode == next.mode
+        && previous.source_table == next.source_table
+        && previous.source_schema == next.source_schema
+        && previous.target_collection == next.target_collection
+        && previous.field_mappings == next.field_mappings
+}
+
+/// Preserve Delivery progress for Pipelines whose binding is unchanged.
+///
+/// `pipelines_from_document` always starts at pending/0; without this merge, every
+/// apply would look like a Deployment restart for already-running Pipelines.
+fn preserve_unchanged_pipeline_delivery(existing: &[Pipeline], pipelines: &mut [Pipeline]) {
+    for pipeline in pipelines.iter_mut() {
+        let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
+            continue;
+        };
+        if pipeline_binding_unchanged(previous, pipeline) {
+            pipeline.delivery_status = previous.delivery_status.clone();
+            pipeline.delivery_applied_changes = previous.delivery_applied_changes;
+        }
+    }
+}
+
+fn pipelines_needing_delivery_start<'a>(
+    existing: &[Pipeline],
+    pipelines: &'a [Pipeline],
+) -> Vec<&'a Pipeline> {
+    pipelines
+        .iter()
+        .filter(|pipeline| {
+            if pipeline.mode != "direct" || pipeline.target_collection.is_empty() {
+                return false;
+            }
+            let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
+                // Newly added Pipeline — start Delivery after Initial Load as needed.
+                return true;
+            };
+            // Unchanged, already-delivered Pipelines keep running without re-Delivery.
+            if pipeline_binding_unchanged(previous, pipeline)
+                && previous.delivery_status == "delivered"
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 async fn deliver_direct_pipelines(
     platform_store_url: &str,
     deployment: &Deployment,
-    pipelines: &[Pipeline],
+    pipelines: &[&Pipeline],
 ) -> Result<(), CliError> {
     let needs_delivery = pipelines
         .iter()
@@ -731,7 +784,7 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
 
     let doc = load_deployment_config(file)?;
     let deployment = document_to_deployment(&doc)?;
-    let pipelines = pipelines_from_document(&doc);
+    let mut pipelines = pipelines_from_document(&doc);
 
     // Apply-time Managed validation before Initial Load / Delivery so unsafe NUMBER
     // and unsupported Managed inputs fail configure-time (ADR-0018 / ADR-0023).
@@ -758,6 +811,25 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         ensure_oracle_source_prerequisites(&deployment.source, &source_tables)?;
     }
 
+    let existing_pipelines = list_pipelines(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?
+        .into_iter()
+        .filter(|p| p.deployment_name == deployment.name)
+        .collect::<Vec<_>>();
+    let existing_names: BTreeSet<String> = existing_pipelines
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    let added: Vec<(String, String)> = pipelines
+        .iter()
+        .filter(|p| !existing_names.contains(&p.name))
+        .map(|p| (p.name.clone(), p.source_table.clone()))
+        .collect();
+
+    // Runtime add (ADR-0007): keep already-running Pipelines' Delivery progress.
+    preserve_unchanged_pipeline_delivery(&existing_pipelines, &mut pipelines);
+
     upsert_deployment(platform_store_url, &deployment)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
@@ -765,8 +837,20 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
+    // Table-level Initial Load only for newly referenced tables; existing Bases stay
+    // on their incremental path (ADR-0019).
     sync_base_datasets_for_pipelines(platform_store_url, &deployment, &pipelines).await?;
-    deliver_direct_pipelines(platform_store_url, &deployment, &pipelines).await?;
+
+    if !existing_pipelines.is_empty() {
+        for (name, source_table) in &added {
+            println!("Runtime Pipeline add: {name} (source={source_table})");
+        }
+    }
+
+    // Start Delivery only for Pipelines that need it; do not re-Deliver unchanged
+    // already-delivered Pipelines (others keep running — ADR-0007 Add).
+    let to_deliver = pipelines_needing_delivery_start(&existing_pipelines, &pipelines);
+    deliver_direct_pipelines(platform_store_url, &deployment, &to_deliver).await?;
 
     println!("Deployment applied: {}", deployment.name);
     Ok(())
