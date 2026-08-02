@@ -26,7 +26,9 @@ use migraloop_platform_store::{
     SecretRefKind, SystemConnection,
 };
 use migraloop_transform::{
-    derived_projected_fields, evaluate_transform, parse_transform_steps, TransformOp,
+    analyze_affect, derived_projected_fields, evaluate_transform,
+    evaluate_transform_for_identities, identity_matches_row, parse_transform_steps, AffectOutcome,
+    BaseChangeKind, TransformOp,
 };
 use thiserror::Error;
 
@@ -961,8 +963,9 @@ async fn deliver_transform_pipeline(
     Ok(())
 }
 
-/// Columns for a Derived Dataset: project fields when present, else Base columns,
+/// Columns for a Derived Dataset: project/groupBy fields when present, else Base columns,
 /// unioned with keys observed in Derived rows. Works for empty Derived results.
+/// Aggregate `as` names inherit the source field's Oracle type metadata.
 fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
     ops: &[TransformOp],
@@ -981,11 +984,35 @@ fn derived_columns_for_ops(
         .iter()
         .map(|c| (c.name.as_str(), c))
         .collect();
+    let mut alias_source: BTreeMap<String, String> = BTreeMap::new();
+    for op in ops {
+        if let TransformOp::GroupBy { aggregates, .. } = op {
+            for agg in aggregates {
+                alias_source.insert(agg.as_name.clone(), agg.field.clone());
+            }
+        }
+    }
     names
         .into_iter()
         .map(|name| {
             if let Some(col) = by_name.get(name.as_str()) {
                 (*col).clone()
+            } else if let Some(source) = alias_source.get(&name) {
+                if let Some(col) = by_name.get(source.as_str()) {
+                    BaseColumn {
+                        name,
+                        oracle_type: col.oracle_type.clone(),
+                        precision: col.precision,
+                        scale: col.scale,
+                    }
+                } else {
+                    BaseColumn {
+                        name,
+                        oracle_type: "NUMBER".to_string(),
+                        precision: None,
+                        scale: None,
+                    }
+                }
             } else {
                 BaseColumn {
                     name,
@@ -996,6 +1023,166 @@ fn derived_columns_for_ops(
             }
         })
         .collect()
+}
+
+fn base_change_kind(op: ChangeOp) -> BaseChangeKind {
+    match op {
+        ChangeOp::Insert => BaseChangeKind::Insert,
+        ChangeOp::Update => BaseChangeKind::Update,
+        ChangeOp::Delete => BaseChangeKind::Delete,
+    }
+}
+
+/// Incremental Transform maintenance for one Base change (Affect Analysis driven).
+async fn maintain_transform_pipeline_for_change(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+    mongo: &MongoTargetConnection,
+    base_columns: &[BaseColumn],
+    base_rows: &[serde_json::Map<String, serde_json::Value>],
+    change: &ChangeEvent,
+    pre_apply: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<(), CliError> {
+    let ops = transform_ops_from_pipeline(pipeline)?;
+    let after = match change.op {
+        ChangeOp::Insert | ChangeOp::Update => {
+            Some(
+                base_rows
+                    .iter()
+                    .find(|row| row_matches_identity(row, &change.identity))
+                    .cloned()
+                    .ok_or_else(|| {
+                        CliError::Failed(format!(
+                            "Base Dataset {} missing row for change identity {:?} after apply",
+                            pipeline.source_table, change.identity
+                        ))
+                    })?,
+            )
+        }
+        ChangeOp::Delete => None,
+    };
+
+    let outcome = analyze_affect(
+        &ops,
+        base_change_kind(change.op),
+        pre_apply,
+        after.as_ref(),
+    )
+    .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
+
+    match outcome {
+        AffectOutcome::SkipUnusedFields => {
+            println!(
+                "Affect Analysis: Pipeline {} skipped (unused fields only)",
+                pipeline.name
+            );
+            Ok(())
+        }
+        AffectOutcome::Recompute { identities } => {
+            println!(
+                "Affect Analysis: Pipeline {} affected identities={}",
+                pipeline.name,
+                identities.len()
+            );
+            recompute_and_deliver_affected_identities(
+                platform_store_url,
+                pipeline,
+                mongo,
+                base_columns,
+                base_rows,
+                &ops,
+                &identities,
+            )
+            .await
+        }
+    }
+}
+
+async fn recompute_and_deliver_affected_identities(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+    mongo: &MongoTargetConnection,
+    base_columns: &[BaseColumn],
+    base_rows: &[serde_json::Map<String, serde_json::Value>],
+    ops: &[TransformOp],
+    identities: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<(), CliError> {
+    let recomputed = evaluate_transform_for_identities(ops, base_rows, identities)
+        .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
+
+    let (mut dataset, existing_rows) = get_derived_rows(
+        platform_store_url,
+        &pipeline.name,
+        Some(&pipeline.deployment_name),
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let mut merged: Vec<serde_json::Map<String, serde_json::Value>> = existing_rows
+        .into_iter()
+        .map(|r| r.data)
+        .filter(|row| !identities.iter().any(|id| identity_matches_row(id, row)))
+        .collect();
+    merged.extend(recomputed.clone());
+
+    let derived_columns = derived_columns_for_ops(base_columns, ops, &merged);
+    dataset.status = "materialized".to_string();
+    dataset.columns = derived_columns.clone();
+    dataset.row_count = merged.len() as i32;
+    replace_derived_dataset(platform_store_url, &dataset, &merged)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let mut upserts = Vec::new();
+    for row in &recomputed {
+        upserts.push(delivery_document_for_row(
+            row,
+            &pipeline.output_identity,
+            &derived_columns,
+            pipeline,
+        )?);
+    }
+    let mut deletes = Vec::new();
+    for identity in identities {
+        let still_present = recomputed
+            .iter()
+            .any(|row| identity_matches_row(identity, row));
+        if !still_present {
+            deletes.push(output_identity_from_row(identity, &pipeline.output_identity)?);
+        }
+    }
+
+    let mut delivered = 0i32;
+    if !upserts.is_empty() {
+        delivered += upsert_managed_documents(mongo, &pipeline.target_collection, &upserts)
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))? as i32;
+    }
+    if !deletes.is_empty() {
+        delivered += delete_documents_by_identity(mongo, &pipeline.target_collection, &deletes)
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))? as i32;
+    }
+
+    if delivered > 0 {
+        update_pipeline_delivery_progress(
+            platform_store_url,
+            &pipeline.deployment_name,
+            &pipeline.name,
+            "delivered",
+            Some(delivered),
+        )
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    }
+
+    println!(
+        "Delivery complete: Pipeline {} upserts={} deletes={} (Affect Analysis)",
+        pipeline.name,
+        upserts.len(),
+        deletes.len()
+    );
+    Ok(())
 }
 
 async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), CliError> {
@@ -1338,6 +1525,12 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             let total_pending = changes.len() as i32;
 
             for (index, change) in changes.iter().enumerate() {
+                // Capture pre-apply Base row for Affect Analysis (unused-field skip / group keys).
+                let pre_apply = rows
+                    .iter()
+                    .find(|row| row_matches_identity(row, &change.identity))
+                    .cloned();
+
                 apply_change_events_to_base_rows(
                     &mut rows,
                     std::slice::from_ref(change),
@@ -1348,83 +1541,99 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 
                 // Delivery before durable checkpoint so retries prefer duplicate applies.
                 for pipeline in &deployment_pipelines {
-                    if pipeline.mode != "direct"
-                        || pipeline.target_collection.is_empty()
-                        || pipeline.source_table != table
-                    {
+                    if pipeline.target_collection.is_empty() || pipeline.source_table != table {
                         continue;
                     }
 
-                    match change.op {
-                        ChangeOp::Insert | ChangeOp::Update => {
-                            let Some(base_row) = rows
-                                .iter()
-                                .find(|row| row_matches_identity(row, &change.identity))
-                            else {
-                                return Err(CliError::Failed(format!(
-                                    "Base Dataset {} missing row for Output Identity {:?}",
-                                    pipeline.source_table, change.identity
-                                )));
-                            };
-                            let document = delivery_document_for_row(
-                                base_row,
-                                &dataset.primary_key,
-                                &dataset.columns,
+                    match pipeline.mode.as_str() {
+                        "direct" => match change.op {
+                            ChangeOp::Insert | ChangeOp::Update => {
+                                let Some(base_row) = rows
+                                    .iter()
+                                    .find(|row| row_matches_identity(row, &change.identity))
+                                else {
+                                    return Err(CliError::Failed(format!(
+                                        "Base Dataset {} missing row for Output Identity {:?}",
+                                        pipeline.source_table, change.identity
+                                    )));
+                                };
+                                let document = delivery_document_for_row(
+                                    base_row,
+                                    &dataset.primary_key,
+                                    &dataset.columns,
+                                    pipeline,
+                                )?;
+                                let upserted = upsert_managed_documents(
+                                    &mongo,
+                                    &pipeline.target_collection,
+                                    &[document],
+                                )
+                                .await
+                                .map_err(|err| CliError::Failed(err.to_string()))?;
+                                update_pipeline_delivery_progress(
+                                    platform_store_url,
+                                    &pipeline.deployment_name,
+                                    &pipeline.name,
+                                    "delivered",
+                                    Some(upserted as i32),
+                                )
+                                .await
+                                .map_err(|err| CliError::Failed(err.to_string()))?;
+                                println!(
+                                    "Delivery complete: Pipeline {} upserts={upserted} deletes=0 \
+                                     (checkpoint-bound)",
+                                    pipeline.name
+                                );
+                            }
+                            ChangeOp::Delete => {
+                                let identity_map: serde_json::Map<String, serde_json::Value> = change
+                                    .identity
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect();
+                                let identity = output_identity_from_row(
+                                    &identity_map,
+                                    &dataset.primary_key,
+                                )?;
+                                let deleted = delete_documents_by_identity(
+                                    &mongo,
+                                    &pipeline.target_collection,
+                                    &[identity],
+                                )
+                                .await
+                                .map_err(|err| CliError::Failed(err.to_string()))?;
+                                update_pipeline_delivery_progress(
+                                    platform_store_url,
+                                    &pipeline.deployment_name,
+                                    &pipeline.name,
+                                    "delivered",
+                                    Some(deleted as i32),
+                                )
+                                .await
+                                .map_err(|err| CliError::Failed(err.to_string()))?;
+                                println!(
+                                    "Delivery complete: Pipeline {} upserts=0 deletes={deleted} \
+                                     (checkpoint-bound)",
+                                    pipeline.name
+                                );
+                            }
+                        },
+                        "transform" => {
+                            maintain_transform_pipeline_for_change(
+                                platform_store_url,
                                 pipeline,
-                            )?;
-                            let upserted = upsert_managed_documents(
                                 &mongo,
-                                &pipeline.target_collection,
-                                &[document],
+                                &dataset.columns,
+                                &rows,
+                                change,
+                                pre_apply.as_ref(),
                             )
-                            .await
-                            .map_err(|err| CliError::Failed(err.to_string()))?;
-                            update_pipeline_delivery_progress(
-                                platform_store_url,
-                                &pipeline.deployment_name,
-                                &pipeline.name,
-                                "delivered",
-                                Some(upserted as i32),
-                            )
-                            .await
-                            .map_err(|err| CliError::Failed(err.to_string()))?;
-                            println!(
-                                "Delivery complete: Pipeline {} upserts={upserted} deletes=0 \
-                                 (checkpoint-bound)",
-                                pipeline.name
-                            );
+                            .await?;
                         }
-                        ChangeOp::Delete => {
-                            let identity_map: serde_json::Map<String, serde_json::Value> = change
-                                .identity
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
-                            let identity = output_identity_from_row(
-                                &identity_map,
-                                &dataset.primary_key,
-                            )?;
-                            let deleted = delete_documents_by_identity(
-                                &mongo,
-                                &pipeline.target_collection,
-                                &[identity],
-                            )
-                            .await
-                            .map_err(|err| CliError::Failed(err.to_string()))?;
-                            update_pipeline_delivery_progress(
-                                platform_store_url,
-                                &pipeline.deployment_name,
-                                &pipeline.name,
-                                "delivered",
-                                Some(deleted as i32),
-                            )
-                            .await
-                            .map_err(|err| CliError::Failed(err.to_string()))?;
-                            println!(
-                                "Delivery complete: Pipeline {} upserts=0 deletes={deleted} \
-                                 (checkpoint-bound)",
-                                pipeline.name
-                            );
+                        other => {
+                            return Err(CliError::Failed(format!(
+                                "unsupported pipeline.mode {other:?} during Incremental Capture"
+                            )));
                         }
                     }
                 }

@@ -313,12 +313,29 @@ fn orders_fixture() -> InitialLoadSnapshot {
             number_col("CUSTOMER_ID", 10, 0, true),
             // Safe decimal → Decimal128 (not IEEE double).
             number_col("AMOUNT", 12, 2, true),
+            // Unused by sum(AMOUNT) Affect Analysis scenarios (issue #17).
+            col("ADDRESS", "VARCHAR2", true),
         ],
-        rows: vec![row(&[
-            ("ORDER_ID", json_num(100)),
-            ("CUSTOMER_ID", json_num(1)),
-            ("AMOUNT", json_str("42.50")),
-        ])],
+        rows: vec![
+            row(&[
+                ("ORDER_ID", json_num(100)),
+                ("CUSTOMER_ID", json_num(1)),
+                ("AMOUNT", json_str("42.50")),
+                ("ADDRESS", json_str("1 Main St")),
+            ]),
+            row(&[
+                ("ORDER_ID", json_num(101)),
+                ("CUSTOMER_ID", json_num(1)),
+                ("AMOUNT", json_str("10.00")),
+                ("ADDRESS", json_str("1 Main St")),
+            ]),
+            row(&[
+                ("ORDER_ID", json_num(200)),
+                ("CUSTOMER_ID", json_num(2)),
+                ("AMOUNT", json_str("5.00")),
+                ("ADDRESS", json_str("2 Side Rd")),
+            ]),
+        ],
     }
 }
 
