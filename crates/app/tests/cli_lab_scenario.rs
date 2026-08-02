@@ -1,6 +1,6 @@
 //! Operator-visible seam: Lab Scenario list / run / remove (Namespace cleanup).
 //!
-//! Agreed seam (issues #60–#62 / PRD #55): CLI Lab Scenario commands. Always-on
+//! Agreed seam (issues #60–#64 / PRD #55): CLI Lab Scenario commands. Always-on
 //! tests cover catalog listing, help surface, one-at-a-time rejection, and
 //! Namespace cleanup control surface. Full Scenario run / re-run / remove against
 //! the Lab Fixture is ignored by default (Docker + Instant Client).
@@ -83,6 +83,24 @@ async fn lab_scenario_list_includes_transform_pipeline() {
     assert!(
         out.contains("transform-pipeline"),
         "catalog must list multi-table Transform Pipeline Scenario, got:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn lab_scenario_list_includes_concurrent_source_workload() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("concurrent-source-workload"),
+        "catalog must list intra-Scenario concurrent Source workload Scenario, got:\n{out}"
     );
 }
 
@@ -746,6 +764,241 @@ async fn lab_scenario_transform_pipeline_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove transform-pipeline failed:\n{remove_out}"
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Full intra-Scenario concurrent Source workload Lab Scenario against Docker Lab
+/// Fixture + Instant Client (issue #64).
+///
+/// ```bash
+/// export LD_LIBRARY_PATH=/path/to/instantclient
+/// cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_concurrent_source_workload_run_and_inspect() {
+    let lab = lab_dir();
+    let store_url = "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop";
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "concurrent-source-workload",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario run concurrent-source-workload");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run concurrent-source-workload failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("correctness=pass"),
+        "expected correctness metric alongside operational metrics, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("thresholds=pass"),
+        "expected equal-weight threshold metric, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("settle_ms=") && run_out.contains("max_settle_ms="),
+        "expected settle threshold metrics, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("duration_ms="),
+        "expected duration metric, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("rows_per_s=")
+            || run_out.contains("throughput")
+            || run_out.contains("rows_applied="),
+        "expected rows/throughput metric, got:\n{run_out}"
+    );
+    assert!(
+        run_out.to_ascii_lowercase().contains("logminer")
+            || run_out.contains("Incremental Capture"),
+        "Scenario must use real capture path, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("parallel")
+            || run_out.to_ascii_lowercase().contains("concurrent"),
+        "Scenario output should describe intra-Scenario concurrent Source workload, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("namespace=left in place")
+            || run_out.to_ascii_lowercase().contains("left in place"),
+        "default completed run must keep Namespace, got:\n{run_out}"
+    );
+
+    let customers_base = Command::new(bin())
+        .args([
+            "base",
+            "--platform-store-url",
+            store_url,
+            "--table",
+            "LAB_CW_CUSTOMERS",
+        ])
+        .output()
+        .expect("customers base inspect");
+    let customers_base_out = String::from_utf8_lossy(&customers_base.stdout);
+    assert!(
+        customers_base.status.success(),
+        "customers base inspect failed: {}",
+        String::from_utf8_lossy(&customers_base.stderr)
+    );
+    assert!(
+        customers_base_out.contains("Alicia")
+            && customers_base_out.contains("Carol")
+            && !customers_base_out.contains("Bob"),
+        "customers Base must reflect concurrent workload, got:\n{customers_base_out}"
+    );
+
+    let derived = Command::new(bin())
+        .args([
+            "derived",
+            "--platform-store-url",
+            store_url,
+            "--pipeline",
+            "lab-cw-order-totals",
+        ])
+        .output()
+        .expect("derived inspect");
+    let derived_out = String::from_utf8_lossy(&derived.stdout);
+    assert!(
+        derived.status.success(),
+        "derived inspect failed: {}",
+        String::from_utf8_lossy(&derived.stderr)
+    );
+    assert!(
+        (derived_out.contains("35") || derived_out.contains("35.00"))
+            && (derived_out.contains("50") || derived_out.contains("50.00")),
+        "Derived Managed totals must match concurrent workload (35 and 50), got:\n{derived_out}"
+    );
+
+    let totals_target = Command::new(bin())
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "target",
+            "--platform-store-url",
+            store_url,
+            "--collection",
+            "lab_cw_order_totals",
+        ])
+        .output()
+        .expect("order totals target inspect");
+    let totals_target_out = String::from_utf8_lossy(&totals_target.stdout);
+    assert!(
+        totals_target.status.success(),
+        "order totals target inspect failed: {}",
+        String::from_utf8_lossy(&totals_target.stderr)
+    );
+    assert!(
+        (totals_target_out.contains("35") || totals_target_out.contains("35.00"))
+            && (totals_target_out.contains("50") || totals_target_out.contains("50.00")),
+        "order totals Target must Deliver Derived Managed outcomes, got:\n{totals_target_out}"
+    );
+
+    let lock_path = format!("{lab}/.migraloop-scenario.lock");
+    assert!(
+        !std::path::Path::new(&lock_path).exists(),
+        "finished Scenario must release the active-run lock (Namespace stays)"
+    );
+
+    // Cross-Scenario concurrency still forbidden while faking an active lock.
+    let pid = std::process::id();
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    fs::write(
+        &lock_path,
+        format!(
+            "{{\"scenario\":\"concurrent-source-workload\",\"pid\":{pid},\"started_at_unix\":{started}}}\n"
+        ),
+    )
+    .expect("write scenario lock");
+    let rejected = Command::new(bin())
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "direct-pipeline",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("run while concurrent scenario lock held");
+    let rejected_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let _ = fs::remove_file(&lock_path);
+    assert!(
+        !rejected.status.success(),
+        "cross-Scenario concurrency must still be rejected, got:\n{rejected_out}"
+    );
+
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "concurrent-source-workload",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove concurrent-source-workload");
+    let remove_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert!(
+        remove.status.success(),
+        "lab scenario remove concurrent-source-workload failed:\n{remove_out}"
     );
 
     let _ = Command::new(bin())
