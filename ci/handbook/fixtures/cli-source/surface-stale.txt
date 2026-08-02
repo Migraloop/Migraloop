@@ -1,0 +1,2 @@
+# Stale snapshot missing `apply`
+migrate

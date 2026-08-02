@@ -1,0 +1,3 @@
+# Committed Operator CLI subcommand surface (fixture)
+apply
+migrate
