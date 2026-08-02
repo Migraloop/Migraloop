@@ -612,7 +612,8 @@ deployment={TRANSFORM_PIPELINE_DEPLOYMENT}"
         && inspect_mentions_amount(&derived_after, "50")
         && !inspect_mentions_amount(&derived_after, "30");
     let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
-        && inspect_mentions_amount(&totals_target, "50");
+        && inspect_mentions_amount(&totals_target, "50")
+        && !inspect_mentions_amount(&totals_target, "30");
 
     let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
 
