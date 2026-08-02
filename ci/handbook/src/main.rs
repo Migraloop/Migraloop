@@ -181,15 +181,23 @@ fn run_all_checks(
         Err(mut errs) => errors.append(&mut errs),
     }
 
-    match check_cli_surface(cli_source, cli_surface) {
-        Ok(subcommands) => {
-            oks.push("cli surface: ok".to_string());
-            match check_cli_reference_mentions(handbook, &subcommands) {
-                Ok(()) => oks.push("cli reference: ok".to_string()),
-                Err(mut errs) => errors.append(&mut errs),
-            }
+    let live_subcommands = match load_live_cli_subcommands(cli_source) {
+        Ok(cmds) => Some(cmds),
+        Err(mut errs) => {
+            errors.append(&mut errs);
+            None
         }
-        Err(mut errs) => errors.append(&mut errs),
+    };
+
+    if let Some(ref live) = live_subcommands {
+        match check_cli_surface_snapshot(live, cli_source, cli_surface) {
+            Ok(()) => oks.push("cli surface: ok".to_string()),
+            Err(mut errs) => errors.append(&mut errs),
+        }
+        match check_cli_reference_mentions(handbook, live) {
+            Ok(()) => oks.push("cli reference: ok".to_string()),
+            Err(mut errs) => errors.append(&mut errs),
+        }
     }
 
     if errors.is_empty() {
@@ -423,18 +431,21 @@ fn segment_match(pattern: &str, segment: &str) -> bool {
     true
 }
 
-fn check_cli_surface(
-    cli_source: &Path,
-    cli_surface: &Path,
-) -> Result<BTreeSet<String>, Vec<String>> {
+fn load_live_cli_subcommands(cli_source: &Path) -> Result<BTreeSet<String>, Vec<String>> {
     let source = fs::read_to_string(cli_source).map_err(|err| {
         vec![format!(
             "failed to read CLI source {}: {err}",
             cli_source.display()
         )]
     })?;
-    let live = extract_cli_subcommands(&source).map_err(|err| vec![err])?;
+    extract_cli_subcommands(&source).map_err(|err| vec![err])
+}
 
+fn check_cli_surface_snapshot(
+    live: &BTreeSet<String>,
+    cli_source: &Path,
+    cli_surface: &Path,
+) -> Result<(), Vec<String>> {
     let snapshot_raw = fs::read_to_string(cli_surface).map_err(|err| {
         vec![format!(
             "failed to read CLI surface snapshot {}: {err}",
@@ -450,7 +461,7 @@ fn check_cli_surface(
             cli_surface.display()
         ));
     }
-    for cmd in snapshot.difference(&live) {
+    for cmd in snapshot.difference(live) {
         errors.push(format!(
             "cli surface: snapshot lists subcommand `{cmd}` not present in live CLI source {}",
             cli_source.display()
@@ -458,7 +469,7 @@ fn check_cli_surface(
     }
 
     if errors.is_empty() {
-        Ok(live)
+        Ok(())
     } else {
         Err(errors)
     }

@@ -40,7 +40,7 @@
     },
     {
       "id": "public-env-contract",
-      "paths": ["compose.yaml", "Dockerfile"],
+      "paths": ["compose.yaml"],
       "handbook_pages": [
         "cli-and-config.md",
         "security.md",

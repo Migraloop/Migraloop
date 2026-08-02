@@ -111,6 +111,27 @@ fn docs_not_needed_exemption_short_circuits_touchpoints_with_rationale() {
 }
 
 #[test]
+fn docs_not_needed_env_exemption_short_circuits_touchpoints() {
+    let mut args = touchpoint_base_args();
+    args.extend(["--changed-path".into(), "src/gated.rs".into()]);
+    let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = Command::new(bin())
+        .args(&str_args)
+        .env("HANDBOOK_DOCS_NOT_NEEDED", "1")
+        .env(
+            "HANDBOOK_DOCS_NOT_NEEDED_RATIONALE",
+            "Local env exemption; no Operator-visible behavior change.",
+        )
+        .output()
+        .expect("run handbook-guard");
+    assert!(
+        output.status.success(),
+        "expected env exemption to skip touchpoint failure:\n{}",
+        combined(&output)
+    );
+}
+
+#[test]
 fn docs_not_needed_without_rationale_fails() {
     let mut args = touchpoint_base_args();
     args.extend([
@@ -160,6 +181,34 @@ fn cli_surface_mismatch_fails() {
         text.contains("apply")
             && (text.to_lowercase().contains("surface") || text.to_lowercase().contains("snapshot")),
         "expected surface mismatch mentioning apply, got:\n{text}"
+    );
+}
+
+#[test]
+fn current_repo_handbook_tree_passes() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root");
+    let output = Command::new(bin())
+        .current_dir(&repo_root)
+        .args([
+            "check",
+            "--handbook",
+            "handbook",
+            "--touchpoints",
+            "ci/handbook/touchpoints.json",
+            "--cli-source",
+            "crates/cli/src/lib.rs",
+            "--cli-surface",
+            "ci/handbook/cli-surface.txt",
+        ])
+        .output()
+        .expect("run handbook-guard");
+    assert!(
+        output.status.success(),
+        "expected current repo handbook tree to pass:\n{}",
+        combined(&output)
     );
 }
 

@@ -13,4 +13,4 @@
 ## Test plan
 
 - [ ] `cargo test -p handbook-guard`
-- [ ] `cargo run -p handbook-guard -- check --handbook handbook`
+- [ ] `git diff --name-only origin/main...HEAD > /tmp/changed.txt && cargo run -p handbook-guard -- check --handbook handbook --changed-paths-file /tmp/changed.txt`
