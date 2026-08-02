@@ -546,11 +546,38 @@ fn apply_change_events_to_base_rows(
     Ok(())
 }
 
+/// Test-only fault injection for restart-resume coverage (ADR-0011).
+/// When set, sync exits after N durable checkpoints to simulate mid-incremental process kill.
 fn sync_fail_after_changes() -> Option<u32> {
     std::env::var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
+}
+
+fn base_with_sync_progress(
+    dataset: &BaseDataset,
+    status: impl Into<String>,
+    row_count: i32,
+    sync_applied_changes: i32,
+    capture_checkpoint: Option<i64>,
+    sync_lag: i32,
+) -> BaseDataset {
+    BaseDataset {
+        deployment_name: dataset.deployment_name.clone(),
+        source_table: dataset.source_table.clone(),
+        source_schema: dataset.source_schema.clone(),
+        status: status.into(),
+        primary_key: dataset.primary_key.clone(),
+        columns: dataset.columns.clone(),
+        omitted_columns: dataset.omitted_columns.clone(),
+        row_count,
+        sync_applied_changes,
+        sync_health: "ok".to_string(),
+        capture_low_watermark: dataset.capture_low_watermark,
+        capture_checkpoint,
+        sync_lag,
+    }
 }
 
 async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
@@ -648,25 +675,19 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 .collect();
 
             if changes.is_empty() {
-                let caught_up = BaseDataset {
-                    deployment_name: deployment.name.clone(),
-                    source_table: table.clone(),
-                    source_schema: schema.clone(),
-                    status: if dataset.status == "initial_load_complete" {
-                        dataset.status.clone()
-                    } else {
-                        "incremental".to_string()
-                    },
-                    primary_key: dataset.primary_key.clone(),
-                    columns: dataset.columns.clone(),
-                    omitted_columns: dataset.omitted_columns.clone(),
-                    row_count: dataset.row_count,
-                    sync_applied_changes: dataset.sync_applied_changes,
-                    sync_health: "ok".to_string(),
-                    capture_low_watermark: Some(low_watermark_i64),
-                    capture_checkpoint: dataset.capture_checkpoint,
-                    sync_lag: 0,
+                let status = if dataset.status == "initial_load_complete" {
+                    dataset.status.clone()
+                } else {
+                    "incremental".to_string()
                 };
+                let caught_up = base_with_sync_progress(
+                    &dataset,
+                    status,
+                    dataset.row_count,
+                    dataset.sync_applied_changes,
+                    dataset.capture_checkpoint,
+                    0,
+                );
                 let rows: Vec<serde_json::Map<String, serde_json::Value>> =
                     base_rows.into_iter().map(|r| r.data).collect();
                 replace_base_dataset(platform_store_url, &caught_up, &rows)
@@ -788,21 +809,14 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 sync_applied += 1;
                 let current_checkpoint = change.position.as_i64();
                 let remaining = total_pending - (index as i32 + 1);
-                let updated = BaseDataset {
-                    deployment_name: deployment.name.clone(),
-                    source_table: table.clone(),
-                    source_schema: schema.clone(),
-                    status: "incremental".to_string(),
-                    primary_key: dataset.primary_key.clone(),
-                    columns: dataset.columns.clone(),
-                    omitted_columns: dataset.omitted_columns.clone(),
-                    row_count: rows.len() as i32,
-                    sync_applied_changes: sync_applied,
-                    sync_health: "ok".to_string(),
-                    capture_low_watermark: Some(low_watermark_i64),
-                    capture_checkpoint: Some(current_checkpoint),
-                    sync_lag: remaining,
-                };
+                let updated = base_with_sync_progress(
+                    &dataset,
+                    "incremental",
+                    rows.len() as i32,
+                    sync_applied,
+                    Some(current_checkpoint),
+                    remaining,
+                );
 
                 replace_base_dataset(platform_store_url, &updated, &rows)
                     .await
@@ -943,14 +957,10 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                     println!("  Cutover: low-watermark=(missing)");
                 }
             }
-            // When lag>0 after a prior stop, health stays ok and lag/checkpoint show resume state.
-            let health_note = if base.sync_lag > 0 && base.capture_checkpoint.is_some() {
-                "resumed"
-            } else {
-                base.sync_health.as_str()
-            };
+            // Sync Health stays unknown|ok; lag + checkpoint make resume state coherent after restart.
             println!(
-                "  Sync Health: {health_note} appliedChanges={} lag={} checkpoint={}",
+                "  Sync Health: {} appliedChanges={} lag={} checkpoint={}",
+                base.sync_health,
                 base.sync_applied_changes,
                 base.sync_lag,
                 base.capture_checkpoint

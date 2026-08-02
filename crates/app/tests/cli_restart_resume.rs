@@ -241,8 +241,10 @@ async fn kill_mid_incremental_resumes_capture_and_delivery_from_checkpoint() {
         "only the checkpointed change should count as applied, got:\n{status_mid}"
     );
     assert!(
-        status_mid.contains("Sync Health: ok") || status_mid.contains("Sync Health: resumed"),
-        "status should show coherent Sync Health after interrupt, got:\n{status_mid}"
+        status_mid.contains("Sync Health: ok")
+            && status_mid.contains("lag=2")
+            && status_mid.contains("checkpoint=1050"),
+        "status should show coherent Sync Health/lag/checkpoint after interrupt, got:\n{status_mid}"
     );
 
     let base_mid = Command::new(bin())
