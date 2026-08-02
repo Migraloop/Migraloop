@@ -10,29 +10,32 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use lab::{run_lab, LabCommand};
 use migraloop_capture::{
-    check_oracle_source_prerequisites, classify_number, discover_source_schema,
-    initial_load_for_source, is_allow_listed_oracle_type, normalize_change_temporals,
-    open_oracle_incremental_capture, CapturePosition, ChangeEvent, ChangeOp, IncrementalCapture,
-    NumberMongoMapping, OracleSourceConnect, SourceColumn, TypeError,
+    check_oracle_source_prerequisites, classify_number, classify_schema_impact,
+    discover_source_schema, initial_load_for_source, is_allow_listed_oracle_type,
+    load_injected_schema_changes, normalize_change_temporals, open_oracle_incremental_capture,
+    CapturePosition, ChangeEvent, ChangeOp, IncrementalCapture, NumberMongoMapping,
+    OracleSourceConnect, PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn,
+    TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
     DeliveryDocument, ManagedFieldAs, MongoTargetConnection,
 };
 use migraloop_platform_store::{
-    base_dataset_exists, delete_base_datasets_not_in, delete_pipeline,
+    base_dataset_exists, clear_schema_change_impacts, delete_base_datasets_not_in, delete_pipeline,
     filter_unapplied_change_ids, get_base_rows, get_derived_rows, health, list_base_datasets,
-    list_deployments, list_derived_datasets, list_pipelines, list_quarantined_changes, migrate,
-    record_applied_source_changes, replace_base_dataset, replace_derived_dataset, replace_pipelines,
-    set_pipeline_paused, update_base_primary_key, update_pipeline_delivery_progress,
-    upsert_deployment, upsert_quarantined_change, BaseColumn, BaseDataset, Deployment,
-    DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth,
-    QuarantinedChange, SecretRef, SecretRefKind, SystemConnection,
+    list_deployments, list_derived_datasets, list_pipelines, list_quarantined_changes,
+    list_schema_change_impacts, migrate, record_applied_source_changes, replace_base_dataset,
+    replace_derived_dataset, replace_pipelines, set_pipeline_paused, update_base_primary_key,
+    update_pipeline_delivery_progress, upsert_deployment, upsert_quarantined_change,
+    upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment, DerivedDataset,
+    FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, QuarantinedChange,
+    SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection,
 };
 use migraloop_transform::{
     analyze_affect, derived_projected_fields, evaluate_transform,
-    evaluate_transform_for_identities, identity_matches_row, parse_transform_steps, AffectOutcome,
-    BaseChangeKind, TransformOp,
+    evaluate_transform_for_identities, identity_matches_row, parse_transform_steps, used_base_fields,
+    AffectOutcome, BaseChangeKind, TransformOp,
 };
 use thiserror::Error;
 
@@ -1814,6 +1817,142 @@ async fn quarantine_poison_change(
     Ok(())
 }
 
+/// Row DML or Source Schema Change in the Incremental Capture stream (ADR-0009).
+enum IncrementalItem {
+    Row(ChangeEvent),
+    Schema(SchemaChangeEvent),
+}
+
+impl IncrementalItem {
+    fn position(&self) -> CapturePosition {
+        match self {
+            Self::Row(c) => c.position,
+            Self::Schema(c) => c.position,
+        }
+    }
+
+    fn change_id(&self) -> &str {
+        match self {
+            Self::Row(c) => &c.change_id,
+            Self::Schema(c) => &c.change_id,
+        }
+    }
+}
+
+/// Dependency columns for Schema Change impact classification.
+fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineSchemaDeps {
+    let mut dependency_columns: BTreeSet<String> = dataset.primary_key.iter().cloned().collect();
+    match pipeline.mode.as_str() {
+        "direct" => {
+            for col in &dataset.columns {
+                if pipeline.field_mappings.get(&col.name) == Some(&FieldMappingAs::Omit) {
+                    continue;
+                }
+                dependency_columns.insert(col.name.clone());
+            }
+        }
+        "transform" => {
+            if let Some(transform) = &pipeline.transform_json {
+                if let Some(steps) = transform.as_array() {
+                    if let Ok(ops) = parse_transform_steps(steps) {
+                        dependency_columns.extend(used_base_fields(&ops));
+                    }
+                }
+            }
+            for field in &pipeline.output_identity {
+                dependency_columns.insert(field.clone());
+            }
+        }
+        _ => {
+            for col in &dataset.columns {
+                dependency_columns.insert(col.name.clone());
+            }
+        }
+    }
+    PipelineSchemaDeps {
+        source_table: pipeline.source_table.clone(),
+        source_schema: pipeline.source_schema.clone(),
+        dependency_columns,
+    }
+}
+
+/// Classify Schema Change impact for Pipelines on this table; warn+pause on Blocking.
+async fn apply_schema_change_impacts(
+    platform_store_url: &str,
+    deployment_pipelines: &mut [Pipeline],
+    dataset: &BaseDataset,
+    schema: &str,
+    table: &str,
+    change: &SchemaChangeEvent,
+) -> Result<(), CliError> {
+    for pipeline in deployment_pipelines.iter_mut() {
+        if pipeline.source_table != table {
+            continue;
+        }
+        if !pipeline.source_schema.is_empty()
+            && !schema.is_empty()
+            && !pipeline.source_schema.eq_ignore_ascii_case(schema)
+        {
+            continue;
+        }
+        let deps = pipeline_schema_deps(pipeline, dataset);
+        let impact = classify_schema_impact(&deps, change);
+        match impact {
+            SchemaImpact::Blocking => {
+                if !pipeline.paused {
+                    set_pipeline_paused(
+                        platform_store_url,
+                        &pipeline.deployment_name,
+                        &pipeline.name,
+                        true,
+                    )
+                    .await
+                    .map_err(|err| CliError::Failed(err.to_string()))?;
+                    pipeline.paused = true;
+                }
+                let record = SchemaChangeImpact {
+                    deployment_name: pipeline.deployment_name.clone(),
+                    pipeline_name: pipeline.name.clone(),
+                    source_schema: schema.to_string(),
+                    source_table: table.to_string(),
+                    change_id: change.change_id.clone(),
+                    capture_position: change.position.as_i64(),
+                    ddl_summary: change.summary.clone(),
+                    impact: impact.as_str().to_string(),
+                    status: "active".to_string(),
+                };
+                upsert_schema_change_impact(platform_store_url, &record)
+                    .await
+                    .map_err(|err| CliError::Failed(err.to_string()))?;
+                eprintln!(
+                    "WARN: Schema Change blocked Pipeline={} change_id={} ddl={} — \
+                     pausing affected Pipeline (not poison quarantine)",
+                    pipeline.name, change.change_id, change.summary
+                );
+                println!(
+                    "Schema Change: Pipeline={} impact=blocking change_id={} ddl={} paused",
+                    pipeline.name, change.change_id, change.summary
+                );
+            }
+            SchemaImpact::NonBlocking => {
+                println!(
+                    "Schema Change: Pipeline={} impact=non_blocking change_id={} ddl={} — \
+                     continue (safe apply)",
+                    pipeline.name, change.change_id, change.summary
+                );
+            }
+            SchemaImpact::Unaffecting => {
+                println!(
+                    "Schema Change: Pipeline={} impact=unaffecting change_id={} ddl={} — \
+                     continue",
+                    pipeline.name, change.change_id, change.summary
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn base_with_sync_progress(
     dataset: &BaseDataset,
     status: impl Into<String>,
@@ -1857,10 +1996,12 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 
     let fail_after = sync_fail_after_changes();
     let max_poison_attempts = poison_max_attempts();
+    let injected_schema_changes = load_injected_schema_changes()
+        .map_err(|err| CliError::Failed(err.to_string()))?;
     let mut applied_this_run: u32 = 0;
 
     for deployment in &deployments {
-        let deployment_pipelines: Vec<_> = pipelines
+        let mut deployment_pipelines: Vec<_> = pipelines
             .iter()
             .filter(|p| p.deployment_name == deployment.name)
             .cloned()
@@ -1941,10 +2082,21 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                     )));
                 }
             };
-            let candidate_ids: Vec<String> = candidate_changes
+            let table_schema_changes: Vec<SchemaChangeEvent> = injected_schema_changes
+                .iter()
+                .filter(|c| c.table.eq_ignore_ascii_case(&table))
+                .filter(|c| c.position >= resume_from)
+                .cloned()
+                .collect();
+            let mut candidate_ids: Vec<String> = candidate_changes
                 .iter()
                 .map(|c| c.change_id.clone())
                 .collect();
+            candidate_ids.extend(
+                table_schema_changes
+                    .iter()
+                    .map(|c| c.change_id.clone()),
+            );
             let unapplied_ids = filter_unapplied_change_ids(
                 platform_store_url,
                 &deployment.name,
@@ -1955,12 +2107,24 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             .await
             .map_err(|err| CliError::Failed(err.to_string()))?;
             let unapplied_set: BTreeSet<_> = unapplied_ids.into_iter().collect();
-            let changes: Vec<ChangeEvent> = candidate_changes
+            let mut items: Vec<IncrementalItem> = candidate_changes
                 .into_iter()
                 .filter(|c| unapplied_set.contains(&c.change_id))
+                .map(IncrementalItem::Row)
                 .collect();
+            items.extend(
+                table_schema_changes
+                    .into_iter()
+                    .filter(|c| unapplied_set.contains(&c.change_id))
+                    .map(IncrementalItem::Schema),
+            );
+            items.sort_by(|a, b| {
+                a.position()
+                    .cmp(&b.position())
+                    .then_with(|| a.change_id().cmp(b.change_id()))
+            });
 
-            if changes.is_empty() {
+            if items.is_empty() {
                 let status = if dataset.status == "initial_load_complete" {
                     dataset.status.clone()
                 } else {
@@ -1993,7 +2157,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 "Incremental Capture: resuming Base Dataset {table} from checkpoint={checkpoint_before} \
                  (exclusive next={}, pending={}, low-watermark={low_watermark})",
                 resume_from,
-                changes.len()
+                items.len()
             );
 
             let supported_names: BTreeSet<String> =
@@ -2003,7 +2167,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
                 base_rows.into_iter().map(|r| r.data).collect();
             let mut sync_applied = dataset.sync_applied_changes;
-            let total_pending = changes.len() as i32;
+            let total_pending = items.len() as i32;
 
             for pipeline in &deployment_pipelines {
                 if pipeline.paused
@@ -2017,119 +2181,232 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 }
             }
 
-            for (index, change) in changes.iter().enumerate() {
-                // Capture pre-apply Base row for Affect Analysis (unused-field skip / group keys).
-                let pre_apply = rows
-                    .iter()
-                    .find(|row| row_matches_identity(row, &change.identity))
-                    .cloned();
+            for (index, item) in items.iter().enumerate() {
+                match item {
+                    IncrementalItem::Schema(schema_change) => {
+                        apply_schema_change_impacts(
+                            platform_store_url,
+                            &mut deployment_pipelines,
+                            &dataset,
+                            &schema,
+                            &table,
+                            schema_change,
+                        )
+                        .await?;
 
-                apply_change_events_to_base_rows(
-                    &mut rows,
-                    std::slice::from_ref(change),
-                    &supported_names,
-                    &source_columns,
-                    configured_tz,
-                )?;
-
-                // Delivery before durable checkpoint so retries prefer duplicate applies.
-                for pipeline in &deployment_pipelines {
-                    if pipeline.target_collection.is_empty() || pipeline.source_table != table {
-                        continue;
+                        let current_checkpoint = schema_change.position.as_i64();
+                        let remaining = total_pending - (index as i32 + 1);
+                        let updated = base_with_sync_progress(
+                            &dataset,
+                            "incremental",
+                            rows.len() as i32,
+                            sync_applied,
+                            Some(current_checkpoint),
+                            remaining,
+                        );
+                        replace_base_dataset(platform_store_url, &updated, &rows)
+                            .await
+                            .map_err(|err| CliError::Failed(err.to_string()))?;
+                        record_applied_source_changes(
+                            platform_store_url,
+                            &deployment.name,
+                            &schema,
+                            &table,
+                            &[(
+                                schema_change.change_id.clone(),
+                                schema_change.position.as_i64(),
+                            )],
+                        )
+                        .await
+                        .map_err(|err| CliError::Failed(err.to_string()))?;
+                        applied_this_run += 1;
+                        println!(
+                            "Incremental Capture: Base Dataset {table} applied schema change_id={} \
+                             checkpoint={current_checkpoint} lag={remaining}",
+                            schema_change.change_id
+                        );
                     }
-                    if pipeline.paused {
-                        // Skip Delivery/processing; Base Capture still advances for shared Bases.
-                        continue;
-                    }
+                    IncrementalItem::Row(change) => {
+                        // Capture pre-apply Base row for Affect Analysis (unused-field skip / group keys).
+                        let pre_apply = rows
+                            .iter()
+                            .find(|row| row_matches_identity(row, &change.identity))
+                            .cloned();
 
-                    match pipeline.mode.as_str() {
-                        "direct" => match change.op {
-                            ChangeOp::Insert | ChangeOp::Update => {
-                                let Some(base_row) = rows
-                                    .iter()
-                                    .find(|row| row_matches_identity(row, &change.identity))
-                                else {
-                                    return Err(CliError::Failed(format!(
-                                        "Base Dataset {} missing row for Output Identity {:?}",
-                                        pipeline.source_table, change.identity
-                                    )));
-                                };
-                                let document = delivery_document_for_row(
-                                    base_row,
-                                    &dataset.primary_key,
-                                    &dataset.columns,
-                                    pipeline,
-                                )?;
-                                match upsert_with_bounded_retries(
-                                    &mongo,
-                                    &pipeline.target_collection,
-                                    &document,
-                                    max_poison_attempts,
-                                )
-                                .await
-                                {
-                                    Ok(upserted) => {
-                                        update_pipeline_delivery_progress(
-                                            platform_store_url,
-                                            &pipeline.deployment_name,
-                                            &pipeline.name,
-                                            "delivered",
-                                            Some(upserted as i32),
+                        apply_change_events_to_base_rows(
+                            &mut rows,
+                            std::slice::from_ref(change),
+                            &supported_names,
+                            &source_columns,
+                            configured_tz,
+                        )?;
+
+                        // Delivery before durable checkpoint so retries prefer duplicate applies.
+                        for pipeline in &deployment_pipelines {
+                            if pipeline.target_collection.is_empty() || pipeline.source_table != table
+                            {
+                                continue;
+                            }
+                            if pipeline.paused {
+                                // Skip Delivery/processing; Base Capture still advances for shared Bases.
+                                continue;
+                            }
+
+                            match pipeline.mode.as_str() {
+                                "direct" => match change.op {
+                                    ChangeOp::Insert | ChangeOp::Update => {
+                                        let Some(base_row) = rows.iter().find(|row| {
+                                            row_matches_identity(row, &change.identity)
+                                        }) else {
+                                            return Err(CliError::Failed(format!(
+                                                "Base Dataset {} missing row for Output Identity {:?}",
+                                                pipeline.source_table, change.identity
+                                            )));
+                                        };
+                                        let document = delivery_document_for_row(
+                                            base_row,
+                                            &dataset.primary_key,
+                                            &dataset.columns,
+                                            pipeline,
+                                        )?;
+                                        match upsert_with_bounded_retries(
+                                            &mongo,
+                                            &pipeline.target_collection,
+                                            &document,
+                                            max_poison_attempts,
                                         )
                                         .await
-                                        .map_err(|err| CliError::Failed(err.to_string()))?;
-                                        println!(
-                                            "Delivery complete: Pipeline {} upserts={upserted} \
-                                             deletes=0 (checkpoint-bound)",
-                                            pipeline.name
-                                        );
+                                        {
+                                            Ok(upserted) => {
+                                                update_pipeline_delivery_progress(
+                                                    platform_store_url,
+                                                    &pipeline.deployment_name,
+                                                    &pipeline.name,
+                                                    "delivered",
+                                                    Some(upserted as i32),
+                                                )
+                                                .await
+                                                .map_err(|err| {
+                                                    CliError::Failed(err.to_string())
+                                                })?;
+                                                println!(
+                                                    "Delivery complete: Pipeline {} upserts={upserted} \
+                                                     deletes=0 (checkpoint-bound)",
+                                                    pipeline.name
+                                                );
+                                            }
+                                            Err((attempts, last_error)) => {
+                                                quarantine_poison_change(
+                                                    platform_store_url,
+                                                    pipeline,
+                                                    &schema,
+                                                    &table,
+                                                    change,
+                                                    document.identity.clone(),
+                                                    "delivery",
+                                                    attempts,
+                                                    &last_error,
+                                                )
+                                                .await?;
+                                            }
+                                        }
                                     }
-                                    Err((attempts, last_error)) => {
-                                        quarantine_poison_change(
+                                    ChangeOp::Delete => {
+                                        let identity = identity_value_from_change(
+                                            change,
+                                            &dataset.primary_key,
+                                        )?;
+                                        match delete_with_bounded_retries(
+                                            &mongo,
+                                            &pipeline.target_collection,
+                                            &identity,
+                                            max_poison_attempts,
+                                        )
+                                        .await
+                                        {
+                                            Ok(deleted) => {
+                                                update_pipeline_delivery_progress(
+                                                    platform_store_url,
+                                                    &pipeline.deployment_name,
+                                                    &pipeline.name,
+                                                    "delivered",
+                                                    Some(deleted as i32),
+                                                )
+                                                .await
+                                                .map_err(|err| {
+                                                    CliError::Failed(err.to_string())
+                                                })?;
+                                                println!(
+                                                    "Delivery complete: Pipeline {} upserts=0 \
+                                                     deletes={deleted} (checkpoint-bound)",
+                                                    pipeline.name
+                                                );
+                                            }
+                                            Err((attempts, last_error)) => {
+                                                quarantine_poison_change(
+                                                    platform_store_url,
+                                                    pipeline,
+                                                    &schema,
+                                                    &table,
+                                                    change,
+                                                    identity,
+                                                    "delivery",
+                                                    attempts,
+                                                    &last_error,
+                                                )
+                                                .await?;
+                                            }
+                                        }
+                                    }
+                                },
+                                "transform" => {
+                                    let mut last_error = String::new();
+                                    let mut succeeded = false;
+                                    for attempt in 1..=max_poison_attempts {
+                                        match maintain_transform_pipeline_for_change(
                                             platform_store_url,
                                             pipeline,
-                                            &schema,
-                                            &table,
+                                            &mongo,
+                                            &dataset.columns,
+                                            &rows,
                                             change,
-                                            document.identity.clone(),
-                                            "delivery",
-                                            attempts,
-                                            &last_error,
-                                        )
-                                        .await?;
-                                    }
-                                }
-                            }
-                            ChangeOp::Delete => {
-                                let identity = identity_value_from_change(
-                                    change,
-                                    &dataset.primary_key,
-                                )?;
-                                match delete_with_bounded_retries(
-                                    &mongo,
-                                    &pipeline.target_collection,
-                                    &identity,
-                                    max_poison_attempts,
-                                )
-                                .await
-                                {
-                                    Ok(deleted) => {
-                                        update_pipeline_delivery_progress(
-                                            platform_store_url,
-                                            &pipeline.deployment_name,
-                                            &pipeline.name,
-                                            "delivered",
-                                            Some(deleted as i32),
+                                            pre_apply.as_ref(),
                                         )
                                         .await
-                                        .map_err(|err| CliError::Failed(err.to_string()))?;
-                                        println!(
-                                            "Delivery complete: Pipeline {} upserts=0 \
-                                             deletes={deleted} (checkpoint-bound)",
-                                            pipeline.name
-                                        );
+                                        {
+                                            Ok(()) => {
+                                                succeeded = true;
+                                                break;
+                                            }
+                                            Err(err) => {
+                                                last_error = err.to_string();
+                                                if attempt < max_poison_attempts {
+                                                    eprintln!(
+                                                        "Delivery retry {attempt}/{max_poison_attempts} \
+                                                         failed: {last_error}"
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
-                                    Err((attempts, last_error)) => {
+                                    if !succeeded {
+                                        let identity = identity_value_from_change(
+                                            change,
+                                            if pipeline.output_identity.is_empty() {
+                                                &dataset.primary_key
+                                            } else {
+                                                &pipeline.output_identity
+                                            },
+                                        )
+                                        .unwrap_or_else(|_| {
+                                            serde_json::Value::Object(
+                                                change
+                                                    .identity
+                                                    .iter()
+                                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                                    .collect(),
+                                            )
+                                        });
                                         quarantine_poison_change(
                                             platform_store_url,
                                             pipeline,
@@ -2138,119 +2415,58 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                                             change,
                                             identity,
                                             "delivery",
-                                            attempts,
+                                            max_poison_attempts,
                                             &last_error,
                                         )
                                         .await?;
                                     }
                                 }
-                            }
-                        },
-                        "transform" => {
-                            let mut last_error = String::new();
-                            let mut succeeded = false;
-                            for attempt in 1..=max_poison_attempts {
-                                match maintain_transform_pipeline_for_change(
-                                    platform_store_url,
-                                    pipeline,
-                                    &mongo,
-                                    &dataset.columns,
-                                    &rows,
-                                    change,
-                                    pre_apply.as_ref(),
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        succeeded = true;
-                                        break;
-                                    }
-                                    Err(err) => {
-                                        last_error = err.to_string();
-                                        if attempt < max_poison_attempts {
-                                            eprintln!(
-                                                "Delivery retry {attempt}/{max_poison_attempts} \
-                                                 failed: {last_error}"
-                                            );
-                                        }
-                                    }
+                                other => {
+                                    return Err(CliError::Failed(format!(
+                                        "unsupported pipeline.mode {other:?} during Incremental Capture"
+                                    )));
                                 }
                             }
-                            if !succeeded {
-                                let identity = identity_value_from_change(
-                                    change,
-                                    if pipeline.output_identity.is_empty() {
-                                        &dataset.primary_key
-                                    } else {
-                                        &pipeline.output_identity
-                                    },
-                                )
-                                .unwrap_or_else(|_| {
-                                    serde_json::Value::Object(
-                                        change
-                                            .identity
-                                            .iter()
-                                            .map(|(k, v)| (k.clone(), v.clone()))
-                                            .collect(),
-                                    )
-                                });
-                                quarantine_poison_change(
-                                    platform_store_url,
-                                    pipeline,
-                                    &schema,
-                                    &table,
-                                    change,
-                                    identity,
-                                    "delivery",
-                                    max_poison_attempts,
-                                    &last_error,
-                                )
-                                .await?;
-                            }
                         }
-                        other => {
-                            return Err(CliError::Failed(format!(
-                                "unsupported pipeline.mode {other:?} during Incremental Capture"
-                            )));
-                        }
+
+                        sync_applied += 1;
+                        let current_checkpoint = change.position.as_i64();
+                        let remaining = total_pending - (index as i32 + 1);
+                        let updated = base_with_sync_progress(
+                            &dataset,
+                            "incremental",
+                            rows.len() as i32,
+                            sync_applied,
+                            Some(current_checkpoint),
+                            remaining,
+                        );
+
+                        replace_base_dataset(platform_store_url, &updated, &rows)
+                            .await
+                            .map_err(|err| CliError::Failed(err.to_string()))?;
+                        record_applied_source_changes(
+                            platform_store_url,
+                            &deployment.name,
+                            &schema,
+                            &table,
+                            &[(change.change_id.clone(), change.position.as_i64())],
+                        )
+                        .await
+                        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+                        applied_this_run += 1;
+                        println!(
+                            "Incremental Capture: Base Dataset {table} applied change_id={} \
+                             checkpoint={current_checkpoint} lag={remaining} rows={}",
+                            change.change_id,
+                            updated.row_count
+                        );
                     }
                 }
 
-                sync_applied += 1;
-                let current_checkpoint = change.position.as_i64();
-                let remaining = total_pending - (index as i32 + 1);
-                let updated = base_with_sync_progress(
-                    &dataset,
-                    "incremental",
-                    rows.len() as i32,
-                    sync_applied,
-                    Some(current_checkpoint),
-                    remaining,
-                );
-
-                replace_base_dataset(platform_store_url, &updated, &rows)
-                    .await
-                    .map_err(|err| CliError::Failed(err.to_string()))?;
-                record_applied_source_changes(
-                    platform_store_url,
-                    &deployment.name,
-                    &schema,
-                    &table,
-                    &[(change.change_id.clone(), change.position.as_i64())],
-                )
-                .await
-                .map_err(|err| CliError::Failed(err.to_string()))?;
-
-                applied_this_run += 1;
-                println!(
-                    "Incremental Capture: Base Dataset {table} applied change_id={} \
-                     checkpoint={current_checkpoint} lag={remaining} rows={}",
-                    change.change_id,
-                    updated.row_count
-                );
-
                 if let Some(limit) = fail_after {
                     if applied_this_run >= limit {
+                        let current_checkpoint = item.position().as_i64();
                         return Err(CliError::Failed(format!(
                             "simulated process kill after {limit} durable checkpoint(s) \
                              (MIGRALOOP_SYNC_FAIL_AFTER_CHANGES); resume from Platform Store \
@@ -2414,6 +2630,9 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     let quarantines = list_quarantined_changes(platform_store_url, None)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
+    let schema_impacts = list_schema_change_impacts(platform_store_url, None)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
 
     for pipeline in &pipelines {
         if pipeline.target_collection.is_empty() {
@@ -2423,6 +2642,14 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             .iter()
             .filter(|q| {
                 q.deployment_name == pipeline.deployment_name && q.pipeline_name == pipeline.name
+            })
+            .collect();
+        let pipeline_schema_blocks: Vec<_> = schema_impacts
+            .iter()
+            .filter(|s| {
+                s.deployment_name == pipeline.deployment_name
+                    && s.pipeline_name == pipeline.name
+                    && s.impact == "blocking"
             })
             .collect();
         let delivery_health = if pipeline.paused {
@@ -2459,6 +2686,13 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                 pipeline_quarantines.len()
             );
         }
+        if !pipeline_schema_blocks.is_empty() {
+            println!(
+                "  Schema Change: Pipeline={} blocking={} paused (stream-wide DDL; not poison quarantine)",
+                pipeline.name,
+                pipeline_schema_blocks.len()
+            );
+        }
     }
 
     if quarantines.is_empty() {
@@ -2470,6 +2704,17 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                 "  Quarantine: Pipeline={} identity={} change_id={} stage={} attempts={} \
                  unhealthy / not aligned error={}",
                 q.pipeline_name, identity, q.change_id, q.stage, q.attempts, q.last_error
+            );
+        }
+    }
+
+    if schema_impacts.is_empty() {
+        println!("Schema Change: (none)");
+    } else {
+        for s in &schema_impacts {
+            println!(
+                "  Schema Change: Pipeline={} impact={} change_id={} table={} ddl={} status={}",
+                s.pipeline_name, s.impact, s.change_id, s.source_table, s.ddl_summary, s.status
             );
         }
     }
@@ -2721,6 +2966,13 @@ async fn resume_pipeline_command(
         &pipeline.deployment_name,
         &pipeline.name,
         false,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+    clear_schema_change_impacts(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
     )
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;

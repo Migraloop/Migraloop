@@ -1482,3 +1482,135 @@ pub async fn count_active_quarantines(
     .map_err(PlatformStoreError::Load)?;
     Ok(count)
 }
+
+/// Durable Schema Change impact record (ADR-0009 / issue #23).
+///
+/// Blocking DDL warns and pauses affected Pipelines. Distinct from
+/// [`QuarantinedChange`] (poison rows keep the Pipeline running).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchemaChangeImpact {
+    pub deployment_name: String,
+    pub pipeline_name: String,
+    pub source_schema: String,
+    pub source_table: String,
+    pub change_id: String,
+    pub capture_position: i64,
+    pub ddl_summary: String,
+    pub impact: String,
+    pub status: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SchemaChangeImpactRow {
+    deployment_name: String,
+    pipeline_name: String,
+    source_schema: String,
+    source_table: String,
+    change_id: String,
+    capture_position: i64,
+    ddl_summary: String,
+    impact: String,
+    status: String,
+}
+
+impl SchemaChangeImpactRow {
+    fn into_impact(self) -> SchemaChangeImpact {
+        SchemaChangeImpact {
+            deployment_name: self.deployment_name,
+            pipeline_name: self.pipeline_name,
+            source_schema: self.source_schema,
+            source_table: self.source_table,
+            change_id: self.change_id,
+            capture_position: self.capture_position,
+            ddl_summary: self.ddl_summary,
+            impact: self.impact,
+            status: self.status,
+        }
+    }
+}
+
+/// Persist or refresh a Schema Change impact (ADR-0009).
+pub async fn upsert_schema_change_impact(
+    database_url: &str,
+    record: &SchemaChangeImpact,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO schema_change_impacts (
+            deployment_name, pipeline_name, source_schema, source_table,
+            change_id, capture_position, ddl_summary, impact, status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
+            source_schema = EXCLUDED.source_schema,
+            source_table = EXCLUDED.source_table,
+            capture_position = EXCLUDED.capture_position,
+            ddl_summary = EXCLUDED.ddl_summary,
+            impact = EXCLUDED.impact,
+            status = EXCLUDED.status,
+            warned_at = NOW()
+        "#,
+    )
+    .bind(&record.deployment_name)
+    .bind(&record.pipeline_name)
+    .bind(&record.source_schema)
+    .bind(&record.source_table)
+    .bind(&record.change_id)
+    .bind(record.capture_position)
+    .bind(&record.ddl_summary)
+    .bind(&record.impact)
+    .bind(&record.status)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+/// List active Schema Change impacts, optionally scoped to one Deployment.
+pub async fn list_schema_change_impacts(
+    database_url: &str,
+    deployment_name: Option<&str>,
+) -> Result<Vec<SchemaChangeImpact>, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let deployment_filter = deployment_name.unwrap_or("");
+    let rows = sqlx::query_as::<_, SchemaChangeImpactRow>(
+        r#"
+        SELECT deployment_name, pipeline_name, source_schema, source_table,
+               change_id, capture_position, ddl_summary, impact, status
+        FROM schema_change_impacts
+        WHERE status = 'active'
+          AND ($1 = '' OR deployment_name = $1)
+        ORDER BY deployment_name, pipeline_name, warned_at, change_id
+        "#,
+    )
+    .bind(deployment_filter)
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+
+    Ok(rows.into_iter().map(SchemaChangeImpactRow::into_impact).collect())
+}
+
+/// Clear active Schema Change impacts for one Pipeline (e.g. on Operator resume).
+pub async fn clear_schema_change_impacts(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+) -> Result<u64, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let result = sqlx::query(
+        r#"
+        UPDATE schema_change_impacts
+        SET status = 'cleared'
+        WHERE deployment_name = $1
+          AND pipeline_name = $2
+          AND status = 'active'
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(result.rows_affected())
+}

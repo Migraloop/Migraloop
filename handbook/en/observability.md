@@ -14,7 +14,7 @@ migraloop status
 - Each **Deployment** (Source/Target identity, LogMiner mechanism: contract vs OCI)
 - Each **Pipeline** (mode, source table, target collection, Delivery status)
 - Each **Base Dataset** (status, row count, columns, omitted unsupported types, Initial Load / cutover watermarks, **Sync Health** with appliedChanges / lag / checkpoint)
-- **Delivery Health** per Pipeline (applied changes / status; `unhealthy` when Poison Change quarantine is active)
+- **Delivery Health** per Pipeline (applied changes / status; `unhealthy` when Poison Change quarantine is active; `paused` when blocking Schema Change pause is active)
 - Active **Quarantine** rows (Output Identity, change id, attempts, last error — unhealthy / not aligned)
 - **Derived Datasets** for Transform Pipelines when present
 
@@ -25,6 +25,7 @@ Healthy examples Operators look for after a first sync:
 - Sync Health lag trends toward caught-up (not permanently growing)
 - Delivery Health shows successful apply for configured Target Bindings (`ok`, not `unhealthy` quarantine)
 - Quarantine: `(none)` unless a poison identity was intentionally left quarantined
+- Schema Change: `(none)` unless a blocking DDL pause was intentionally left active
 
 ## Deeper inspection commands
 

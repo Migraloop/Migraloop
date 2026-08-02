@@ -12,7 +12,7 @@ Source DDL is classified against each Pipeline’s dependencies (ADR-0009):
 | Affects the Pipeline but apply stays safe | Processing continues |
 | Blocks safe apply (retries cannot progress) | **Warn and pause** the affected Pipeline(s) |
 
-This pause rule is for **stream-wide blockers**, not single-row poison data. Operators can also intentionally pause/resume a Pipeline with `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>`, or remove one with `migraloop remove --pipeline <name>` (see [Pipeline](pipeline.md) and [CLI & Config](cli-and-config.md)) without restarting the Deployment. Until automatic DDL-driven pause wires into those verbs, treat unblockable apply failures as Operator-visible errors in `status` / logs and pause or remove affected Pipelines explicitly.
+This pause rule is for **stream-wide blockers**, not single-row poison data. When Incremental Capture sees blocking Source DDL, `migraloop sync` emits an Operator-visible **WARN**, persists a Schema Change impact, and pauses the affected Pipeline(s) via the same durable pause flag as `migraloop pause`—without quarantine. Unaffecting or non-blocking schema changes continue; `status` shows `Delivery Health: paused` plus Schema Change rows for active blocking impacts (distinct from Poison Change quarantine). Operators can also intentionally pause/resume a Pipeline with `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>`, or remove one with `migraloop remove --pipeline <name>` (see [Pipeline](pipeline.md) and [CLI & Config](cli-and-config.md)) without restarting the Deployment. Resume clears active Schema Change impacts for that Pipeline and catch-up Delivers from durable Base/Derived state.
 
 ## Poison Change Handling
 

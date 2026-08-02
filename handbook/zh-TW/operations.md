@@ -12,7 +12,7 @@ Source DDL 會依每條 Pipeline 的相依性分類（ADR-0009）：
 | 影響 Pipeline 但 apply 仍安全 | 繼續處理 |
 | 阻擋安全 apply（重試無法前進） | **警告並 pause** 受影響的 Pipeline(s) |
 
-此 pause 規則用於 **stream-wide blockers**，不是單一列的 poison data。Operator 也可主動用 `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>` pause/resume 一條 Pipeline，或以 `migraloop remove --pipeline <name>` 移除一條（見 [Pipeline](pipeline.md) 與 [CLI 與 Config](cli-and-config.md)），且不必重啟 Deployment。在自動 DDL-driven pause 接上這些動詞之前，把無法解除的 apply 失敗當成 `status` / logs 上的 Operator 可見錯誤，並明確 pause 或移除受影響的 Pipelines。
+此 pause 規則用於 **stream-wide blockers**，不是單一列的 poison data。當 Incremental Capture 遇到會阻塞的 Source DDL 時，`migraloop sync` 會發出 Operator 可見的 **WARN**、持久化 Schema Change impact，並以與 `migraloop pause` 相同的耐久 pause 旗標 pause 受影響的 Pipeline(s)—不會走 quarantine。Unaffecting 或 non-blocking 的 schema changes 會繼續；`status` 會顯示 `Delivery Health: paused`，以及作用中的 blocking Schema Change 列（與 Poison Change quarantine 不同）。Operator 也可主動用 `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>` pause/resume 一條 Pipeline，或以 `migraloop remove --pipeline <name>` 移除一條（見 [Pipeline](pipeline.md) 與 [CLI 與 Config](cli-and-config.md)），且不必重啟 Deployment。Resume 會清除該 Pipeline 作用中的 Schema Change impacts，並依耐久 Base/Derived 狀態做 catch-up Delivery。
 
 ## Poison Change Handling
 

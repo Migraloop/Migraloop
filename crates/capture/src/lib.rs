@@ -12,6 +12,7 @@ mod oracle_connect;
 mod oracle_prerequisites;
 mod oracle_source;
 mod oracle_types;
+mod schema_change;
 
 pub use logminer::{
     change_events_from_logminer_contents, logminer_change_id, open_oracle_incremental_capture,
@@ -36,6 +37,11 @@ pub use oracle_types::{
     aware_temporal_to_utc, classify_number, is_allow_listed_oracle_type, naive_temporal_to_utc,
     normalize_oracle_type, resolve_temporal_timezone, NumberMongoMapping, ResolvedTimezone,
     TypeError, DECIMAL128_MAX_PRECISION, INT64_SAFE_PRECISION, RAW_SIZE_CAP_BYTES,
+};
+pub use schema_change::{
+    classify_schema_impact, load_injected_schema_changes, load_schema_changes_file,
+    schema_change_id, PipelineSchemaDeps, SchemaChangeEvent, SchemaChangeInjectError,
+    SchemaChangeKind, SchemaImpact, INJECT_SCHEMA_CHANGES_ENV,
 };
 
 use std::collections::BTreeMap;
