@@ -71,6 +71,8 @@ const BULK_LOAD_MAX_LAG: i32 = 0;
 const BULK_LOAD_MAX_DURATION_MS: u128 = 600_000;
 /// Fail-able minimum throughput (rows/s) for the bulk load (US21).
 const BULK_LOAD_MIN_ROWS_PER_S: f64 = 50.0;
+/// Poll interval while waiting for Delivery/Health catch-up after bulk Initial Load (US47).
+const BULK_LOAD_SETTLE_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Subcommand)]
 pub enum ScenarioCommand {
@@ -165,6 +167,12 @@ async fn scenario_run(
              (`{}` since unix {})",
             existing.scenario, existing.started_at_unix
         )));
+    }
+
+    // Lab-only outcome probe: exercise equal-weight fail axes through the real CLI
+    // report/exit path without Docker (issue #63 / PRD #55 metrics tests).
+    if let Ok(probe) = std::env::var("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE") {
+        return emit_scenario_outcome_probe(entry.0, &probe);
     }
 
     ensure_fixture_ready_for_scenario(lab_dir).await?;
@@ -301,6 +309,79 @@ fn scenario_failure_kind(correctness: bool, thresholds_ok: bool) -> &'static str
         (true, false) => "threshold",
         (true, true) => "scenario",
     }
+}
+
+/// Emit a synthetic bulk-load Scenario outcome through the same report + exit
+/// contract as a real run (CLI-seam metrics/correctness fail-axis verification).
+fn emit_scenario_outcome_probe(scenario: &str, probe: &str) -> Result<(), CliError> {
+    if scenario != BULK_LOAD_ID {
+        return Err(CliError::Failed(format!(
+            "MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE is only supported for `{BULK_LOAD_ID}` \
+             (got `{scenario}`)"
+        )));
+    }
+    let report = match probe {
+        "threshold-fail" => {
+            let sample = BulkLoadMetricSample {
+                lag: 0,
+                max_lag: BULK_LOAD_MAX_LAG,
+                duration_ms: BULK_LOAD_MAX_DURATION_MS + 1,
+                max_duration_ms: BULK_LOAD_MAX_DURATION_MS,
+                rows_per_s: BULK_LOAD_MIN_ROWS_PER_S / 2.0,
+                min_rows_per_s: BULK_LOAD_MIN_ROWS_PER_S,
+            };
+            let (_, detail) = evaluate_bulk_load_thresholds(&sample);
+            ScenarioReport {
+                correctness: true,
+                rows_applied: BULK_LOAD_ROW_COUNT,
+                detail,
+                capture_path_note: "Initial Load".to_string(),
+                settle_ms: None,
+                max_settle_ms: None,
+                lag: Some(sample.lag),
+                max_lag: Some(sample.max_lag),
+                min_rows_per_s: Some(sample.min_rows_per_s),
+                max_duration_ms: Some(sample.max_duration_ms),
+                measured_rows_per_s: Some(sample.rows_per_s),
+                measured_duration_ms: Some(sample.duration_ms),
+                thresholds_ok: false,
+            }
+        }
+        "correctness-fail" => ScenarioReport {
+            correctness: false,
+            rows_applied: BULK_LOAD_ROW_COUNT - 1,
+            detail: format!(
+                "correctness: expected rows={BULK_LOAD_ROW_COUNT} \
+base_rows={} target_rows={}",
+                BULK_LOAD_ROW_COUNT - 1,
+                BULK_LOAD_ROW_COUNT - 1
+            ),
+            capture_path_note: "Initial Load".to_string(),
+            settle_ms: None,
+            max_settle_ms: None,
+            lag: Some(0),
+            max_lag: Some(BULK_LOAD_MAX_LAG),
+            min_rows_per_s: Some(BULK_LOAD_MIN_ROWS_PER_S),
+            max_duration_ms: Some(BULK_LOAD_MAX_DURATION_MS),
+            measured_rows_per_s: Some(800.0),
+            measured_duration_ms: Some(120_000),
+            thresholds_ok: true,
+        },
+        other => {
+            return Err(CliError::Failed(format!(
+                "Unknown MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE `{other}` \
+                 (expected `threshold-fail` or `correctness-fail`)"
+            )));
+        }
+    };
+
+    let duration = Duration::from_millis(report.measured_duration_ms.unwrap_or(0) as u64);
+    print_scenario_report(scenario, true, duration, &report, false);
+    let kind = scenario_failure_kind(report.correctness, report.thresholds_ok);
+    Err(CliError::Failed(format!(
+        "Lab Scenario {kind} failed: {}",
+        report.detail
+    )))
 }
 
 fn report_defines_thresholds(report: &ScenarioReport) -> bool {
@@ -1492,59 +1573,86 @@ min_rows_per_s={BULK_LOAD_MIN_ROWS_PER_S}"
         )));
     }
 
-    let load_duration = load_started.elapsed();
-    let measured_duration_ms = load_duration.as_millis();
-    let measured_rows_per_s = if load_duration.as_secs_f64() > 0.0 {
-        BULK_LOAD_ROW_COUNT as f64 / load_duration.as_secs_f64()
+    // US47: wait until Delivery/Health catch up within duration threshold before final asserts.
+    println!(
+        "Lab Scenario: settling bulk Delivery / Sync Health within \
+max_duration_ms={BULK_LOAD_MAX_DURATION_MS}..."
+    );
+    let mut last_detail = String::new();
+    let mut settled = false;
+    let (base_rows, target_rows, lag) = loop {
+        let measured_duration_ms = load_started.elapsed().as_millis();
+        let base_after = run_product_cli(
+            &bin,
+            &[
+                "base",
+                "--platform-store-url",
+                LAB_PLATFORM_STORE_URL,
+                "--table",
+                BULK_LOAD_TABLE,
+            ],
+        )
+        .await?;
+        let target_after = run_product_cli(
+            &bin,
+            &[
+                "target",
+                "--platform-store-url",
+                LAB_PLATFORM_STORE_URL,
+                "--collection",
+                BULK_LOAD_COLLECTION,
+            ],
+        )
+        .await?;
+        let status_out = run_product_cli(
+            &bin,
+            &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        )
+        .await?;
+
+        let base_rows = parse_inspect_row_count(&base_after).ok_or_else(|| {
+            CliError::Failed(format!(
+                "Lab Scenario could not parse Base row count after bulk Initial Load:\n{base_after}"
+            ))
+        })?;
+        let target_rows = parse_target_document_count(&target_after).ok_or_else(|| {
+            CliError::Failed(format!(
+                "Lab Scenario could not parse Target document count after bulk Delivery:\n{target_after}"
+            ))
+        })?;
+        let lag = parse_sync_lag_for_table(&status_out, BULK_LOAD_TABLE).ok_or_else(|| {
+            CliError::Failed(format!(
+                "Lab Scenario could not parse Sync Health lag for {BULK_LOAD_TABLE}:\n{status_out}"
+            ))
+        })?;
+
+        let rows_ok = base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
+        let lag_ok = lag <= BULK_LOAD_MAX_LAG;
+        if rows_ok && lag_ok {
+            settled = true;
+            break (base_rows, target_rows, lag);
+        }
+
+        last_detail = format!(
+            "bulk Delivery/Health not yet caught up \
+(base_rows={base_rows} target_rows={target_rows} lag={lag}).\n\
+Base:\n{base_after}\nTarget:\n{target_after}\nStatus:\n{status_out}"
+        );
+        if measured_duration_ms > BULK_LOAD_MAX_DURATION_MS {
+            break (base_rows, target_rows, lag);
+        }
+        tokio::time::sleep(BULK_LOAD_SETTLE_POLL).await;
+    };
+
+    let measured_duration_ms = load_started.elapsed().as_millis();
+    let measured_rows_per_s = if load_started.elapsed().as_secs_f64() > 0.0 {
+        BULK_LOAD_ROW_COUNT as f64 / load_started.elapsed().as_secs_f64()
     } else {
         BULK_LOAD_ROW_COUNT as f64
     };
 
-    let base_after = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            BULK_LOAD_TABLE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            BULK_LOAD_COLLECTION,
-        ],
-    )
-    .await?;
-    let status_out = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-
-    let base_rows = parse_inspect_row_count(&base_after).ok_or_else(|| {
-        CliError::Failed(format!(
-            "Lab Scenario could not parse Base row count after bulk Initial Load:\n{base_after}"
-        ))
-    })?;
-    let target_rows = parse_target_document_count(&target_after).ok_or_else(|| {
-        CliError::Failed(format!(
-            "Lab Scenario could not parse Target document count after bulk Delivery:\n{target_after}"
-        ))
-    })?;
-    let lag = parse_sync_lag_for_table(&status_out, BULK_LOAD_TABLE).ok_or_else(|| {
-        CliError::Failed(format!(
-            "Lab Scenario could not parse Sync Health lag for {BULK_LOAD_TABLE}:\n{status_out}"
-        ))
-    })?;
-
     let rows_applied = count_delivery_ops(&apply_out).max(base_rows);
+    // Correctness is row-level Managed outcomes; lag/duration/throughput are threshold axes.
     let correctness =
         base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
     let sample = BulkLoadMetricSample {
@@ -1555,7 +1663,13 @@ min_rows_per_s={BULK_LOAD_MIN_ROWS_PER_S}"
         rows_per_s: measured_rows_per_s,
         min_rows_per_s: BULK_LOAD_MIN_ROWS_PER_S,
     };
-    let (thresholds_ok, threshold_detail) = evaluate_bulk_load_thresholds(&sample);
+    let (thresholds_ok, mut threshold_detail) = evaluate_bulk_load_thresholds(&sample);
+    if !settled && !thresholds_ok && !last_detail.is_empty() {
+        threshold_detail = format!(
+            "{threshold_detail} (bulk Delivery/Health settle incomplete within \
+max_duration_ms={BULK_LOAD_MAX_DURATION_MS}). {last_detail}"
+        );
+    }
 
     let mut detail_parts = Vec::new();
     if !correctness {

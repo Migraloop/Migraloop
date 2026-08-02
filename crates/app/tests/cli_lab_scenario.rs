@@ -2,11 +2,11 @@
 //!
 //! Agreed seam (issues #60–#64, #63 / PRD #55): CLI Lab Scenario commands.
 //! Always-on tests cover catalog listing (including bulk-load), help surface,
-//! one-at-a-time rejection, and Namespace cleanup control surface. Metric
-//! threshold vs correctness fail-axis reporting for bulk-load is covered in
-//! `migraloop-cli` unit tests (`lab_scenario::tests`). Full Scenario run /
-//! re-run / remove against the Lab Fixture is ignored by default (Docker +
-//! Instant Client).
+//! one-at-a-time rejection, Namespace cleanup control surface, and CLI-seam
+//! bulk-load correctness-fail / metrics-fail probes
+//! (`MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE`). Full Scenario run / re-run /
+//! remove against the Lab Fixture is ignored by default (Docker + Instant
+//! Client).
 
 use std::fs;
 use std::process::Command;
@@ -122,6 +122,90 @@ async fn lab_scenario_list_includes_bulk_load() {
     assert!(
         out.contains("bulk-load"),
         "catalog must list bulk-load Lab Scenario (~100k Source inserts), got:\n{out}"
+    );
+}
+
+/// CLI-seam metrics-fail: threshold failure fails the Scenario while correctness would pass.
+#[tokio::test]
+async fn lab_scenario_bulk_load_threshold_fail_via_cli_probe() {
+    let (_tmp, lab) = temp_lab_dir();
+    let run = Command::new(bin())
+        .env("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE", "threshold-fail")
+        .args(["lab", "scenario", "run", "bulk-load", "--lab-dir", &lab])
+        .output()
+        .expect("run bulk-load threshold-fail probe");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        !run.status.success(),
+        "threshold-fail probe must fail the Scenario run, got:\n{out}"
+    );
+    assert!(
+        out.contains("Lab Scenario: FAIL"),
+        "expected FAIL report, got:\n{out}"
+    );
+    assert!(
+        out.contains("correctness=pass"),
+        "metrics-fail must keep correctness=pass, got:\n{out}"
+    );
+    assert!(
+        out.contains("thresholds=fail"),
+        "expected thresholds=fail, got:\n{out}"
+    );
+    assert!(
+        out.contains("lag=") && out.contains("duration_ms=") && out.contains("rows_per_s="),
+        "expected lag/throughput/duration metrics, got:\n{out}"
+    );
+    assert!(
+        out.contains("Lab Scenario threshold failed"),
+        "US36 must name threshold failure, got:\n{out}"
+    );
+    assert!(
+        out.contains("namespace=left in place"),
+        "failed run must keep Namespace, got:\n{out}"
+    );
+}
+
+/// CLI-seam correctness-fail: row-level miss fails even when metrics would pass.
+#[tokio::test]
+async fn lab_scenario_bulk_load_correctness_fail_via_cli_probe() {
+    let (_tmp, lab) = temp_lab_dir();
+    let run = Command::new(bin())
+        .env("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE", "correctness-fail")
+        .args(["lab", "scenario", "run", "bulk-load", "--lab-dir", &lab])
+        .output()
+        .expect("run bulk-load correctness-fail probe");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        !run.status.success(),
+        "correctness-fail probe must fail the Scenario run, got:\n{out}"
+    );
+    assert!(
+        out.contains("Lab Scenario: FAIL"),
+        "expected FAIL report, got:\n{out}"
+    );
+    assert!(
+        out.contains("correctness=fail"),
+        "expected correctness=fail, got:\n{out}"
+    );
+    assert!(
+        out.contains("thresholds=pass"),
+        "correctness-fail must keep thresholds=pass when metrics would pass, got:\n{out}"
+    );
+    assert!(
+        out.contains("Lab Scenario correctness failed"),
+        "US36 must name correctness failure, got:\n{out}"
+    );
+    assert!(
+        out.contains("detail=correctness:"),
+        "expected correctness detail, got:\n{out}"
     );
 }
 
