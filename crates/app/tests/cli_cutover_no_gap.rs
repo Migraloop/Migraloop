@@ -170,7 +170,8 @@ async fn cutover_establishes_low_watermark_and_loses_no_source_changes() {
         "Initial Load must establish a low-watermark before snapshot, got:\n{apply_out}"
     );
 
-    // Snapshot baseline still has Alice (pre-update) and Bob; Alicia change is after watermark.
+    // Snapshot has Alice (pre-update), Bob, and Carol (overlap with Incremental INSERT).
+    // Alicia change is after watermark and must not be lost at cutover.
     let base_before = Command::new(bin())
         .args(["base", "--platform-store-url", &url, "--table", "CUSTOMERS"])
         .output()
@@ -178,13 +179,15 @@ async fn cutover_establishes_low_watermark_and_loses_no_source_changes() {
     assert!(base_before.status.success());
     let before = String::from_utf8_lossy(&base_before.stdout);
     assert!(
-        before.contains("Alice") && before.contains("Bob") && !before.contains("Alicia"),
-        "snapshot must not already include post-watermark Alicia update, got:\n{before}"
+        before.contains("Alice")
+            && before.contains("Bob")
+            && before.contains("Carol")
+            && !before.contains("Alicia"),
+        "snapshot must include overlap Carol but not post-watermark Alicia, got:\n{before}"
     );
     assert!(
-        before.to_ascii_lowercase().contains("watermark")
-            || before.contains("lowWatermark")
-            || before.contains("low_watermark"),
+        before.to_ascii_lowercase().contains("low-watermark")
+            || before.to_ascii_lowercase().contains("watermark"),
         "Base inspect must surface cutover low-watermark, got:\n{before}"
     );
 

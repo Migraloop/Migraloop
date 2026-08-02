@@ -126,6 +126,8 @@ fn customers_fixture() -> InitialLoadSnapshot {
             col("BIO", "BLOB", false),
         ],
         // Include unsupported BIO values so Initial Load must actively omit them.
+        // Carol is in the snapshot AND as an Incremental INSERT after the low-watermark
+        // (overlap duplicate absorbed idempotently; ADR-0004).
         rows: vec![
             row(&[
                 ("ID", json_num(1)),
@@ -140,6 +142,13 @@ fn customers_fixture() -> InitialLoadSnapshot {
                 ("EMAIL", json_str("bob@example.com")),
                 ("ACTIVE", json_num(0)),
                 ("BIO", json_str("blob-bytes-bob")),
+            ]),
+            row(&[
+                ("ID", json_num(3)),
+                ("NAME", json_str("Carol")),
+                ("EMAIL", json_str("carol@example.com")),
+                ("ACTIVE", json_num(1)),
+                ("BIO", json_str("blob-bytes-carol")),
             ]),
         ],
     }
@@ -208,7 +217,8 @@ pub fn incremental_changes_stub(
 
 fn customers_incremental_fixture() -> Vec<ChangeEvent> {
     // Positions are after CUSTOMERS_LOW_WATERMARK (1000). The Alice→Alicia update at
-    // 1050 is the classic "snapshot saw old value; CDC overlap must not gap" case.
+    // 1050 is the classic "snapshot saw old value; Incremental Capture overlap must
+    // not gap" case.
     vec![
         ChangeEvent {
             table: "CUSTOMERS".to_string(),

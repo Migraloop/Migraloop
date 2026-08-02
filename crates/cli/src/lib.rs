@@ -578,8 +578,10 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             ));
         }
 
-        // Incremental Capture into Base first; Delivery reads Base (and delete identities).
-        let mut captured_by_table: Vec<(String, Vec<ChangeEvent>)> = Vec::new();
+        // Prefer duplicates over gaps (ADR-0004): always read Incremental Capture from the
+        // cutover low-watermark, absorb already-applied change_ids via Platform Store dedupe,
+        // Deliver first, then durable-ize Base/checkpoint so a Delivery failure can retry.
+        let mongo = mongo_target_from_deployment(deployment)?;
 
         for (schema, table) in tables {
             let (dataset, base_rows) =
@@ -599,20 +601,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 ))
             })?;
 
-            // Resume from checkpoint when present; otherwise start at low-watermark (overlap).
-            let from_position = match dataset.capture_checkpoint {
-                Some(checkpoint) => CapturePosition::from_i64(checkpoint.saturating_add(1))
-                    .unwrap_or(low_watermark),
-                None => low_watermark,
-            };
-            if from_position < low_watermark {
-                return Err(CliError::Failed(format!(
-                    "Incremental Capture for {table} cannot start before cutover low-watermark \
-                     {low_watermark} (from_position={from_position})"
-                )));
-            }
-
-            let candidate_changes = incremental_changes_stub(&table, from_position)
+            let candidate_changes = incremental_changes_stub(&table, low_watermark)
                 .map_err(|err| CliError::Failed(err.to_string()))?;
             let candidate_ids: Vec<String> = candidate_changes
                 .iter()
@@ -647,6 +636,76 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 base_rows.into_iter().map(|r| r.data).collect();
 
             apply_change_events_to_base_rows(&mut rows, &changes, &supported_names)?;
+
+            // Delivery before durable checkpoint so cutover retries prefer duplicate applies.
+            for pipeline in &deployment_pipelines {
+                if pipeline.mode != "direct"
+                    || pipeline.target_collection.is_empty()
+                    || pipeline.source_table != table
+                {
+                    continue;
+                }
+
+                let mut upserts = Vec::new();
+                let mut deletes = Vec::new();
+                for change in &changes {
+                    match change.op {
+                        ChangeOp::Insert | ChangeOp::Update => {
+                            let Some(base_row) = rows
+                                .iter()
+                                .find(|row| row_matches_identity(row, &change.identity))
+                            else {
+                                return Err(CliError::Failed(format!(
+                                    "Base Dataset {} missing row for Output Identity {:?}",
+                                    pipeline.source_table, change.identity
+                                )));
+                            };
+                            let identity =
+                                output_identity_from_row(base_row, &dataset.primary_key)?;
+                            upserts.push(DeliveryDocument {
+                                identity,
+                                managed_fields: base_row.clone(),
+                            });
+                        }
+                        ChangeOp::Delete => {
+                            let identity_map: serde_json::Map<String, serde_json::Value> = change
+                                .identity
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            deletes.push(output_identity_from_row(
+                                &identity_map,
+                                &dataset.primary_key,
+                            )?);
+                        }
+                    }
+                }
+
+                let upserted =
+                    upsert_managed_documents(&mongo, &pipeline.target_collection, &upserts)
+                        .await
+                        .map_err(|err| CliError::Failed(err.to_string()))?;
+                let deleted =
+                    delete_documents_by_identity(&mongo, &pipeline.target_collection, &deletes)
+                        .await
+                        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+                let applied = (upserted + deleted) as i32;
+                update_pipeline_delivery_progress(
+                    platform_store_url,
+                    &pipeline.deployment_name,
+                    &pipeline.name,
+                    "delivered",
+                    Some(applied),
+                )
+                .await
+                .map_err(|err| CliError::Failed(err.to_string()))?;
+
+                println!(
+                    "Delivery complete: Pipeline {} upserts={} deletes={} (from Base)",
+                    pipeline.name, upserted, deleted
+                );
+            }
 
             let max_position = changes
                 .iter()
@@ -692,90 +751,6 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                  low-watermark overlap (rows={}, checkpoint={max_position})",
                 changes.len(),
                 updated.row_count
-            );
-            captured_by_table.push((table, changes));
-        }
-
-        let mongo = mongo_target_from_deployment(deployment)?;
-        for pipeline in &deployment_pipelines {
-            if pipeline.mode != "direct" || pipeline.target_collection.is_empty() {
-                continue;
-            }
-
-            let Some((_, changes)) = captured_by_table
-                .iter()
-                .find(|(table, _)| table == &pipeline.source_table)
-            else {
-                continue;
-            };
-
-            // Direct Pipeline Delivery: upserts from current Base rows; deletes by identity.
-            let (dataset, base_rows) = get_base_rows(
-                platform_store_url,
-                &pipeline.source_table,
-                Some(&pipeline.deployment_name),
-            )
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-
-            let mut upserts = Vec::new();
-            let mut deletes = Vec::new();
-            for change in changes {
-                match change.op {
-                    ChangeOp::Insert | ChangeOp::Update => {
-                        let Some(base_row) = base_rows
-                            .iter()
-                            .find(|row| row_matches_identity(&row.data, &change.identity))
-                        else {
-                            return Err(CliError::Failed(format!(
-                                "Base Dataset {} missing row for Output Identity {:?}",
-                                pipeline.source_table, change.identity
-                            )));
-                        };
-                        let identity =
-                            output_identity_from_row(&base_row.data, &dataset.primary_key)?;
-                        upserts.push(DeliveryDocument {
-                            identity,
-                            managed_fields: base_row.data.clone(),
-                        });
-                    }
-                    ChangeOp::Delete => {
-                        let identity_map: serde_json::Map<String, serde_json::Value> = change
-                            .identity
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        deletes.push(output_identity_from_row(
-                            &identity_map,
-                            &dataset.primary_key,
-                        )?);
-                    }
-                }
-            }
-
-            let upserted =
-                upsert_managed_documents(&mongo, &pipeline.target_collection, &upserts)
-                    .await
-                    .map_err(|err| CliError::Failed(err.to_string()))?;
-            let deleted =
-                delete_documents_by_identity(&mongo, &pipeline.target_collection, &deletes)
-                    .await
-                    .map_err(|err| CliError::Failed(err.to_string()))?;
-
-            let applied = (upserted + deleted) as i32;
-            update_pipeline_delivery_progress(
-                platform_store_url,
-                &pipeline.deployment_name,
-                &pipeline.name,
-                "delivered",
-                Some(applied),
-            )
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-
-            println!(
-                "Delivery complete: Pipeline {} upserts={} deletes={} (from Base)",
-                pipeline.name, upserted, deleted
             );
         }
     }
@@ -876,13 +851,13 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             }
             match (base.capture_low_watermark, base.capture_checkpoint) {
                 (Some(wm), Some(cp)) => {
-                    println!("  Cutover: lowWatermark={wm} checkpoint={cp}");
+                    println!("  Cutover: low-watermark={wm} checkpoint={cp}");
                 }
                 (Some(wm), None) => {
-                    println!("  Cutover: lowWatermark={wm} checkpoint=(none)");
+                    println!("  Cutover: low-watermark={wm} checkpoint=(none)");
                 }
                 _ => {
-                    println!("  Cutover: lowWatermark=(missing)");
+                    println!("  Cutover: low-watermark=(missing)");
                 }
             }
             println!(
@@ -930,13 +905,13 @@ async fn print_base(
     );
     match (dataset.capture_low_watermark, dataset.capture_checkpoint) {
         (Some(wm), Some(cp)) => {
-            println!("cutover: lowWatermark={wm} checkpoint={cp}");
+            println!("cutover: low-watermark={wm} checkpoint={cp}");
         }
         (Some(wm), None) => {
-            println!("cutover: lowWatermark={wm} checkpoint=(none)");
+            println!("cutover: low-watermark={wm} checkpoint=(none)");
         }
         _ => {
-            println!("cutover: lowWatermark=(missing)");
+            println!("cutover: low-watermark=(missing)");
         }
     }
     let columns = dataset

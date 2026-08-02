@@ -191,7 +191,7 @@ async fn stub_incremental_insert_update_delete_update_base_then_mongo() {
 
     migrate_and_apply(&url, &config);
 
-    // Baseline after Initial Load: Alice (1) and Bob (2).
+    // Baseline after Initial Load: Alice (1), Bob (2), and overlap Carol (3).
     let base_before = Command::new(bin())
         .args(["base", "--platform-store-url", &url, "--table", "CUSTOMERS"])
         .output()
@@ -199,7 +199,7 @@ async fn stub_incremental_insert_update_delete_update_base_then_mongo() {
     assert!(base_before.status.success());
     let before = String::from_utf8_lossy(&base_before.stdout);
     assert!(
-        before.contains("Alice") && before.contains("Bob"),
+        before.contains("Alice") && before.contains("Bob") && before.contains("Carol"),
         "expected Initial Load rows before incremental, got:\n{before}"
     );
 
@@ -355,10 +355,11 @@ async fn incremental_delivery_preserves_non_managed_fields_and_status_shows_prog
             && (status_out.contains("delivered") || status_out.contains("ok")),
         "expected Delivery Health progress after incremental Delivery, got:\n{status_out}"
     );
-    // Initial Load delivered 2 docs; stub batch Delivers 3 Output Identity applies (2 upsert + 1 delete).
+    // Initial Load delivered 3 docs (Alice/Bob/Carol); stub batch Delivers 3 Output Identity
+    // applies (2 upsert + 1 delete), including Carol overlap upsert.
     assert!(
         status_out.contains("Delivery Health: ok")
-            && status_out.contains("appliedChanges=5"),
-        "expected Delivery Health appliedChanges=5 after Initial Load + incremental, got:\n{status_out}"
+            && status_out.contains("appliedChanges=6"),
+        "expected Delivery Health appliedChanges=6 after Initial Load + incremental, got:\n{status_out}"
     );
 }
