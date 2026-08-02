@@ -13,7 +13,7 @@ migraloop status
 - **Platform Store** 可达性 / 健康与 schema version
 - 每个 **Deployment**（Source/Target 标识、LogMiner 机制：contract 或 OCI）
 - 每条 **Pipeline**（mode、source 表、target collection、Delivery status）
-- 每个 **Base Dataset**（status、行数、列、省略的不支持类型、Initial Load / cutover watermarks、含 appliedChanges / lag / checkpoint 的 **Sync Health**）
+- 每个 **Base Dataset**（status、行数、列、省略的不支持类型、Initial Load / cutover watermarks、含 appliedChanges / lag / checkpoint 的 **Sync Health**、含 checked/mismatched 计数的 **Source Alignment**）
 - 每条 Pipeline 的 **Delivery Health**（已应用变更 / status；有 Poison Change quarantine 时为 `unhealthy`；有 blocking Schema Change pause 时为 `paused`）
 - 作用中的 **Quarantine** 行（Output Identity、change id、attempts、last error — unhealthy / not aligned）
 - Transform Pipelines 的 **Derived Datasets**（若有）
@@ -39,7 +39,8 @@ migraloop status
 
 ## Sync Health vs Delivery Health
 
-- **Sync Health** — 从 Source capture 到 Base Dataset 是否跟上且成功应用。必要但不充分证明与 source 比特级对齐（见领域文档中的 Source Alignment Check / 后续 Operations 深度）。
+- **Sync Health** — 从 Source capture 到 Base Dataset 是否跟上且成功应用。必要但不充分证明 Base 匹配 Source。
+- **Source Alignment** — 该 Base 上次 Source Alignment Check 结果（`unknown` / `aligned` / `partial`）。在把 Base 当作 Drift baseline 前运行 `migraloop align`（resource-gated；用 Source reads 修复 Base；从不写入 Source）。`partial` 表示上次检查碰到 `--max-rows` budget。
 - **Delivery Health** — Pipeline 的 Target Binding change stream 是否跟上且成功应用。对 non-Managed 字段的编辑与此信号无关。
 
 ## Logs 与 metrics

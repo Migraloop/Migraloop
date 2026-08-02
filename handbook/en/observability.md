@@ -13,7 +13,7 @@ migraloop status
 - **Platform Store** reachability / health and schema version
 - Each **Deployment** (Source/Target identity, LogMiner mechanism: contract vs OCI)
 - Each **Pipeline** (mode, source table, target collection, Delivery status)
-- Each **Base Dataset** (status, row count, columns, omitted unsupported types, Initial Load / cutover watermarks, **Sync Health** with appliedChanges / lag / checkpoint)
+- Each **Base Dataset** (status, row count, columns, omitted unsupported types, Initial Load / cutover watermarks, **Sync Health** with appliedChanges / lag / checkpoint, **Source Alignment** with checked/mismatched counts)
 - **Delivery Health** per Pipeline (applied changes / status; `unhealthy` when Poison Change quarantine is active; `paused` when blocking Schema Change pause is active)
 - Active **Quarantine** rows (Output Identity, change id, attempts, last error — unhealthy / not aligned)
 - **Derived Datasets** for Transform Pipelines when present
@@ -39,7 +39,8 @@ Add `--deployment <name>` when multiple Deployments share table/collection/pipel
 
 ## Sync Health vs Delivery Health
 
-- **Sync Health** — capture from Source into a Base Dataset is caught up and applying successfully. Necessary but not sufficient to claim byte-identical source alignment (see Source Alignment Check in domain docs / future Operations depth).
+- **Sync Health** — capture from Source into a Base Dataset is caught up and applying successfully. Necessary but not sufficient to claim Base matches Source.
+- **Source Alignment** — last Source Alignment Check result for that Base (`unknown` / `aligned` / `partial`). Run `migraloop align` (resource-gated; repairs Base from Source reads; never writes Source) before treating Base as a Drift baseline. `partial` means the last check hit its `--max-rows` budget.
 - **Delivery Health** — the change stream for a Pipeline’s Target Binding is caught up and applying successfully. Edits to non-Managed fields are irrelevant.
 
 ## Logs and metrics

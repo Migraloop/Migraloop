@@ -127,6 +127,12 @@ const SCHEMA_CHANGE_PAUSE_COLLECTION: &str = "lab_sc_customers";
 const SCHEMA_CHANGE_PAUSE_PIPELINE: &str = "lab-sc-customers";
 const SCHEMA_CHANGE_PAUSE_DEPLOYMENT: &str = "lab-schema-change-pause";
 
+const SOURCE_ALIGNMENT_ID: &str = "source-alignment";
+const SOURCE_ALIGNMENT_TABLE: &str = "LAB_SA_CUSTOMERS";
+const SOURCE_ALIGNMENT_COLLECTION: &str = "lab_sa_customers";
+const SOURCE_ALIGNMENT_PIPELINE: &str = "lab-sa-customers";
+const SOURCE_ALIGNMENT_DEPLOYMENT: &str = "lab-source-alignment";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -210,6 +216,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         CHANGE_PIPELINE_ID,
         POISON_QUARANTINE_ID,
         SCHEMA_CHANGE_PAUSE_ID,
+        SOURCE_ALIGNMENT_ID,
     ]
 }
 
@@ -253,6 +260,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             SCHEMA_CHANGE_PAUSE_ID,
             "Blocking DDL Schema Change warn+pause",
+        ),
+        (
+            SOURCE_ALIGNMENT_ID,
+            "Source Alignment Check for Base Datasets",
         ),
     ]
 }
@@ -547,6 +558,7 @@ async fn scenario_run(
         CHANGE_PIPELINE_ID => run_change_pipeline(lab_dir).await,
         POISON_QUARANTINE_ID => run_poison_quarantine(lab_dir).await,
         SCHEMA_CHANGE_PAUSE_ID => run_schema_change_pause(lab_dir).await,
+        SOURCE_ALIGNMENT_ID => run_source_alignment(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -638,6 +650,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         CHANGE_PIPELINE_ID => remove_change_pipeline_namespace(lab_dir).await,
         POISON_QUARANTINE_ID => remove_poison_quarantine_namespace(lab_dir).await,
         SCHEMA_CHANGE_PAUSE_ID => remove_schema_change_pause_namespace(lab_dir).await,
+        SOURCE_ALIGNMENT_ID => remove_source_alignment_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -4027,6 +4040,337 @@ EXIT;\n"
                 "Failed to drive Source DDL for schema-change-pause:\n{err}"
             ))
         })
+}
+
+async fn run_source_alignment(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {SOURCE_ALIGNMENT_ID}");
+    println!(
+        "Scenario Namespace: table={SOURCE_ALIGNMENT_TABLE} \
+collection={SOURCE_ALIGNMENT_COLLECTION} deployment={SOURCE_ALIGNMENT_DEPLOYMENT} \
+pipeline={SOURCE_ALIGNMENT_PIPELINE}"
+    );
+
+    prepare_source_alignment_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, SOURCE_ALIGNMENT_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: mutating Source ID=1 → AlignedAlice (controlled Base≠Source; no sync)..."
+    );
+    mutate_source_alignment_name(lab_dir, 1, "AlignedAlice").await?;
+
+    println!("Lab Scenario: running Source Alignment Check (default resource-gated budget)...");
+    let align_out = run_product_cli(
+        &bin,
+        &[
+            "align",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            SOURCE_ALIGNMENT_TABLE,
+        ],
+    )
+    .await?;
+    let align_lower = align_out.to_ascii_lowercase();
+    if !(align_lower.contains("source alignment")
+        && (align_lower.contains("mismatched") || align_lower.contains("misaligned"))
+        && align_lower.contains("repaired"))
+    {
+        return Err(CliError::Failed(format!(
+            "align must detect mismatch and repair Base from Source:\n{align_out}"
+        )));
+    }
+    if align_lower.contains("write source") || align_lower.contains("updating source") {
+        return Err(CliError::Failed(format!(
+            "align must never write Source:\n{align_out}"
+        )));
+    }
+
+    let base_out = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            SOURCE_ALIGNMENT_TABLE,
+        ],
+    )
+    .await?;
+    if !managed_name_present(&base_out, "AlignedAlice") || managed_name_present(&base_out, "Alice")
+    {
+        return Err(CliError::Failed(format!(
+            "Base must be repaired to AlignedAlice from Source:\n{base_out}"
+        )));
+    }
+
+    let source_name = query_source_alignment_name(lab_dir, 1).await?;
+    if source_name != "AlignedAlice" {
+        return Err(CliError::Failed(format!(
+            "Source must remain AlignedAlice after align (never written by check); got {source_name:?}"
+        )));
+    }
+
+    let status_out = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !(status_out.contains("Source Alignment:")
+        && status_out.to_ascii_lowercase().contains("aligned"))
+    {
+        return Err(CliError::Failed(format!(
+            "status must show Source Alignment after check:\n{status_out}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: mutating Source ID=2 → BobAligned; align --max-rows 1 (resource gate)..."
+    );
+    mutate_source_alignment_name(lab_dir, 2, "BobAligned").await?;
+    let gated_out = run_product_cli(
+        &bin,
+        &[
+            "align",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            SOURCE_ALIGNMENT_TABLE,
+            "--max-rows",
+            "1",
+        ],
+    )
+    .await?;
+    let gated_lower = gated_out.to_ascii_lowercase();
+    if !(gated_lower.contains("maxrows=1")
+        && (gated_lower.contains("partial") || gated_lower.contains("truncated")))
+    {
+        return Err(CliError::Failed(format!(
+            "resource-gated align must report maxRows=1 and partial/truncated:\n{gated_out}"
+        )));
+    }
+    let base_gated = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            SOURCE_ALIGNMENT_TABLE,
+        ],
+    )
+    .await?;
+    if managed_name_present(&base_gated, "BobAligned") {
+        return Err(CliError::Failed(format!(
+            "max-rows=1 must not full-slam repair Bob:\n{base_gated}"
+        )));
+    }
+
+    println!("Lab Scenario: align with larger budget to repair remaining Base row...");
+    let full_out = run_product_cli(
+        &bin,
+        &[
+            "align",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            SOURCE_ALIGNMENT_TABLE,
+            "--max-rows",
+            "1000",
+        ],
+    )
+    .await?;
+    let base_full = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            SOURCE_ALIGNMENT_TABLE,
+        ],
+    )
+    .await?;
+    if !managed_name_present(&base_full, "BobAligned") {
+        return Err(CliError::Failed(format!(
+            "larger budget must repair Bob from Source:\n{full_out}\n{base_full}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out);
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (detect + repair Base from Source; resource-gated max-rows; Source not written)"
+    );
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: "Source Alignment Check (OCI reads)".to_string(),
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_source_alignment_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={SOURCE_ALIGNMENT_TABLE}, collection={SOURCE_ALIGNMENT_COLLECTION}, \
+          deployment={SOURCE_ALIGNMENT_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {SOURCE_ALIGNMENT_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for source-alignment:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{SOURCE_ALIGNMENT_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for source-alignment:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, SOURCE_ALIGNMENT_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{SOURCE_ALIGNMENT_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_source_alignment_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_source_alignment_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {SOURCE_ALIGNMENT_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {SOURCE_ALIGNMENT_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {SOURCE_ALIGNMENT_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {SOURCE_ALIGNMENT_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare source-alignment Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_source_alignment_name(
+    lab_dir: &Path,
+    id: i64,
+    name: &str,
+) -> Result<(), CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {SOURCE_ALIGNMENT_TABLE} SET NAME = '{name}' WHERE ID = {id};\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to mutate Source for source-alignment:\n{err}"
+            ))
+        })
+}
+
+async fn query_source_alignment_name(lab_dir: &Path, id: i64) -> Result<String, CliError> {
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+SELECT NAME FROM {SOURCE_ALIGNMENT_TABLE} WHERE ID = {id};\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    let out = sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to query Source for source-alignment:\n{err}"
+            ))
+        })?;
+    let name = out
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && *line != "NAME")
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return Err(CliError::Failed(format!(
+            "Source query for ID={id} returned empty NAME:\n{out}"
+        )));
+    }
+    Ok(name)
 }
 
 async fn run_remove_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {

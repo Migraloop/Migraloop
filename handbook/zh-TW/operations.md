@@ -25,6 +25,17 @@ Source DDL 會依每條 Pipeline 的相依性分類（ADR-0009）：
 
 被 quarantine 的 keys 在修復或重試前保持 unhealthy / not aligned—絕不默默略過。不要預期單列壞資料就 pause 整條 Pipeline。有界 Delivery 重試後，`migraloop sync` 會持久化 quarantine、發出 Operator 可見的 **ALERT**，並繼續處理其他 changes；`migraloop status` 會顯示 `Delivery Health: unhealthy`，並把每個被 quarantine 的 Output Identity 標為 unhealthy / not aligned。
 
+
+## Source Alignment Check
+
+單靠 Sync Health 不能證明 Base 符合 Source。Operator 在把 Base Dataset 當作 Drift baseline 之前，應執行可排程、resource-gated 的 **Source Alignment Check**：
+
+```bash
+migraloop align [--table CUSTOMERS] [--max-rows 1000]
+```
+
+檢查最多讀取 `--max-rows` 筆 Source 列（預設 `1000`—不是全表 slam），以主鍵比對 Base，並在不一致時用這些 Source reads 修復 Base。**從不寫入 Source**。`status` 顯示上次執行的 `Source Alignment: aligned|partial|unknown` 與 checked/mismatched 計數（`partial` = budget 被截斷）。見 [CLI 與 Config](cli-and-config.md) 與 [Observability](observability.md)。
+
 ## Backpressure
 
 當 Platform Store apply、Derived maintenance 或 Target Delivery 跟不上時（ADR-0020）：

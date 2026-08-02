@@ -1,6 +1,7 @@
 # Committed Operator CLI subcommand surface.
 # Keep in sync with crates/cli/src/lib.rs `enum Command` (clap kebab-case names).
 # When this file changes, update handbook/*/cli-and-config.md in all locales.
+align
 apply
 base
 derived

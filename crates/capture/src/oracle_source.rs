@@ -56,6 +56,129 @@ pub fn initial_load_for_source(
     Ok(snapshot)
 }
 
+/// Resource-gated Source read for Source Alignment Check (issue #24).
+///
+/// Reads at most `max_rows` Source rows (never a full slam by default). Does not
+/// write the Source. Contract/stub hosts sample the contract catalog; live hosts
+/// use `FETCH FIRST` over OCI.
+pub fn alignment_check_read_for_source(
+    source: &OracleSourceConnect,
+    password: &str,
+    schema: &str,
+    table: &str,
+    max_rows: u32,
+    configured_timezone: Option<&str>,
+) -> Result<crate::AlignmentCheckSample, CaptureError> {
+    if max_rows == 0 {
+        return Err(CaptureError::ContractCatalog {
+            detail: "Source Alignment Check max_rows must be >= 1".to_string(),
+        });
+    }
+    if source.is_contract_harness() {
+        let snapshot = load_contract_source_catalog()?.initial_load(table, configured_timezone)?;
+        let total = snapshot.rows.len();
+        let take = (max_rows as usize).min(total);
+        let truncated = total > take;
+        return Ok(crate::AlignmentCheckSample {
+            table: snapshot.table,
+            primary_key: snapshot.primary_key,
+            columns: snapshot.columns,
+            rows: snapshot.rows.into_iter().take(take).collect(),
+            truncated,
+            source_row_count: Some(total),
+        });
+    }
+    let conn = connect_oracle(source, password)?;
+    let owner = resolve_oracle_schema(source, schema);
+    let mut sample = alignment_check_read_oci(&conn, &source.host, &owner, table, max_rows)?;
+    let db_tz = read_db_timezone(&conn, &source.host).ok().flatten();
+    let tz = configured_timezone.or(db_tz.as_deref());
+    // Reuse Initial Load temporal normalization on the sampled rows.
+    let mut snapshot = InitialLoadSnapshot {
+        table: sample.table.clone(),
+        low_watermark: CapturePosition(0),
+        primary_key: sample.primary_key.clone(),
+        columns: sample.columns.clone(),
+        rows: sample.rows,
+    };
+    normalize_snapshot_temporals(&mut snapshot, tz)?;
+    sample.rows = snapshot.rows;
+    Ok(sample)
+}
+
+fn alignment_check_read_oci(
+    conn: &Connection,
+    host: &str,
+    owner: &str,
+    table: &str,
+    max_rows: u32,
+) -> Result<crate::AlignmentCheckSample, CaptureError> {
+    let table = table.trim().to_ascii_uppercase();
+    if table.is_empty() {
+        return Err(CaptureError::UnknownTable(table));
+    }
+    let columns = discover_columns(conn, host, owner, &table)?;
+    if columns.is_empty() {
+        return Err(CaptureError::UnknownTable(format!("{owner}.{table}")));
+    }
+    let primary_key = discover_primary_key(conn, host, owner, &table)?;
+    if primary_key.is_empty() {
+        return Err(CaptureError::OciUnavailable {
+            host: host.to_string(),
+            detail: format!(
+                "Oracle table {owner}.{table} has no primary key; Source Alignment Check requires a PK"
+            ),
+        });
+    }
+
+    let count_sql = format!("SELECT COUNT(*) FROM \"{owner}\".\"{table}\"");
+    let source_row_count: i64 = conn
+        .query_row_as::<(i64,)>(&count_sql, &[])
+        .map_err(|err| map_oracle_error(host, err))?
+        .0;
+    let source_row_count = usize::try_from(source_row_count.max(0)).unwrap_or(usize::MAX);
+
+    let select_cols: Vec<String> = columns
+        .iter()
+        .map(|c| format!("TO_CHAR(\"{}\") AS \"{}\"", c.name, c.name))
+        .collect();
+    // ORDER BY PK for a stable resource-gated window (schedulable / resumable later).
+    let order_cols: Vec<String> = primary_key
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect();
+    let sql = format!(
+        "SELECT {} FROM \"{}\".\"{}\" ORDER BY {} FETCH FIRST {} ROWS ONLY",
+        select_cols.join(", "),
+        owner,
+        table,
+        order_cols.join(", "),
+        max_rows
+    );
+
+    let rows = conn.query(&sql, &[]).map_err(|err| map_oracle_error(host, err))?;
+    let mut out_rows = Vec::new();
+    for row_result in rows {
+        let row = row_result.map_err(|err| map_oracle_error(host, err))?;
+        let mut values = Vec::with_capacity(columns.len());
+        for idx in 0..columns.len() {
+            let v: Option<String> = row.get(idx).map_err(|err| map_oracle_error(host, err))?;
+            values.push(v);
+        }
+        out_rows.push(values_to_json(values, &columns)?);
+    }
+
+    let truncated = source_row_count > out_rows.len();
+    Ok(crate::AlignmentCheckSample {
+        table,
+        primary_key,
+        columns,
+        rows: out_rows,
+        truncated,
+        source_row_count: Some(source_row_count),
+    })
+}
+
 fn initial_load_oci(
     conn: &Connection,
     host: &str,
@@ -288,6 +411,23 @@ mod tests {
             .expect("contract initial load");
         assert_eq!(snapshot.table, "CUSTOMERS");
         assert!(!snapshot.rows.is_empty());
+    }
+
+    #[test]
+    fn contract_alignment_check_read_respects_max_rows_budget() {
+        clear_contract_source_catalog_override();
+        let source = OracleSourceConnect {
+            host: "stub".into(),
+            port: 1521,
+            database: "STUB".into(),
+            username: "sync_user".into(),
+        };
+        let sample = alignment_check_read_for_source(&source, "unused", "APP", "CUSTOMERS", 1, None)
+            .expect("gated alignment read");
+        assert_eq!(sample.rows.len(), 1);
+        assert!(sample.truncated);
+        assert_eq!(sample.source_row_count, Some(3));
+        assert_eq!(sample.rows[0].get("NAME"), Some(&json!("Alice")));
     }
 
     #[test]

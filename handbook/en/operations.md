@@ -25,6 +25,16 @@ When a single change or Output Identity repeatedly fails but the rest of the str
 
 Quarantined keys stay unhealthy / not aligned until repaired or retried—never a silent skip. Do not expect a whole-Pipeline pause for one bad row. After bounded Delivery retries, `migraloop sync` persists the quarantine, emits an Operator-visible **ALERT**, and continues other changes; `migraloop status` shows `Delivery Health: unhealthy` with each quarantined Output Identity marked unhealthy / not aligned.
 
+## Source Alignment Check
+
+Sync Health alone does not prove Base matches Source. Operators run a schedulable, resource-gated **Source Alignment Check** before treating a Base Dataset as a Drift baseline:
+
+```bash
+migraloop align [--table CUSTOMERS] [--max-rows 1000]
+```
+
+The check reads at most `--max-rows` Source rows (default `1000` — not a full slam), compares them to Base by primary key, and repairs Base from those Source reads when misaligned. It **never writes Source**. `status` shows `Source Alignment: aligned|partial|unknown` with checked/mismatched counts from the last run (`partial` = budget truncated). See [CLI & Config](cli-and-config.md) and [Observability](observability.md).
+
 ## Backpressure
 
 When Platform Store apply, Derived maintenance, or Target Delivery cannot keep up (ADR-0020):

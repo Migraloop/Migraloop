@@ -1,0 +1,30 @@
+# Lab Scenario recipe (ADR-0025 / issue #24).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: source-alignment
+summary: Source Alignment Check detects Base≠Source, repairs Base only, resource-gated max-rows
+namespace:
+  source_tables:
+    - LAB_SA_CUSTOMERS
+  target_collections:
+    - lab_sa_customers
+  deployment: lab-source-alignment
+  pipelines:
+    - lab-sa-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery)
+    - mutate Source (ID=1 NAME→AlignedAlice) without sync — controlled Base≠Source
+    - run align (default max-rows budget) — detect mismatch, repair Base from Source
+    - assert Base repaired, Source unchanged by align, status shows Source Alignment
+    - mutate Source ID=2; align --max-rows 1 — assert resource gate (not full slam)
+    - align with larger budget — repair remaining Base row
+checks:
+  correctness:
+    - "align detects Base≠Source after controlled Source mutation (mismatched/repaired lines)"
+    - "Base is repaired from Source reads; Source NAME remains AlignedAlice (align never writes Source)"
+    - "status shows Source Alignment after check"
+    - "align --max-rows 1 is resource-gated (partial/truncated; does not repair unchecked rows)"
+thresholds: {}
