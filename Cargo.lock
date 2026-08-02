@@ -1431,6 +1431,7 @@ dependencies = [
  "migraloop-platform-store",
  "migraloop-transform",
  "oracle",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
