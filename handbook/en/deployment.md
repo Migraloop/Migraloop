@@ -34,7 +34,7 @@ For manual end-to-end verification on a disposable real stack (ADR-0025), use th
 
 ```bash
 migraloop lab up      # from repo root (or pass --lab-dir)
-migraloop lab status  # Fixture readiness + connection details; no default Pipeline
+migraloop lab status  # Fixture readiness + active/leftover Scenario Namespace + connection details; no default Pipeline
 migraloop lab scenario list
 migraloop lab scenario run direct-pipeline   # needs host Instant Client (LD_LIBRARY_PATH)
 migraloop lab scenario run rt-project   # Rich Transform project → Derived → Delivery

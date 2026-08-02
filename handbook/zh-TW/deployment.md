@@ -34,7 +34,7 @@ migraloop status
 
 ```bash
 migraloop lab up      # 在 repo 根目錄（或傳 --lab-dir）
-migraloop lab status  # Fixture 就緒狀態 + 連線細節；沒有預設 Pipeline
+migraloop lab status  # Fixture 就緒狀態 + active/leftover Scenario Namespace + 連線細節；沒有預設 Pipeline
 migraloop lab scenario list
 migraloop lab scenario run direct-pipeline   # 需要 host Instant Client（LD_LIBRARY_PATH）
 migraloop lab scenario run rt-project   # Rich Transform project → Derived → Delivery

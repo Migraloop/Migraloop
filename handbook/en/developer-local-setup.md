@@ -43,7 +43,7 @@ Disposable Oracle + MongoDB + Platform Store + app for **manual** Sync→Deliver
 ```bash
 cargo build -p migraloop-app
 ./target/debug/migraloop lab up
-./target/debug/migraloop lab status
+./target/debug/migraloop lab status   # Fixture ready + Scenario run active/leftover/(none)
 ./target/debug/migraloop lab scenario list
 # Scenario apply/sync needs Instant Client: export LD_LIBRARY_PATH=/path/to/instantclient
 ./target/debug/migraloop lab scenario run direct-pipeline
@@ -52,7 +52,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run bulk-load
-# Inspect leftover Scenario Namespace with migraloop base / derived / target, or mutate Lab DBs directly.
+# lab status names leftover Namespace after keep-on-finish; also inspect with base / derived / target.
 # Re-run wipes Namespace first; or: lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
 ```
