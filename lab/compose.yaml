@@ -3,28 +3,32 @@
 #
 # Project name is forced by `migraloop lab` (`migraloop-lab`).
 # Run via: migraloop lab up
+#
+# `network_mode: host` keeps Lab operable in nested Docker environments where
+# bridge container-to-container traffic is blocked; services listen on the host
+# loopback/ports Operators already use for connection details.
 
 name: migraloop-lab
 
 services:
   platform-store:
     image: postgres:16
+    network_mode: host
     environment:
       POSTGRES_USER: migraloop
       POSTGRES_PASSWORD: migraloop
       POSTGRES_DB: migraloop
     volumes:
       - lab_platform_store_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U migraloop -d migraloop"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U migraloop -d migraloop"]
       interval: 5s
       timeout: 5s
       retries: 20
 
   oracle:
     image: gvenzl/oracle-free:23-slim
+    network_mode: host
     environment:
       ORACLE_PASSWORD: lab_oracle_sys
       APP_USER: SYNC_USER
@@ -32,14 +36,8 @@ services:
     volumes:
       - lab_oracle_data:/opt/oracle/oradata
       - ./oracle/init:/container-entrypoint-initdb.d:ro
-    ports:
-      - "1521:1521"
     healthcheck:
-      test:
-        [
-          "CMD",
-          "healthcheck.sh",
-        ]
+      test: ["CMD", "healthcheck.sh"]
       interval: 15s
       timeout: 10s
       retries: 40
@@ -47,19 +45,20 @@ services:
 
   mongo:
     image: mongo:7
+    network_mode: host
     environment:
       MONGO_INITDB_ROOT_USERNAME: migraloop
       MONGO_INITDB_ROOT_PASSWORD: lab_mongo
       MONGO_INITDB_DATABASE: lab
     volumes:
       - lab_mongo_data:/data/db
-    ports:
-      - "27017:27017"
     healthcheck:
       test:
         [
           "CMD",
           "mongosh",
+          "--host",
+          "127.0.0.1",
           "-u",
           "migraloop",
           "-p",
@@ -74,9 +73,15 @@ services:
       retries: 20
 
   app:
+    # Lab uses a host-built binary image (lab/Dockerfile) so bring-up does not
+    # recompile the whole workspace inside Docker. Root Dockerfile remains the
+    # production-shaped install path.
     build:
       context: ..
-      dockerfile: Dockerfile
+      dockerfile: lab/Dockerfile
+      args:
+        MIGRALOOP_BIN: target/debug/migraloop
+    network_mode: host
     depends_on:
       platform-store:
         condition: service_healthy
@@ -85,8 +90,22 @@ services:
       mongo:
         condition: service_healthy
     environment:
-      MIGRALOOP_PLATFORM_STORE_URL: postgres://migraloop:migraloop@platform-store:5432/migraloop
-    command: ["migraloop", "run"]
+      MIGRALOOP_PLATFORM_STORE_URL: postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
+    # ENTRYPOINT is already `migraloop`; only override the subcommand.
+    command: ["run"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "migraloop",
+          "status",
+          "--platform-store-url",
+          "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
 volumes:
   lab_platform_store_data:

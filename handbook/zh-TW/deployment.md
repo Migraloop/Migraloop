@@ -38,9 +38,9 @@ migraloop lab status  # Fixture 就緒狀態 + 連線細節；沒有預設 Pipel
 migraloop lab down    # 移除 containers 與 volumes
 ```
 
-Compose 定義：`lab/compose.yaml`（project `migraloop-lab`）。Lab Oracle init 會啟用 ARCHIVELOG 與 database supplemental logging 以供 LogMiner；**不會**預先套用任何 Deployment 或 Pipelines—那些來自 Lab Scenario 或你自己的 `migraloop apply`。與上方預設雙 container 安裝、以及 CI 使用的 contract/stub harness 都不同。
+Compose 定義：`lab/compose.yaml`（project `migraloop-lab`）。Lab `app` image（`lab/Dockerfile`）會複製 host 建好的 `migraloop` binary，避免在 Docker 內重編；`migraloop lab up` 若缺少 binary 會先建置。Lab Oracle init 會啟用 ARCHIVELOG 與 database supplemental logging 以供 LogMiner；**不會**預先套用任何 Deployment 或 Pipelines—那些來自 Lab Scenario 或你自己的 `migraloop apply`。與上方預設雙 container 安裝（root `Dockerfile`）、以及 CI 使用的 contract/stub harness 都不同。
 
-資源提醒：Lab Oracle（Free）通常需要數 GB RAM，第一次拉 image／開機可能要數分鐘。
+資源提醒：Lab Oracle（Free）通常需要數 GB RAM，第一次拉 image／開機可能要數分鐘。Lab Compose 使用 `network_mode: host`，以便在 bridge 網路被擋的巢狀 Docker 環境仍可運作。若巢狀 Docker 在 overlay whiteout 解壓失敗，可改用 dockerd `storage-driver: vfs`（並關閉 containerd snapshotter）。
 
 ## Runtime 模型
 

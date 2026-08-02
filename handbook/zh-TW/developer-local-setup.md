@@ -48,7 +48,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab down
 ```
 
-Bring-up 後預設：Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`、MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`。Lab bring-up 不會套用 sample Deployments/Pipelines。需要 Docker Compose；第一次 Oracle 開機可能要數分鐘。見 [CLI 與 Config](cli-and-config.md)（`lab`）與 [Deployment](deployment.md)。
+Bring-up 後預設：Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`、MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`。Lab bring-up 不會套用 sample Deployments/Pipelines。需要 Docker Compose；`lab up` 若缺少 binary 會建置 `target/debug/migraloop`，再由 `lab/Dockerfile` 打包（Ubuntu 24.04 base 以對齊 host glibc）。Lab Compose 使用 `network_mode: host`。第一次 Oracle 開機可能要數分鐘。巢狀 Docker whiteout 解壓失敗時可用 dockerd `storage-driver: vfs`。見 [CLI 與 Config](cli-and-config.md)（`lab`）與 [Deployment](deployment.md)。
 
 ## 測試
 

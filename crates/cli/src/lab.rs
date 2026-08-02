@@ -73,6 +73,47 @@ fn compose_file(lab_dir: &Path) -> Result<PathBuf, CliError> {
     Ok(path)
 }
 
+/// Lab app image copies a host-built `migraloop` binary (see `lab/Dockerfile`).
+async fn ensure_lab_app_binary(lab_dir: &Path) -> Result<(), CliError> {
+    let repo_root = lab_dir
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| lab_dir.parent().unwrap_or(lab_dir).to_path_buf());
+    let bin = repo_root.join("target/debug/migraloop");
+    if bin.is_file() {
+        return Ok(());
+    }
+
+    println!(
+        "Lab Fixture: building host migraloop binary at {} ...",
+        bin.display()
+    );
+    let status = Command::new("cargo")
+        .args(["build", "-p", "migraloop-app"])
+        .current_dir(&repo_root)
+        .status()
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Lab Fixture needs a host-built migraloop binary, but `cargo build` failed to start: {err}"
+            ))
+        })?;
+    if !status.success() {
+        return Err(CliError::Failed(format!(
+            "Lab Fixture `cargo build -p migraloop-app` failed (status {status}). \
+             Build the binary at the repo root, then re-run `migraloop lab up`."
+        )));
+    }
+    if !bin.is_file() {
+        return Err(CliError::Failed(format!(
+            "expected Lab app binary at {} after cargo build",
+            bin.display()
+        )));
+    }
+    Ok(())
+}
+
 fn compose_base(lab_dir: &Path) -> Result<Command, CliError> {
     let file = compose_file(lab_dir)?;
     // Prefer `docker compose` (v2 plugin); fall back to `docker-compose`.
@@ -89,6 +130,10 @@ fn compose_base(lab_dir: &Path) -> Result<Command, CliError> {
                 .to_string(),
         ));
     };
+    // Resolve to an absolute compose path so `-f` does not depend on cwd tricks.
+    // (`current_dir(lab_dir)` + relative `lab/compose.yaml` would look up lab/lab/...)
+    let file = file.canonicalize().unwrap_or(file);
+    let lab_dir = lab_dir.canonicalize().unwrap_or_else(|_| lab_dir.to_path_buf());
     cmd.arg("-f")
         .arg(&file)
         .arg("-p")
@@ -136,10 +181,21 @@ async fn lab_up(lab_dir: &Path) -> Result<(), CliError> {
     println!("Lab Fixture: bringing up disposable stack (Oracle, MongoDB, Platform Store, app)...");
     println!("Lab Fixture: no sample Deployment or Pipelines will be applied.");
 
+    ensure_lab_app_binary(lab_dir).await?;
+
     let (ok, out) = run_compose(lab_dir, &["up", "-d", "--build"]).await?;
     if !ok {
+        let hint = if out.contains("failed to convert whiteout")
+            || out.contains("operation not permitted")
+        {
+            "\nHint: nested Docker/overlay environments often need a non-overlay storage \
+             driver (for example dockerd with `\"storage-driver\": \"vfs\"` and \
+             `\"features\": { \"containerd-snapshotter\": false }`)."
+        } else {
+            ""
+        };
         return Err(CliError::Failed(format!(
-            "Lab bring-up failed (image pull, port conflict, or compose error):\n{out}"
+            "Lab bring-up failed (image pull, port conflict, or compose error):\n{out}{hint}"
         )));
     }
 
@@ -461,7 +517,7 @@ async fn ensure_platform_store_migrated(lab_dir: &Path) -> Result<(), CliError> 
             "migraloop",
             "migrate",
             "--platform-store-url",
-            "postgres://migraloop:migraloop@platform-store:5432/migraloop",
+            LAB_PLATFORM_STORE_URL,
         ],
     )
     .await?;
