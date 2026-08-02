@@ -38,7 +38,7 @@ pub struct Spec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PipelineSpec {
     pub name: String,
     pub mode: String,
@@ -50,6 +50,12 @@ pub struct PipelineSpec {
     /// Example: `fields: { HUGE_AMOUNT: { as: string } }`
     #[serde(default)]
     pub fields: std::collections::BTreeMap<String, FieldMappingSpec>,
+    /// Required Output Identity field names for Transform Pipelines.
+    #[serde(default)]
+    pub output_identity: Option<Vec<String>>,
+    /// Declarative Rich Transform steps (project/filter). Rejected for Direct.
+    #[serde(default)]
+    pub transform: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -299,10 +305,14 @@ fn parse_document(path: &Path, raw: &str) -> Result<DeploymentDocument, CliError
 
 fn looks_like_plaintext_password_error(err: &str, raw: &str) -> bool {
     let lower = err.to_ascii_lowercase();
+    // Only rewrite when the parse error itself is about password — not every
+    // unknown-field failure in a document that happens to contain password refs.
+    let error_about_password = lower.contains("password");
     let has_password_context = raw.contains("password:")
         || raw.contains("\"password\"")
-        || lower.contains("password");
-    has_password_context
+        || error_about_password;
+    error_about_password
+        && has_password_context
         && (lower.contains("did not match")
             || lower.contains("invalid type")
             || lower.contains("expected")
@@ -364,9 +374,9 @@ fn validate_pipeline(pipeline: &PipelineSpec) -> Result<(), CliError> {
             "pipeline.name must not be empty".to_string(),
         ));
     }
-    if pipeline.mode != "direct" {
+    if pipeline.mode != "direct" && pipeline.mode != "transform" {
         return Err(CliError::Failed(format!(
-            "unsupported pipeline.mode {:?}; v1 Initial Load slice supports only \"direct\"",
+            "unsupported pipeline.mode {:?}; expected \"direct\" or \"transform\"",
             pipeline.mode
         )));
     }
@@ -389,6 +399,94 @@ fn validate_pipeline(pipeline: &PipelineSpec) -> Result<(), CliError> {
             ));
         }
     }
+
+    if pipeline.mode == "direct" {
+        if pipeline.transform.is_some() {
+            return Err(CliError::Failed(
+                "Direct Pipeline must not declare transform; use mode: transform".to_string(),
+            ));
+        }
+        if pipeline.output_identity.is_some() {
+            return Err(CliError::Failed(
+                "Direct Pipeline Output Identity defaults from the source primary key; \
+                 omit outputIdentity"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    // Transform Pipeline: Output Identity required; declarative analyzable ops only.
+    match &pipeline.output_identity {
+        None => {
+            return Err(CliError::Failed(format!(
+                "Transform Pipeline {} requires outputIdentity before it can run",
+                pipeline.name
+            )));
+        }
+        Some(identity) if identity.is_empty() => {
+            return Err(CliError::Failed(format!(
+                "Transform Pipeline {} requires a non-empty outputIdentity",
+                pipeline.name
+            )));
+        }
+        Some(identity) => {
+            for field in identity {
+                if field.trim().is_empty() {
+                    return Err(CliError::Failed(format!(
+                        "Transform Pipeline {} outputIdentity entries must not be empty",
+                        pipeline.name
+                    )));
+                }
+            }
+        }
+    }
+
+    let Some(steps) = &pipeline.transform else {
+        return Err(CliError::Failed(format!(
+            "Transform Pipeline {} requires a declarative transform",
+            pipeline.name
+        )));
+    };
+    if steps.is_empty() {
+        return Err(CliError::Failed(format!(
+            "Transform Pipeline {} transform must declare at least one operator",
+            pipeline.name
+        )));
+    }
+
+    validate_transform_steps(pipeline, steps)?;
+
+    if pipeline.target.is_none() {
+        return Err(CliError::Failed(format!(
+            "Transform Pipeline {} requires target.collection for Delivery",
+            pipeline.name
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_transform_steps(
+    pipeline: &PipelineSpec,
+    steps: &[serde_json::Value],
+) -> Result<(), CliError> {
+    use migraloop_transform::{parse_transform_steps, TransformStepSpec};
+
+    let mut parsed = Vec::with_capacity(steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        let spec: TransformStepSpec = serde_json::from_value(step.clone()).map_err(|err| {
+            CliError::Failed(format!(
+                "Transform Pipeline {} has invalid transform step {}: {err}",
+                pipeline.name,
+                index + 1
+            ))
+        })?;
+        parsed.push(spec);
+    }
+    parse_transform_steps(&parsed).map_err(|err| {
+        CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name))
+    })?;
     Ok(())
 }
 

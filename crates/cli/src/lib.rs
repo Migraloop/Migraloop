@@ -18,11 +18,15 @@ use migraloop_delivery::{
 };
 use migraloop_platform_store::{
     base_dataset_exists, delete_base_datasets_not_in, filter_unapplied_change_ids, get_base_rows,
-    health, list_base_datasets, list_deployments, list_pipelines, migrate,
-    record_applied_source_changes, replace_base_dataset, replace_pipelines, update_base_primary_key,
+    get_derived_rows, health, list_base_datasets, list_deployments, list_derived_datasets,
+    list_pipelines, migrate, record_applied_source_changes, replace_base_dataset,
+    replace_derived_dataset, replace_pipelines, update_base_primary_key,
     update_pipeline_delivery_progress, upsert_deployment, BaseColumn, BaseDataset, Deployment,
-    FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind,
-    SystemConnection,
+    DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef,
+    SecretRefKind, SystemConnection,
+};
+use migraloop_transform::{
+    evaluate_transform, parse_transform_steps, TransformOp, TransformStepSpec,
 };
 use thiserror::Error;
 
@@ -85,6 +89,18 @@ pub enum Command {
         #[arg(long)]
         collection: String,
         /// Deployment name when multiple Pipelines share a collection name
+        #[arg(long)]
+        deployment: Option<String>,
+    },
+    /// Inspect Derived Dataset rows for a Transform Pipeline
+    Derived {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Pipeline name whose Derived Dataset to inspect
+        #[arg(long)]
+        pipeline: String,
+        /// Deployment name when multiple Derived Datasets share a Pipeline name
         #[arg(long)]
         deployment: Option<String>,
     },
@@ -183,6 +199,10 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
             (name.clone(), mapping)
         })
         .collect();
+    let output_identity = pipeline.output_identity.clone().unwrap_or_default();
+    let transform_json = pipeline.transform.as_ref().map(|steps| {
+        serde_json::Value::Array(steps.clone())
+    });
     Pipeline {
         deployment_name: deployment_name.to_string(),
         name: pipeline.name.clone(),
@@ -197,6 +217,8 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
         delivery_status,
         delivery_applied_changes: 0,
         field_mappings,
+        output_identity,
+        transform_json,
     }
 }
 
@@ -229,31 +251,60 @@ fn resolve_secret_value(reference: &SecretRef, field: &str) -> Result<String, Cl
 
 fn output_identity_from_row(
     row: &serde_json::Map<String, serde_json::Value>,
-    primary_key: &[String],
+    identity_fields: &[String],
 ) -> Result<serde_json::Value, CliError> {
-    if primary_key.is_empty() {
+    if identity_fields.is_empty() {
         return Err(CliError::Failed(
-            "Base Dataset has no primary key for Output Identity".to_string(),
+            "Output Identity fields are empty".to_string(),
         ));
     }
-    if primary_key.len() == 1 {
-        let key = &primary_key[0];
+    if identity_fields.len() == 1 {
+        let key = &identity_fields[0];
         return row.get(key).cloned().ok_or_else(|| {
             CliError::Failed(format!(
-                "Base row missing Output Identity column {key}"
+                "row missing Output Identity column {key}"
             ))
         });
     }
     let mut identity = serde_json::Map::new();
-    for key in primary_key {
+    for key in identity_fields {
         let value = row.get(key).cloned().ok_or_else(|| {
             CliError::Failed(format!(
-                "Base row missing Output Identity column {key}"
+                "row missing Output Identity column {key}"
             ))
         })?;
         identity.insert(key.clone(), value);
     }
     Ok(serde_json::Value::Object(identity))
+}
+
+fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformOp>, CliError> {
+    let Some(value) = &pipeline.transform_json else {
+        return Err(CliError::Failed(format!(
+            "Transform Pipeline {} is missing transform definition",
+            pipeline.name
+        )));
+    };
+    let steps = value.as_array().ok_or_else(|| {
+        CliError::Failed(format!(
+            "Transform Pipeline {} transform must be an array of operators",
+            pipeline.name
+        ))
+    })?;
+    let mut parsed = Vec::with_capacity(steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        let spec: TransformStepSpec = serde_json::from_value(step.clone()).map_err(|err| {
+            CliError::Failed(format!(
+                "Transform Pipeline {} has invalid transform step {}: {err}",
+                pipeline.name,
+                index + 1
+            ))
+        })?;
+        parsed.push(spec);
+    }
+    parse_transform_steps(&parsed).map_err(|err| {
+        CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name))
+    })
 }
 
 fn mongo_target_from_deployment(deployment: &Deployment) -> Result<MongoTargetConnection, CliError> {
@@ -437,18 +488,19 @@ fn validate_pipeline_managed_fields(
 
 fn delivery_document_for_row(
     row: &serde_json::Map<String, serde_json::Value>,
-    dataset: &BaseDataset,
+    identity_fields: &[String],
+    columns: &[BaseColumn],
     pipeline: &Pipeline,
 ) -> Result<DeliveryDocument, CliError> {
     let managed = apply_field_mappings_to_row(row, pipeline);
-    let identity = output_identity_from_row(&managed, &dataset.primary_key).or_else(|_| {
+    let identity = output_identity_from_row(&managed, identity_fields).or_else(|_| {
         // Identity may be omitted from Managed via field mapping; fall back to full row.
-        output_identity_from_row(row, &dataset.primary_key)
+        output_identity_from_row(row, identity_fields)
     })?;
     Ok(DeliveryDocument {
         identity,
         managed_fields: managed,
-        columns: delivery_columns_from_base(&dataset.columns),
+        columns: delivery_columns_from_base(columns),
         field_as: managed_field_as_map(pipeline),
     })
 }
@@ -652,13 +704,14 @@ fn pipeline_source_tables(pipelines: &[Pipeline]) -> Vec<String> {
     tables.into_iter().collect()
 }
 
-/// Whether a Direct Pipeline has a Target Binding configured for Delivery.
-fn direct_pipeline_has_target(pipeline: &Pipeline) -> bool {
-    pipeline.mode == "direct" && !pipeline.target_collection.is_empty()
+/// Whether a Pipeline has a Target Binding configured for Delivery.
+fn pipeline_has_target(pipeline: &Pipeline) -> bool {
+    (pipeline.mode == "direct" || pipeline.mode == "transform")
+        && !pipeline.target_collection.is_empty()
 }
 
 /// Whether two Pipeline declarations are the same (mode, Source table, Target Binding,
-/// field mappings) — not a revision/Change of that Pipeline.
+/// field mappings, transform) — not a revision/Change of that Pipeline.
 ///
 /// Used so runtime Pipeline add can preserve Delivery progress for unchanged Pipelines
 /// (ADR-0007) without treating a declaration change as a no-op add.
@@ -668,6 +721,8 @@ fn pipeline_declaration_unchanged(previous: &Pipeline, next: &Pipeline) -> bool 
         && previous.source_schema == next.source_schema
         && previous.target_collection == next.target_collection
         && previous.field_mappings == next.field_mappings
+        && previous.output_identity == next.output_identity
+        && previous.transform_json == next.transform_json
 }
 
 /// Preserve Delivery progress for Pipelines whose declaration is unchanged.
@@ -693,7 +748,7 @@ fn pipelines_needing_delivery_start<'a>(
     pipelines
         .iter()
         .filter(|pipeline| {
-            if !direct_pipeline_has_target(pipeline) {
+            if !pipeline_has_target(pipeline) {
                 return false;
             }
             let Some(previous) = existing.iter().find(|p| p.name == pipeline.name) else {
@@ -711,12 +766,12 @@ fn pipelines_needing_delivery_start<'a>(
         .collect()
 }
 
-async fn deliver_direct_pipelines(
+async fn deliver_pipelines(
     platform_store_url: &str,
     deployment: &Deployment,
     pipelines: &[&Pipeline],
 ) -> Result<(), CliError> {
-    let needs_delivery = pipelines.iter().any(|p| direct_pipeline_has_target(p));
+    let needs_delivery = pipelines.iter().any(|p| pipeline_has_target(p));
     if !needs_delivery {
         return Ok(());
     }
@@ -724,63 +779,231 @@ async fn deliver_direct_pipelines(
     let mongo = mongo_target_from_deployment(deployment)?;
 
     for pipeline in pipelines {
-        if !direct_pipeline_has_target(pipeline) {
+        if !pipeline_has_target(pipeline) {
             continue;
         }
 
-        let (dataset, rows) = get_base_rows(
-            platform_store_url,
-            &pipeline.source_table,
-            Some(&pipeline.deployment_name),
-        )
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-
-        let source_columns = stub_source_columns(&pipeline.source_table)?;
-        let managed_names: BTreeSet<String> = dataset
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .filter(|name| {
-                !matches!(
-                    pipeline.field_mappings.get(name),
-                    Some(FieldMappingAs::Omit)
-                )
-            })
-            .collect();
-        validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
-
-        let mut documents = Vec::with_capacity(rows.len());
-        for row in &rows {
-            // Direct Pipeline Managed fields default to all supported Base columns,
-            // minus omit mappings; unsafe NUMBER requires string/omit (ADR-0023).
-            documents.push(delivery_document_for_row(&row.data, &dataset, pipeline)?);
+        match pipeline.mode.as_str() {
+            "direct" => {
+                deliver_direct_pipeline(platform_store_url, deployment, pipeline, &mongo).await?;
+            }
+            "transform" => {
+                deliver_transform_pipeline(platform_store_url, deployment, pipeline, &mongo)
+                    .await?;
+            }
+            other => {
+                return Err(CliError::Failed(format!(
+                    "unsupported pipeline.mode {other:?} for Delivery"
+                )));
+            }
         }
-
-        let delivered = upsert_managed_documents(&mongo, &pipeline.target_collection, &documents)
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-
-        update_pipeline_delivery_progress(
-            platform_store_url,
-            &pipeline.deployment_name,
-            &pipeline.name,
-            "delivered",
-            Some(delivered as i32),
-        )
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-
-        println!(
-            "Delivery complete: Pipeline {} → {}.{} ({} documents)",
-            pipeline.name,
-            deployment.target.database,
-            pipeline.target_collection,
-            delivered
-        );
     }
 
     Ok(())
+}
+
+async fn deliver_direct_pipeline(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    pipeline: &Pipeline,
+    mongo: &MongoTargetConnection,
+) -> Result<(), CliError> {
+    let (dataset, rows) = get_base_rows(
+        platform_store_url,
+        &pipeline.source_table,
+        Some(&pipeline.deployment_name),
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let source_columns = stub_source_columns(&pipeline.source_table)?;
+    let managed_names: BTreeSet<String> = dataset
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .filter(|name| {
+            !matches!(
+                pipeline.field_mappings.get(name),
+                Some(FieldMappingAs::Omit)
+            )
+        })
+        .collect();
+    validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
+
+    if dataset.primary_key.is_empty() {
+        return Err(CliError::Failed(
+            "Base Dataset has no primary key for Output Identity".to_string(),
+        ));
+    }
+
+    let mut documents = Vec::with_capacity(rows.len());
+    for row in &rows {
+        // Direct Pipeline Managed fields default to all supported Base columns,
+        // minus omit mappings; unsafe NUMBER requires string/omit (ADR-0023).
+        documents.push(delivery_document_for_row(
+            &row.data,
+            &dataset.primary_key,
+            &dataset.columns,
+            pipeline,
+        )?);
+    }
+
+    let delivered = upsert_managed_documents(mongo, &pipeline.target_collection, &documents)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    update_pipeline_delivery_progress(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
+        "delivered",
+        Some(delivered as i32),
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    println!(
+        "Delivery complete: Pipeline {} → {}.{} ({} documents)",
+        pipeline.name,
+        deployment.target.database,
+        pipeline.target_collection,
+        delivered
+    );
+    Ok(())
+}
+
+async fn deliver_transform_pipeline(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    pipeline: &Pipeline,
+    mongo: &MongoTargetConnection,
+) -> Result<(), CliError> {
+    if pipeline.output_identity.is_empty() {
+        return Err(CliError::Failed(format!(
+            "Transform Pipeline {} requires outputIdentity before it can run",
+            pipeline.name
+        )));
+    }
+
+    let (base, base_rows) = get_base_rows(
+        platform_store_url,
+        &pipeline.source_table,
+        Some(&pipeline.deployment_name),
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let ops = transform_ops_from_pipeline(pipeline)?;
+    let base_maps: Vec<_> = base_rows.iter().map(|r| r.data.clone()).collect();
+    let derived_rows = evaluate_transform(&ops, &base_maps)
+        .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
+
+    let derived_columns = derived_columns_from_base(&base.columns, &derived_rows);
+    let source_columns = stub_source_columns(&pipeline.source_table)?;
+    let managed_names: BTreeSet<String> = derived_columns
+        .iter()
+        .map(|c| c.name.clone())
+        .filter(|name| {
+            !matches!(
+                pipeline.field_mappings.get(name),
+                Some(FieldMappingAs::Omit)
+            )
+        })
+        .collect();
+    validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
+
+    for field in &pipeline.output_identity {
+        if !derived_columns.iter().any(|c| c.name == *field)
+            && !derived_rows.iter().any(|row| row.contains_key(field))
+        {
+            return Err(CliError::Failed(format!(
+                "Transform Pipeline {} outputIdentity field {field} is not present in Derived output",
+                pipeline.name
+            )));
+        }
+    }
+
+    let dataset = DerivedDataset {
+        deployment_name: pipeline.deployment_name.clone(),
+        pipeline_name: pipeline.name.clone(),
+        status: "materialized".to_string(),
+        output_identity: pipeline.output_identity.clone(),
+        columns: derived_columns.clone(),
+        row_count: derived_rows.len() as i32,
+    };
+    replace_derived_dataset(platform_store_url, &dataset, &derived_rows)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    println!(
+        "Derived Dataset materialized: Pipeline {} ({} rows)",
+        pipeline.name, dataset.row_count
+    );
+
+    let mut documents = Vec::with_capacity(derived_rows.len());
+    for row in &derived_rows {
+        documents.push(delivery_document_for_row(
+            row,
+            &pipeline.output_identity,
+            &derived_columns,
+            pipeline,
+        )?);
+    }
+
+    let delivered = upsert_managed_documents(mongo, &pipeline.target_collection, &documents)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    update_pipeline_delivery_progress(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
+        "delivered",
+        Some(delivered as i32),
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    println!(
+        "Delivery complete: Pipeline {} → {}.{} ({} documents)",
+        pipeline.name,
+        deployment.target.database,
+        pipeline.target_collection,
+        delivered
+    );
+    Ok(())
+}
+
+/// Columns present in Derived rows, preserving Base schema metadata when available.
+fn derived_columns_from_base(
+    base_columns: &[BaseColumn],
+    derived_rows: &[serde_json::Map<String, serde_json::Value>],
+) -> Vec<BaseColumn> {
+    let mut names = BTreeSet::new();
+    for row in derived_rows {
+        for key in row.keys() {
+            names.insert(key.clone());
+        }
+    }
+    let by_name: BTreeMap<&str, &BaseColumn> = base_columns
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
+    names
+        .into_iter()
+        .map(|name| {
+            if let Some(col) = by_name.get(name.as_str()) {
+                (*col).clone()
+            } else {
+                BaseColumn {
+                    name,
+                    oracle_type: "VARCHAR2".to_string(),
+                    precision: None,
+                    scale: None,
+                }
+            }
+        })
+        .collect()
 }
 
 async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), CliError> {
@@ -855,7 +1078,7 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
     // Start Delivery only for Pipelines that need it; do not re-Deliver unchanged
     // already-delivered Pipelines (others keep running — ADR-0007 Add).
     let to_deliver = pipelines_needing_delivery_start(&existing_pipelines, &pipelines);
-    deliver_direct_pipelines(platform_store_url, &deployment, &to_deliver).await?;
+    deliver_pipelines(platform_store_url, &deployment, &to_deliver).await?;
 
     println!("Deployment applied: {}", deployment.name);
     Ok(())
@@ -1151,8 +1374,12 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                                     pipeline.source_table, change.identity
                                 )));
                             };
-                            let document =
-                                delivery_document_for_row(base_row, &dataset, pipeline)?;
+                            let document = delivery_document_for_row(
+                                base_row,
+                                &dataset.primary_key,
+                                &dataset.columns,
+                                pipeline,
+                            )?;
                             let upserted = upsert_managed_documents(
                                 &mongo,
                                 &pipeline.target_collection,
@@ -1383,6 +1610,27 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
+    let derived = list_derived_datasets(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    if derived.is_empty() {
+        println!("Derived Dataset: (none)");
+    } else {
+        for dataset in &derived {
+            let columns = dataset
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let identity = dataset.output_identity.join(", ");
+            println!(
+                "Derived Dataset: Pipeline={} status={} rows={} outputIdentity=[{}] columns=[{}]",
+                dataset.pipeline_name, dataset.status, dataset.row_count, identity, columns
+            );
+        }
+    }
+
     for pipeline in &pipelines {
         if pipeline.target_collection.is_empty() {
             continue;
@@ -1452,6 +1700,36 @@ async fn print_base(
         println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
     }
 
+    Ok(())
+}
+
+async fn print_derived(
+    platform_store_url: &str,
+    pipeline_name: &str,
+    deployment_name: Option<&str>,
+) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+
+    let (dataset, rows) = get_derived_rows(platform_store_url, pipeline_name, deployment_name)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let identity = dataset.output_identity.join(", ");
+    let columns = dataset
+        .columns
+        .iter()
+        .map(|c| format!("{}:{}", c.name, c.oracle_type))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "Derived Dataset: Pipeline={} status={} rows={} outputIdentity=[{}]",
+        dataset.pipeline_name, dataset.status, dataset.row_count, identity
+    );
+    println!("columns: [{columns}]");
+    for row in rows {
+        let value = serde_json::Value::Object(row.data);
+        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+    }
     Ok(())
 }
 
@@ -1548,6 +1826,11 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             collection,
             deployment,
         } => print_target(&platform_store_url, &collection, deployment.as_deref()).await,
+        Command::Derived {
+            platform_store_url,
+            pipeline,
+            deployment,
+        } => print_derived(&platform_store_url, &pipeline, deployment.as_deref()).await,
         Command::Sync { platform_store_url } => sync_incremental(&platform_store_url).await,
         Command::Run { platform_store_url } => {
             apply_migrations(&platform_store_url).await?;
