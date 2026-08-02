@@ -46,6 +46,18 @@ pub struct PipelineSpec {
     /// Target Binding for Delivery. Optional so Deployment/Base-only apply still works.
     #[serde(default)]
     pub target: Option<PipelineTargetSpec>,
+    /// Managed-field mapping overrides for unsafe NUMBER / omit (ADR-0023).
+    /// Example: `fields: { HUGE_AMOUNT: { as: string } }`
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, FieldMappingSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldMappingSpec {
+    /// `string` (map to string) or `omit` (remove from Managed output).
+    #[serde(rename = "as")]
+    pub map_as: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +84,9 @@ pub struct SystemSpec {
     pub database: String,
     pub username: String,
     pub password: PasswordField,
+    /// IANA timezone for naive DATE/TIMESTAMP when Source DB timezone is unreadable.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 /// Password must be a secret reference — never a plaintext string in config.
@@ -232,6 +247,7 @@ pub fn load_deployment_config(path: &Path) -> Result<DeploymentDocument, CliErro
 
     let doc = parse_document(path, &raw)?;
     validate_document(&doc)?;
+    validate_source_timezone(doc.spec.source.timezone.as_deref())?;
     doc.spec.source.password.validate("source.password")?;
     doc.spec.target.password.validate("target.password")?;
     Ok(doc)
@@ -358,6 +374,34 @@ fn validate_pipeline(pipeline: &PipelineSpec) -> Result<(), CliError> {
                 "pipeline.target.collection must not be empty".to_string(),
             ));
         }
+    }
+    for (field, mapping) in &pipeline.fields {
+        if field.trim().is_empty() {
+            return Err(CliError::Failed(
+                "pipeline.fields keys must not be empty".to_string(),
+            ));
+        }
+        match mapping.map_as.as_str() {
+            "string" | "omit" => {}
+            other => {
+                return Err(CliError::Failed(format!(
+                    "pipeline.fields.{field}.as must be \"string\" or \"omit\", got {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate source.timezone when present (IANA name).
+pub fn validate_source_timezone(timezone: Option<&str>) -> Result<(), CliError> {
+    let Some(tz) = timezone.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if tz.parse::<chrono_tz::Tz>().is_err() {
+        return Err(CliError::Failed(format!(
+            "source.timezone {tz:?} is not a valid IANA timezone"
+        )));
     }
     Ok(())
 }

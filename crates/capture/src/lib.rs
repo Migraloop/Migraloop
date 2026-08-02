@@ -2,6 +2,14 @@
 //!
 //! v1 early slices use a stub/fixture Source; Oracle LogMiner lands in a later ticket.
 
+mod oracle_types;
+
+pub use oracle_types::{
+    aware_temporal_to_utc, classify_number, is_allow_listed_oracle_type, naive_temporal_to_utc,
+    normalize_oracle_type, resolve_temporal_timezone, NumberMongoMapping, TypeError,
+    DECIMAL128_MAX_PRECISION, INT64_SAFE_PRECISION, RAW_SIZE_CAP_BYTES,
+};
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +46,8 @@ impl std::fmt::Display for CapturePosition {
 pub enum CaptureError {
     #[error("unknown stub Source table: {0}")]
     UnknownTable(String),
+    #[error(transparent)]
+    Type(#[from] TypeError),
 }
 
 /// Kind of Incremental Capture change from the Source.
@@ -70,7 +80,37 @@ pub struct ChangeEvent {
 pub struct SourceColumn {
     pub name: String,
     pub oracle_type: String,
+    /// True when the column is on the v1 allow-list (ADR-0018).
     pub supported: bool,
+    /// Declared precision for NUMBER (None = unconstrained / unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<i32>,
+    /// Declared scale for NUMBER.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<i32>,
+    /// Declared size for RAW/CHAR-like types when relevant to allow-list caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i32>,
+}
+
+impl SourceColumn {
+    pub fn is_temporal_naive(&self) -> bool {
+        matches!(
+            normalize_oracle_type(&self.oracle_type).as_str(),
+            "DATE" | "TIMESTAMP"
+        )
+    }
+
+    pub fn is_temporal_aware(&self) -> bool {
+        matches!(
+            normalize_oracle_type(&self.oracle_type).as_str(),
+            "TIMESTAMP WITH TIME ZONE" | "TIMESTAMP WITH LOCAL TIME ZONE"
+        )
+    }
+
+    pub fn is_number(&self) -> bool {
+        normalize_oracle_type(&self.oracle_type) == "NUMBER"
+    }
 }
 
 /// Result of a table-level Initial Load from the Source.
@@ -98,17 +138,104 @@ impl InitialLoadSnapshot {
 /// CUSTOMERS stub low-watermark (established before snapshot).
 pub const CUSTOMERS_LOW_WATERMARK: CapturePosition = CapturePosition(1000);
 
+/// Stub Source DB timezone when readable.
+///
+/// Set `MIGRALOOP_STUB_DB_TIMEZONE` (IANA name) to simulate a readable DB zone.
+/// When unset, the stub reports no readable DB timezone (user must set source.timezone
+/// for naive DATE/TIMESTAMP).
+pub fn stub_db_timezone() -> Option<String> {
+    std::env::var("MIGRALOOP_STUB_DB_TIMEZONE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Discover stub Source schema for a table (no temporal normalization).
+pub fn source_schema_stub(table: &str) -> Result<Vec<SourceColumn>, CaptureError> {
+    Ok(raw_fixture(table)?.columns)
+}
+
+fn raw_fixture(table: &str) -> Result<InitialLoadSnapshot, CaptureError> {
+    match table {
+        "CUSTOMERS" => Ok(customers_fixture()),
+        "ORDERS" => Ok(orders_fixture()),
+        "EVENTS" => Ok(events_fixture()),
+        "ACCOUNTS" => Ok(accounts_fixture()),
+        other => Err(CaptureError::UnknownTable(other.to_string())),
+    }
+}
+
 /// Perform Initial Load for a table from the stub/fixture Source.
 ///
 /// Establishes a low-watermark capture position first, then reads the snapshot.
 /// Incremental Capture must start from that watermark so cutover overlaps
 /// (prefer duplicates over gaps; ADR-0004).
-pub fn initial_load_stub(table: &str) -> Result<InitialLoadSnapshot, CaptureError> {
-    match table {
-        "CUSTOMERS" => Ok(customers_fixture()),
-        "ORDERS" => Ok(orders_fixture()),
-        other => Err(CaptureError::UnknownTable(other.to_string())),
+///
+/// Temporal values in the returned snapshot are normalized to UTC ISO-8601 strings
+/// when `configured_timezone` / readable DB timezone allow (ADR-0022).
+pub fn initial_load_stub(
+    table: &str,
+    configured_timezone: Option<&str>,
+) -> Result<InitialLoadSnapshot, CaptureError> {
+    let mut snapshot = raw_fixture(table)?;
+    normalize_snapshot_temporals(&mut snapshot, configured_timezone)?;
+    Ok(snapshot)
+}
+
+/// Normalize temporal fields in an Incremental change row to UTC (ADR-0022).
+pub fn normalize_change_temporals(
+    columns: &[SourceColumn],
+    row: &mut BTreeMap<String, serde_json::Value>,
+    configured_timezone: Option<&str>,
+) -> Result<(), CaptureError> {
+    let tz_needed = columns.iter().any(|c| c.supported && c.is_temporal_naive());
+    let tz = if tz_needed {
+        Some(resolve_temporal_timezone(
+            stub_db_timezone().as_deref(),
+            configured_timezone,
+        )?)
+    } else {
+        None
+    };
+
+    for column in columns.iter().filter(|c| c.supported) {
+        let Some(value) = row.get_mut(&column.name) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if column.is_temporal_naive() {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| {
+                    TypeError::InvalidTemporal(value.to_string(), "expected string".into())
+                })?
+                .to_string();
+            let utc = naive_temporal_to_utc(&raw, tz.expect("tz resolved"))?;
+            *value = serde_json::Value::String(utc.to_rfc3339());
+        } else if column.is_temporal_aware() {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| {
+                    TypeError::InvalidTemporal(value.to_string(), "expected string".into())
+                })?
+                .to_string();
+            let utc = aware_temporal_to_utc(&raw)?;
+            *value = serde_json::Value::String(utc.to_rfc3339());
+        }
     }
+    Ok(())
+}
+
+fn normalize_snapshot_temporals(
+    snapshot: &mut InitialLoadSnapshot,
+    configured_timezone: Option<&str>,
+) -> Result<(), CaptureError> {
+    for row in &mut snapshot.rows {
+        normalize_change_temporals(&snapshot.columns, row, configured_timezone)?;
+    }
+    Ok(())
 }
 
 fn customers_fixture() -> InitialLoadSnapshot {
@@ -119,10 +246,10 @@ fn customers_fixture() -> InitialLoadSnapshot {
         low_watermark: CUSTOMERS_LOW_WATERMARK,
         primary_key: vec!["ID".to_string()],
         columns: vec![
-            col("ID", "NUMBER", true),
+            number_col("ID", 10, 0, true),
             col("NAME", "VARCHAR2", true),
             col("EMAIL", "VARCHAR2", true),
-            col("ACTIVE", "NUMBER", true),
+            number_col("ACTIVE", 1, 0, true),
             col("BIO", "BLOB", false),
         ],
         // Include unsupported BIO values so Initial Load must actively omit them.
@@ -160,23 +287,97 @@ fn orders_fixture() -> InitialLoadSnapshot {
         low_watermark: CapturePosition(500),
         primary_key: vec!["ORDER_ID".to_string()],
         columns: vec![
-            col("ORDER_ID", "NUMBER", true),
-            col("CUSTOMER_ID", "NUMBER", true),
-            col("AMOUNT", "NUMBER", true),
+            number_col("ORDER_ID", 10, 0, true),
+            number_col("CUSTOMER_ID", 10, 0, true),
+            // Safe decimal → Decimal128 (not IEEE double).
+            number_col("AMOUNT", 12, 2, true),
         ],
         rows: vec![row(&[
             ("ORDER_ID", json_num(100)),
             ("CUSTOMER_ID", json_num(1)),
-            ("AMOUNT", json_num(42)),
+            ("AMOUNT", json_str("42.50")),
+        ])],
+    }
+}
+
+fn events_fixture() -> InitialLoadSnapshot {
+    InitialLoadSnapshot {
+        table: "EVENTS".to_string(),
+        low_watermark: CapturePosition(2000),
+        primary_key: vec!["EVENT_ID".to_string()],
+        columns: vec![
+            number_col("EVENT_ID", 10, 0, true),
+            col("NAME", "VARCHAR2", true),
+            // Naive DATE — needs DB timezone or source.timezone (ADR-0022).
+            col("OCCURRED_AT", "DATE", true),
+            col("AWARE_AT", "TIMESTAMP WITH TIME ZONE", true),
+        ],
+        rows: vec![row(&[
+            ("EVENT_ID", json_num(1)),
+            ("NAME", json_str("kickoff")),
+            // Naive wall-clock; interpretation depends on timezone resolution.
+            ("OCCURRED_AT", json_str("2024-01-15T10:30:00")),
+            ("AWARE_AT", json_str("2024-01-15T10:30:00+09:00")),
+        ])],
+    }
+}
+
+fn accounts_fixture() -> InitialLoadSnapshot {
+    InitialLoadSnapshot {
+        table: "ACCOUNTS".to_string(),
+        low_watermark: CapturePosition(3000),
+        primary_key: vec!["ACCOUNT_ID".to_string()],
+        columns: vec![
+            number_col("ACCOUNT_ID", 10, 0, true),
+            col("NAME", "VARCHAR2", true),
+            // Safe Long.
+            number_col("BALANCE_CENTS", 18, 0, true),
+            // Safe Decimal128.
+            number_col("RATE", 10, 4, true),
+            // Unsafe declared precision (>34) — must string or omit at apply (ADR-0023).
+            number_col("HUGE_AMOUNT", 38, 10, true),
+            // Unconstrained NUMBER — unsafe (never default IEEE double).
+            SourceColumn {
+                name: "LEGACY_NUM".to_string(),
+                oracle_type: "NUMBER".to_string(),
+                supported: true,
+                precision: None,
+                scale: None,
+                size: None,
+            },
+        ],
+        rows: vec![row(&[
+            ("ACCOUNT_ID", json_num(1)),
+            ("NAME", json_str("primary")),
+            ("BALANCE_CENTS", json_num(123456789012345678)),
+            ("RATE", json_str("1.2500")),
+            ("HUGE_AMOUNT", json_str("123456789012345678901234567890.1234567890")),
+            ("LEGACY_NUM", json_str("999")),
         ])],
     }
 }
 
 fn col(name: &str, oracle_type: &str, supported: bool) -> SourceColumn {
+    let size = None;
+    let supported = supported && is_allow_listed_oracle_type(oracle_type, size);
     SourceColumn {
         name: name.to_string(),
         oracle_type: oracle_type.to_string(),
         supported,
+        precision: None,
+        scale: None,
+        size,
+    }
+}
+
+fn number_col(name: &str, precision: i32, scale: i32, supported: bool) -> SourceColumn {
+    SourceColumn {
+        name: name.to_string(),
+        oracle_type: "NUMBER".to_string(),
+        supported: supported && is_allow_listed_oracle_type("NUMBER", None),
+        precision: Some(precision),
+        scale: Some(scale),
+        size: None,
     }
 }
 
@@ -210,7 +411,7 @@ pub fn incremental_changes_stub(
             .into_iter()
             .filter(|change| change.position >= from_position)
             .collect()),
-        "ORDERS" => Ok(Vec::new()),
+        "ORDERS" | "EVENTS" | "ACCOUNTS" => Ok(Vec::new()),
         other => Err(CaptureError::UnknownTable(other.to_string())),
     }
 }
@@ -265,9 +466,13 @@ mod tests {
 
     #[test]
     fn initial_load_establishes_low_watermark_before_snapshot_rows() {
-        let snapshot = initial_load_stub("CUSTOMERS").expect("customers snapshot");
+        let snapshot =
+            initial_load_stub("CUSTOMERS", None).expect("customers snapshot");
         assert_eq!(snapshot.low_watermark, CUSTOMERS_LOW_WATERMARK);
-        assert!(snapshot.rows.iter().any(|r| r.get("NAME") == Some(&json_str("Alice"))));
+        assert!(snapshot
+            .rows
+            .iter()
+            .any(|r| r.get("NAME") == Some(&json_str("Alice"))));
         assert!(!snapshot
             .rows
             .iter()
@@ -287,5 +492,35 @@ mod tests {
         let changes =
             incremental_changes_stub("CUSTOMERS", CapturePosition(1071)).expect("past end");
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn events_initial_load_normalizes_naive_date_with_configured_timezone() {
+        let snapshot = initial_load_stub("EVENTS", Some("America/New_York")).expect("events");
+        let occurred = snapshot.rows[0]
+            .get("OCCURRED_AT")
+            .and_then(|v| v.as_str())
+            .expect("OCCURRED_AT");
+        assert_eq!(occurred, "2024-01-15T15:30:00+00:00");
+        let aware = snapshot.rows[0]
+            .get("AWARE_AT")
+            .and_then(|v| v.as_str())
+            .expect("AWARE_AT");
+        assert_eq!(aware, "2024-01-15T01:30:00+00:00");
+    }
+
+    #[test]
+    fn events_initial_load_fails_without_timezone_when_db_unreadable() {
+        std::env::remove_var("MIGRALOOP_STUB_DB_TIMEZONE");
+        let err = initial_load_stub("EVENTS", None).expect_err("needs tz");
+        assert!(err.to_string().contains("timezone"));
+    }
+
+    #[test]
+    fn blob_is_not_allow_listed() {
+        let snapshot = initial_load_stub("CUSTOMERS", None).unwrap();
+        let bio = snapshot.columns.iter().find(|c| c.name == "BIO").unwrap();
+        assert!(!bio.supported);
+        assert!(!is_allow_listed_oracle_type("BLOB", None));
     }
 }

@@ -2,23 +2,26 @@
 
 mod config;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use migraloop_capture::{
-    incremental_changes_stub, initial_load_stub, CapturePosition, ChangeEvent, ChangeOp,
+    classify_number, incremental_changes_stub, initial_load_stub, is_allow_listed_oracle_type,
+    normalize_change_temporals, source_schema_stub, CapturePosition, ChangeEvent, ChangeOp,
+    NumberMongoMapping, SourceColumn,
 };
 use migraloop_delivery::{
-    delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryDocument,
-    MongoTargetConnection,
+    delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
+    DeliveryDocument, ManagedFieldAs, MongoTargetConnection,
 };
 use migraloop_platform_store::{
     base_dataset_exists, delete_base_datasets_not_in, filter_unapplied_change_ids, get_base_rows,
     health, list_base_datasets, list_deployments, list_pipelines, migrate,
     record_applied_source_changes, replace_base_dataset, replace_pipelines, update_base_primary_key,
     update_pipeline_delivery_progress, upsert_deployment, BaseColumn, BaseDataset, Deployment,
-    OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind, SystemConnection,
+    FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, SecretRef, SecretRefKind,
+    SystemConnection,
 };
 use thiserror::Error;
 
@@ -128,6 +131,14 @@ fn document_to_deployment(doc: &DeploymentDocument) -> Result<Deployment, CliErr
             database: doc.spec.source.database.clone(),
             username: doc.spec.source.username.clone(),
             password_ref: source_password_ref,
+            timezone: doc
+                .spec
+                .source
+                .timezone
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         },
         target: SystemConnection {
             kind: doc.spec.target.kind.clone(),
@@ -136,6 +147,7 @@ fn document_to_deployment(doc: &DeploymentDocument) -> Result<Deployment, CliErr
             database: doc.spec.target.database.clone(),
             username: doc.spec.target.username.clone(),
             password_ref: target_password_ref,
+            timezone: String::new(),
         },
     })
 }
@@ -159,6 +171,18 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
     } else {
         "pending".to_string()
     };
+    let field_mappings = pipeline
+        .fields
+        .iter()
+        .filter_map(|(name, spec)| {
+            let mapping = match spec.map_as.as_str() {
+                "string" => FieldMappingAs::String,
+                "omit" => FieldMappingAs::Omit,
+                _ => return None,
+            };
+            Some((name.clone(), mapping))
+        })
+        .collect();
     Pipeline {
         deployment_name: deployment_name.to_string(),
         name: pipeline.name.clone(),
@@ -172,6 +196,7 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
         target_collection,
         delivery_status,
         delivery_applied_changes: 0,
+        field_mappings,
     }
 }
 
@@ -261,15 +286,170 @@ fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
 }
 
 fn format_system_line(label: &str, system: &SystemConnection) -> String {
+    let timezone = if system.timezone.is_empty() {
+        "(none)".to_string()
+    } else {
+        system.timezone.clone()
+    };
     format!(
-        "  {label}: {} {}:{} database={} username={} passwordRef={}",
+        "  {label}: {} {}:{} database={} username={} passwordRef={} timezone={}",
         system.kind,
         system.host,
         system.port,
         system.database,
         system.username,
-        system.password_ref.display()
+        system.password_ref.display(),
+        timezone
     )
+}
+
+fn source_timezone_opt(deployment: &Deployment) -> Option<&str> {
+    let tz = deployment.source.timezone.trim();
+    if tz.is_empty() {
+        None
+    } else {
+        Some(tz)
+    }
+}
+
+fn base_columns_from_source(columns: &[&SourceColumn]) -> Vec<BaseColumn> {
+    columns
+        .iter()
+        .map(|c| BaseColumn {
+            name: c.name.clone(),
+            oracle_type: c.oracle_type.clone(),
+            precision: c.precision,
+            scale: c.scale,
+        })
+        .collect()
+}
+
+fn delivery_columns_from_base(columns: &[BaseColumn]) -> Vec<DeliveryColumn> {
+    columns
+        .iter()
+        .map(|c| DeliveryColumn {
+            name: c.name.clone(),
+            oracle_type: c.oracle_type.clone(),
+            precision: c.precision,
+            scale: c.scale,
+        })
+        .collect()
+}
+
+fn managed_field_as_map(
+    pipeline: &Pipeline,
+) -> std::collections::BTreeMap<String, ManagedFieldAs> {
+    pipeline
+        .field_mappings
+        .iter()
+        .map(|(k, v)| {
+            let mapped = match v {
+                FieldMappingAs::String => ManagedFieldAs::String,
+                FieldMappingAs::Omit => ManagedFieldAs::Omit,
+            };
+            (k.clone(), mapped)
+        })
+        .collect()
+}
+
+fn apply_field_mappings_to_row(
+    row: &serde_json::Map<String, serde_json::Value>,
+    pipeline: &Pipeline,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (key, value) in row {
+        match pipeline.field_mappings.get(key) {
+            Some(FieldMappingAs::Omit) => continue,
+            Some(FieldMappingAs::String) => {
+                let as_string = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    other => other.to_string(),
+                };
+                out.insert(key.clone(), serde_json::Value::String(as_string));
+            }
+            None => {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Apply-time validation for Managed/transform inputs (ADR-0018 / ADR-0023).
+fn validate_pipeline_managed_fields(
+    pipeline: &Pipeline,
+    source_columns: &[SourceColumn],
+    managed_column_names: &BTreeSet<String>,
+) -> Result<(), CliError> {
+    let by_name: std::collections::BTreeMap<&str, &SourceColumn> = source_columns
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
+
+    for (field, mapping) in &pipeline.field_mappings {
+        match by_name.get(field.as_str()) {
+            None => {
+                return Err(CliError::Failed(format!(
+                    "Pipeline {} fields.{} references unknown Source column",
+                    pipeline.name, field
+                )));
+            }
+            Some(col) if !col.supported || !is_allow_listed_oracle_type(&col.oracle_type, col.size) => {
+                if *mapping != FieldMappingAs::Omit {
+                    return Err(CliError::Failed(format!(
+                        "Pipeline {} cannot use unsupported Oracle type {} column {} as \
+                         Managed/transform input; omit it or remove the field mapping \
+                         (allow-list omission only)",
+                        pipeline.name, col.oracle_type, field
+                    )));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    for name in managed_column_names {
+        let Some(col) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        if !col.is_number() {
+            continue;
+        }
+        if classify_number(col.precision, col.scale) != NumberMongoMapping::Unsafe {
+            continue;
+        }
+        match pipeline.field_mappings.get(name) {
+            Some(FieldMappingAs::String) | Some(FieldMappingAs::Omit) => {}
+            None => {
+                return Err(CliError::Failed(format!(
+                    "NUMBER column {name} has unsafe declared precision/scale \
+                     (precision={:?}, scale={:?}); Pipeline {} cannot apply until \
+                     fields.{name}.as is string or omit (ADR-0023); never default IEEE double",
+                    col.precision, col.scale, pipeline.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn delivery_document_for_row(
+    row: &serde_json::Map<String, serde_json::Value>,
+    dataset: &BaseDataset,
+    pipeline: &Pipeline,
+) -> Result<DeliveryDocument, CliError> {
+    let managed = apply_field_mappings_to_row(row, pipeline);
+    let identity = output_identity_from_row(&managed, &dataset.primary_key).or_else(|_| {
+        // Identity may be omitted from Managed via field mapping; fall back to full row.
+        output_identity_from_row(row, &dataset.primary_key)
+    })?;
+    Ok(DeliveryDocument {
+        identity,
+        managed_fields: managed,
+        columns: delivery_columns_from_base(&dataset.columns),
+        field_as: managed_field_as_map(pipeline),
+    })
 }
 
 async fn ensure_store_healthy(platform_store_url: &str) -> Result<(), CliError> {
@@ -286,9 +466,11 @@ async fn ensure_store_healthy(platform_store_url: &str) -> Result<(), CliError> 
 
 async fn sync_base_datasets_for_pipelines(
     platform_store_url: &str,
-    deployment_name: &str,
+    deployment: &Deployment,
     pipelines: &[Pipeline],
 ) -> Result<(), CliError> {
+    let deployment_name = &deployment.name;
+    let configured_tz = source_timezone_opt(deployment);
     let mut tables = BTreeSet::new();
     for pipeline in pipelines {
         tables.insert((
@@ -310,22 +492,24 @@ async fn sync_base_datasets_for_pipelines(
         if already {
             // Existing Bases stay; do not reload on Pipeline re-apply (ADR-0019).
             // Backfill Output Identity PK metadata when an older Base predates Delivery.
-            ensure_base_primary_key(platform_store_url, deployment_name, &schema, &table).await?;
+            ensure_base_primary_key(
+                platform_store_url,
+                deployment_name,
+                &schema,
+                &table,
+                configured_tz,
+            )
+            .await?;
             continue;
         }
 
         // ADR-0004: establish low-watermark first, then snapshot (stub does both).
-        let snapshot = initial_load_stub(&table).map_err(|err| CliError::Failed(err.to_string()))?;
+        let snapshot = initial_load_stub(&table, configured_tz)
+            .map_err(|err| CliError::Failed(err.to_string()))?;
         let low_watermark = snapshot.low_watermark;
 
-        let columns: Vec<BaseColumn> = snapshot
-            .supported_columns()
-            .into_iter()
-            .map(|c| BaseColumn {
-                name: c.name.clone(),
-                oracle_type: c.oracle_type.clone(),
-            })
-            .collect();
+        let supported = snapshot.supported_columns();
+        let columns = base_columns_from_source(&supported);
         let omitted_columns: Vec<OmittedColumn> = snapshot
             .omitted_columns()
             .into_iter()
@@ -383,6 +567,7 @@ async fn ensure_base_primary_key(
     deployment_name: &str,
     source_schema: &str,
     source_table: &str,
+    configured_timezone: Option<&str>,
 ) -> Result<(), CliError> {
     let (dataset, _) = get_base_rows(platform_store_url, source_table, Some(deployment_name))
         .await
@@ -391,8 +576,8 @@ async fn ensure_base_primary_key(
         return Ok(());
     }
 
-    let snapshot =
-        initial_load_stub(source_table).map_err(|err| CliError::Failed(err.to_string()))?;
+    let snapshot = initial_load_stub(source_table, configured_timezone)
+        .map_err(|err| CliError::Failed(err.to_string()))?;
     if snapshot.primary_key.is_empty() {
         return Err(CliError::Failed(format!(
             "stub Source table {source_table} has no primary key for Output Identity"
@@ -409,6 +594,11 @@ async fn ensure_base_primary_key(
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
     Ok(())
+}
+
+/// Load stub Source schema metadata for apply-time Managed field validation.
+fn stub_source_columns(table: &str) -> Result<Vec<SourceColumn>, CliError> {
+    source_schema_stub(table).map_err(|err| CliError::Failed(err.to_string()))
 }
 
 async fn deliver_direct_pipelines(
@@ -438,15 +628,25 @@ async fn deliver_direct_pipelines(
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
+        let source_columns = stub_source_columns(&pipeline.source_table)?;
+        let managed_names: BTreeSet<String> = dataset
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .filter(|name| {
+                !matches!(
+                    pipeline.field_mappings.get(name),
+                    Some(FieldMappingAs::Omit)
+                )
+            })
+            .collect();
+        validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
+
         let mut documents = Vec::with_capacity(rows.len());
         for row in &rows {
-            let identity = output_identity_from_row(&row.data, &dataset.primary_key)?;
-            // Direct Pipeline Managed fields default to all supported Base columns.
-            let managed_fields = row.data.clone();
-            documents.push(DeliveryDocument {
-                identity,
-                managed_fields,
-            });
+            // Direct Pipeline Managed fields default to all supported Base columns,
+            // minus omit mappings; unsafe NUMBER requires string/omit (ADR-0023).
+            documents.push(delivery_document_for_row(&row.data, &dataset, pipeline)?);
         }
 
         let delivered = upsert_managed_documents(&mongo, &pipeline.target_collection, &documents)
@@ -482,6 +682,24 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
     let deployment = document_to_deployment(&doc)?;
     let pipelines = pipelines_from_document(&doc);
 
+    // Apply-time Managed validation before Initial Load / Delivery so unsafe NUMBER
+    // and unsupported Managed inputs fail configure-time (ADR-0018 / ADR-0023).
+    for pipeline in &pipelines {
+        let source_columns = stub_source_columns(&pipeline.source_table)?;
+        let managed_names: BTreeSet<String> = source_columns
+            .iter()
+            .filter(|c| c.supported)
+            .map(|c| c.name.clone())
+            .filter(|name| {
+                !matches!(
+                    pipeline.field_mappings.get(name),
+                    Some(FieldMappingAs::Omit)
+                )
+            })
+            .collect();
+        validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
+    }
+
     upsert_deployment(platform_store_url, &deployment)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
@@ -489,7 +707,7 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
-    sync_base_datasets_for_pipelines(platform_store_url, &deployment.name, &pipelines).await?;
+    sync_base_datasets_for_pipelines(platform_store_url, &deployment, &pipelines).await?;
     deliver_direct_pipelines(platform_store_url, &deployment, &pipelines).await?;
 
     println!("Deployment applied: {}", deployment.name);
@@ -506,6 +724,8 @@ fn row_matches_identity(
 fn supported_row_from_change(
     change: &ChangeEvent,
     supported_names: &BTreeSet<String>,
+    source_columns: &[SourceColumn],
+    configured_timezone: Option<&str>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, CliError> {
     let Some(row) = &change.row else {
         return Err(CliError::Failed(format!(
@@ -513,22 +733,32 @@ fn supported_row_from_change(
             change.op, change.identity
         )));
     };
-    Ok(row
+    let mut as_btree: BTreeMap<String, serde_json::Value> = row
         .iter()
         .filter(|(name, _)| supported_names.contains(*name))
         .map(|(name, value)| (name.clone(), value.clone()))
-        .collect())
+        .collect();
+    normalize_change_temporals(source_columns, &mut as_btree, configured_timezone)
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    Ok(as_btree.into_iter().collect())
 }
 
 fn apply_change_events_to_base_rows(
     rows: &mut Vec<serde_json::Map<String, serde_json::Value>>,
     changes: &[ChangeEvent],
     supported_names: &BTreeSet<String>,
+    source_columns: &[SourceColumn],
+    configured_timezone: Option<&str>,
 ) -> Result<(), CliError> {
     for change in changes {
         match change.op {
             ChangeOp::Insert | ChangeOp::Update => {
-                let managed = supported_row_from_change(change, supported_names)?;
+                let managed = supported_row_from_change(
+                    change,
+                    supported_names,
+                    source_columns,
+                    configured_timezone,
+                )?;
                 if let Some(existing) = rows
                     .iter_mut()
                     .find(|row| row_matches_identity(row, &change.identity))
@@ -712,6 +942,8 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 
             let supported_names: BTreeSet<String> =
                 dataset.columns.iter().map(|c| c.name.clone()).collect();
+            let source_columns = stub_source_columns(&table)?;
+            let configured_tz = source_timezone_opt(deployment);
             let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
                 base_rows.into_iter().map(|r| r.data).collect();
             let mut sync_applied = dataset.sync_applied_changes;
@@ -722,6 +954,8 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                     &mut rows,
                     std::slice::from_ref(change),
                     &supported_names,
+                    &source_columns,
+                    configured_tz,
                 )?;
 
                 // Delivery before durable checkpoint so retries prefer duplicate applies.
@@ -744,15 +978,12 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                                     pipeline.source_table, change.identity
                                 )));
                             };
-                            let identity =
-                                output_identity_from_row(base_row, &dataset.primary_key)?;
+                            let document =
+                                delivery_document_for_row(base_row, &dataset, pipeline)?;
                             let upserted = upsert_managed_documents(
                                 &mongo,
                                 &pipeline.target_collection,
-                                &[DeliveryDocument {
-                                    identity,
-                                    managed_fields: base_row.clone(),
-                                }],
+                                &[document],
                             )
                             .await
                             .map_err(|err| CliError::Failed(err.to_string()))?;

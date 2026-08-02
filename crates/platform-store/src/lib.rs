@@ -72,6 +72,10 @@ pub struct SystemConnection {
     pub database: String,
     pub username: String,
     pub password_ref: SecretRef,
+    /// IANA timezone for naive DATE/TIMESTAMP when Source DB timezone is unreadable.
+    /// Empty means unset (ADR-0022).
+    #[serde(default)]
+    pub timezone: String,
 }
 
 /// Durable Deployment pairing one Source System with one Target System.
@@ -80,6 +84,23 @@ pub struct Deployment {
     pub name: String,
     pub source: SystemConnection,
     pub target: SystemConnection,
+}
+
+/// Explicit Managed-field mapping override for Pipeline apply (ADR-0023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldMappingAs {
+    String,
+    Omit,
+}
+
+impl FieldMappingAs {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Omit => "omit",
+        }
+    }
 }
 
 /// A Pipeline declared inside a Deployment.
@@ -96,6 +117,9 @@ pub struct Pipeline {
     pub delivery_status: String,
     /// Count of Output Identity Delivery applies (upserts + deletes) for progress.
     pub delivery_applied_changes: i32,
+    /// Per-field Managed mapping overrides (`string` / `omit`) keyed by column name.
+    #[serde(default)]
+    pub field_mappings: std::collections::BTreeMap<String, FieldMappingAs>,
 }
 
 /// Supported column kept in a Base Dataset.
@@ -103,6 +127,10 @@ pub struct Pipeline {
 pub struct BaseColumn {
     pub name: String,
     pub oracle_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<i32>,
 }
 
 /// Unsupported Source column omitted from the Base Dataset.
@@ -217,16 +245,16 @@ pub async fn upsert_deployment(
         INSERT INTO deployments (
             name,
             source_kind, source_host, source_port, source_database, source_username,
-            source_password_ref_kind, source_password_ref_value,
+            source_password_ref_kind, source_password_ref_value, source_timezone,
             target_kind, target_host, target_port, target_database, target_username,
             target_password_ref_kind, target_password_ref_value,
             applied_at
         ) VALUES (
             $1,
             $2, $3, $4, $5, $6,
-            $7, $8,
-            $9, $10, $11, $12, $13,
-            $14, $15,
+            $7, $8, $9,
+            $10, $11, $12, $13, $14,
+            $15, $16,
             now()
         )
         ON CONFLICT (name) DO UPDATE SET
@@ -237,6 +265,7 @@ pub async fn upsert_deployment(
             source_username = EXCLUDED.source_username,
             source_password_ref_kind = EXCLUDED.source_password_ref_kind,
             source_password_ref_value = EXCLUDED.source_password_ref_value,
+            source_timezone = EXCLUDED.source_timezone,
             target_kind = EXCLUDED.target_kind,
             target_host = EXCLUDED.target_host,
             target_port = EXCLUDED.target_port,
@@ -255,6 +284,7 @@ pub async fn upsert_deployment(
     .bind(&deployment.source.username)
     .bind(deployment.source.password_ref.kind.as_str())
     .bind(&deployment.source.password_ref.value)
+    .bind(&deployment.source.timezone)
     .bind(&deployment.target.kind)
     .bind(&deployment.target.host)
     .bind(deployment.target.port)
@@ -284,12 +314,15 @@ pub async fn replace_pipelines(
         .map_err(PlatformStoreError::Persist)?;
 
     for pipeline in pipelines {
+        let field_mappings_json = serde_json::to_string(&pipeline.field_mappings)
+            .map_err(PlatformStoreError::InvalidJson)?;
         sqlx::query(
             r#"
             INSERT INTO pipelines (
                 deployment_name, name, mode, source_table, source_schema,
-                target_collection, delivery_status, delivery_applied_changes, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                target_collection, delivery_status, delivery_applied_changes,
+                field_mappings_json, applied_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -300,6 +333,7 @@ pub async fn replace_pipelines(
         .bind(&pipeline.target_collection)
         .bind(&pipeline.delivery_status)
         .bind(pipeline.delivery_applied_changes)
+        .bind(&field_mappings_json)
         .execute(&mut *tx)
         .await
         .map_err(PlatformStoreError::Persist)?;
@@ -410,7 +444,7 @@ pub async fn list_deployments(
         SELECT
             name,
             source_kind, source_host, source_port, source_database, source_username,
-            source_password_ref_kind, source_password_ref_value,
+            source_password_ref_kind, source_password_ref_value, source_timezone,
             target_kind, target_host, target_port, target_database, target_username,
             target_password_ref_kind, target_password_ref_value
         FROM deployments
@@ -430,7 +464,8 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     let rows = sqlx::query_as::<_, PipelineRow>(
         r#"
         SELECT deployment_name, name, mode, source_table, source_schema,
-               target_collection, delivery_status, delivery_applied_changes
+               target_collection, delivery_status, delivery_applied_changes,
+               field_mappings_json
         FROM pipelines
         ORDER BY deployment_name, name
         "#,
@@ -439,7 +474,7 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     .await
     .map_err(PlatformStoreError::Load)?;
 
-    Ok(rows.into_iter().map(PipelineRow::into_pipeline).collect())
+    rows.into_iter().map(PipelineRow::into_pipeline).collect()
 }
 
 /// Update Delivery status for one Pipeline.
@@ -631,6 +666,7 @@ struct DeploymentRow {
     source_username: String,
     source_password_ref_kind: String,
     source_password_ref_value: String,
+    source_timezone: String,
     target_kind: String,
     target_host: String,
     target_port: i32,
@@ -654,6 +690,7 @@ impl DeploymentRow {
                     kind: SecretRefKind::parse(&self.source_password_ref_kind)?,
                     value: self.source_password_ref_value,
                 },
+                timezone: self.source_timezone,
             },
             target: SystemConnection {
                 kind: self.target_kind,
@@ -665,6 +702,7 @@ impl DeploymentRow {
                     kind: SecretRefKind::parse(&self.target_password_ref_kind)?,
                     value: self.target_password_ref_value,
                 },
+                timezone: String::new(),
             },
         })
     }
@@ -680,11 +718,14 @@ struct PipelineRow {
     target_collection: String,
     delivery_status: String,
     delivery_applied_changes: i32,
+    field_mappings_json: String,
 }
 
 impl PipelineRow {
-    fn into_pipeline(self) -> Pipeline {
-        Pipeline {
+    fn into_pipeline(self) -> Result<Pipeline, PlatformStoreError> {
+        let field_mappings = serde_json::from_str(&self.field_mappings_json)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        Ok(Pipeline {
             deployment_name: self.deployment_name,
             name: self.name,
             mode: self.mode,
@@ -693,7 +734,8 @@ impl PipelineRow {
             target_collection: self.target_collection,
             delivery_status: self.delivery_status,
             delivery_applied_changes: self.delivery_applied_changes,
-        }
+            field_mappings,
+        })
     }
 }
 
