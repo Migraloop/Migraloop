@@ -48,7 +48,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab down
 ```
 
-Defaults after bring-up: Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`, MongoDB `migraloop` / `lab_mongo` database `lab`. Lab bring-up does not apply sample Deployments/Pipelines. Requires Docker Compose; first Oracle boot can take several minutes. See [CLI & Config](cli-and-config.md) (`lab`) and [Deployment](deployment.md).
+Defaults after bring-up: Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`, MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`. Lab bring-up does not apply sample Deployments/Pipelines. Requires Docker Compose; first Oracle boot can take several minutes. See [CLI & Config](cli-and-config.md) (`lab`) and [Deployment](deployment.md).
 
 ## Tests
 

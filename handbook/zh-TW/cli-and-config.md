@@ -130,7 +130,7 @@ Lab 是手動驗證—不是 Release Quality Gate，也不是 contract/stub LogM
 | `MIGRALOOP_PLATFORM_STORE_URL` | Operator CLI 與 compose `app` 使用的 Platform Store 連線 URL（`postgres://...`） |
 | 設定中 `fromEnv` 參照的密鑰環境變數名 | 你在 `password.fromEnv` 寫的任何名稱（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply/sync 時必須存在於行程環境 |
 | `LD_LIBRARY_PATH` | 真實 Oracle host：Oracle Instant Client libraries 目錄（apply/sync runtime 需要；`contract`/`stub` 不使用） |
-| Lab disposable defaults | `migraloop lab up` 之後：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`（僅本機 Lab） |
+| Lab disposable defaults | `migraloop lab up` 之後：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`（僅本機 Lab） |
 
 ### Contract-harness Source Prerequisite probes（僅 host `stub` / `contract`）
 

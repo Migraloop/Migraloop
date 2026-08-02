@@ -108,8 +108,10 @@ async fn lab_up_status_down_fixture_lifecycle() {
         "lab up should include Oracle connection details, got:\n{up_out}"
     );
     assert!(
-        up_out.contains("MONGO_PASSWORD") || up_out.contains("Mongo"),
-        "lab up should include MongoDB connection details, got:\n{up_out}"
+        up_out.contains("authSource=admin")
+            || up_out.contains("MONGO_PASSWORD")
+            || up_out.contains("Mongo"),
+        "lab up should include MongoDB connection details (with authSource), got:\n{up_out}"
     );
 
     let status = Command::new(bin())

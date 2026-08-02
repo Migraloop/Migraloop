@@ -150,8 +150,8 @@ async fn lab_up(lab_dir: &Path) -> Result<(), CliError> {
     ensure_platform_store_migrated(lab_dir).await?;
 
     println!("Lab Fixture: ready");
+    print_deployment_pipeline_state().await;
     print_connection_details();
-    print_empty_deployment_notice();
     Ok(())
 }
 
@@ -205,14 +205,14 @@ async fn lab_status(lab_dir: &Path) -> Result<(), CliError> {
     println!("Lab Fixture: ready");
     for (name, _) in &services {
         let detail = if name == "oracle" && oracle_ok {
-            "ready (ARCHIVELOG + database supplemental logging)"
+            "ready (ARCHIVELOG + database supplemental logging; SYNC_USER can probe)"
         } else {
             "ready"
         };
         println!("  {name}: {detail}");
     }
     println!("  Platform Store: healthy");
-    print_empty_deployment_notice();
+    print_deployment_pipeline_state().await;
     print_connection_details();
     Ok(())
 }
@@ -304,18 +304,6 @@ async fn service_readiness(lab_dir: &Path) -> Result<Vec<(String, bool)>, CliErr
     if running.is_empty() {
         let (ok2, text) = run_compose(lab_dir, &["ps"]).await?;
         if ok2 {
-            for name in wanted {
-                if text.contains(name) && (text.contains("running") || text.contains("Up")) {
-                    // Heuristic only; prefer JSON path above.
-                    let lower = text.to_ascii_lowercase();
-                    if lower.contains(&format!("{name}")) {
-                        // Mark based on presence of "healthy" near service when possible.
-                        running.insert(name.to_string());
-                    }
-                }
-            }
-            // Refine: only mark services whose line mentions running/healthy.
-            running.clear();
             for line in text.lines() {
                 let lower = line.to_ascii_lowercase();
                 for name in wanted {
@@ -379,28 +367,59 @@ fn record_service_if_running(item: &serde_json::Value, running: &mut std::collec
 
 async fn probe_oracle_prerequisites(lab_dir: &Path) -> Result<(), CliError> {
     // Probe inside the Oracle container so host Instant Client is not required for Lab status.
-    // LOG_MODE is instance-wide (CDB); supplemental logging is checked in FREEPDB1.
-    let sql = "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+    // SYSDBA confirms ARCHIVELOG + DB supplemental logging; SYNC_USER confirms Lab capture grants.
+    let sys_sql = "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
 WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
 SELECT 'LOG_MODE=' || LOG_MODE FROM V$DATABASE;\n\
 ALTER SESSION SET CONTAINER=FREEPDB1;\n\
 SELECT 'SUPP=' || NVL(SUPPLEMENTAL_LOG_DATA_MIN, 'NO') FROM V$DATABASE;\n\
 EXIT;\n";
+    let sys_text = sqlplus_in_oracle(lab_dir, "/ as sysdba", sys_sql).await?;
+    let upper = sys_text.to_ascii_uppercase();
+    if !upper.contains("LOG_MODE=ARCHIVELOG") {
+        return Err(CliError::Failed(format!(
+            "Lab Oracle is not in ARCHIVELOG mode (required for LogMiner):\n{sys_text}"
+        )));
+    }
+    if !(upper.contains("SUPP=YES") || upper.contains("SUPP=IMPLICIT")) {
+        return Err(CliError::Failed(format!(
+            "Lab Oracle database supplemental logging is not enabled:\n{sys_text}"
+        )));
+    }
 
+    let sync_sql = "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+SELECT 'SYNC_OK=' || NVL(SUPPLEMENTAL_LOG_DATA_MIN, 'NO') FROM V$DATABASE;\n\
+EXIT;\n";
+    // Inside the container, connect via local FREEPDB1 service name as SYNC_USER.
+    let sync_connect_local = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    let sync_text = match sqlplus_in_oracle(lab_dir, &sync_connect_local, sync_sql).await {
+        Ok(text) => text,
+        Err(err) => {
+            return Err(CliError::Failed(format!(
+                "Lab SYNC_USER cannot probe Source Prerequisites (grants/LogMiner readiness): {err}"
+            )));
+        }
+    };
+    let sync_upper = sync_text.to_ascii_uppercase();
+    if !(sync_upper.contains("SYNC_OK=YES") || sync_upper.contains("SYNC_OK=IMPLICIT")) {
+        return Err(CliError::Failed(format!(
+            "Lab SYNC_USER cannot read database supplemental logging state:\n{sync_text}"
+        )));
+    }
+    Ok(())
+}
+
+async fn sqlplus_in_oracle(
+    lab_dir: &Path,
+    connect: &str,
+    sql: &str,
+) -> Result<String, CliError> {
     let mut cmd = compose_base(lab_dir)?;
-    cmd.args([
-        "exec",
-        "-T",
-        "-e",
-        "ORACLE_PWD=lab_oracle_sys",
-        "oracle",
-        "sqlplus",
-        "-s",
-        "/ as sysdba",
-    ])
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    cmd.args(["exec", "-T", "oracle", "sqlplus", "-s", connect])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
@@ -425,22 +444,10 @@ EXIT;\n";
     );
     if !output.status.success() {
         return Err(CliError::Failed(format!(
-            "Oracle prerequisite probe failed:\n{text}"
+            "Oracle sqlplus probe failed ({connect}):\n{text}"
         )));
     }
-
-    let upper = text.to_ascii_uppercase();
-    if !upper.contains("LOG_MODE=ARCHIVELOG") {
-        return Err(CliError::Failed(format!(
-            "Lab Oracle is not in ARCHIVELOG mode (required for LogMiner):\n{text}"
-        )));
-    }
-    if !(upper.contains("SUPP=YES") || upper.contains("SUPP=IMPLICIT")) {
-        return Err(CliError::Failed(format!(
-            "Lab Oracle database supplemental logging is not enabled:\n{text}"
-        )));
-    }
-    Ok(())
+    Ok(text)
 }
 
 async fn ensure_platform_store_migrated(lab_dir: &Path) -> Result<(), CliError> {
@@ -507,9 +514,9 @@ fn print_connection_details() {
          {LAB_ORACLE_PASSWORD_ENV}={LAB_ORACLE_PASSWORD_DEFAULT}"
     );
     println!(
-        "  MongoDB Target: host={LAB_MONGO_HOST} port={LAB_MONGO_PORT} \
-         database={LAB_MONGO_DATABASE} user={LAB_MONGO_USER} \
-         {LAB_MONGO_PASSWORD_ENV}={LAB_MONGO_PASSWORD_DEFAULT}"
+        "  MongoDB Target: mongodb://{LAB_MONGO_USER}:{LAB_MONGO_PASSWORD_DEFAULT}\
+@{LAB_MONGO_HOST}:{LAB_MONGO_PORT}/{LAB_MONGO_DATABASE}?authSource=admin \
+         ({LAB_MONGO_PASSWORD_ENV}={LAB_MONGO_PASSWORD_DEFAULT})"
     );
     println!();
     println!("Next:");
@@ -520,8 +527,42 @@ fn print_connection_details() {
     println!("  # Apply a Deployment yourself, or run a Lab Scenario when available.");
 }
 
-fn print_empty_deployment_notice() {
-    println!("Deployment: (none)");
-    println!("Pipeline: (none)");
-    println!("  (Lab Fixture does not apply a default Deployment or Pipelines)");
+async fn print_deployment_pipeline_state() {
+    // Read live Platform Store state so status never invents a default Pipeline,
+    // and still reflects Deployments the operator applied after bring-up.
+    let output = Command::new(std::env::current_exe().unwrap_or_else(|_| PathBuf::from("migraloop")))
+        .args(["status", "--platform-store-url", LAB_PLATFORM_STORE_URL])
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut saw_deployment = false;
+            let mut saw_pipeline = false;
+            for line in text.lines() {
+                if line.starts_with("Deployment:") {
+                    println!("{line}");
+                    saw_deployment = true;
+                } else if line.starts_with("Pipeline:") {
+                    println!("{line}");
+                    saw_pipeline = true;
+                }
+            }
+            if !saw_deployment {
+                println!("Deployment: (none)");
+            }
+            if !saw_pipeline {
+                println!("Pipeline: (none)");
+            }
+            if text.contains("Deployment: (none)") && text.contains("Pipeline: (none)") {
+                println!(
+                    "  (Lab Fixture does not apply a default Deployment or Pipelines)"
+                );
+            }
+        }
+        _ => {
+            println!("Deployment: (unknown — Platform Store status unavailable)");
+            println!("Pipeline: (unknown — Platform Store status unavailable)");
+        }
+    }
 }

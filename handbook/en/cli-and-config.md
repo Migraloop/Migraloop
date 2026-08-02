@@ -130,7 +130,7 @@ Lab is manual verification—not the Release Quality Gate and not the contract/s
 | `MIGRALOOP_PLATFORM_STORE_URL` | Platform Store connection URL (`postgres://...`) used by Operator CLI commands and compose `app` |
 | Secret env names referenced from config | Any names you put in `password.fromEnv` (for example `ORACLE_PASSWORD`, `MONGO_PASSWORD`) must be present in the process environment at apply/sync time |
 | `LD_LIBRARY_PATH` | For real Oracle hosts: directory of Oracle Instant Client libraries (required at apply/sync runtime; not used by `contract`/`stub`) |
-| Lab disposable defaults | After `migraloop lab up`: `ORACLE_PASSWORD=lab_oracle`, `MONGO_PASSWORD=lab_mongo`, Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop` (local Lab only) |
+| Lab disposable defaults | After `migraloop lab up`: `ORACLE_PASSWORD=lab_oracle`, `MONGO_PASSWORD=lab_mongo`, Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin` (local Lab only) |
 
 ### Contract-harness Source Prerequisite probes (host `stub` / `contract` only)
 
