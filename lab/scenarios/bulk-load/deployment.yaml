@@ -1,0 +1,31 @@
+# Lab Scenario: bulk-load
+# Self-contained Scenario Namespace for ~100k Source volume + metric thresholds
+# (ADR-0025 / issue #63). Applied via the real product `migraloop apply` path.
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-bulk-load
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-bl-items
+      mode: direct
+      source:
+        table: LAB_BL_ITEMS
+      target:
+        collection: lab_bl_items

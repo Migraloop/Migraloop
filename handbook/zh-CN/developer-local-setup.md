@@ -49,6 +49,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run direct-pipeline
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
+./target/debug/migraloop lab scenario run bulk-load
 # 用 migraloop base / derived / target 查看留下的 Scenario Namespace，或直接变更 Lab DB。
 # 重跑会先 wipe Namespace；或：lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
@@ -95,7 +96,7 @@ Lab Fixture lifecycle seam（默认 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、多表 Transform Pipeline 与 concurrent Source workload seams（默认 ignored；需要 Docker Lab Fixture + Instant Client）：
+Lab Scenario Direct Pipeline、多表 Transform Pipeline 、concurrent Source workload 与 bulk-load seams（默认 ignored；需要 Docker Lab Fixture + Instant Client）：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
