@@ -23,8 +23,8 @@ invoked by this job (ADR-0025 / ADR-0028).
      -- --ignored --nocapture
    ```
 
-2. Copy the printed `duration_ms` / `rows_per_s` into
-   `direct_pipeline_microbench_baseline.json` (prefer a slightly conservative
-   duration / throughput so ordinary runner noise stays inside the allowed %).
+2. Copy the printed timed-run `duration_ms` / `rows_per_s` (the `seed_rows=N`
+   line after warmup) into `direct_pipeline_microbench_baseline.json`. Prefer
+   values measured on `ubuntu-latest` CI so the ~20% band is real, not padded.
 
 3. Keep `allowed_regression_pct` at ~20 unless intentionally retuning the gate.

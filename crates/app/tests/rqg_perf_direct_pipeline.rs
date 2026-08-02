@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::json;
 use tempfile::TempDir;
 
 /// Committed baseline shape under `ci/rqg/direct_pipeline_microbench_baseline.json`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 struct PerfBaseline {
     seed_rows: u64,
     duration_ms: u64,
@@ -69,15 +70,7 @@ fn compare_to_baseline(measured: &PerfMeasurement, baseline: &PerfBaseline) -> R
 }
 
 fn parse_baseline(raw: &str) -> PerfBaseline {
-    let v: Value = serde_json::from_str(raw).expect("baseline JSON");
-    PerfBaseline {
-        seed_rows: v["seed_rows"].as_u64().expect("seed_rows"),
-        duration_ms: v["duration_ms"].as_u64().expect("duration_ms"),
-        rows_per_s: v["rows_per_s"].as_f64().expect("rows_per_s"),
-        allowed_regression_pct: v["allowed_regression_pct"]
-            .as_f64()
-            .expect("allowed_regression_pct"),
-    }
+    serde_json::from_str(raw).expect("baseline JSON")
 }
 
 fn throughput(rows: u64, duration: Duration) -> f64 {
@@ -425,6 +418,10 @@ async fn run_timed_microbench(seed_rows: u64) -> PerfMeasurement {
         apply_out.contains("Initial Load complete") && apply_out.contains("CUSTOMERS"),
         "expected Initial Load for CUSTOMERS, got:\n{apply_out}"
     );
+    assert!(
+        apply_out.contains("Delivery complete"),
+        "expected Delivery after Initial Load, got:\n{apply_out}"
+    );
 
     let sync = run_sync_with_catalog(&url, &catalog_path);
     assert!(
@@ -438,6 +435,11 @@ async fn run_timed_microbench(seed_rows: u64) -> PerfMeasurement {
         sync_out.to_ascii_lowercase().contains("incremental")
             || sync_out.to_ascii_lowercase().contains("sync"),
         "expected Incremental Capture progress in sync output, got:\n{sync_out}"
+    );
+    assert!(
+        sync_out.contains("Delivery complete")
+            || sync_out.to_ascii_lowercase().contains("deliver"),
+        "expected Delivery after Incremental Capture, got:\n{sync_out}"
     );
 
     let elapsed = started.elapsed();
