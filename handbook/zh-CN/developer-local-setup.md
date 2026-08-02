@@ -195,6 +195,7 @@ cargo run -p handbook-guard -- check \
 ```
 
 `handbook/en`、`handbook/zh-TW`、`handbook/zh-CN` 下的 locale trees 必须保持路径同构。英文为 canonical。
+
 ## 目录提醒
 
 | 路径 | 读者 |

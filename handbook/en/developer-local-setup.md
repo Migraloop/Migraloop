@@ -102,7 +102,7 @@ Every PR/push must keep four parallel checks green (ADR-0011, ADR-0028). Handboo
 
 | Check | What it runs | Local reproduction |
 | --- | --- | --- |
-| **Handbook guard** | `cargo test -p handbook-guard` plus the handbook check entrypoint | See [Handbook guard](#handbook-guard-docs-ci-seam) below |
+| **Handbook guard** | `cargo test -p handbook-guard` plus the handbook check entrypoint | See the Handbook guard section below |
 | **rqg-unit** | Workspace crate tests excluding `migraloop-app` and `handbook-guard` (no Postgres/Mongo) | `cargo test --workspace --exclude migraloop-app --exclude handbook-guard` |
 | **rqg-integration** | Non-ignored `migraloop-app` tests (correctness, contract, fault, capability CI twins) | CI-parity env below, then `cargo test -p migraloop-app` |
 | **rqg-perf** | Fixed Direct Pipeline microbench on contract/stub vs committed baseline (~20% regression; one retry) | CI-parity env below, then `bash ci/rqg/run_direct_pipeline_microbench.sh` |
