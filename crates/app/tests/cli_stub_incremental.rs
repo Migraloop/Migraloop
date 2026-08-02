@@ -1,9 +1,9 @@
-//! Operator-visible seam: stub Incremental Capture updates Base then Mongo.
+//! Operator-visible seam: LogMiner (contract) Incremental Capture updates Base then Mongo.
 //!
-//! Agreed seam (issue #8 / PRD): CLI config/status + resulting Base/Target outcomes.
-//! Insert/update/delete-style stub changes apply identity-keyed and Managed-field
-//! scoped for a Direct Pipeline. Sync/Delivery progress is visible in status.
-//! Does not claim no-gap cutover or restart resume.
+//! Agreed seam (issue #8 / #13 / PRD): CLI config/status + resulting Base/Target outcomes.
+//! Insert/update/delete-style LogMiner contract changes apply identity-keyed and
+//! Managed-field scoped for a Direct Pipeline. Sync/Delivery progress is visible in status.
+//! Cutover / restart resume are covered by dedicated seam tests.
 
 use std::fs;
 use std::path::{Path, PathBuf};

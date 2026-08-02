@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use migraloop_capture::{
-    check_oracle_source_prerequisites, classify_number, incremental_changes_stub,
-    initial_load_stub, is_allow_listed_oracle_type, normalize_change_temporals,
-    probe_oracle_source_prerequisites_stub, source_schema_stub, CapturePosition, ChangeEvent,
-    ChangeOp, NumberMongoMapping, SourceColumn, TypeError,
+    check_oracle_source_prerequisites, classify_number, initial_load_stub,
+    is_allow_listed_oracle_type, normalize_change_temporals, open_oracle_incremental_capture,
+    source_schema_stub, CapturePosition, ChangeEvent, ChangeOp, IncrementalCapture,
+    NumberMongoMapping, OracleSourceConnect, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
@@ -602,11 +602,42 @@ fn stub_source_columns(table: &str) -> Result<Vec<SourceColumn>, CliError> {
     source_schema_stub(table).map_err(|err| CliError::Failed(err.to_string()))
 }
 
+fn oracle_source_connect(source: &SystemConnection) -> Result<OracleSourceConnect, CliError> {
+    if source.port <= 0 || source.port > u16::MAX as i32 {
+        return Err(CliError::Failed(
+            "source.port must be a valid TCP port".to_string(),
+        ));
+    }
+    Ok(OracleSourceConnect {
+        host: source.host.clone(),
+        port: source.port as u16,
+        database: source.database.clone(),
+        username: source.username.clone(),
+    })
+}
+
+/// Open LogMiner-backed Incremental Capture for a Deployment Source System.
+fn open_deployment_incremental_capture(
+    source: &SystemConnection,
+) -> Result<IncrementalCapture, CliError> {
+    let connect = oracle_source_connect(source)?;
+    let password = resolve_secret_value(&source.password_ref, "source.password")?;
+    open_oracle_incremental_capture(&connect, &password)
+        .map_err(|err| CliError::Failed(err.to_string()))
+}
+
 /// Fail-fast Oracle Source Prerequisites before capture runs (ADR-0021).
 ///
-/// Probes Source settings read-only; never auto-alters customer Oracle config.
-fn ensure_oracle_source_prerequisites(source_tables: &[String]) -> Result<(), CliError> {
-    let state = probe_oracle_source_prerequisites_stub();
+/// Probes via the same LogMiner capture backend the Sync path uses (contract or
+/// OCI). Read-only; never auto-alters customer Oracle config.
+fn ensure_oracle_source_prerequisites(
+    source: &SystemConnection,
+    source_tables: &[String],
+) -> Result<(), CliError> {
+    let capture = open_deployment_incremental_capture(source)?;
+    let state = capture
+        .probe_prerequisites()
+        .map_err(|err| CliError::Failed(err.to_string()))?;
     check_oracle_source_prerequisites(&state, source_tables)
         .map_err(|err| CliError::Failed(err.to_string()))
 }
@@ -721,8 +752,10 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
     }
 
     // ADR-0021: fail-fast Source Prerequisites before any capture (Initial Load).
-    if deployment.source.kind.eq_ignore_ascii_case("oracle") {
-        ensure_oracle_source_prerequisites(&pipeline_source_tables(&pipelines))?;
+    // Deployment-only apply (no Pipeline tables) does not open LogMiner yet.
+    let source_tables = pipeline_source_tables(&pipelines);
+    if deployment.source.kind.eq_ignore_ascii_case("oracle") && !source_tables.is_empty() {
+        ensure_oracle_source_prerequisites(&deployment.source, &source_tables)?;
     }
 
     upsert_deployment(platform_store_url, &deployment)
@@ -873,9 +906,19 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
         }
 
         // ADR-0021: fail-fast Source Prerequisites before Incremental Capture.
-        if deployment.source.kind.eq_ignore_ascii_case("oracle") {
+        // LogMiner-backed capture (contract or OCI) is opened once per Deployment.
+        let capture = if deployment.source.kind.eq_ignore_ascii_case("oracle") {
             let source_tables: Vec<String> = tables.iter().map(|(_, t)| t.clone()).collect();
-            ensure_oracle_source_prerequisites(&source_tables)?;
+            ensure_oracle_source_prerequisites(&deployment.source, &source_tables)?;
+            Some(open_deployment_incremental_capture(&deployment.source)?)
+        } else {
+            None
+        };
+        if let Some(ref capture) = capture {
+            println!(
+                "Incremental Capture: mechanism={}",
+                capture.mechanism_label()
+            );
         }
 
         // Resume from durable Platform Store checkpoint (exclusive). Initial Load sets
@@ -914,8 +957,18 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 None => low_watermark,
             };
 
-            let candidate_changes = incremental_changes_stub(&table, resume_from)
-                .map_err(|err| CliError::Failed(err.to_string()))?;
+            let candidate_changes = match &capture {
+                Some(capture) => capture
+                    .fetch_changes(&table, resume_from)
+                    .map_err(|err| CliError::Failed(err.to_string()))?,
+                None => {
+                    return Err(CliError::Failed(format!(
+                        "Incremental Capture requires an Oracle Source System (LogMiner); \
+                         got kind={}",
+                        deployment.source.kind
+                    )));
+                }
+            };
             let candidate_ids: Vec<String> = candidate_changes
                 .iter()
                 .map(|c| c.change_id.clone())
@@ -1151,6 +1204,15 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             println!("Deployment: {}", deployment.name);
             println!("{}", format_system_line("Source", &deployment.source));
             println!("{}", format_system_line("Target", &deployment.target));
+            if deployment.source.kind.eq_ignore_ascii_case("oracle") {
+                let connect = oracle_source_connect(&deployment.source)?;
+                let mechanism = if connect.is_contract_harness() {
+                    "LogMiner (contract)"
+                } else {
+                    "LogMiner (OCI)"
+                };
+                println!("  Incremental Capture: {mechanism}");
+            }
         }
     }
 

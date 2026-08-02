@@ -15,7 +15,7 @@ pub const MIN_REDO_RETENTION_HOURS: u32 = 24;
 
 /// Read-only observation of Oracle Source Prerequisite state.
 ///
-/// Produced by a Source probe (stub today; real OCI queries later). Callers must
+/// Produced by a Source probe (LogMiner contract harness or OCI). Callers must
 /// treat this as observational — never write these values back to Oracle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleSourcePrerequisiteState {
