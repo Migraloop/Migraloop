@@ -1,0 +1,5 @@
+# 从这里开始
+
+从安装到第一个 Pipeline 与 Sync Health / Delivery Health 检查的精简路径。细节见各功能章节。
+
+_章节 stub — 完整内容于后续 handbook 工单补齐。_
