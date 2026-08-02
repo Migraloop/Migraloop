@@ -28,8 +28,8 @@ pub use oracle_prerequisites::{
 };
 pub use contract_catalog::{
     clear_contract_source_catalog_override, load_contract_source_catalog,
-    lock_contract_catalog_for_test, set_contract_source_catalog_override, snapshot,
-    ContractSourceCatalog, ContractSourceCatalogFile, CONTRACT_SOURCE_CATALOG_ENV,
+    set_contract_source_catalog_override, snapshot, ContractSourceCatalog,
+    ContractSourceCatalogFile, CONTRACT_SOURCE_CATALOG_ENV,
 };
 pub use oracle_source::{discover_source_schema, initial_load_for_source};
 pub use oracle_types::{

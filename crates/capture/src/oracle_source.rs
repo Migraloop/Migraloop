@@ -270,14 +270,13 @@ pub(crate) fn mined_value_to_json(
 mod tests {
     use super::*;
     use crate::{
-        clear_contract_source_catalog_override, col, lock_contract_catalog_for_test, number_col,
-        set_contract_source_catalog_override, snapshot, ContractSourceCatalog,
+        clear_contract_source_catalog_override, col, number_col, set_contract_source_catalog_override,
+        snapshot, ContractSourceCatalog,
     };
     use serde_json::json;
 
     #[test]
     fn contract_host_initial_load_uses_default_named_fixtures() {
-        let _lock = lock_contract_catalog_for_test();
         clear_contract_source_catalog_override();
         let source = OracleSourceConnect {
             host: "contract".into(),
@@ -293,7 +292,6 @@ mod tests {
 
     #[test]
     fn contract_host_discovers_and_loads_injected_non_fixture_table() {
-        let _lock = lock_contract_catalog_for_test();
         clear_contract_source_catalog_override();
         let mut catalog = ContractSourceCatalog::with_default_fixtures();
         let mut row = BTreeMap::new();
@@ -335,7 +333,6 @@ mod tests {
 
     #[test]
     fn real_host_without_reachable_oracle_names_oci_or_instant_client() {
-        let _lock = lock_contract_catalog_for_test();
         clear_contract_source_catalog_override();
         let source = OracleSourceConnect {
             host: "127.0.0.1".into(),
