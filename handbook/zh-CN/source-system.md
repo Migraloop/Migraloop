@@ -59,7 +59,7 @@ Live OCI probe 要求 **ARCHIVELOG** 模式。可读时会报告可用 archived-
 3. 运行 `migraloop apply` / `migraloop sync`。未满足的 prerequisites 会在运行前失败并指出缺什么。
 4. 修好指名的 Oracle 设置后重跑。平台绝不会自动执行 `ALTER DATABASE` / `ALTER TABLE` 来「修复」失败。
 
-**Local Sync Lab：** `migraloop lab up` 会布署可丢弃的 Oracle Source，并已满足 Lab 使用所需的 database-level prerequisites（ARCHIVELOG + database supplemental logging + sync-user grants）。当 Lab Scenario（或你）创建 Pipeline 引用的表时，仍须套用 table-level supplemental logging—例如 `migraloop lab scenario run direct-pipeline` 或 `transform-pipeline` 会在其 Scenario Namespace 表加上 `SUPPLEMENTAL LOG DATA (ALL) COLUMNS`，再走真实 `apply` / LogMiner `sync`（需要 host Instant Client / `LD_LIBRARY_PATH`）。重跑同一 Scenario 会先 drop 再重建那些 Namespace 表；`lab scenario remove` 可在不重跑的情况下清除。Lab 不会变更客户／生产环境数据库。
+**Local Sync Lab：** `migraloop lab up` 会布署可丢弃的 Oracle Source，并已满足 Lab 使用所需的 database-level prerequisites（ARCHIVELOG + database supplemental logging + sync-user grants）。当 Lab Scenario（或你）创建 Pipeline 引用的表时，仍须套用 table-level supplemental logging—例如 `migraloop lab scenario run direct-pipeline`、`transform-pipeline` 或 `concurrent-source-workload` 会在其 Scenario Namespace 表加上 `SUPPLEMENTAL LOG DATA (ALL) COLUMNS`，再走真实 `apply` / LogMiner `sync`（需要 host Instant Client / `LD_LIBRARY_PATH`）。重跑同一 Scenario 会先 drop 再重建那些 Namespace 表；`lab scenario remove` 可在不重跑的情况下清除。Lab 不会变更客户／生产环境数据库。
 
 ### Contract LogMiner harness（测试 / 本地切片）
 

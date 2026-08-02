@@ -48,6 +48,7 @@ cargo build -p migraloop-app
 # Scenario apply/sync needs Instant Client: export LD_LIBRARY_PATH=/path/to/instantclient
 ./target/debug/migraloop lab scenario run direct-pipeline
 ./target/debug/migraloop lab scenario run transform-pipeline
+./target/debug/migraloop lab scenario run concurrent-source-workload
 # Inspect leftover Scenario Namespace with migraloop base / derived / target, or mutate Lab DBs directly.
 # Re-run wipes Namespace first; or: lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
@@ -94,7 +95,7 @@ Lab Fixture lifecycle seam (ignored by default; requires Docker Compose + Lab Or
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline and multi-table Transform Pipeline seams (ignored by default; requires Docker Lab Fixture + Instant Client):
+Lab Scenario Direct Pipeline, multi-table Transform Pipeline, and concurrent Source workload seams (ignored by default; requires Docker Lab Fixture + Instant Client):
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient

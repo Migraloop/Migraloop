@@ -1,9 +1,10 @@
 //! Lab Scenario catalog, run orchestration, and Namespace cleanup
-//! (issues #60–#62 / ADR-0025).
+//! (issues #60–#64 / ADR-0025).
 //!
 //! Lab-specific machinery: catalog listing, Scenario Namespace lifecycle
 //! (prepare / re-run wipe / manual remove / opt-in auto-remove), Source workload
-//! driving, one-at-a-time lock, and result reporting.
+//! driving (including recipe-authored intra-Scenario concurrency), one-at-a-time
+//! lock, and result reporting.
 //! Apply / Sync / inspect use the real product CLI path.
 
 use std::fs::{self, OpenOptions};
@@ -42,6 +43,19 @@ const TRANSFORM_ORDER_TOTALS_COLLECTION: &str = "lab_tp_order_totals";
 const TRANSFORM_ORDER_TOTALS_PIPELINE: &str = "lab-tp-order-totals";
 const TRANSFORM_PIPELINE_DEPLOYMENT: &str = "lab-transform-pipeline";
 
+const CONCURRENT_SOURCE_ID: &str = "concurrent-source-workload";
+const CONCURRENT_SOURCE_SUMMARY: &str =
+    "Intra-Scenario concurrent Source workload: parallel multi-table changes → Target/Derived under contention";
+const CONCURRENT_CUSTOMERS_TABLE: &str = "LAB_CW_CUSTOMERS";
+const CONCURRENT_ORDERS_TABLE: &str = "LAB_CW_ORDERS";
+const CONCURRENT_CUSTOMERS_COLLECTION: &str = "lab_cw_customers";
+const CONCURRENT_ORDER_TOTALS_COLLECTION: &str = "lab_cw_order_totals";
+const CONCURRENT_ORDER_TOTALS_PIPELINE: &str = "lab-cw-order-totals";
+const CONCURRENT_SOURCE_DEPLOYMENT: &str = "lab-concurrent-source-workload";
+/// Fail-able settle threshold after concurrent Source changes (US21 / US47).
+const CONCURRENT_MAX_SETTLE_MS: u128 = 300_000;
+const CONCURRENT_SETTLE_POLL: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Subcommand)]
 pub enum ScenarioCommand {
     /// List selectable Lab Scenarios in the catalog
@@ -52,7 +66,7 @@ pub enum ScenarioCommand {
     },
     /// Run a Lab Scenario by id (one Scenario at a time)
     Run {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`, `concurrent-source-workload`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -63,7 +77,7 @@ pub enum ScenarioCommand {
     },
     /// Fully remove a Scenario Namespace without starting a run
     Remove {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`, `concurrent-source-workload`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -101,6 +115,7 @@ fn catalog() -> &'static [(&'static str, &'static str)] {
     &[
         (DIRECT_PIPELINE_ID, DIRECT_PIPELINE_SUMMARY),
         (TRANSFORM_PIPELINE_ID, TRANSFORM_PIPELINE_SUMMARY),
+        (CONCURRENT_SOURCE_ID, CONCURRENT_SOURCE_SUMMARY),
     ]
 }
 
@@ -143,6 +158,7 @@ async fn scenario_run(
     let result = match scenario {
         DIRECT_PIPELINE_ID => run_direct_pipeline(lab_dir).await,
         TRANSFORM_PIPELINE_ID => run_transform_pipeline(lab_dir).await,
+        CONCURRENT_SOURCE_ID => run_concurrent_source_workload(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -151,15 +167,28 @@ async fn scenario_run(
 
     match result {
         Ok(report) => {
+            let passed = report.correctness && report.thresholds_ok;
             let mut namespace_removed = false;
-            if auto_remove {
+            if auto_remove && passed {
                 // Opt-in cleanup after success only — failures keep Namespace for debug (US35).
                 remove_scenario_namespace(scenario, lab_dir).await?;
                 namespace_removed = true;
             }
             drop(lock);
             print_scenario_report(entry.0, true, duration, &report, namespace_removed);
-            Ok(())
+            if passed {
+                Ok(())
+            } else if !report.correctness {
+                Err(CliError::Failed(format!(
+                    "Lab Scenario correctness failed: {}",
+                    report.detail
+                )))
+            } else {
+                Err(CliError::Failed(format!(
+                    "Lab Scenario threshold failed: {}",
+                    report.detail
+                )))
+            }
         }
         Err(err) => {
             drop(lock);
@@ -168,6 +197,9 @@ async fn scenario_run(
                 rows_applied: 0,
                 detail: err.to_string(),
                 capture_path_note: String::new(),
+                settle_ms: None,
+                max_settle_ms: None,
+                thresholds_ok: true,
             };
             print_scenario_report(entry.0, false, duration, &report, false);
             Err(err)
@@ -208,6 +240,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
     match scenario {
         DIRECT_PIPELINE_ID => remove_direct_pipeline_namespace(lab_dir).await,
         TRANSFORM_PIPELINE_ID => remove_transform_pipeline_namespace(lab_dir).await,
+        CONCURRENT_SOURCE_ID => remove_concurrent_source_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -219,6 +252,12 @@ struct ScenarioReport {
     rows_applied: u64,
     detail: String,
     capture_path_note: String,
+    /// Settle duration after concurrent Source changes (contention Scenario).
+    settle_ms: Option<u128>,
+    /// Scenario-defined max settle threshold that can fail the run (equal weight).
+    max_settle_ms: Option<u128>,
+    /// Operational threshold outcome; `true` when the Scenario defines none.
+    thresholds_ok: bool,
 }
 
 fn print_scenario_report(
@@ -234,7 +273,7 @@ fn print_scenario_report(
     } else {
         report.rows_applied as f64
     };
-    let outcome = if overall_pass && report.correctness {
+    let outcome = if overall_pass && report.correctness && report.thresholds_ok {
         "PASS"
     } else {
         "FAIL"
@@ -243,6 +282,18 @@ fn print_scenario_report(
     println!("Lab Scenario: {outcome}");
     println!("  scenario={scenario}");
     println!("  correctness={}", if report.correctness { "pass" } else { "fail" });
+    if report.max_settle_ms.is_some() {
+        println!(
+            "  thresholds={}",
+            if report.thresholds_ok { "pass" } else { "fail" }
+        );
+        if let Some(settle_ms) = report.settle_ms {
+            println!("  settle_ms={settle_ms}");
+        }
+        if let Some(max_settle_ms) = report.max_settle_ms {
+            println!("  max_settle_ms={max_settle_ms}");
+        }
+    }
     println!("  duration_ms={duration_ms}");
     println!("  rows_applied={}", report.rows_applied);
     println!("  rows_per_s={rows_per_s:.2}");
@@ -376,6 +427,9 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
         rows_applied,
         detail: String::new(),
         capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        thresholds_ok: true,
     })
 }
 
@@ -637,6 +691,9 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
         rows_applied,
         detail: String::new(),
         capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        thresholds_ok: true,
     })
 }
 
@@ -813,6 +870,413 @@ EXIT;\n"
                 "Failed to drive multi-table Source insert/update/delete for Lab Scenario:\n{err}"
             ))
         })
+}
+
+async fn run_concurrent_source_workload(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {CONCURRENT_SOURCE_ID}");
+    println!(
+        "Scenario Namespace: tables={CONCURRENT_CUSTOMERS_TABLE},{CONCURRENT_ORDERS_TABLE} \
+collections={CONCURRENT_CUSTOMERS_COLLECTION},{CONCURRENT_ORDER_TOTALS_COLLECTION} \
+deployment={CONCURRENT_SOURCE_DEPLOYMENT}"
+    );
+    println!(
+        "Lab Scenario: recipe uses intra-Scenario parallel Source sessions \
+(not a second concurrent Scenario run); max_settle_ms={CONCURRENT_MAX_SETTLE_MS}"
+    );
+
+    prepare_concurrent_source_namespace(lab_dir).await?;
+    println!(
+        "Lab Scenario: Scenario Namespace prepared (multi-table schema + seed + supplemental logging)"
+    );
+
+    let config_path = deployment_config_path(lab_dir, CONCURRENT_SOURCE_ID)?;
+    let bin = lab_migraloop_bin();
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_path.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !(apply_out.to_ascii_lowercase().contains("derived")
+        || apply_out.contains(CONCURRENT_ORDER_TOTALS_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+        )));
+    }
+
+    let customers_base = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            CONCURRENT_CUSTOMERS_TABLE,
+        ],
+    )
+    .await?;
+    let orders_base = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            CONCURRENT_ORDERS_TABLE,
+        ],
+    )
+    .await?;
+    if !(managed_field_present(&customers_base, "NAME", "Alice")
+        && managed_field_present(&customers_base, "NAME", "Bob"))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load customers Base check failed (expected Alice and Bob):\n{customers_base}"
+        )));
+    }
+    if !(managed_field_present(&orders_base, "AMOUNT", "10")
+        && managed_field_present(&orders_base, "AMOUNT", "20")
+        && managed_field_present(&orders_base, "AMOUNT", "5"))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load orders Base check failed (expected amounts 10/20/5):\n{orders_base}"
+        )));
+    }
+
+    let derived_after_apply = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            CONCURRENT_ORDER_TOTALS_PIPELINE,
+        ],
+    )
+    .await?;
+    // Seed totals: customer 1 = 10+20=30, customer 2 = 5.
+    if !(inspect_mentions_amount(&derived_after_apply, "30")
+        && inspect_mentions_amount(&derived_after_apply, "5"))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load Derived check failed (expected totals 30 and 5):\n{derived_after_apply}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: driving concurrent Source workload \
+(parallel customers + orders sessions)..."
+    );
+    mutate_concurrent_source_workload(lab_dir).await?;
+
+    // US47: wait until Delivery catches up within Scenario thresholds before final asserts.
+    println!(
+        "Lab Scenario: settling Incremental Capture + Delivery within max_settle_ms={CONCURRENT_MAX_SETTLE_MS}..."
+    );
+    let settle_started = Instant::now();
+    let mut sync_out = String::new();
+    let mut capture_note = String::new();
+    let mut last_detail = String::new();
+
+    loop {
+        let settle_ms = settle_started.elapsed().as_millis();
+        if settle_ms > CONCURRENT_MAX_SETTLE_MS {
+            return Ok(ScenarioReport {
+                correctness: false,
+                rows_applied: count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out),
+                detail: format!(
+                    "threshold: concurrent Source changes did not settle within \
+max_settle_ms={CONCURRENT_MAX_SETTLE_MS} (elapsed settle_ms={settle_ms}). {last_detail}"
+                ),
+                capture_path_note: capture_note,
+                settle_ms: Some(settle_ms),
+                max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
+                thresholds_ok: false,
+            });
+        }
+
+        sync_out = run_product_cli(
+            &bin,
+            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        )
+        .await?;
+        if sync_out.to_ascii_lowercase().contains("logminer") {
+            capture_note = "LogMiner".to_string();
+        } else if capture_note.is_empty() {
+            return Err(CliError::Failed(format!(
+                "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+            )));
+        }
+
+        let customers_base_after = run_product_cli(
+            &bin,
+            &[
+                "base",
+                "--platform-store-url",
+                LAB_PLATFORM_STORE_URL,
+                "--table",
+                CONCURRENT_CUSTOMERS_TABLE,
+            ],
+        )
+        .await?;
+        let derived_after = run_product_cli(
+            &bin,
+            &[
+                "derived",
+                "--platform-store-url",
+                LAB_PLATFORM_STORE_URL,
+                "--pipeline",
+                CONCURRENT_ORDER_TOTALS_PIPELINE,
+            ],
+        )
+        .await?;
+        let customers_target = run_product_cli(
+            &bin,
+            &[
+                "target",
+                "--platform-store-url",
+                LAB_PLATFORM_STORE_URL,
+                "--collection",
+                CONCURRENT_CUSTOMERS_COLLECTION,
+            ],
+        )
+        .await?;
+        let totals_target = run_product_cli(
+            &bin,
+            &[
+                "target",
+                "--platform-store-url",
+                LAB_PLATFORM_STORE_URL,
+                "--collection",
+                CONCURRENT_ORDER_TOTALS_COLLECTION,
+            ],
+        )
+        .await?;
+
+        // Customers Direct: Alicia + Carol present, Bob deleted.
+        let customers_base_ok = managed_field_present(&customers_base_after, "NAME", "Alicia")
+            && managed_field_present(&customers_base_after, "NAME", "Carol")
+            && !managed_field_present(&customers_base_after, "NAME", "Bob");
+        let customers_target_ok = managed_field_present(&customers_target, "NAME", "Alicia")
+            && managed_field_present(&customers_target, "NAME", "Carol")
+            && !managed_field_present(&customers_target, "NAME", "Bob");
+        // After concurrent mutate: cust1=20+5+10=35, cust2=5+15+30=50.
+        let derived_ok = inspect_mentions_amount(&derived_after, "35")
+            && inspect_mentions_amount(&derived_after, "50")
+            && !inspect_mentions_amount(&derived_after, "30");
+        let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
+            && inspect_mentions_amount(&totals_target, "50")
+            && !inspect_mentions_amount(&totals_target, "30");
+
+        if customers_base_ok && customers_target_ok && derived_ok && totals_target_ok {
+            break;
+        }
+
+        last_detail = format!(
+            "correctness not yet settled.\n\
+Customers Base:\n{customers_base_after}\nCustomers Target:\n{customers_target}\n\
+Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
+        );
+        tokio::time::sleep(CONCURRENT_SETTLE_POLL).await;
+    }
+
+    let settle_ms = settle_started.elapsed().as_millis();
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+    println!(
+        "Lab Scenario: correctness checks passed after concurrent Source settle \
+(settle_ms={settle_ms}, Base + Derived + Target Managed outcomes)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: Some(settle_ms),
+        max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
+        thresholds_ok: true,
+    })
+}
+
+/// Fully remove concurrent-source-workload Scenario Namespace. Idempotent.
+async fn remove_concurrent_source_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (tables={CONCURRENT_CUSTOMERS_TABLE},{CONCURRENT_ORDERS_TABLE}, \
+          collections={CONCURRENT_CUSTOMERS_COLLECTION},{CONCURRENT_ORDER_TOTALS_COLLECTION}, \
+          deployment={CONCURRENT_SOURCE_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {CONCURRENT_ORDERS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {CONCURRENT_CUSTOMERS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace tables \
+                 {CONCURRENT_CUSTOMERS_TABLE}/{CONCURRENT_ORDERS_TABLE}:\n{err}"
+            ))
+        })?;
+
+    for collection in [
+        CONCURRENT_CUSTOMERS_COLLECTION,
+        CONCURRENT_ORDER_TOTALS_COLLECTION,
+    ] {
+        let js = format!("db.getCollection('{collection}').drop()");
+        mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Mongo Scenario Namespace collection {collection}:\n{err}"
+            ))
+        })?;
+    }
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, CONCURRENT_SOURCE_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{CONCURRENT_SOURCE_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_concurrent_source_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_concurrent_source_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {CONCURRENT_CUSTOMERS_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200)\n\
+);\n\
+ALTER TABLE {CONCURRENT_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+CREATE TABLE {CONCURRENT_ORDERS_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
+  AMOUNT NUMBER(10) NOT NULL,\n\
+  NOTE VARCHAR2(200)\n\
+);\n\
+ALTER TABLE {CONCURRENT_ORDERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {CONCURRENT_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
+INSERT INTO {CONCURRENT_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
+INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (1, 1, 10, 'seed-a');\n\
+INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (2, 1, 20, 'seed-b');\n\
+INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (3, 2, 5, 'seed-c');\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare concurrent Source workload Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+/// Intra-Scenario concurrent Source workload: three parallel sqlplus sessions.
+///
+/// Expected after all commits (deterministic finals; PK ranges do not overlap):
+/// - customers: Alicia + Carol (Bob deleted)
+/// - order totals: cust1=35 (20+5+10), cust2=50 (5+15+30)
+async fn mutate_concurrent_source_workload(lab_dir: &Path) -> Result<(), CliError> {
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+
+    // Session A — customers Direct path (serial steps inside one session).
+    let sql_customers = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {CONCURRENT_CUSTOMERS_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
+INSERT INTO {CONCURRENT_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (3, 'Carol', 'carol@example.com');\n\
+DELETE FROM {CONCURRENT_CUSTOMERS_TABLE} WHERE ID = 2;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    // Session B — parallel inserts/delete on orders for CUSTOMER_ID=1.
+    let sql_orders_cust1 = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (10, 1, 5, 'par-a');\n\
+INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (11, 1, 10, 'par-b');\n\
+DELETE FROM {CONCURRENT_ORDERS_TABLE} WHERE ID = 1;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    // Session C — parallel inserts on orders for CUSTOMER_ID=2 (contention on Derived totals).
+    let sql_orders_cust2 = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (20, 2, 15, 'par-c');\n\
+INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (21, 2, 30, 'par-d');\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+
+    let (customers, orders_a, orders_b) = tokio::join!(
+        sqlplus_in_oracle(lab_dir, &connect, &sql_customers),
+        sqlplus_in_oracle(lab_dir, &connect, &sql_orders_cust1),
+        sqlplus_in_oracle(lab_dir, &connect, &sql_orders_cust2),
+    );
+
+    customers.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed concurrent customers Source session for Lab Scenario:\n{err}"
+        ))
+    })?;
+    orders_a.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed concurrent orders (customer 1) Source session for Lab Scenario:\n{err}"
+        ))
+    })?;
+    orders_b.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed concurrent orders (customer 2) Source session for Lab Scenario:\n{err}"
+        ))
+    })?;
+
+    Ok(())
 }
 
 /// Fully remove Direct Pipeline Scenario Namespace (Source table, Target collection,
