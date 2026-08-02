@@ -102,6 +102,16 @@ const REMOVE_PIPELINE_CUSTOMERS_PIPELINE: &str = "lab-rp-customers";
 const REMOVE_PIPELINE_REPORTING_PIPELINE: &str = "lab-rp-customers-reporting";
 const REMOVE_PIPELINE_DEPLOYMENT: &str = "lab-remove-pipeline";
 
+const CHANGE_PIPELINE_ID: &str = "change-pipeline";
+const CHANGE_PIPELINE_CUSTOMERS_TABLE: &str = "LAB_CP_CUSTOMERS";
+const CHANGE_PIPELINE_ACTIVE_COLLECTION: &str = "lab_cp_active_customers";
+const CHANGE_PIPELINE_REPORTING_COLLECTION: &str = "lab_cp_customers_reporting";
+const CHANGE_PIPELINE_ACTIVE_PIPELINE: &str = "lab-cp-active-customers";
+const CHANGE_PIPELINE_REPORTING_PIPELINE: &str = "lab-cp-customers-reporting";
+const CHANGE_PIPELINE_DEPLOYMENT: &str = "lab-change-pipeline";
+const CHANGE_PIPELINE_SEMANTIC_CONFIG: &str = "deployment-semantic.yaml";
+const CHANGE_PIPELINE_METADATA_CONFIG: &str = "deployment-metadata.yaml";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -182,6 +192,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         IDEMPOTENT_REDELIVERY_ID,
         PAUSE_RESUME_ID,
         REMOVE_PIPELINE_ID,
+        CHANGE_PIPELINE_ID,
     ]
 }
 
@@ -213,6 +224,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             REMOVE_PIPELINE_ID,
             "Pipeline remove CLI verb",
+        ),
+        (
+            CHANGE_PIPELINE_ID,
+            "Pipeline revision change via apply (Derived rebuild / metadata-only skip)",
         ),
     ]
 }
@@ -504,6 +519,7 @@ async fn scenario_run(
         IDEMPOTENT_REDELIVERY_ID => run_idempotent_redelivery(lab_dir).await,
         PAUSE_RESUME_ID => run_pause_resume(lab_dir).await,
         REMOVE_PIPELINE_ID => run_remove_pipeline(lab_dir).await,
+        CHANGE_PIPELINE_ID => run_change_pipeline(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -592,6 +608,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         IDEMPOTENT_REDELIVERY_ID => remove_idempotent_redelivery_namespace(lab_dir).await,
         PAUSE_RESUME_ID => remove_pause_resume_namespace(lab_dir).await,
         REMOVE_PIPELINE_ID => remove_remove_pipeline_namespace(lab_dir).await,
+        CHANGE_PIPELINE_ID => remove_change_pipeline_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -1008,13 +1025,21 @@ fn parse_labeled_u64(line: &str, label: &str) -> u64 {
 }
 
 fn deployment_config_path(lab_dir: &Path, scenario_id: &str) -> Result<PathBuf, CliError> {
+    scenario_config_path(lab_dir, scenario_id, "deployment.yaml")
+}
+
+fn scenario_config_path(
+    lab_dir: &Path,
+    scenario_id: &str,
+    filename: &str,
+) -> Result<PathBuf, CliError> {
     let path = lab_dir
         .join("scenarios")
         .join(scenario_id)
-        .join("deployment.yaml");
+        .join(filename);
     if !path.is_file() {
         return Err(CliError::Failed(format!(
-            "Lab Scenario deployment config not found at {} \
+            "Lab Scenario config not found at {} \
              (expected under the repo `lab/scenarios/{scenario_id}/` directory)",
             path.display()
         )));
@@ -4002,6 +4027,380 @@ impl Drop for ScenarioLock {
     }
 }
 
+async fn run_change_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {CHANGE_PIPELINE_ID}");
+    println!(
+        "Scenario Namespace: table={CHANGE_PIPELINE_CUSTOMERS_TABLE} \
+collections={CHANGE_PIPELINE_ACTIVE_COLLECTION},{CHANGE_PIPELINE_REPORTING_COLLECTION} \
+deployment={CHANGE_PIPELINE_DEPLOYMENT}"
+    );
+
+    prepare_change_pipeline_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let bin = lab_migraloop_bin();
+    let initial_config = deployment_config_path(lab_dir, CHANGE_PIPELINE_ID)?;
+    let semantic_config =
+        scenario_config_path(lab_dir, CHANGE_PIPELINE_ID, CHANGE_PIPELINE_SEMANTIC_CONFIG)?;
+    let metadata_config =
+        scenario_config_path(lab_dir, CHANGE_PIPELINE_ID, CHANGE_PIPELINE_METADATA_CONFIG)?;
+
+    println!("Lab Scenario: apply initial Deployment (Transform ACTIVE==1 + shared Direct)...");
+    let apply_v1 = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            initial_config.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_v1.contains("Derived Dataset materialized")
+        || apply_v1.contains("Delivery complete: Pipeline"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario initial apply did not Deliver Pipelines:\n{apply_v1}"
+        )));
+    }
+
+    let target_v1 = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            CHANGE_PIPELINE_ACTIVE_COLLECTION,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&target_v1, "Alice")
+        && managed_name_present(&target_v1, "Carol")
+        && !managed_name_present(&target_v1, "Bob"))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial ACTIVE==1 Target must Deliver Alice/Carol only:\n{target_v1}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: apply semantic Transform revision (ACTIVE==0) via real product path..."
+    );
+    let apply_v2 = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            semantic_config.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario semantic revision path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    let apply_v2_lower = apply_v2.to_ascii_lowercase();
+    if !(apply_v2_lower.contains("revision")
+        && apply_v2.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE)
+        && (apply_v2_lower.contains("paused") || apply_v2_lower.contains("pause")))
+    {
+        return Err(CliError::Failed(format!(
+            "Semantic revision must pause old Delivery and report Pipeline revision:\n{apply_v2}"
+        )));
+    }
+    if !apply_v2.contains(&format!(
+        "Derived Dataset materialized: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
+    )) {
+        return Err(CliError::Failed(format!(
+            "Semantic revision must rebuild Derived:\n{apply_v2}"
+        )));
+    }
+    if apply_v2.contains(&format!(
+        "Initial Load complete: Base Dataset {CHANGE_PIPELINE_CUSTOMERS_TABLE}"
+    )) {
+        return Err(CliError::Failed(format!(
+            "Shared Base must not be rebuilt on Pipeline revision:\n{apply_v2}"
+        )));
+    }
+    if apply_v2.contains(&format!(
+        "Delivery complete: Pipeline {CHANGE_PIPELINE_REPORTING_PIPELINE}"
+    )) {
+        return Err(CliError::Failed(format!(
+            "Unchanged sibling Pipeline must not be re-Delivered on revision:\n{apply_v2}"
+        )));
+    }
+
+    let derived_v2 = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            CHANGE_PIPELINE_ACTIVE_PIPELINE,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&derived_v2, "Bob")
+        && !managed_name_present(&derived_v2, "Alice")
+        && !managed_name_present(&derived_v2, "Carol"))
+    {
+        return Err(CliError::Failed(format!(
+            "Rebuilt Derived must match ACTIVE==0 filter:\n{derived_v2}"
+        )));
+    }
+
+    let target_v2 = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            CHANGE_PIPELINE_ACTIVE_COLLECTION,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&target_v2, "Bob")
+        && !managed_name_present(&target_v2, "Alice")
+        && !managed_name_present(&target_v2, "Carol"))
+    {
+        return Err(CliError::Failed(format!(
+            "Re-Delivery must upsert Bob and reconcile-delete Alice/Carol:\n{target_v2}"
+        )));
+    }
+
+    let base_after = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            CHANGE_PIPELINE_CUSTOMERS_TABLE,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&base_after, "Alice")
+        && managed_name_present(&base_after, "Bob")
+        && managed_name_present(&base_after, "Carol"))
+    {
+        return Err(CliError::Failed(format!(
+            "Shared Base rows must remain after Pipeline revision:\n{base_after}"
+        )));
+    }
+
+    let reporting = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            CHANGE_PIPELINE_REPORTING_COLLECTION,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&reporting, "Alice")
+        && managed_name_present(&reporting, "Bob")
+        && managed_name_present(&reporting, "Carol"))
+    {
+        return Err(CliError::Failed(format!(
+            "Sibling Direct Target must remain from Shared Base:\n{reporting}"
+        )));
+    }
+
+    println!("Lab Scenario: sync Incremental Capture under the new revision...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if sync_out.to_ascii_lowercase().contains("error")
+        && !sync_out.to_ascii_lowercase().contains("no changes")
+    {
+        return Err(CliError::Failed(format!(
+            "Incremental sync after Pipeline revision must succeed:\n{sync_out}"
+        )));
+    }
+    let status_after_sync = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if status_after_sync
+        .to_ascii_lowercase()
+        .lines()
+        .any(|line| line.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE) && line.contains("paused"))
+    {
+        return Err(CliError::Failed(format!(
+            "Pipeline must not remain paused after revision when continuing incremental:\n{status_after_sync}"
+        )));
+    }
+
+    println!("Lab Scenario: apply metadata-only description change...");
+    let apply_meta = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            metadata_config.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario metadata revision path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    let apply_meta_lower = apply_meta.to_ascii_lowercase();
+    if !(apply_meta_lower.contains("metadata")
+        && apply_meta_lower.contains("skip")
+        && apply_meta.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "Metadata-only change must report rebuild skipped:\n{apply_meta}"
+        )));
+    }
+    if apply_meta.contains(&format!(
+        "Derived Dataset materialized: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
+    )) || apply_meta.contains(&format!(
+        "Delivery complete: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
+    )) {
+        return Err(CliError::Failed(format!(
+            "Metadata-only change must not rebuild Derived or re-Deliver:\n{apply_meta}"
+        )));
+    }
+
+    let target_meta = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            CHANGE_PIPELINE_ACTIVE_COLLECTION,
+        ],
+    )
+    .await?;
+    if target_meta != target_v2 {
+        return Err(CliError::Failed(format!(
+            "Metadata-only change must leave Target unchanged.\nBefore:\n{target_v2}\nAfter:\n{target_meta}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_v1)
+        + count_delivery_ops(&apply_v2)
+        + count_delivery_ops(&sync_out)
+        + count_delivery_ops(&apply_meta);
+
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (semantic revision rebuilt Derived/re-Delivered; incremental continued; \
+Shared Base kept; metadata-only skipped)"
+    );
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: String::new(),
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_change_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={CHANGE_PIPELINE_CUSTOMERS_TABLE}, \
+          collections={CHANGE_PIPELINE_ACTIVE_COLLECTION},{CHANGE_PIPELINE_REPORTING_COLLECTION}, \
+          deployment={CHANGE_PIPELINE_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {CHANGE_PIPELINE_CUSTOMERS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for change-pipeline:\n{err}"
+            ))
+        })?;
+
+    let js = format!(
+        "db.getCollection('{CHANGE_PIPELINE_ACTIVE_COLLECTION}').drop();\n\
+db.getCollection('{CHANGE_PIPELINE_REPORTING_COLLECTION}').drop();"
+    );
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collections for change-pipeline:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, CHANGE_PIPELINE_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{CHANGE_PIPELINE_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_change_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_change_pipeline_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {CHANGE_PIPELINE_CUSTOMERS_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {CHANGE_PIPELINE_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {CHANGE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {CHANGE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+INSERT INTO {CHANGE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare change-pipeline Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4056,6 +4455,10 @@ mod tests {
         assert!(
             ids.iter().any(|id| id == REMOVE_PIPELINE_ID),
             "catalog must include remove-pipeline for Pipeline remove CLI verb"
+        );
+        assert!(
+            ids.iter().any(|id| id == CHANGE_PIPELINE_ID),
+            "catalog must include change-pipeline for Pipeline revision change"
         );
         let coverage = lab.join("scenarios/COVERAGE.md");
         let body = fs::read_to_string(&coverage).expect("COVERAGE.md");

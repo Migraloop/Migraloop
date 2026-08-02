@@ -59,13 +59,13 @@ Operator 形狀見 [Rich Transform](rich-transform.md)。
 **目前已出貨 CLI 上 Operator 的做法：**
 
 1. 編輯宣告式 Deployment 文件（新增/變更/移除 Pipeline 項目）。
-2. `migraloop apply -f deployment.yaml` — upsert Deployment + Pipeline 集合；對新參照的資料表做 table-level **Initial Load**；當 Transform 修訂需要時重建 Derived 輸出；無關的 Pipeline 變更不會重建共用 Base Datasets。
+2. `migraloop apply -f deployment.yaml` — upsert Deployment + Pipeline 集合；對新參照的資料表做 table-level **Initial Load**；當 Pipeline 的語意宣告變更時套用 **revision**（mode、Source table、Target Binding、fields、Output Identity 或 transform）：暫停該 Pipeline 的舊 Delivery，依需要重建其 Derived Dataset 並重新 Delivery（含消失 identity 的 delete reconciliation），然後繼續 incremental。Shared Base Datasets 不會因 Pipeline revision 而重建。僅變更選用的 `description` 屬 metadata-only，可跳過 rebuild／re-Delivery。無關 Pipeline 持續運行。
 3. `migraloop sync` — 對活躍（未 pause）的 Pipelines 做 Incremental Capture + Delivery。
 4. `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>` — 在不重啟 Deployment 的前提下，停止或繼續單一 Pipeline 的 Delivery/processing。Pause 會耐久寫入 Platform Store；resume 會依目前 Base/Derived 狀態做 catch-up Delivery。其他 Pipelines 不受影響。`status` 會在該 Pipeline 與其 Delivery Health 上顯示 `paused`。
 5. `migraloop remove --pipeline <name>` — 在不重啟 Deployment 的前提下停止該 Pipeline 並停止 Delivery。若其他 Pipelines 仍引用，Shared Base Datasets 會保留；不再被引用的 Bases 會被 prune。`status` 不再把該 Pipeline 列為 active。若要在之後的 `apply` 中持續省略它，也請從 declarative config 移除該 Pipeline 項目。
 6. `migraloop status` / `base` / `target` / `derived` — 檢查進度與健康。
 
-Stream-wide blockers（例如無法解除的 DDL）仍依 [Operations](operations.md) 的 pause 指引；Operator 主動 pause/resume/remove 則是刻意停止的一等 control-plane 路徑。
+Stream-wide blockers（例如無法解除的 DDL）仍依 [Operations](operations.md) 的 pause 指引；Operator 主動 pause/resume/remove／透過 apply 的 change 則是刻意停止與 revision 的一等 control-plane 路徑。
 
 ## Capture 範圍
 

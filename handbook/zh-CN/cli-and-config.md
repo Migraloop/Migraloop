@@ -24,7 +24,7 @@ migraloop migrate --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 ### `apply`
 
-应用声明式 Deployment 配置（YAML 或 JSON）。验证 secrets-by-reference、Source/Target kinds、Pipeline specs、（当 Pipelines 引用表时）Source Prerequisites，视需要执行 schema discovery + Initial Load，并 upsert Deployment/Pipeline 状态。
+应用声明式 Deployment 配置（YAML 或 JSON）。验证 secrets-by-reference、Source/Target kinds、Pipeline specs、（当 Pipelines 引用表时）Source Prerequisites，视需要执行 schema discovery + Initial Load，并 upsert Deployment/Pipeline 状态。以语义 Pipeline 变更重新 apply（transform/binding 等）是 Operator 的 **Pipeline revision** 路径：暂停该 Pipeline 的旧 Delivery，按需要重建 Derived 并重新 Delivery，然后继续 incremental；Shared Bases 不重建。仅变更可选的 `description` 属 metadata-only，可跳过 rebuild。
 
 在真实 Oracle Source host（非 `contract`/`stub`）上，apply 会通过 OCI 从 live Source 做 schema discovery 与 Initial Load（需要 Instant Client；见 [Source System](source-system.md)）。contract/stub host 使用进程内 **contract Source catalog**（CI 切片；默认命名 fixtures 供场景可读性；可用 `MIGRALOOP_CONTRACT_SOURCE_CATALOG` 注入额外表—不是受支持的 production Source 机制）。
 
@@ -160,8 +160,8 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `up` | 启动可丢弃 Fixture；就绪时打印连接细节 |
 | `status` | 报告 Fixture 就绪状态（engines + Oracle prerequisites + Platform Store），以及哪个 Scenario Namespace 为 **active**（run 进行中）或 **leftover**（run 结束后保留），或各自为 `(none)`。在你套用配置或运行 Lab Scenario 之前也会显示 `Deployment: (none)` / `Pipeline: (none)` — 请用 Scenario run / leftover 行判断，不必从那些行自行猜测 |
 | `down` | 拆除 containers 与 volumes |
-| `scenario list` | 按 `--lab-dir` 磁盘上的 recipe 列出可选 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已注册 runner）。summary 来自各 recipe—例如 `direct-pipeline`、`rt-project`、`rt-filter`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`、`idempotent-redelivery`、`pause-resume`、`remove-pipeline`。list 也会回报已出货 capability 覆盖（complete vs gaps；见 `lab/scenarios/COVERAGE.md`） |
-| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。若 Source/Target 不是 Lab Fixture engines 也会拒绝（客户／生产数据库不在 Lab 范围—那些请用普通的 `apply`/`sync`）。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定义的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 与 operational metrics 等权）。`rt-project` / `rt-filter` 覆盖已出货 Rich Transform `project` 与 `filter` operators；`concurrent-source-workload` 在单一 Scenario 内跑并行 Source sessions；`bulk-load` 会 bulk-insert 约 100k Source rows，且 metric thresholds 可独立于 correctness 让 run 失败；`idempotent-redelivery` 会强制对同一批 Output Identities 做 duplicate-safe re-Delivery，并检查 Managed Target 结果仍正确；`pause-resume` 覆盖 `pause` / `resume` CLI 动词（一条 Pipeline 停止 Delivery、另一条继续；resume 自耐久 Base catch-up）。`remove-pipeline` 覆盖 `remove`（停止 Delivery；仍被引用的 Shared Base 保留；status 不再列出该 Pipeline）。第二个 Scenario run 仍会被拒绝。默认 keep-on-finish 保留 Namespace 供实时 `base`/`derived`/`target` 检查；成功后若要删除可传 `--auto-remove` |
+| `scenario list` | 按 `--lab-dir` 磁盘上的 recipe 列出可选 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已注册 runner）。summary 来自各 recipe—例如 `direct-pipeline`、`rt-project`、`rt-filter`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`、`idempotent-redelivery`、`pause-resume`、`remove-pipeline`、`change-pipeline`。list 也会回报已出货 capability 覆盖（complete vs gaps；见 `lab/scenarios/COVERAGE.md`） |
+| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。若 Source/Target 不是 Lab Fixture engines 也会拒绝（客户／生产数据库不在 Lab 范围—那些请用普通的 `apply`/`sync`）。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定义的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 与 operational metrics 等权）。`rt-project` / `rt-filter` 覆盖已出货 Rich Transform `project` 与 `filter` operators；`concurrent-source-workload` 在单一 Scenario 内跑并行 Source sessions；`bulk-load` 会 bulk-insert 约 100k Source rows，且 metric thresholds 可独立于 correctness 让 run 失败；`idempotent-redelivery` 会强制对同一批 Output Identities 做 duplicate-safe re-Delivery，并检查 Managed Target 结果仍正确；`pause-resume` 覆盖 `pause` / `resume` CLI 动词（一条 Pipeline 停止 Delivery、另一条继续；resume 自耐久 Base catch-up）。`remove-pipeline` 覆盖 `remove`（停止 Delivery；仍被引用的 Shared Base 保留；status 不再列出该 Pipeline）；`change-pipeline` 覆盖通过 `apply` 的 Pipeline revision（暂停旧 Delivery → 重建该 Pipeline 的 Derived／重新 Delivery；Shared Bases 不重建；仅 `description` 的 metadata-only 变更可跳过 rebuild）。第二个 Scenario run 仍会被拒绝。默认 keep-on-finish 保留 Namespace 供实时 `base`/`derived`/`target` 检查；成功后若要删除可传 `--auto-remove` |
 | `scenario remove` | 完整移除 Scenario Namespace（Source tables、Target collections、Platform Store Deployment），且不启动 run。若已有 Scenario 作用中则拒绝。已不存在时为 idempotent |
 
 | Flag | 含义 |
@@ -216,6 +216,7 @@ Docker secrets 从 `/run/secrets/<name>` 解析。
 | --- | --- |
 | `name` | 非空 |
 | `mode` | `direct` 或 `transform` |
+| `description` | 可选、Operator-facing 注释；仅 metadata—单独变更不会重建 Derived 或重新 Delivery |
 | `source.table` | 必要；可选 `source.schema`（live Oracle owner；默认为 Source `username`） |
 | `target.collection` | Target Binding；仅 Base-only 实验可省略 |
 | `fields` | 字段 → `{ as: string \| omit }` 的映射 |

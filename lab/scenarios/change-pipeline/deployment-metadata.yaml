@@ -1,0 +1,43 @@
+# Lab Scenario: change-pipeline (metadata-only description change)
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-change-pipeline
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-cp-active-customers
+      mode: transform
+      description: active customers renamed comment
+      source:
+        table: LAB_CP_CUSTOMERS
+      target:
+        collection: lab_cp_active_customers
+      outputIdentity: [ID]
+      transform:
+        - project:
+            fields: [ID, NAME, ACTIVE]
+        - filter:
+            field: ACTIVE
+            eq: 0
+    - name: lab-cp-customers-reporting
+      mode: direct
+      source:
+        table: LAB_CP_CUSTOMERS
+      target:
+        collection: lab_cp_customers_reporting
