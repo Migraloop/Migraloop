@@ -121,8 +121,16 @@ What must pass before a build is production-releasable (see ADR-0011): correctne
 _Avoid_: Manual-only release, requiring long-running chaos programs as the sole v1 bar
 
 **Local Sync Lab**:
-A first-class, human-operated environment for manually verifying the real product end-to-end (Sync through Delivery). The Lab provisions disposable Source System, Target System, Platform Store, and app for Lab use only—operators do not assemble those pieces by hand. It runs the same product path a trusted Deployment would use—not a fake, stub, or simplified substitute for capture/Delivery. Distinct from the Release Quality Gate (automated CI) and from the in-process LogMiner contract/stub harness used only in tests. Connecting a customer’s real databases is out of scope for the Lab; that remains ordinary Deployment configuration.
+A first-class, human-operated environment for manually verifying the real product end-to-end (Sync through Delivery). The Lab provisions disposable Source System, Target System, Platform Store, and app for Lab use only—operators do not assemble those pieces by hand. It runs the same product path a trusted Deployment would use—not a fake, stub, or simplified substitute for capture/Delivery. Distinct from the Release Quality Gate (automated CI) and from the in-process LogMiner contract/stub harness used only in tests. Connecting a customer’s real databases is out of scope for the Lab; that remains ordinary Deployment configuration. Operators may still change Lab databases directly at the DB level (SQL, restore); that escape hatch is not a separate product concept.
 _Avoid_: CI pipeline, Release Quality Gate, contract/stub harness as the Lab, “toy” sync that skips real Source/Target engines, requiring BYO Oracle/Mongo to use the Lab, treating Lab databases as production Source/Target Systems
+
+**Lab Fixture**:
+The Lab’s ready starting point once engines and the app are up: enough Source schema, privileges/prerequisites, and baseline seed so a Lab Scenario (or manual DB work) can run. It is not a feature-coverage catalog by itself.
+_Avoid_: Release fixture in CI, treating every Scenario as only a Fixture
+
+**Lab Scenario**:
+A predefined, manually invoked recipe that exercises a slice of real product behavior inside the Local Sync Lab (for example bulk Source inserts, or a multi-table Transform Pipeline). The operator runs it; the Scenario performs its own setup/actions rather than requiring the operator to script the flow. The Scenario catalog aims to cover the product’s first-class capabilities; it is not the Release Quality Gate and does not replace automated CI.
+_Avoid_: Unit test, CI job, contract/stub harness case, ad-hoc SQL alone as the Scenario concept
 
 **Upgrade Compatibility**:
 How versions move forward in production (see ADR-0014). Platform Store uses versioned schema migrations applied on startup; configuration is SemVer’d with compatible reads of older configs. Upgrades must be **backward compatible**: a newer app must run existing Deployments and accepted older config/store data without forcing a rebuild or hand-rewriting Pipelines. Breaking changes require an explicit, automated compatibility path—not silent breakage. Short sync pause during single-instance upgrade is allowed; data/checkpoint loss is not.
