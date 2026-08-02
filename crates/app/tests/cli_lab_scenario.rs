@@ -305,6 +305,29 @@ async fn lab_scenario_list_includes_pause_resume() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_remove_pipeline() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("remove-pipeline"),
+        "catalog must list remove-pipeline Lab Scenario (#20), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("remove") && (lower.contains("shared") || lower.contains("delivery")),
+        "remove-pipeline summary should mention remove and Shared Base/Delivery, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {

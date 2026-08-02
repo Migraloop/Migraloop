@@ -7,6 +7,7 @@ derived
 lab
 migrate
 pause
+remove
 resume
 run
 status

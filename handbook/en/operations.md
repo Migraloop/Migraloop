@@ -12,7 +12,7 @@ Source DDL is classified against each Pipeline’s dependencies (ADR-0009):
 | Affects the Pipeline but apply stays safe | Processing continues |
 | Blocks safe apply (retries cannot progress) | **Warn and pause** the affected Pipeline(s) |
 
-This pause rule is for **stream-wide blockers**, not single-row poison data. Operators can also intentionally pause/resume a Pipeline with `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>` (see [Pipeline](pipeline.md) and [CLI & Config](cli-and-config.md)) without restarting the Deployment. Until automatic DDL-driven pause wires into those verbs, treat unblockable apply failures as Operator-visible errors in `status` / logs and pause or remove affected Pipelines explicitly.
+This pause rule is for **stream-wide blockers**, not single-row poison data. Operators can also intentionally pause/resume a Pipeline with `migraloop pause --pipeline <name>` / `migraloop resume --pipeline <name>`, or remove one with `migraloop remove --pipeline <name>` (see [Pipeline](pipeline.md) and [CLI & Config](cli-and-config.md)) without restarting the Deployment. Until automatic DDL-driven pause wires into those verbs, treat unblockable apply failures as Operator-visible errors in `status` / logs and pause or remove affected Pipelines explicitly.
 
 ## Poison Change Handling
 

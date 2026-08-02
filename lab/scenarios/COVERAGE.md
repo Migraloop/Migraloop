@@ -21,6 +21,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Bulk load (~100k) with fail-able metric thresholds | `bulk-load` |
 | Idempotent re-delivery / duplicate-safe Delivery | `idempotent-redelivery` |
 | Dedicated Pipeline pause/resume CLI verbs | `pause-resume` |
+| Dedicated Pipeline remove CLI verb | `remove-pipeline` |
 
 ## Visible gaps (not yet shipped)
 

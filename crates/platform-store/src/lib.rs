@@ -562,6 +562,34 @@ pub async fn set_pipeline_paused(
     Ok(())
 }
 
+/// Delete one Pipeline (Derived Dataset CASCADE). Deployment and shared Bases stay
+/// until callers prune unreferenced Bases (ADR-0007 / issue #20).
+pub async fn delete_pipeline(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let result = sqlx::query(
+        r#"
+        DELETE FROM pipelines
+        WHERE deployment_name = $1 AND name = $2
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    if result.rows_affected() == 0 {
+        return Err(PlatformStoreError::NotFound(format!(
+            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+        )));
+    }
+    Ok(())
+}
+
 /// Update Delivery status for one Pipeline.
 pub async fn update_pipeline_delivery_status(
     database_url: &str,
