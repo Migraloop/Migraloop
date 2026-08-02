@@ -31,7 +31,7 @@ pub struct OracleSourcePrerequisiteState {
 pub enum PrerequisiteError {
     #[error(
         "Oracle Source Prerequisites not met: {summary}. \
-         The platform does not automatically alter Source DB settings; \
+         The platform does not automatically alter Source System settings; \
          fix these on Oracle, then re-run. See docs/oracle-source-prerequisites.md"
     )]
     Unmet { summary: String },

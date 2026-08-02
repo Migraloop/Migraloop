@@ -2,7 +2,7 @@
 //!
 //! Agreed seam (PRD Testing Decisions / issue #12): CLI apply/sync fail with a clear
 //! pre-run error when Source Prerequisites are unmet; satisfied checks allow proceed.
-//! The platform never auto-alters Source DB settings to "fix" prerequisites.
+//! The platform never auto-alters Source System settings to "fix" prerequisites.
 //! Stub Source simulates Oracle probe state via env (same pattern as timezone stub).
 
 use std::fs;

@@ -1,6 +1,6 @@
 # Oracle Source Prerequisites
 
-Before Initial Load or Incremental Capture runs against an Oracle Source System, the platform validates **Source Prerequisites** and fails fast with a clear error when they are unmet (ADR-0021). The platform **does not** automatically alter customer Oracle settings to satisfy these checks.
+Before Initial Load or Incremental Capture runs against an Oracle Source System, the platform validates **Source Prerequisites** and fails fast with a clear error when they are unmet (ADR-0021). The platform **does not** automatically alter Source System settings to satisfy these checks.
 
 v1 Incremental Capture uses LogMiner. The checks below are the minimum documented requirements for correct capture.
 
