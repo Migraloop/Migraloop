@@ -1,5 +1,77 @@
 # Pipeline
 
-Declare Direct / Transform Pipelines; add, pause, resume, remove, and change.
+A **Pipeline** is a user-defined flow inside a **Deployment** that produces one target collection. The Deployment owns the Source/Target pair; the Pipeline owns mode, source table reference, optional Rich Transform, Output Identity, Target Binding, and field mapping overrides.
 
-_Stub chapter — content deepens in a later handbook ticket._
+## Modes
+
+| Mode | Behavior |
+| --- | --- |
+| `direct` | No Rich Transform. One Base Dataset is Delivered to the Target Binding. Output Identity defaults from the source primary key. |
+| `transform` | Declares a declarative **Rich Transform**, materializes a **Derived Dataset**, and Delivers that. Requires non-empty `outputIdentity` and at least one transform operator. |
+
+## Declaring Pipelines
+
+Pipelines live under `spec.pipelines` in the Deployment document:
+
+```yaml
+pipelines:
+  - name: orders_direct
+    mode: direct
+    source:
+      table: ORDERS
+      schema: APP                 # optional
+    target:
+      collection: orders
+    # optional Managed-field overrides (unsafe NUMBER, etc.)
+    fields:
+      HUGE_AMOUNT:
+        as: string               # or omit
+
+  - name: orders_by_customer
+    mode: transform
+    source:
+      table: ORDERS
+    target:
+      collection: orders_by_customer
+    outputIdentity: [CUSTOMER_ID]
+    transform:
+      - groupBy:
+          keys: [CUSTOMER_ID]
+          aggregates:
+            - op: sum
+              field: AMOUNT
+              as: TOTAL_AMOUNT
+```
+
+Validation rules enforced on `apply`:
+
+- `mode` is `direct` or `transform`
+- Direct Pipelines must not declare `transform`
+- Transform Pipelines require `outputIdentity` and a non-empty declarative `transform`
+- `fields` keys map source/Managed field names to `{ as: string }` or `{ as: omit }` (ADR-0023)
+
+See [Rich Transform](rich-transform.md) for operator shapes.
+
+## Lifecycle (control plane)
+
+Product model: add, pause, resume, remove, and change Pipelines without restarting the whole Deployment (ADR-0007).
+
+**What Operators do today with the shipped CLI:**
+
+1. Edit the declarative Deployment document (add/change/remove Pipeline entries).
+2. `migraloop apply -f deployment.yaml` — upserts Deployment + Pipeline set; runs table-level **Initial Load** for newly referenced tables; rebuilds Derived output when a Transform revision requires it; shared Base Datasets are not rebuilt for an unrelated Pipeline change.
+3. `migraloop sync` — Incremental Capture + Delivery for active work.
+4. `migraloop status` / `base` / `target` / `derived` — inspect progress and health.
+
+Dedicated pause/resume subcommands remain part of the control-plane contract; until they ship as first-class CLI verbs, treat stream-wide blockers via Operations guidance and keep Pipelines declared only while they should run.
+
+## Capture scope
+
+Which Source tables enter Sync is determined by Pipeline `source.table` references. Each table has at most one Base Dataset per Deployment, shared across Pipelines. New tables get table-level Initial Load only.
+
+## Related chapters
+
+- Source prerequisites and types: [Source System](source-system.md)
+- Target Binding / Managed fields: [Target System](target-system.md)
+- Transform operators: [Rich Transform](rich-transform.md)
+- Config field reference: [CLI & Config reference](cli-and-config.md)

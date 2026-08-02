@@ -1,5 +1,103 @@
 # Source System
 
-连接形态、Source Prerequisites，以及 capture 所需的 Required Privileges。
+**Source System** 是平台从中 capture 的用户数据库。v1 以 **Oracle** 搭配 **LogMiner** 做 **Incremental Capture**。连接标识是 `kind` + host/port/database/username，外加 password secret reference。
 
-_章节 stub — 完整内容于后续 handbook 工单补齐。_
+## 连接形态
+
+在 Deployment 配置的 `spec.source` 下：
+
+| 字段 | 含义 |
+| --- | --- |
+| `kind` | v1 必须为 `oracle` |
+| `host` | Oracle host。特殊值 `contract` 或 `stub` 会选用进程内 LogMiner contract harness（测试 / 本地切片）—不是真实 Oracle |
+| `port` | TCP port（通常 `1521`） |
+| `database` | Service / database 名称 |
+| `username` | Sync 账号（最小 Required Privileges；不是默认就要 admin） |
+| `password` | Secret reference：`fromEnv`、`fromFile` 或 `fromDockerSecret` |
+| `timezone` | 可选 IANA 名称或 Oracle 风格 offset（`+09:00`）。在 naive DATE/TIMESTAMP 需要解读且 Source DB timezone 不可读时使用 |
+
+真实 Oracle host 使用 **OCI LogMiner** adapter。若 runtime 没有 Oracle Instant Client / OCI bindings，apply/sync 会以 LogMiner/OCI 名称 fail fast—不会默默退回 stub catalog。
+
+## Source Prerequisites（Oracle / LogMiner）
+
+在 **Initial Load** 或 **Incremental Capture** 之前，平台会验证 **Source Prerequisites**；未满足时以清楚错误 **fail fast**（ADR-0021）。平台**不会**自动修改 Source System 设置来「修好」这些检查。
+
+### 1. Database supplemental logging
+
+在 database 层启用 minimum supplemental logging：
+
+```sql
+ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+```
+
+没有这个设置，LogMiner 无法可靠重建 change vectors。
+
+### 2. Table-level key supplemental logging
+
+对每一张被 Pipeline 引用的表，启用 PRIMARY KEY 或 ALL COLUMNS supplemental logging：
+
+```sql
+ALTER TABLE <schema>.<table> ADD SUPPLEMENTAL LOG DATA (PRIMARY KEY) COLUMNS;
+-- 或当表没有可用 PK / 需要完整 before-images 时：
+ALTER TABLE <schema>.<table> ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+```
+
+缺少 table-level logging 会导致该表 Incremental Capture 不完整或不正确。
+
+### 3. 足够的 redo / archive retention
+
+至少保留 **24 小时** redo（online + archived），让 Initial Load overlap、Incremental Capture lag，以及进程重启后的 resume 仍能读到需要的变更历史。按你的 Oracle edition 配置 archive destination retention / FRA policy。
+
+若 redo 在平台消费前就过期，变更会丢失—平台宁可不跑，也不做不完整 capture。
+
+### Operator 工作流程
+
+1. 以 DBA / 具备权限的 Operator 在 Source System 上应用上述 SQL（或等效设置）。
+2. 确认 sync 用户的 grants（见下方 Required Privileges）。
+3. 运行 `migraloop apply` / `migraloop sync`。未满足的 prerequisites 会在运行前失败并指出缺什么。
+4. 修好指名的 Oracle 设置后重跑。平台绝不会自动执行 `ALTER DATABASE` / `ALTER TABLE` 来「修复」失败。
+
+### Contract LogMiner harness（测试 / 本地切片）
+
+当 Source `host` 为 `contract` 或 `stub` 时，Incremental Capture 使用进程内 **LogMiner contract harness**。该 harness 的 prerequisite probes 由环境变量驱动（只读；从不变更数据库）：
+
+| 变量 | 含义 | 默认 |
+| --- | --- | --- |
+| `MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING` | database supplemental logging 的 `on` / `off` | `on` |
+| `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all`、空字符串，或已启用 PK/ALL logging 的逗号分隔表 | `all` |
+| `MIGRALOOP_STUB_REDO_RETENTION_HOURS` | 报告的 redo retention（小时） | `72` |
+
+## Required Privileges
+
+Sync 账号需要足以执行 **Initial Load**、**Incremental Capture**（LogMiner session 与相关 dictionary/redo 读取）、Pipeline 引用表的 schema discovery，以及 alignment 类读取的权限—不是只能用 superuser（ADR-0016）。
+
+实务上账号必须能：
+
+- 对 Pipeline 引用的表（与 schema）做 Initial Load 所需的 `SELECT`
+- 打开 LogMiner / 读取 Incremental Capture 所需的 redo contents views
+- 读取 supplemental-logging 与 schema probe 所需的 data-dictionary metadata
+
+在你的 Oracle edition 上授予能满足上述职责的最小集合。Admin/DBA 可用于 lab，但不得当成生产环境文档默认。
+
+## Supported Source Types（v1）
+
+Schema discovery 之后，Sync 只把 allow-list 内的 Oracle 类型转入 Platform Store（ADR-0018、ADR-0023）：
+
+- **Allow-list：** `NUMBER`（precision/scale 规则）、`FLOAT` / `BINARY_FLOAT` / `BINARY_DOUBLE`、`CHAR` / `NCHAR` / `VARCHAR2` / `NVARCHAR2`、`DATE`、`TIMESTAMP`（含 WITH TIME ZONE / LOCAL TIME ZONE）、`RAW`（有 size cap），以及上述的 nullable 形式。
+- **Out of scope：** `BLOB`、`CLOB`、`NCLOB`、`BFILE`、`LONG` / `LONG RAW`、`XMLType`、object types、nested tables / VARRAYs、`ROWID` / `UROWID` 与其他特殊类型。
+
+不支持的列会从 Base Dataset **省略**（表仍会 sync）；省略情况可在 `migraloop status` 看到。若 Pipeline 需要不支持列则无法使用—绝不做默默 coercion。
+
+**NUMBER：** 在安全时映射到保精度的 Mongo 类型（`NumberLong` / `Decimal128`）。Schema 不安全的 NUMBER 列必须在配置时以 Pipeline `fields`（`as: string` 或 `as: omit`）解决—不是在 runtime 逐行 quarantine。
+
+**时间类型：** 平台内部使用 UTC。带时区值会变成绝对瞬间。Naive DATE/TIMESTAMP 在可读时使用 Source DB timezone，否则使用配置的 Source `timezone`。
+
+## 哪些表会被 capture
+
+Sync 按 **Pipeline 引用** 选择表—不是整 schema mirror。每张纳入的表在 Deployment 内至多一个共用 **Base Dataset**（完整 supported-type 行），供所有需要它的 Pipeline 重用。新增被引用的表只对该表做 **table-level Initial Load**。
+
+## 相关章节
+
+- 与 Target 配对：[Deployment](deployment.md)
+- 引用表的 Pipelines：[Pipeline](pipeline.md)
+- Secrets 与 TLS：[Security](security.md)

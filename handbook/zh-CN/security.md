@@ -1,5 +1,49 @@
 # Security
 
-给 Operator 的 secrets-by-reference 与 TLS 指引。
+Operator 如何为 Source System、Target System 与 Platform Store 提供凭证并保护连接。
 
-_章节 stub — 完整内容于后续 handbook 工单补齐。_
+## Secrets by reference
+
+凭证**不得**以明文存在 Pipeline/Deployment 文档，也不得把已解析的密钥值写进 Platform Store 行（ADR-0006）。v1 接受来自：
+
+| 引用形式 | 配置形状 | 解析方式 |
+| --- | --- | --- |
+| 环境变量 | `password: { fromEnv: NAME }` | apply/sync 时的 `std::env` |
+| 挂载文件 | `password: { fromFile: /path/to/secret }` | 文件内容（去掉尾部换行） |
+| Docker secret | `password: { fromDockerSecret: name }` | `/run/secrets/<name>` |
+
+必须恰好设置 **一个** `fromEnv`、`fromFile` 或 `fromDockerSecret`。明文 password 字符串会让配置验证以清楚错误失败。
+
+示例：
+
+```yaml
+password:
+  fromEnv: ORACLE_PASSWORD
+```
+
+外部密钥管理（Vault / cloud KMS）可于后续加入；若你在 runtime 注入 env 或文件，v1 不要求它们也能安全上线。
+
+Compose 中的 Platform Store URL 可能为随附 lab 风格 store 内嵌本地密码—生产环境的 store 凭证请用与任何 Postgres DSN 相同的方式保护（env / orchestrator secrets），且不要把 Source/Target 密码贴进 YAML。
+
+## TLS / Connection Security
+
+TLS **支持** Source、Target 与 Platform Store 连接，并在生产环境 **建议启用**（ADR-0017）。本地/开发或明确选择的环境仍允许 cleartext—v1 不会对每个非 TLS 连接硬性失败。
+
+Operator 指引：
+
+- 生产网络中优先为 Oracle、MongoDB、Postgres 使用可 TLS 的连接路径
+- 密钥材料不要进 shell history 或已提交的配置
+- 限制 Source/Target 账号的 Required Privileges（见 [Source System](source-system.md) 与 [Target System](target-system.md)）
+
+## 公开环境变量面
+
+| 变量 | 敏感度 |
+| --- | --- |
+| `MIGRALOOP_PLATFORM_STORE_URL` | 使用密码 DSN 时含 store 凭证—以 orchestrator secrets 注入 |
+| `fromEnv` 使用的名称 | 密钥值—永不提交 |
+
+## 相关章节
+
+- 配置形状：[CLI 与 Config 参考](cli-and-config.md)
+- 安装默认：[Deployment](deployment.md)
+- 本地 compose 密码：[Developer 本地设置](developer-local-setup.md)
