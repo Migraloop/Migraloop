@@ -290,7 +290,15 @@ fn load_recipe(path: &Path) -> Result<ScenarioRecipe, CliError> {
 /// Selectable catalog: registered runners that have `recipe.yaml` + deployment
 /// config under `lab_dir/scenarios/<id>/`. Summaries come from the recipe file.
 fn load_selectable_catalog(lab_dir: &Path) -> Result<Vec<(String, String)>, CliError> {
-    let mut entries = Vec::new();
+    Ok(load_selectable_recipes(lab_dir)?
+        .into_iter()
+        .map(|recipe| (recipe.id, recipe.summary))
+        .collect())
+}
+
+/// Load complete selectable Scenario recipes (id matches directory + deployment config present).
+fn load_selectable_recipes(lab_dir: &Path) -> Result<Vec<ScenarioRecipe>, CliError> {
+    let mut recipes = Vec::new();
     for id in registered_scenario_ids() {
         let scenario_dir = lab_dir.join("scenarios").join(id);
         let recipe_path = scenario_dir.join("recipe.yaml");
@@ -315,9 +323,41 @@ fn load_selectable_catalog(lab_dir: &Path) -> Result<Vec<(String, String)>, CliE
                 deployment_path.display()
             )));
         }
-        entries.push((recipe.id, recipe.summary));
+        recipes.push(recipe);
     }
-    Ok(entries)
+    Ok(recipes)
+}
+
+/// Active Lab Scenario id from the one-at-a-time lock (live PID only).
+pub(crate) fn active_scenario_run(lab_dir: &Path) -> Result<Option<String>, CliError> {
+    let lock_path = lab_dir.join(LOCK_FILE_NAME);
+    Ok(read_active_lock(&lock_path)?.map(|lock| lock.scenario))
+}
+
+/// Scenario ids whose Namespace Deployment is still present in the Platform Store
+/// while no run is active for that Scenario (leftover after keep-on-finish).
+///
+/// `present_deployments` are Deployment names currently in the Lab Platform Store.
+/// When `active` is set, that Scenario is treated as the active run, not a leftover.
+pub(crate) fn leftover_scenario_namespaces(
+    lab_dir: &Path,
+    present_deployments: &[String],
+    active: Option<&str>,
+) -> Result<Vec<String>, CliError> {
+    let recipes = load_selectable_recipes(lab_dir)?;
+    let present: std::collections::BTreeSet<&str> =
+        present_deployments.iter().map(String::as_str).collect();
+    let mut leftovers = Vec::new();
+    for recipe in recipes {
+        if active.is_some_and(|id| id == recipe.id) {
+            continue;
+        }
+        if present.contains(recipe.namespace.deployment.as_str()) {
+            leftovers.push(recipe.id);
+        }
+    }
+    leftovers.sort();
+    Ok(leftovers)
 }
 
 fn scenario_list(lab_dir: &Path) -> Result<(), CliError> {
@@ -2889,6 +2929,35 @@ mod tests {
             gaps.iter().any(|g| g.contains("Rich Transform filter")),
             "missing rt-filter must be a visible gap; gaps={gaps:?}"
         );
+    }
+
+    #[test]
+    fn leftover_namespaces_match_present_deployments_excluding_active() {
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab");
+        let present = vec![
+            DIRECT_PIPELINE_DEPLOYMENT.to_string(),
+            TRANSFORM_PIPELINE_DEPLOYMENT.to_string(),
+            "unrelated-operator-deployment".to_string(),
+        ];
+        let leftovers = leftover_scenario_namespaces(&lab, &present, Some(DIRECT_PIPELINE_ID))
+            .expect("leftover match");
+        assert_eq!(
+            leftovers,
+            vec![TRANSFORM_PIPELINE_ID.to_string()],
+            "active Scenario must not be listed as leftover; unrelated Deployments ignored"
+        );
+
+        let all = leftover_scenario_namespaces(&lab, &present, None).expect("leftover match");
+        assert_eq!(
+            all,
+            vec![
+                DIRECT_PIPELINE_ID.to_string(),
+                TRANSFORM_PIPELINE_ID.to_string()
+            ]
+        );
+
+        let empty = leftover_scenario_namespaces(&lab, &[], None).expect("empty");
+        assert!(empty.is_empty());
     }
 
     #[test]

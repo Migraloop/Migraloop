@@ -43,7 +43,7 @@ Compose 預設憑證（`migraloop` / `migraloop`）僅供本機開發。
 ```bash
 cargo build -p migraloop-app
 ./target/debug/migraloop lab up
-./target/debug/migraloop lab status
+./target/debug/migraloop lab status   # Fixture ready + Scenario run active/leftover/(none)
 ./target/debug/migraloop lab scenario list
 # Scenario apply/sync 需要 Instant Client：export LD_LIBRARY_PATH=/path/to/instantclient
 ./target/debug/migraloop lab scenario run direct-pipeline
@@ -52,7 +52,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run bulk-load
-# 用 migraloop base / derived / target 檢視留下的 Scenario Namespace，或直接變更 Lab DB。
+# keep-on-finish 後 lab status 會標出 leftover Namespace；也可用 base / derived / target 檢視。
 # 重跑會先 wipe Namespace；或：lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
 ```

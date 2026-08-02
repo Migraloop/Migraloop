@@ -1,13 +1,13 @@
 //! Operator-visible seam: Lab Scenario list / run / remove (Namespace cleanup).
 //!
-//! Agreed seam (issues #60–#66, #63 / PRD #55): CLI Lab Scenario commands.
+//! Agreed seam (issues #60–#66, #63, #84 / PRD #55): CLI Lab Scenario commands.
 //! Always-on tests cover catalog listing from on-disk `recipe.yaml` packages
 //! (including bulk-load, rt-project, rt-filter), shipped-capability coverage
 //! visibility, help surface, one-at-a-time rejection, Namespace cleanup control
 //! surface, and CLI-seam bulk-load correctness-fail / metrics-fail probes
 //! (`MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE`). Full Scenario run / re-run / remove
-//! against the Lab Fixture is ignored by default (Docker + Instant Client) —
-//! not a Release Quality Gate.
+//! against the Lab Fixture (including leftover Namespace naming on `lab status`)
+//! is ignored by default (Docker + Instant Client) — not a Release Quality Gate.
 
 use std::fs;
 use std::path::Path;
@@ -725,6 +725,30 @@ async fn lab_scenario_direct_pipeline_run_and_inspect() {
         run_out.contains("namespace=left in place")
             || run_out.to_ascii_lowercase().contains("left in place"),
         "default completed run must keep Namespace, got:\n{run_out}"
+    );
+
+    // Issue #84: after a finished run, lab status names the leftover Namespace
+    // (and not an active run) without forcing operators to guess from Deployment lines.
+    let leftover_status = Command::new(bin())
+        .args(["lab", "status", "--lab-dir", &lab])
+        .output()
+        .expect("lab status after scenario keep");
+    let leftover_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&leftover_status.stdout),
+        String::from_utf8_lossy(&leftover_status.stderr)
+    );
+    assert!(
+        leftover_status.status.success(),
+        "lab status after Scenario keep failed:\n{leftover_out}"
+    );
+    assert!(
+        leftover_out.contains("Scenario run: (none)"),
+        "finished Scenario must not report an active run, got:\n{leftover_out}"
+    );
+    assert!(
+        leftover_out.contains("Scenario Namespace leftover: direct-pipeline"),
+        "lab status must name leftover Scenario Namespace, got:\n{leftover_out}"
     );
 
     // Re-run same Scenario: full Namespace remove before recreate must succeed.

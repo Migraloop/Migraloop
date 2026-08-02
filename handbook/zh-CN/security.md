@@ -25,7 +25,7 @@ password:
 
 Compose 中的 Platform Store URL 可能为随附 lab 风格 store 内嵌本地密码—生产环境的 store 凭证请用与任何 Postgres DSN 相同的方式保护（env / orchestrator secrets），且不要把 Source/Target 密码贴进 YAML。
 
-**Local Sync Lab** 可丢弃默认（`migraloop lab up`）刻意方便本地开发，并在 bring-up 后打印（`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store `migraloop`/`migraloop`）。Lab Scenario 运行与 Namespace 清理（`migraloop lab scenario run direct-pipeline|rt-project|rt-filter|transform-pipeline|concurrent-source-workload|bulk-load …`、`remove`、`--auto-remove`）会以相同的 Lab-only secret references，对可丢弃堆栈跑真实 `apply`/`sync` 与 Fixture DB 清理（Scenario recipes 位于 `lab/scenarios/<id>/`）。仅供 Lab 使用；绝不要把 Lab 命令或 Scenario 配置指向客户生产环境数据库。
+**Local Sync Lab** 可丢弃默认（`migraloop lab up`）刻意方便本地开发，并在 bring-up 后打印（`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store `migraloop`/`migraloop`）；`migraloop lab status` 也会一并显示这些 Lab-only 连接细节与 active/leftover Scenario Namespace 状态。Lab Scenario 运行与 Namespace 清理（`migraloop lab scenario run direct-pipeline|rt-project|rt-filter|transform-pipeline|concurrent-source-workload|bulk-load …`、`remove`、`--auto-remove`）会以相同的 Lab-only secret references，对可丢弃堆栈跑真实 `apply`/`sync` 与 Fixture DB 清理（Scenario recipes 位于 `lab/scenarios/<id>/`）。仅供 Lab 使用；绝不要把 Lab 命令或 Scenario 配置指向客户生产环境数据库。
 
 ## TLS / Connection Security
 

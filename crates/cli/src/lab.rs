@@ -1,8 +1,9 @@
-//! Local Sync Lab Fixture orchestration (issue #59 / ADR-0025).
+//! Local Sync Lab Fixture orchestration (issues #59, #84 / ADR-0025).
 //!
 //! Lab-specific machinery only: disposable stack bring-up / status / tear-down,
 //! plus shared helpers for Lab Scenario runners. Fixture bring-up does not apply
-//! Deployments or Pipelines.
+//! Deployments or Pipelines. Status also reports active vs leftover Scenario
+//! Namespace so operators need not guess from raw Deployment/Pipeline lines.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -12,7 +13,9 @@ use clap::Subcommand;
 use tokio::process::Command;
 use tokio::time::sleep;
 
-use crate::lab_scenario::{run_scenario_command, ScenarioCommand};
+use crate::lab_scenario::{
+    active_scenario_run, leftover_scenario_namespaces, run_scenario_command, ScenarioCommand,
+};
 use crate::CliError;
 
 pub const LAB_COMPOSE_PROJECT: &str = "migraloop-lab";
@@ -41,7 +44,7 @@ pub enum LabCommand {
         #[arg(long, default_value = "lab")]
         lab_dir: PathBuf,
     },
-    /// Report Lab Fixture readiness and connection details (no default Pipeline implied)
+    /// Report Lab Fixture readiness, active/leftover Scenario Namespace, and connection details
     Status {
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -214,7 +217,7 @@ async fn lab_up(lab_dir: &Path) -> Result<(), CliError> {
     ensure_platform_store_migrated(lab_dir).await?;
 
     println!("Lab Fixture: ready");
-    print_deployment_pipeline_state().await;
+    let _ = print_deployment_pipeline_state().await;
     print_connection_details();
     Ok(())
 }
@@ -225,6 +228,8 @@ async fn lab_status(lab_dir: &Path) -> Result<(), CliError> {
     if !docker_available() {
         println!("Lab Fixture: not ready");
         println!("  Docker / Compose: unavailable");
+        // No Lab stack ⇒ empty Namespace (not "unknown").
+        print_scenario_namespace_state(lab_dir, Some(&[])).await?;
         return Err(CliError::Failed(
             "Lab Fixture is not ready (Docker Compose unavailable)".to_string(),
         ));
@@ -241,6 +246,16 @@ async fn lab_status(lab_dir: &Path) -> Result<(), CliError> {
                 if *ready { "ready" } else { "not ready" }
             );
         }
+        // Probe leftovers only when Platform Store service is up; otherwise empty.
+        let store_service_ready = services
+            .iter()
+            .any(|(name, ready)| name == "platform-store" && *ready);
+        let deployments = if store_service_ready {
+            lab_platform_store_deployments().await
+        } else {
+            Some(Vec::new())
+        };
+        print_scenario_namespace_state(lab_dir, deployments.as_deref()).await?;
         return Err(CliError::Failed(
             "Lab Fixture is not ready".to_string(),
         ));
@@ -251,6 +266,8 @@ async fn lab_status(lab_dir: &Path) -> Result<(), CliError> {
         Err(err) => {
             println!("Lab Fixture: not ready");
             println!("  Oracle Source Prerequisites: {err}");
+            let deployments = lab_platform_store_deployments().await;
+            print_scenario_namespace_state(lab_dir, deployments.as_deref()).await?;
             return Err(CliError::Failed(
                 "Lab Fixture is not ready (Oracle Source Prerequisites)".to_string(),
             ));
@@ -261,6 +278,7 @@ async fn lab_status(lab_dir: &Path) -> Result<(), CliError> {
     if !store_ok {
         println!("Lab Fixture: not ready");
         println!("  Platform Store: not healthy (run `migraloop lab up` or wait for app migrate)");
+        print_scenario_namespace_state(lab_dir, None).await?;
         return Err(CliError::Failed(
             "Lab Fixture is not ready (Platform Store)".to_string(),
         ));
@@ -276,7 +294,8 @@ async fn lab_status(lab_dir: &Path) -> Result<(), CliError> {
         println!("  {name}: {detail}");
     }
     println!("  Platform Store: healthy");
-    print_deployment_pipeline_state().await;
+    let deployments = print_deployment_pipeline_state().await;
+    print_scenario_namespace_state(lab_dir, deployments.as_deref()).await?;
     print_connection_details();
     Ok(())
 }
@@ -674,10 +693,35 @@ pub(crate) async fn ensure_fixture_ready_for_scenario(lab_dir: &Path) -> Result<
     Ok(())
 }
 
-async fn print_deployment_pipeline_state() {
+/// Deployment names from Lab Platform Store product status (`None` when unreachable).
+async fn lab_platform_store_deployments() -> Option<Vec<String>> {
+    let output = Command::new(lab_migraloop_bin())
+        .args(["status", "--platform-store-url", LAB_PLATFORM_STORE_URL])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut deployments = Vec::new();
+    for line in text.lines() {
+        if let Some(name) = line.strip_prefix("Deployment:") {
+            let name = name.trim();
+            if name != "(none)" && !name.is_empty() {
+                deployments.push(name.to_string());
+            }
+        }
+    }
+    Some(deployments)
+}
+
+/// Print Deployment/Pipeline lines from product status. Returns `Some(names)` when
+/// Platform Store status succeeded, or `None` when unavailable.
+async fn print_deployment_pipeline_state() -> Option<Vec<String>> {
     // Read live Platform Store state so status never invents a default Pipeline,
     // and still reflects Deployments the operator applied after bring-up.
-    let output = Command::new(std::env::current_exe().unwrap_or_else(|_| PathBuf::from("migraloop")))
+    let output = Command::new(lab_migraloop_bin())
         .args(["status", "--platform-store-url", LAB_PLATFORM_STORE_URL])
         .output()
         .await;
@@ -686,10 +730,15 @@ async fn print_deployment_pipeline_state() {
             let text = String::from_utf8_lossy(&out.stdout);
             let mut saw_deployment = false;
             let mut saw_pipeline = false;
+            let mut deployments = Vec::new();
             for line in text.lines() {
-                if line.starts_with("Deployment:") {
+                if let Some(name) = line.strip_prefix("Deployment:") {
+                    let name = name.trim();
                     println!("{line}");
                     saw_deployment = true;
+                    if name != "(none)" && !name.is_empty() {
+                        deployments.push(name.to_string());
+                    }
                 } else if line.starts_with("Pipeline:") {
                     println!("{line}");
                     saw_pipeline = true;
@@ -706,10 +755,50 @@ async fn print_deployment_pipeline_state() {
                     "  (Lab Fixture does not apply a default Deployment or Pipelines)"
                 );
             }
+            Some(deployments)
         }
         _ => {
             println!("Deployment: (unknown — Platform Store status unavailable)");
             println!("Pipeline: (unknown — Platform Store status unavailable)");
+            None
         }
     }
+}
+
+/// Report active Scenario run (lock) vs leftover Scenario Namespace (recipe Deployments
+/// still present after keep-on-finish). Distinct labels so operators need not infer
+/// state from raw Deployment/Pipeline lines alone (issue #84 / PRD #55 US29).
+///
+/// `present_deployments`: `Some` when Platform Store status was readable (`[]` = empty);
+/// `None` when leftovers cannot be determined (do not print a false `(none)`).
+async fn print_scenario_namespace_state(
+    lab_dir: &Path,
+    present_deployments: Option<&[String]>,
+) -> Result<(), CliError> {
+    let active = active_scenario_run(lab_dir)?;
+    match &active {
+        Some(id) => println!("Scenario run: active — {id}"),
+        None => println!("Scenario run: (none)"),
+    }
+
+    match present_deployments {
+        None => {
+            println!(
+                "Scenario Namespace leftover: (unknown — Platform Store status unavailable)"
+            );
+        }
+        Some(deployments) => {
+            let leftovers =
+                leftover_scenario_namespaces(lab_dir, deployments, active.as_deref())?;
+            if leftovers.is_empty() {
+                println!("Scenario Namespace leftover: (none)");
+            } else {
+                println!(
+                    "Scenario Namespace leftover: {}",
+                    leftovers.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
 }

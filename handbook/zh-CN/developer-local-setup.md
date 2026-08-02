@@ -43,7 +43,7 @@ Compose 默认凭证（`migraloop` / `migraloop`）仅供本地开发。
 ```bash
 cargo build -p migraloop-app
 ./target/debug/migraloop lab up
-./target/debug/migraloop lab status
+./target/debug/migraloop lab status   # Fixture ready + Scenario run active/leftover/(none)
 ./target/debug/migraloop lab scenario list
 # Scenario apply/sync 需要 Instant Client：export LD_LIBRARY_PATH=/path/to/instantclient
 ./target/debug/migraloop lab scenario run direct-pipeline
@@ -52,7 +52,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run bulk-load
-# 用 migraloop base / derived / target 查看留下的 Scenario Namespace，或直接变更 Lab DB。
+# keep-on-finish 后 lab status 会标出 leftover Namespace；也可用 base / derived / target 查看。
 # 重跑会先 wipe Namespace；或：lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
 ```

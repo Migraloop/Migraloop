@@ -1,10 +1,13 @@
 //! Operator-visible seam: Local Sync Lab Fixture up / status / down.
 //!
-//! Agreed seam (issue #59 / PRD #55): CLI Lab commands against the real stack.
-//! Always-on tests cover Fixture-not-ready and CLI surface. Full bring-up is
-//! ignored by default (needs Docker Compose + Lab Oracle image pull).
+//! Agreed seam (issues #59, #84 / PRD #55 US29): CLI Lab commands against the
+//! real stack. Always-on tests cover Fixture-not-ready, empty Scenario Namespace
+//! reporting, active-run naming via the Scenario lock, and CLI surface. Full
+//! bring-up is ignored by default (needs Docker Compose + Lab Oracle image pull).
 
+use std::fs;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn bin() -> String {
     env!("CARGO_BIN_EXE_migraloop").to_string()
@@ -15,6 +18,16 @@ fn lab_dir() -> String {
     // for the app crate (`crates/app`).
     let manifest = env!("CARGO_MANIFEST_DIR");
     format!("{manifest}/../../lab")
+}
+
+/// Isolated `--lab-dir` with a stub `compose.yaml` so lock-based status probes
+/// do not race on `lab/.migraloop-scenario.lock`.
+fn temp_lab_dir() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("temp lab dir");
+    fs::write(dir.path().join("compose.yaml"), "name: migraloop-lab-test\n")
+        .expect("write stub compose.yaml");
+    let path = dir.path().to_string_lossy().into_owned();
+    (dir, path)
 }
 
 #[tokio::test]
@@ -46,6 +59,53 @@ async fn lab_status_reports_fixture_not_ready_when_stack_is_down() {
         !combined.to_ascii_lowercase().contains("pipeline: orders")
             && !combined.contains("default Deployment"),
         "lab status must not advertise a default Deployment/Pipeline, got:\n{combined}"
+    );
+    // Empty / not-ready case (issue #84): operators see no active run and no leftover.
+    assert!(
+        combined.contains("Scenario run: (none)"),
+        "expected empty Scenario run when Fixture is down, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("Scenario Namespace leftover: (none)"),
+        "expected empty leftover Namespace when Fixture is down, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn lab_status_names_active_scenario_namespace_from_lock() {
+    let (_tmp, lab) = temp_lab_dir();
+    let lock_path = format!("{lab}/.migraloop-scenario.lock");
+    let pid = std::process::id();
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    fs::write(
+        &lock_path,
+        format!(
+            "{{\"scenario\":\"direct-pipeline\",\"pid\":{pid},\"started_at_unix\":{started}}}\n"
+        ),
+    )
+    .expect("write scenario lock");
+
+    let status = Command::new(bin())
+        .args(["lab", "status", "--lab-dir", &lab])
+        .output()
+        .expect("run lab status with active lock");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    // Fixture may be not ready (stub compose / no Docker stack); active run must still be named.
+    assert!(
+        combined.contains("Scenario run: active — direct-pipeline"),
+        "lab status must name the active Scenario Namespace, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Scenario run: (none)"),
+        "active lock must not report Scenario run as none, got:\n{combined}"
     );
 }
 
@@ -138,6 +198,14 @@ async fn lab_up_status_down_fixture_lifecycle() {
     assert!(
         status_out.contains("Pipeline: (none)"),
         "bring-up must not pre-apply Pipelines, got:\n{status_out}"
+    );
+    assert!(
+        status_out.contains("Scenario run: (none)"),
+        "fresh Fixture must report no active Scenario run, got:\n{status_out}"
+    );
+    assert!(
+        status_out.contains("Scenario Namespace leftover: (none)"),
+        "fresh Fixture must report no leftover Scenario Namespace, got:\n{status_out}"
     );
 
     // Product status against Lab Platform Store must also show empty Deployment/Pipeline.
