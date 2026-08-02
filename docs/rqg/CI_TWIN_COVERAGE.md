@@ -6,7 +6,7 @@ Rows are **currently shipped** Lab catalog capabilities. Evidence cells must poi
 
 ## Matrix status
 
-**Complete for currently shipped Lab-covered capabilities.**
+**Complete for currently shipped Lab-covered capabilities** at the contract-path depth ADR-0028 / #96 require: every row below has non-ignored `rqg-integration` evidence. Where the Lab Scenario adds real-engine or OS-parallel surface that CI cannot host, Notes mark that remainder as Lab-manual (still not a completeness gap for the gate).
 
 When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a non-ignored contract-path CI twin, update this matrix, and only then restate completeness for the expanded shipped surface.
 
@@ -18,9 +18,9 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Multi-table Transform Pipeline (`groupBy` / `sum`) | `transform-pipeline` | `cli_groupby_sum_affect.rs`, `cli_multi_table_incremental.rs` | Affect Analysis + multi-table Direct/Transform settle |
 | Rich Transform `project` | `rt-project` | `cli_transform_pipeline.rs` (`project` paths) | |
 | Rich Transform `filter` | `rt-filter` | `cli_transform_pipeline.rs` (`filter` paths) | |
-| Rich Transform `groupBy` / `sum` (also under contention) | `transform-pipeline`, `concurrent-source-workload` | `cli_groupby_sum_affect.rs`, `cli_multi_table_incremental.rs` | Contention OS parallelism stays Lab; CI covers multi-table settle correctness |
-| Intra-Scenario concurrent Source workload | `concurrent-source-workload` | `cli_multi_table_incremental.rs` | Contract-path correctness where sensible (multi-table Incremental settle); parallel sqlplus sessions remain Lab-manual |
-| Bulk load (~100k) with fail-able metric thresholds | `bulk-load` | Correctness: `cli_direct_pipeline_initial_load.rs`, `cli_contract_catalog_initial_load.rs`, `cli_direct_pipeline_delivery.rs`. Control-plane probes: `cli_lab_scenario.rs` (`lab_scenario_bulk_load_*_via_cli_probe`) | Large-volume / lag / throughput / duration **thresholds stay Lab-manual** (ADR-0025 / ADR-0028)—not RQG evidence |
+| Rich Transform `groupBy` / `sum` (also under contention) | `transform-pipeline`, `concurrent-source-workload` | `cli_groupby_sum_affect.rs`, `cli_multi_table_incremental.rs` | CI: multi-table settle after both Bases change. OS-parallel Source sessions stay Lab-manual |
+| Intra-Scenario concurrent Source workload | `concurrent-source-workload` | `cli_multi_table_incremental.rs` | CI twin = same multi-table Pipeline shape settling after Incremental on both tables (correctness where sensible). Parallel sqlplus / contention timing stay Lab-manual |
+| Bulk load (~100k) with fail-able metric thresholds | `bulk-load` | `cli_direct_pipeline_initial_load.rs`, `cli_contract_catalog_initial_load.rs`, `cli_direct_pipeline_delivery.rs` | CI twin = Initial Load + Delivery correctness on contract/stub. ~100k volume and lag/throughput/duration **thresholds stay Lab-manual** (ADR-0025 / ADR-0028)—never RQG evidence |
 | Idempotent re-delivery / duplicate-safe Delivery | `idempotent-redelivery` | `cli_idempotent_redelivery.rs` (also overlap absorb: `cli_cutover_no_gap.rs`; Managed-only upsert: `cli_direct_pipeline_delivery.rs`, `cli_stub_incremental.rs`) | Force re-Delivery via Platform Store Delivery status + product `apply` |
 
 ## Explicitly not gate evidence
@@ -33,14 +33,4 @@ Do **not** cite these as Release Quality Gate / CI twin proof (they stay `#[igno
 
 Lab catalog control-plane seams that are always-on (list/help/isolation / outcome probes) may appear in `rqg-integration` but are not substitutes for capability behavior twins above.
 
-## Related RQG slices (not Lab COVERAGE rows)
-
-These are required by ADR-0011 / ADR-0028 and already covered by non-ignored app tests; they are listed here so gaps are not confused with Lab catalog rows:
-
-| RQG slice | Non-ignored evidence |
-| --- | --- |
-| Cutover / Initial↔Incremental hand-off | `cli_cutover_no_gap.rs` |
-| Restart-resume / basic fault | `cli_restart_resume.rs` |
-| Oracle→Mongo contract/stub harness | `cli_stub_incremental.rs`, `cli_logminer_incremental.rs`, `cli_contract_catalog_initial_load.rs`, `cli_source_prerequisites.rs` |
-
-Performance regression thresholds are owned by `rqg-perf` (separate job; see parent #94 / #97)—not this matrix.
+Performance regression thresholds are owned by `rqg-perf` (separate job; see parent #94 / #97)—not this matrix. Cutover, restart-resume, and other ADR-0011 slices stay covered by existing non-ignored app tests outside this Lab-catalog twin table.
