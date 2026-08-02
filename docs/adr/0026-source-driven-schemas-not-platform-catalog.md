@@ -1,0 +1,3 @@
+# Source schemas come from the Source System, not a platform business catalog
+
+Sync, schema discovery, Initial Load, and Incremental Capture are Source-driven: table names and column shapes come from the operator’s Source System for Pipeline-referenced tables (ADR-0019), not from a product-embedded catalog of business schemas (e.g. sample orders/customers layouts). Early tracer-bullet fixtures may use named tables in tests; that is not a supported production Source model and must not remain what the shipped runtime depends on. Generality is proven on the operator seam against real/contract Sources (including dedicated arbitrary/random-schema coverage when that path exists)—not by treating hard-coded fixture catalogs as the product.
