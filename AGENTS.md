@@ -22,11 +22,11 @@ When closing out **`/implement`**, if a PR already exists for the branch: work i
 
 ## Cursor Cloud specific instructions
 
-This repo currently has no application dependencies. Cloud agents can work directly with the committed skills under `.agents/skills/`.
+Cloud `install`/`start` (`.cursor/environment.json`) set up nested-friendly Docker for **Local Sync Lab**:
 
-When app dependencies are added, update `.cursor/environment.json`:
+- `install`: `cargo fetch` plus `.cursor/cloud-dind-install.sh` — installs `docker.io`, Compose v2, and `fuse-overlayfs`; writes `.cursor/daemon.json` (`storage-driver: fuse-overlayfs`, containerd snapshotter disabled); pre-warms Lab images (`postgres:16`, `mongo:7`, `gvenzl/oracle-free:23-slim`).
+- `start`: `.cursor/cloud-dind-start.sh` — starts `dockerd` with that recipe (Cloud VMs have no systemd Docker unit).
 
-- `install`: run the repo's dependency setup (for example `pnpm install`)
-- `start`: start any long-lived services the agent needs (for example `docker compose up -d`)
+Default overlay/overlayfs DinD fails Lab image extract with whiteout `EPERM`. Do not invent session-local storage-driver workarounds; use the baked recipe. After `start`, `migraloop lab up` / `lab status` should yield a ready Lab Fixture. Matrix evidence (pass/fail per recipe): implementing PR for GitHub issue #107.
 
-Keep heavy one-off builds out of `install`; document task-specific commands here instead.
+Keep heavy one-off app builds out of `install` (Lab images pre-warm is intentional). Agents can work directly with committed skills under `.agents/skills/`.

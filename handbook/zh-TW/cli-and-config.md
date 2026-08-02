@@ -131,7 +131,7 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 ### `lab`
 
-Local Sync Lab Fixture 與 Lab Scenarios（ADR-0025）。佈建可拋棄的真實堆疊—Oracle Source（Lab 已滿足的 Source Prerequisites）、MongoDB Target、Platform Store 與 app。Bring-up **不會**套用 sample Deployment 或 Pipelines。Operator 接著可 list/run 可選的 **Lab Scenarios**，在 **Scenario Namespace** 內以真實 product path 套用 Deployment 並驅動 Sync/Delivery。需要 Docker Compose 與 repo 的 `lab/` 目錄（或 `--lab-dir`）。Scenario 的 `apply`/`sync` 需要 host 上的 Oracle Instant Client（`LD_LIBRARY_PATH`）。
+Local Sync Lab Fixture 與 Lab Scenarios（ADR-0025）。佈建可拋棄的真實堆疊—Oracle Source（Lab 已滿足的 Source Prerequisites）、MongoDB Target、Platform Store 與 app。Bring-up **不會**套用 sample Deployment 或 Pipelines。Operator 接著可 list/run 可選的 **Lab Scenarios**，在 **Scenario Namespace** 內以真實 product path 套用 Deployment 並驅動 Sync/Delivery。需要 Docker Compose 與 repo 的 `lab/` 目錄（或 `--lab-dir`）。Scenario 的 `apply`/`sync` 需要 host 上的 Oracle Instant Client（`LD_LIBRARY_PATH`）。若巢狀 Docker 在 overlay whiteout 解壓失敗，需改用 dockerd `fuse-overlayfs` 或 `vfs`（並關閉 containerd snapshotter）；`lab up` 遇 whiteout/`EPERM` 時會印出此提示。**Cursor Cloud** 會在 environment `install`/`start` 套用 `fuse-overlayfs`—見 [Developer local setup](developer-local-setup.md) 與 [Deployment](deployment.md)。
 
 ```bash
 migraloop lab up [--lab-dir lab]

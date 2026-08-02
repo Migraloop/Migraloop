@@ -1,4 +1,4 @@
 {
-  "install": "cargo fetch",
-  "start": "echo 'No long-lived services required by default; use docker compose -f compose.yaml up for Platform Store + app'"
+  "install": "cargo fetch && bash .cursor/cloud-dind-install.sh",
+  "start": "bash .cursor/cloud-dind-start.sh"
 }
