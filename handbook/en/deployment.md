@@ -32,7 +32,7 @@ migraloop status
 
 - v1 runs **one active app instance** (internally concurrent) plus the Platform Store.
 - All durable Deployment state (Pipelines, Base/Derived Datasets, checkpoints) lives in the Platform Store so a replacement instance can resume.
-- Automatic multi-instance failover is later; do not run multi-writer active-active.
+- Automatic multi-instance failover is later; active processing remains single-leader (not multi-writer).
 
 ## Declaring a Deployment
 

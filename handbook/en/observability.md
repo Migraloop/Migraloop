@@ -1,6 +1,6 @@
 # Observability
 
-The product **Observability Surface** (ADR-0008) is the minimum production signal set: structured logs; **Sync Health** and **Delivery Health** (lag, checkpoints, errors); per-Pipeline status; Prometheus metrics; alertable failure counters. Distributed tracing / vendor APM is optional later.
+Operators need Sync / Delivery signals, structured logs, and (as the Observability Surface lands) Prometheus metrics with alertable failure counters (ADR-0008). Distributed tracing / vendor APM is optional later.
 
 ## What to run first
 
@@ -8,7 +8,7 @@ The product **Observability Surface** (ADR-0008) is the minimum production signa
 migraloop status
 ```
 
-`status` reports:
+`status` is the primary Operator loop today. It reports:
 
 - **Platform Store** reachability / health and schema version
 - Each **Deployment** (Source/Target identity, LogMiner mechanism: contract vs OCI)
@@ -42,7 +42,7 @@ Add `--deployment <name>` when multiple Deployments share table/collection/pipel
 ## Logs and metrics
 
 - App/CLI emit structured operational lines on Initial Load, Incremental Capture, Delivery, and failures (stdout/stderr of the `migraloop` process / container logs).
-- Prometheus metrics and alert counters are part of the Observability Surface contract; wire scrapers when the metrics endpoint ships in your build. Until then, treat `status` lag/checkpoint/error lines as the primary Operator loop.
+- A Prometheus scrape endpoint and alert counters are part of the Observability Surface **contract** (ADR-0008) and are not yet the primary Operator interface—use `status` lag/checkpoint/error lines until metrics land in your build.
 
 ## Related chapters
 

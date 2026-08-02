@@ -21,13 +21,13 @@ Compose sets `MIGRALOOP_PLATFORM_STORE_URL` for the app. The app entrypoint runs
 
 Details: [Deployment](deployment.md) · flags and env: [CLI & Config reference](cli-and-config.md) · secrets/TLS: [Security](security.md)
 
-## 2. Prepare Source and Target
+## 2. Prepare Source System and Target System
 
 Before apply/sync:
 
 1. Satisfy Oracle **Source Prerequisites** (supplemental logging, redo retention) and **Required Privileges** — [Source System](source-system.md).
 2. Provide a MongoDB **Target System** the Delivery account can write — [Target System](target-system.md).
-3. Supply Source/Target passwords only via secret references (`fromEnv` / `fromFile` / `fromDockerSecret`) — [Security](security.md).
+3. Supply Source System / Target System passwords only via secret references (`fromEnv` / `fromFile` / `fromDockerSecret`) — [Security](security.md).
 
 ## 3. Apply a Deployment with a first Pipeline
 

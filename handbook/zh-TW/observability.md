@@ -1,6 +1,6 @@
 # Observability
 
-產品 **Observability Surface**（ADR-0008）是正式環境的最小訊號集合：structured logs；**Sync Health** 與 **Delivery Health**（lag、checkpoints、errors）；per-Pipeline status；Prometheus metrics；可告警的 failure counters。Distributed tracing / 廠商 APM 屬後續可選。
+Operator 需要 Sync / Delivery 訊號、structured logs，以及（隨 Observability Surface 落地）附可告警 failure counters 的 Prometheus metrics（ADR-0008）。Distributed tracing / 廠商 APM 屬後續可選。
 
 ## 先跑這個
 
@@ -8,7 +8,7 @@
 migraloop status
 ```
 
-`status` 會回報：
+`status` 是目前主要的 Operator 迴圈。它會回報：
 
 - **Platform Store** 可連線性 / 健康與 schema version
 - 每個 **Deployment**（Source/Target 識別、LogMiner 機制：contract 或 OCI）
@@ -42,7 +42,7 @@ migraloop status
 ## Logs 與 metrics
 
 - App/CLI 在 Initial Load、Incremental Capture、Delivery 與失敗時輸出結構化維運訊息（`migraloop` 行程 / container logs 的 stdout/stderr）。
-- Prometheus metrics 與告警 counters 屬 Observability Surface 契約；當你的 build 提供 metrics endpoint 時再接 scraper。在那之前，把 `status` 的 lag/checkpoint/error 行當成主要 Operator 迴圈。
+- Prometheus scrape endpoint 與告警 counters 屬 Observability Surface **契約**（ADR-0008），尚非主要 Operator 介面—在你的 build 提供 metrics 之前，請使用 `status` 的 lag/checkpoint/error 行。
 
 ## 相關章節
 

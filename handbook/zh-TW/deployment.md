@@ -32,7 +32,7 @@ migraloop status
 
 - v1 以 **一個 active app instance**（內部可並行）加上 Platform Store 執行。
 - 所有耐久 Deployment 狀態（Pipelines、Base/Derived Datasets、checkpoints）存在 Platform Store，替換 instance 才能續跑。
-- 自動 multi-instance failover 屬後續階段；不要跑 multi-writer active-active。
+- 自動 multi-instance failover 屬後續階段；active processing 維持 single-leader（非 multi-writer）。
 
 ## 宣告 Deployment
 

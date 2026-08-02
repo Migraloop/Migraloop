@@ -106,11 +106,7 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 ### Contract-harness Source Prerequisite probes（仅 host `stub` / `contract`）
 
-| 变量 | 含义 | 默认 |
-| --- | --- | --- |
-| `MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING` | `on` / `off` | `on` |
-| `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all`、空字符串，或逗号分隔表 | `all` |
-| `MIGRALOOP_STUB_REDO_RETENTION_HOURS` | 报告的 redo retention 小时数 | `72` |
+进程内 LogMiner harness 的环境变量名称与默认见 [Source System](source-system.md)（`MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING`、`MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING`、`MIGRALOOP_STUB_REDO_RETENTION_HOURS`）。
 
 ## Deployment 配置契约
 

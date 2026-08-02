@@ -1,29 +1,29 @@
 # Operations
 
-Day-2 behaviors Operators should expect when running Deployments in production. Several controls are specified in ADRs and the domain glossary; use this chapter as the operational contract and verify against `migraloop status` / logs as implementations land.
+Day-2 behaviors Operators should expect when running Deployments in production. Several controls below are **product contracts** recorded in ADRs and the domain glossary; confirm what your build exposes via `migraloop status` / logs as each control lands.
 
 ## Schema Change Handling
 
 Source DDL is classified against each Pipeline’s dependencies (ADR-0009):
 
-| Impact | Platform behavior |
+| Impact | Intended platform behavior |
 | --- | --- |
 | Does not affect the Pipeline | Processing continues; schema can catch up |
 | Affects the Pipeline but apply stays safe | Processing continues |
 | Blocks safe apply (retries cannot progress) | **Warn and pause** the affected Pipeline(s) |
 
-This pause rule is for **stream-wide blockers**, not single-row poison data.
+This pause rule is for **stream-wide blockers**, not single-row poison data. Dedicated pause/resume CLI verbs are part of the control-plane contract (see [Pipeline](pipeline.md)); until they ship, treat unblockable apply failures as Operator-visible errors in `status` / logs and keep only runnable Pipelines declared in config.
 
 ## Poison Change Handling
 
-When a single change or Output Identity repeatedly fails but the rest of the stream can continue (ADR-0015):
+When a single change or Output Identity repeatedly fails but the rest of the stream can continue (ADR-0015), the intended path is:
 
 1. Bounded retries
 2. **Quarantine** that change/identity
 3. **Alert** Operators
 4. **Keep the Pipeline running**
 
-Quarantined keys stay unhealthy / not aligned until repaired or retried—never a silent skip. Do not expect a whole-Pipeline pause for one bad row.
+Quarantined keys stay unhealthy / not aligned until repaired or retried—never a silent skip. Do not expect a whole-Pipeline pause for one bad row. Until quarantine surfaces in `status`, watch apply errors and Delivery Health for stuck identities.
 
 ## Backpressure
 

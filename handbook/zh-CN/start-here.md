@@ -21,13 +21,13 @@ Compose 会为 app 设置 `MIGRALOOP_PLATFORM_STORE_URL`。entrypoint 执行 `mi
 
 细节：[Deployment](deployment.md) · 标志与环境变量：[CLI 与 Config 参考](cli-and-config.md) · 密钥/TLS：[Security](security.md)
 
-## 2. 准备 Source 与 Target
+## 2. 准备 Source System 与 Target System
 
 在 apply/sync 之前：
 
 1. 满足 Oracle **Source Prerequisites**（supplemental logging、redo retention）与 **Required Privileges** — [Source System](source-system.md)。
 2. 准备 Delivery 账号可写入的 MongoDB **Target System** — [Target System](target-system.md)。
-3. Source/Target 密码只能用 secret reference（`fromEnv` / `fromFile` / `fromDockerSecret`）— [Security](security.md)。
+3. Source System / Target System 密码只能用 secret reference（`fromEnv` / `fromFile` / `fromDockerSecret`）— [Security](security.md)。
 
 ## 3. 应用含第一条 Pipeline 的 Deployment
 

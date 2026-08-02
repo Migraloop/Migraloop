@@ -106,11 +106,7 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 ### Contract-harness Source Prerequisite probes (host `stub` / `contract` only)
 
-| Variable | Meaning | Default |
-| --- | --- | --- |
-| `MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING` | `on` / `off` | `on` |
-| `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all`, empty, or comma-separated tables | `all` |
-| `MIGRALOOP_STUB_REDO_RETENTION_HOURS` | Reported redo retention hours | `72` |
+Env names and defaults for the in-process LogMiner harness live in [Source System](source-system.md) (`MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING`, `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING`, `MIGRALOOP_STUB_REDO_RETENTION_HOURS`).
 
 ## Deployment config contract
 

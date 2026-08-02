@@ -1,29 +1,29 @@
 # Operations
 
-Operator 在生产环境运行 Deployments 时应预期的 day-2 行为。若干控制项已在 ADRs 与领域 glossary 中规范；把本章当成运维契约，并在实现到位时以 `migraloop status` / logs 核对。
+Operator 在生产环境运行 Deployments 时应预期的 day-2 行为。下列若干控制项是 ADRs 与领域 glossary 记录的 **产品契约**；每个控制项落地时，请以 `migraloop status` / logs 核对你的 build 实际暴露什么。
 
 ## Schema Change Handling
 
 Source DDL 会按每条 Pipeline 的依赖分类（ADR-0009）：
 
-| 影响 | 平台行为 |
+| 影响 | 预期平台行为 |
 | --- | --- |
 | 不影响该 Pipeline | 继续处理；schema 可稍后追上 |
 | 影响 Pipeline 但 apply 仍安全 | 继续处理 |
 | 阻挡安全 apply（重试无法前进） | **警告并 pause** 受影响的 Pipeline(s) |
 
-此 pause 规则用于 **stream-wide blockers**，不是单行 poison data。
+此 pause 规则用于 **stream-wide blockers**，不是单行 poison data。专用 pause/resume CLI 动词属 control-plane 契约（见 [Pipeline](pipeline.md)）；在它们出货前，把无法解除的 apply 失败当成 `status` / logs 上的 Operator 可见错误，并只在配置中保留可运行的 Pipelines。
 
 ## Poison Change Handling
 
-当单个 change 或 Output Identity 反复失败，但流其余部分仍可继续时（ADR-0015）：
+当单个 change 或 Output Identity 反复失败，但流其余部分仍可继续时（ADR-0015），预期路径是：
 
 1. 有界重试
 2. **Quarantine** 该 change/identity
 3. **Alert** Operators
 4. **让 Pipeline 继续跑**
 
-被 quarantine 的 keys 在修复或重试前保持 unhealthy / not aligned—绝不默默跳过。不要预期单行坏数据就 pause 整条 Pipeline。
+被 quarantine 的 keys 在修复或重试前保持 unhealthy / not aligned—绝不默默跳过。不要预期单行坏数据就 pause 整条 Pipeline。在 quarantine 出现在 `status` 之前，请从 apply 错误与 Delivery Health 观察卡住的 identities。
 
 ## Backpressure
 
