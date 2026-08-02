@@ -51,6 +51,56 @@ Compose 定義：`lab/compose.yaml`（project `migraloop-lab`）。Lab `app` ima
 
 資源提醒：Lab Oracle（Free）通常需要數 GB RAM，第一次拉 image／開機可能要數分鐘。Lab Compose 使用 `network_mode: host`，以便在 bridge 網路被擋的巢狀 Docker 環境仍可運作。若巢狀 Docker 在 overlay whiteout 解壓失敗，可改用 dockerd `storage-driver: vfs`（並關閉 containerd snapshotter）。
 
+### DB-level restore / load escape hatch
+
+當你需要在 Lab Scenario recipe **之外**載入或還原資料—SQL dump、臨時 inserts，或 Mongo seed/restore—請使用可拋棄的 Lab engines，以及 `migraloop lab status`（或 `lab up`）印出的連線細節。這是通往真實堆疊的 escape hatch，**不是**第二套 Scenario 撰寫模型，也**不是** Release Quality Gate／CI。
+
+範例位於 `lab/escape-hatch/`（`oracle-load.sql`、`mongo-load.js`，以及僅綁定 Lab 的 `deployment.yaml`，以便接回一般 product path）。沒有 `recipe.yaml`，此流程也**不要**執行 `migraloop lab scenario …`。
+
+```bash
+migraloop lab up
+migraloop lab status   # 複製 Lab Oracle / Mongo / Platform Store 細節
+
+# 載入 Lab Oracle（compose exec — 不需要 BYO 正式環境 Source）
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T oracle \
+  sqlplus -s SYNC_USER/lab_oracle@FREEPDB1 < lab/escape-hatch/oracle-load.sql
+
+# 載入 Lab Mongo（Target 端 seed／restore 式檢視）
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T mongo \
+  mongosh --quiet --host 127.0.0.1 -u migraloop -p lab_mongo \
+  --authenticationDatabase admin lab < lab/escape-hatch/mongo-load.js
+
+# 接回真實 product path（apply / status / base / target / sync）
+export MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
+export ORACLE_PASSWORD=lab_oracle
+export MONGO_PASSWORD=lab_mongo
+# 對 Lab Oracle 做 apply/sync 需要 host Instant Client：
+# export LD_LIBRARY_PATH=/path/to/instantclient
+migraloop apply -f lab/escape-hatch/deployment.yaml
+migraloop status
+migraloop base --table LAB_ESCAPE_CUSTOMERS
+migraloop target --collection lab_escape_customers   # Delivery 跑完後
+migraloop sync                                       # 可選的 Incremental Capture 後續
+```
+
+**可選的 dump 工具還原**（相同 Lab 連線細節；仍不是 Scenario／不是 CI）。因 Lab Compose 使用 `network_mode: host`，host 工具可連 `127.0.0.1` Lab ports：
+
+```bash
+# MongoDB archive → Lab Mongo（範例；依 dump 路徑／ns 調整）
+mongorestore \
+  --uri 'mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin' \
+  --archive=your-lab-seed.archive
+
+# Oracle Data Pump → Lab Oracle（需能連到 Lab 的 client；
+# 可拋棄 image 的 SYS 密碼為 lab_oracle_sys — 僅供 Lab）
+impdp SYNC_USER/lab_oracle@//127.0.0.1:1521/FREEPDB1 \
+  DUMPFILE=your_lab_seed.dmp DIRECTORY=DATA_PUMP_DIR TABLE_EXISTS_ACTION=REPLACE
+```
+
+若 dump restore 進 Lab Oracle 且之後要 sync，請套用 table-level supplemental logging（同 `oracle-load.sql`），再以綁定 Lab 的 Deployment 走一般 `migraloop apply`／`status`／`base`／`target`／`sync`。非 Delivery-managed 的 Target 端 load/restore 請用 Lab Mongo URI 以 mongosh 檢視；`migraloop target` 用於 product Delivery 之後的 collections。
+
+請只在可拋棄 Fixture 上載入—絕不要把此 escape hatch 指向客戶／正式環境 engines。若要打包好的 correctness + metrics recipe，請優先用 Lab Scenarios；當你已有 SQL／JS／dumps 要自行放入 Lab 資料庫時，再用此路徑。
+
 ## Runtime 模型
 
 - v1 以 **一個 active app instance**（內部可並行）加上 Platform Store 執行。

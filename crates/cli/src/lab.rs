@@ -1,9 +1,11 @@
-//! Local Sync Lab Fixture orchestration (issues #59, #84 / ADR-0025).
+//! Local Sync Lab Fixture orchestration (issues #59, #84, #87 / ADR-0025).
 //!
 //! Lab-specific machinery only: disposable stack bring-up / status / tear-down,
 //! plus shared helpers for Lab Scenario runners. Fixture bring-up does not apply
 //! Deployments or Pipelines. Status also reports active vs leftover Scenario
 //! Namespace so operators need not guess from raw Deployment/Pipeline lines.
+//! Connection details support the DB-level restore/load escape hatch
+//! (`lab/escape-hatch/`) — not a Lab Scenario and not the Release Quality Gate.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -651,6 +653,10 @@ fn print_connection_details() {
     println!("  migraloop lab scenario list");
     println!("  # Scenario apply/sync needs host Oracle Instant Client (LD_LIBRARY_PATH).");
     println!("  migraloop lab scenario run direct-pipeline");
+    println!(
+        "  # DB-level restore/load escape hatch (not a Lab Scenario; not CI): \
+         see handbook Deployment / lab/escape-hatch/"
+    );
 }
 
 /// Path to the `migraloop` binary used for real product apply/sync/inspect from Lab.

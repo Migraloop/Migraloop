@@ -51,6 +51,56 @@ Compose definition: `lab/compose.yaml` (project `migraloop-lab`). The Lab `app` 
 
 Resource note: Lab Oracle (Free) typically needs several GB RAM and a few minutes on first image pull/boot. Lab Compose uses `network_mode: host` so the Fixture stays usable in nested Docker environments where bridge networking is blocked. Nested Docker environments that fail image extract on overlay whiteouts may need dockerd `storage-driver: vfs` (with containerd snapshotter disabled).
 
+### DB-level restore / load escape hatch
+
+When you need to load or restore data **outside** a Lab Scenario recipe—SQL dumps, ad-hoc inserts, or Mongo seed/restore—use the disposable Lab engines and the connection details from `migraloop lab status` (or `lab up`). This is an escape hatch onto the real stack, **not** a second Scenario authoring model and **not** the Release Quality Gate / CI.
+
+Samples live under `lab/escape-hatch/` (`oracle-load.sql`, `mongo-load.js`, plus a Lab-only `deployment.yaml` so you can continue on the ordinary product path). There is no `recipe.yaml` and you do **not** run `migraloop lab scenario …` for this flow.
+
+```bash
+migraloop lab up
+migraloop lab status   # copy Lab Oracle / Mongo / Platform Store details
+
+# Load into Lab Oracle (compose exec — no BYO production Source required)
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T oracle \
+  sqlplus -s SYNC_USER/lab_oracle@FREEPDB1 < lab/escape-hatch/oracle-load.sql
+
+# Load into Lab Mongo (Target-side seed / restore-style inspect)
+docker compose -f lab/compose.yaml -p migraloop-lab exec -T mongo \
+  mongosh --quiet --host 127.0.0.1 -u migraloop -p lab_mongo \
+  --authenticationDatabase admin lab < lab/escape-hatch/mongo-load.js
+
+# Continue on the real product path (apply / status / base / target / sync)
+export MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
+export ORACLE_PASSWORD=lab_oracle
+export MONGO_PASSWORD=lab_mongo
+# Host Instant Client required for apply/sync against Lab Oracle:
+# export LD_LIBRARY_PATH=/path/to/instantclient
+migraloop apply -f lab/escape-hatch/deployment.yaml
+migraloop status
+migraloop base --table LAB_ESCAPE_CUSTOMERS
+migraloop target --collection lab_escape_customers   # after Delivery has run
+migraloop sync                                       # optional Incremental Capture follow-up
+```
+
+**Optional dump-tool restore** (same Lab connection details; still not a Scenario / not CI). Host tools talk to Lab ports on `127.0.0.1` because Lab Compose uses `network_mode: host`:
+
+```bash
+# MongoDB archive → Lab Mongo (example; adjust dump path / ns)
+mongorestore \
+  --uri 'mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin' \
+  --archive=your-lab-seed.archive
+
+# Oracle Data Pump → Lab Oracle (run from a client with network access to Lab;
+# SYS password for the disposable image is lab_oracle_sys — Lab-only)
+impdp SYNC_USER/lab_oracle@//127.0.0.1:1521/FREEPDB1 \
+  DUMPFILE=your_lab_seed.dmp DIRECTORY=DATA_PUMP_DIR TABLE_EXISTS_ACTION=REPLACE
+```
+
+After a dump restore into Lab Oracle tables you intend to sync, apply table-level supplemental logging (as `oracle-load.sql` does), then use ordinary `migraloop apply` / `status` / `base` / `target` / `sync` with a Lab-bound Deployment. Target-side loads/restores that are not Delivery-managed are inspected with mongosh against the Lab Mongo URI; `migraloop target` inspects collections after product Delivery.
+
+Keep loads on the disposable Fixture only—never point this escape hatch at customer/production engines. Prefer Lab Scenarios when you want a packaged correctness + metrics recipe; use this path when you already have SQL/JS/dumps to place into Lab databases yourself.
+
 ## Runtime model
 
 - v1 runs **one active app instance** (internally concurrent) plus the Platform Store.
