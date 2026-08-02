@@ -84,20 +84,56 @@ Operator 面向細節見 [Deployment](deployment.md)。CLI-seam 覆蓋：always-
 
 ### 撰寫 Lab Scenario（feature-time coverage）
 
-第一級 capability 在設計時就要一併規劃 Lab Scenario 覆蓋，否則視為未完成（ADR-0025）。開發 feature 時請走這條可重複路徑：
+已出貨第一級 capability 的完整度階梯（ADR-0025 + ADR-0028）：**capability → Lab Scenario → 非 ignored 的 contract-path CI twin**。在手動 Lab Scenario 與 Release Quality Gate twin 都齊之前，該 capability 視為未完成。開發 feature 時請走這條可重複路徑：
 
 1. 建立 `lab/scenarios/<id>/`，包含：
    - `recipe.yaml` — catalog metadata：`id`、`summary`、**Scenario Namespace**（`source_tables`、`target_collections`、`deployment`、`pipelines`）、`workload`（`concurrency`：`serial`|`parallel`、有序 `steps`）、`checks.correctness`、可選的等權 `thresholds`（`max_settle_ms`、`max_lag`、`max_duration_ms`、`min_rows_per_s`）
    - `deployment.yaml` — 真實 product Deployment config（與 Operator `apply` 相同格式），且只能綁定 Lab Fixture engines（`migraloop lab status` 所示的 `127.0.0.1` / `localhost` Oracle + Mongo endpoints）。Scenario `run` 會在 apply/sync 前拒絕非 Lab／正式環境 engine targets。
 2. 在 `crates/cli/src/lab_scenario.rs` 實作 Namespace prepare/remove、Source workload、checks 與 thresholds，並向其他 runners 註冊 Scenario id。
 3. 確認 `migraloop lab scenario list` 顯示新 id，且 **summary 來自 `recipe.yaml`**。Selectable catalog = 已註冊 runner，且在 `--lab-dir` 下同時有 recipe + deployment 檔。
-4. 在 Lab Fixture 上手動驗證 `migraloop lab scenario run <id>`。list／控制面行為維持 always-on CLI-seam 測試；完整 Fixture run 維持 `#[ignore]` — 不是 Release Quality Gate。
+4. 在 Lab Fixture 上手動驗證 `migraloop lab scenario run <id>`。list／控制面行為維持 always-on CLI-seam 測試；完整 Fixture run 維持 `#[ignore]` — 不是 Release Quality Gate 證據。
+5. 在 `crates/app/tests` 新增**非 ignored** 的 contract-path CI twin（優先延伸既有 CLI／`migraloop-app` seams，走 contract/stub + Platform Store/Mongo）。更新 Lab↔CI 矩陣 `docs/rqg/CI_TWIN_COVERAGE.md`。**不要**為了「過 gate」而取消 ignore Lab Scenario／Fixture／live Oracle 測試，也**不要**新增會跑 Lab Scenario catalog 的 CI job。
 
-Recipe 慣例與短清單亦見 `lab/scenarios/README.md`。已出貨 capability 覆蓋與可見 gaps：`lab/scenarios/COVERAGE.md`（亦由 `lab scenario list` 摘要）。
+Recipe 慣例與短清單亦見 `lab/scenarios/README.md`。已出貨 capability 的 Lab gaps：`lab/scenarios/COVERAGE.md`（亦由 `lab scenario list` 摘要）。同一批 capability 的 CI twin 列：`docs/rqg/CI_TWIN_COVERAGE.md`。
+
+## Release Quality Gate
+
+每個 PR／push 都必須讓四個平行 checks 全綠（ADR-0011、ADR-0028）。Handbook guard 維持獨立 workflow；其餘三個 jobs 在 `.github/workflows/release-quality-gate.yml`。自動化表面請稱為 **Release Quality Gate**／**contract-path CI twin**—絕不要叫「Mock Lab」，也不要把 Local Sync Lab 當成 gate。
+
+| Check | 跑什麼 | 本地重現 |
+| --- | --- | --- |
+| **Handbook guard** | `cargo test -p handbook-guard` 加上 handbook check entrypoint | 見下方「Handbook guard」一節 |
+| **rqg-unit** | workspace crate 測試，排除 `migraloop-app` 與 `handbook-guard`（不需 Postgres/Mongo） | `cargo test --workspace --exclude migraloop-app --exclude handbook-guard` |
+| **rqg-integration** | 非 ignored 的 `migraloop-app` 測試（正確性、contract、fault、capability CI twins） | 下方 CI 對齊 env，再 `cargo test -p migraloop-app` |
+| **rqg-perf** | contract/stub 上固定 Direct Pipeline microbench，對照 committed baseline（約 20% regression；失敗可重試一次） | 下方 CI 對齊 env，再 `bash ci/rqg/run_direct_pipeline_microbench.sh` |
+
+`rqg-integration` 與 `rqg-perf` 使用與 CI 相同的 service 憑證。執行那些 cargo／bash 指令前請設定：
+
+| 變數 | CI／本地對齊值 |
+| --- | --- |
+| `MIGRALOOP_TEST_ADMIN_URL` | `postgres://migraloop:migraloop@127.0.0.1:5432/postgres` |
+| `MIGRALOOP_TEST_MONGO_HOST` | `127.0.0.1` |
+| `MIGRALOOP_TEST_MONGO_PORT` | `27017` |
+
+這些 jobs 的 MongoDB 預期 root 帳密為 `deliver_user`／`mongo-secret-value`（`authSource=admin`）—與 app 整合測試硬編碼的預設相同。本地服務範例：
+
+```bash
+docker compose up -d platform-store   # Postgres 16；admin URL 如上
+docker run -d --name migraloop-rqg-mongo -p 27017:27017 \
+  -e MONGO_INITDB_ROOT_USERNAME=deliver_user \
+  -e MONGO_INITDB_ROOT_PASSWORD=mongo-secret-value \
+  mongo:7
+# 部分 schema／Delivery probes 還需要：pip install pymongo
+export MIGRALOOP_TEST_ADMIN_URL=postgres://migraloop:migraloop@127.0.0.1:5432/postgres
+export MIGRALOOP_TEST_MONGO_HOST=127.0.0.1
+export MIGRALOOP_TEST_MONGO_PORT=27017
+```
+
+預設 `cargo test -p migraloop-app` 會略過 `#[ignore]` 的 Lab Fixture／Lab Scenario／live Oracle 測試，以及僅供 `rqg-perf` 的 microbench—請維持如此。Lab Scenario `bulk-load` 維持**手動**；它不是 performance gate（`rqg-perf` 由 `ci/rqg/` 負責）。已出貨 Lab capability → 非 ignored CI twin 證據矩陣：`docs/rqg/CI_TWIN_COVERAGE.md`。
 
 ## 測試
 
-Unit/crate 測試：
+Unit/crate 測試（以 workspace 方式執行時亦涵蓋於上方的 `rqg-unit`）：
 
 ```bash
 cargo test -p migraloop-capture
@@ -105,12 +141,7 @@ cargo test -p migraloop-transform
 cargo test -p migraloop-cli
 ```
 
-`crates/app/tests` 下的整合測試通常需要可連線的 Postgres（以及常需要 MongoDB），透過：
-
-| 變數 | 常見預設 |
-| --- | --- |
-| `MIGRALOOP_TEST_ADMIN_URL` | `postgres://migraloop:migraloop@127.0.0.1:5432/postgres` |
-| `MIGRALOOP_TEST_MONGO_HOST` / `MIGRALOOP_TEST_MONGO_PORT` | `127.0.0.1` / `27017` |
+`crates/app/tests` 下的整合測試通常需要可連線的 Postgres（以及常需要 MongoDB），變數見 [Release Quality Gate](#release-quality-gate)：
 
 ```bash
 cargo test -p migraloop-app
@@ -134,7 +165,7 @@ Lab Fixture lifecycle seam（預設 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load 與 idempotent-redelivery seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）：
+Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load 與 idempotent-redelivery seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）。這些是**手動 Lab** seams—不是 Release Quality Gate 證據，也不應接到 CI：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
@@ -152,7 +183,7 @@ Operator 的 apply/sync/inspect 驗證步驟見 [Source System](source-system.md
 
 ## Handbook guard（文件 CI seam）
 
-變更 Operator/Developer 可見行為或 handbook 頁面時，執行與 CI 相同的 entrypoint：
+變更 Operator/Developer 可見行為或 handbook 頁面時，執行與 CI 相同的 entrypoint（這是與 Release Quality Gate jobs 並行的 Handbook guard check—不能取代 `rqg-unit`／`rqg-integration`／`rqg-perf`）：
 
 ```bash
 cargo test -p handbook-guard
@@ -164,7 +195,6 @@ cargo run -p handbook-guard -- check \
 ```
 
 `handbook/en`、`handbook/zh-TW`、`handbook/zh-CN` 下的 locale trees 必須保持路徑同構。英文為 canonical。
-
 ## 目錄提醒
 
 | 路徑 | 讀者 |

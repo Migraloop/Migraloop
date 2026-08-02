@@ -84,20 +84,56 @@ Operator-facing detail: [Deployment](deployment.md). CLI-seam coverage: always-o
 
 ### Authoring a Lab Scenario (feature-time coverage)
 
-A first-class capability is incomplete until Lab Scenario coverage is designed with it (ADR-0025). Use this repeatable path while building a feature:
+Completeness ladder for a shipped first-class capability (ADR-0025 + ADR-0028): **capability → Lab Scenario → non-ignored contract-path CI twin**. A capability is incomplete until both the manual Lab Scenario and a Release Quality Gate twin exist. Use this repeatable path while building a feature:
 
 1. Create `lab/scenarios/<id>/` with:
    - `recipe.yaml` — catalog metadata: `id`, `summary`, **Scenario Namespace** (`source_tables`, `target_collections`, `deployment`, `pipelines`), `workload` (`concurrency`: `serial`|`parallel`, ordered `steps`), `checks.correctness`, optional equal-weight `thresholds` (`max_settle_ms`, `max_lag`, `max_duration_ms`, `min_rows_per_s`)
    - `deployment.yaml` — real product Deployment config (same format Operators apply), bound only to Lab Fixture engines (`127.0.0.1` / `localhost` Oracle + Mongo endpoints from `migraloop lab status`). Scenario `run` refuses non-Lab / production engine targets before apply/sync.
 2. Implement Namespace prepare/remove, Source workload, checks, and thresholds in `crates/cli/src/lab_scenario.rs`, and register the Scenario id with the other runners.
 3. Confirm `migraloop lab scenario list` shows the new id and **summary from `recipe.yaml`**. Selectable catalog = registered runners that have both recipe + deployment files under `--lab-dir`.
-4. Manually verify with `migraloop lab scenario run <id>` on a Lab Fixture. Keep always-on CLI-seam tests for list/control-plane behavior; full Fixture runs stay `#[ignore]` — not Release Quality Gate.
+4. Manually verify with `migraloop lab scenario run <id>` on a Lab Fixture. Keep always-on CLI-seam tests for list/control-plane behavior; full Fixture runs stay `#[ignore]` — not Release Quality Gate evidence.
+5. Add a **non-ignored** contract-path CI twin under `crates/app/tests` (prefer extending existing CLI/`migraloop-app` seams on contract/stub + Platform Store/Mongo). Update the Lab↔CI matrix in `docs/rqg/CI_TWIN_COVERAGE.md`. Do **not** un-ignore Lab Scenario / Fixture / live Oracle tests to “satisfy” the gate, and do **not** add a CI job that runs the Lab Scenario catalog.
 
-Recipe conventions and a short checklist also live in `lab/scenarios/README.md`. Shipped-capability coverage and visible gaps: `lab/scenarios/COVERAGE.md` (also summarized by `lab scenario list`).
+Recipe conventions and a short checklist also live in `lab/scenarios/README.md`. Shipped-capability Lab gaps: `lab/scenarios/COVERAGE.md` (also summarized by `lab scenario list`). CI twin rows for the same capabilities: `docs/rqg/CI_TWIN_COVERAGE.md`.
+
+## Release Quality Gate
+
+Every PR/push must keep four parallel checks green (ADR-0011, ADR-0028). Handbook guard stays its own workflow; the other three jobs live in `.github/workflows/release-quality-gate.yml`. Call the automated surface **Release Quality Gate** / **contract-path CI twin**—never “Mock Lab,” and never treat Local Sync Lab as the gate.
+
+| Check | What it runs | Local reproduction |
+| --- | --- | --- |
+| **Handbook guard** | `cargo test -p handbook-guard` plus the handbook check entrypoint | See [Handbook guard](#handbook-guard-docs-ci-seam) below |
+| **rqg-unit** | Workspace crate tests excluding `migraloop-app` and `handbook-guard` (no Postgres/Mongo) | `cargo test --workspace --exclude migraloop-app --exclude handbook-guard` |
+| **rqg-integration** | Non-ignored `migraloop-app` tests (correctness, contract, fault, capability CI twins) | CI-parity env below, then `cargo test -p migraloop-app` |
+| **rqg-perf** | Fixed Direct Pipeline microbench on contract/stub vs committed baseline (~20% regression; one retry) | CI-parity env below, then `bash ci/rqg/run_direct_pipeline_microbench.sh` |
+
+`rqg-integration` and `rqg-perf` use the same service credentials as CI. Set these before those cargo/bash commands:
+
+| Variable | CI / local parity value |
+| --- | --- |
+| `MIGRALOOP_TEST_ADMIN_URL` | `postgres://migraloop:migraloop@127.0.0.1:5432/postgres` |
+| `MIGRALOOP_TEST_MONGO_HOST` | `127.0.0.1` |
+| `MIGRALOOP_TEST_MONGO_PORT` | `27017` |
+
+MongoDB for those jobs expects root auth `deliver_user` / `mongo-secret-value` (`authSource=admin`)—the same defaults app integration tests hardcode. Example local services:
+
+```bash
+docker compose up -d platform-store   # Postgres 16; admin URL above
+docker run -d --name migraloop-rqg-mongo -p 27017:27017 \
+  -e MONGO_INITDB_ROOT_USERNAME=deliver_user \
+  -e MONGO_INITDB_ROOT_PASSWORD=mongo-secret-value \
+  mongo:7
+# Some schema/Delivery probes also need: pip install pymongo
+export MIGRALOOP_TEST_ADMIN_URL=postgres://migraloop:migraloop@127.0.0.1:5432/postgres
+export MIGRALOOP_TEST_MONGO_HOST=127.0.0.1
+export MIGRALOOP_TEST_MONGO_PORT=27017
+```
+
+Default `cargo test -p migraloop-app` skips `#[ignore]` Lab Fixture / Lab Scenario / live Oracle tests and the `rqg-perf`-only microbench—keep it that way. Lab Scenario `bulk-load` stays **manual**; it is not the performance gate (`ci/rqg/` owns `rqg-perf`). Matrix of shipped Lab capabilities → non-ignored CI twin evidence: `docs/rqg/CI_TWIN_COVERAGE.md`.
 
 ## Tests
 
-Unit/crate tests:
+Unit/crate tests (also covered by `rqg-unit` when run workspace-wide as above):
 
 ```bash
 cargo test -p migraloop-capture
@@ -105,12 +141,7 @@ cargo test -p migraloop-transform
 cargo test -p migraloop-cli
 ```
 
-App integration tests under `crates/app/tests` expect a reachable Postgres (and often MongoDB) via:
-
-| Variable | Default habit |
-| --- | --- |
-| `MIGRALOOP_TEST_ADMIN_URL` | `postgres://migraloop:migraloop@127.0.0.1:5432/postgres` |
-| `MIGRALOOP_TEST_MONGO_HOST` / `MIGRALOOP_TEST_MONGO_PORT` | `127.0.0.1` / `27017` |
+App integration tests under `crates/app/tests` expect a reachable Postgres (and often MongoDB) via the env table in [Release Quality Gate](#release-quality-gate):
 
 ```bash
 cargo test -p migraloop-app
@@ -134,7 +165,7 @@ Lab Fixture lifecycle seam (ignored by default; requires Docker Compose + Lab Or
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline, Rich Transform `project`/`filter`, multi-table Transform Pipeline, concurrent Source workload, bulk-load, and idempotent-redelivery seams (ignored by default; requires Docker Lab Fixture + Instant Client):
+Lab Scenario Direct Pipeline, Rich Transform `project`/`filter`, multi-table Transform Pipeline, concurrent Source workload, bulk-load, and idempotent-redelivery seams (ignored by default; requires Docker Lab Fixture + Instant Client). These are **manual Lab** seams—not Release Quality Gate evidence and not something to wire into CI:
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
@@ -152,7 +183,7 @@ See [Source System](source-system.md) for the Operator apply/sync/inspect verifi
 
 ## Handbook guard (docs CI seam)
 
-When changing Operator/Developer-visible behavior or handbook pages, run the same entrypoint CI uses:
+When changing Operator/Developer-visible behavior or handbook pages, run the same entrypoint CI uses (this is the Handbook guard check alongside the Release Quality Gate jobs—not a substitute for `rqg-unit` / `rqg-integration` / `rqg-perf`):
 
 ```bash
 cargo test -p handbook-guard
