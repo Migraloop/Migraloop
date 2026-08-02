@@ -60,7 +60,8 @@ pub fn initial_load_for_source(
 ///
 /// Reads at most `max_rows` Source rows (never a full slam by default). Does not
 /// write the Source. Contract/stub hosts sample the contract catalog; live hosts
-/// use `FETCH FIRST` over OCI.
+/// use bounded `FETCH FIRST` over OCI (plus one peek row for truncation — no
+/// full-table `COUNT(*)`).
 pub fn alignment_check_read_for_source(
     source: &OracleSourceConnect,
     password: &str,
@@ -131,29 +132,24 @@ fn alignment_check_read_oci(
         });
     }
 
-    let count_sql = format!("SELECT COUNT(*) FROM \"{owner}\".\"{table}\"");
-    let source_row_count: i64 = conn
-        .query_row_as::<(i64,)>(&count_sql, &[])
-        .map_err(|err| map_oracle_error(host, err))?
-        .0;
-    let source_row_count = usize::try_from(source_row_count.max(0)).unwrap_or(usize::MAX);
-
     let select_cols: Vec<String> = columns
         .iter()
         .map(|c| format!("TO_CHAR(\"{}\") AS \"{}\"", c.name, c.name))
         .collect();
-    // ORDER BY PK for a stable resource-gated window (schedulable / resumable later).
+    // ORDER BY PK for a stable resource-gated window. Fetch one extra row to
+    // detect truncation without a full-table COUNT(*) slam (CONTEXT.md).
     let order_cols: Vec<String> = primary_key
         .iter()
         .map(|c| format!("\"{c}\""))
         .collect();
+    let fetch_limit = u64::from(max_rows).saturating_add(1);
     let sql = format!(
         "SELECT {} FROM \"{}\".\"{}\" ORDER BY {} FETCH FIRST {} ROWS ONLY",
         select_cols.join(", "),
         owner,
         table,
         order_cols.join(", "),
-        max_rows
+        fetch_limit
     );
 
     let rows = conn.query(&sql, &[]).map_err(|err| map_oracle_error(host, err))?;
@@ -168,14 +164,18 @@ fn alignment_check_read_oci(
         out_rows.push(values_to_json(values, &columns)?);
     }
 
-    let truncated = source_row_count > out_rows.len();
+    let truncated = out_rows.len() as u64 > u64::from(max_rows);
+    if truncated {
+        out_rows.truncate(max_rows as usize);
+    }
     Ok(crate::AlignmentCheckSample {
         table,
         primary_key,
         columns,
         rows: out_rows,
         truncated,
-        source_row_count: Some(source_row_count),
+        // Live OCI avoids COUNT(*); contract catalog still reports known totals.
+        source_row_count: None,
     })
 }
 
