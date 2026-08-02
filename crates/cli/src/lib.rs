@@ -752,11 +752,10 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
     }
 
     // ADR-0021: fail-fast Source Prerequisites before any capture (Initial Load).
-    if deployment.source.kind.eq_ignore_ascii_case("oracle") {
-        ensure_oracle_source_prerequisites(
-            &deployment.source,
-            &pipeline_source_tables(&pipelines),
-        )?;
+    // Deployment-only apply (no Pipeline tables) does not open LogMiner yet.
+    let source_tables = pipeline_source_tables(&pipelines);
+    if deployment.source.kind.eq_ignore_ascii_case("oracle") && !source_tables.is_empty() {
+        ensure_oracle_source_prerequisites(&deployment.source, &source_tables)?;
     }
 
     upsert_deployment(platform_store_url, &deployment)

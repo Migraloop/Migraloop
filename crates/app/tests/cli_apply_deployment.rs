@@ -65,7 +65,7 @@ metadata:
 spec:
   source:
     kind: oracle
-    host: stub
+    host: oracle.example.com
     port: 1521
     database: ORCLPDB1
     username: sync_user
@@ -128,7 +128,7 @@ spec:
     );
     assert!(
         stdout.contains("Source: oracle")
-            && stdout.contains("stub:1521")
+            && stdout.contains("oracle.example.com:1521")
             && stdout.contains("ORCLPDB1")
             && stdout.contains("sync_user"),
         "expected non-secret Source connection config, got:\n{stdout}"
@@ -166,7 +166,7 @@ metadata:
 spec:
   source:
     kind: oracle
-    host: stub
+    host: oracle.example.com
     port: 1521
     database: ORCLPDB1
     username: sync_user
@@ -235,7 +235,7 @@ metadata:
 spec:
   source:
     kind: oracle
-    host: stub
+    host: oracle.example.com
     port: 1521
     database: ORCLPDB1
     username: sync_user
@@ -305,7 +305,7 @@ metadata:
 spec:
   source:
     kind: oracle
-    host: stub
+    host: oracle-v1.example.com
     port: 1521
     database: ORCLPDB1
     username: sync_user
@@ -334,7 +334,7 @@ metadata:
 spec:
   source:
     kind: oracle
-    host: contract
+    host: oracle-v2.example.com
     port: 1522
     database: ORCLPDB2
     username: sync_user_v2
@@ -399,7 +399,7 @@ spec:
 
     assert!(stdout.contains("Deployment: primary"));
     assert!(
-        stdout.contains("contract:1522")
+        stdout.contains("oracle-v2.example.com:1522")
             && stdout.contains("ORCLPDB2")
             && stdout.contains("sync_user_v2"),
         "expected updated Source config, got:\n{stdout}"
@@ -420,7 +420,7 @@ spec:
         "status must not leak file secret values:\n{stdout}"
     );
     assert!(
-        !stdout.contains("stub") && !stdout.contains("mongo-v1.example.com"),
+        !stdout.contains("oracle-v1.example.com") && !stdout.contains("mongo-v1.example.com"),
         "status should show updated Deployment only once, got:\n{stdout}"
     );
 }
@@ -440,7 +440,7 @@ metadata:
 spec:
   source:
     kind: oracle
-    host: stub
+    host: oracle.example.com
     port: 1521
     database: ORCLPDB1
     username: sync_user
@@ -522,7 +522,7 @@ metadata:
 spec:
   source:
     kind: oracle
-    host: stub
+    host: oracle.example.com
     port: 1521
     database: ORCLPDB1
     username: sync_user
@@ -576,7 +576,7 @@ metadata:
 spec:
   source:
     kind: oracle
-    host: stub
+    host: oracle.example.com
     port: 1521
     database: ORCLPDB1
     username: sync_user
@@ -638,7 +638,7 @@ async fn apply_json_creates_deployment() {
   "spec": {
     "source": {
       "kind": "oracle",
-      "host": "stub",
+      "host": "oracle.json.example.com",
       "port": 1521,
       "database": "ORCL",
       "username": "src",
@@ -688,7 +688,7 @@ async fn apply_json_creates_deployment() {
     let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(
         stdout.contains("Deployment: from-json")
-            && stdout.contains("stub:1521"),
+            && stdout.contains("oracle.json.example.com:1521"),
         "expected JSON-applied Deployment in status, got:\n{stdout}"
     );
 }

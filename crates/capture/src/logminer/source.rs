@@ -16,6 +16,11 @@ pub struct OracleSourceConnect {
 }
 
 impl OracleSourceConnect {
+    /// Contract/stub harness selection for local and CI slices.
+    ///
+    /// `host: stub` was already the test Deployment convention before LogMiner;
+    /// `host: contract` is the explicit LogMiner contract harness name. Real
+    /// Oracle hosts always select the OCI adapter (no silent stub fallback).
     pub fn is_contract_harness(&self) -> bool {
         let host = self.host.trim();
         host.eq_ignore_ascii_case("contract") || host.eq_ignore_ascii_case("stub")

@@ -1,28 +1,34 @@
 //! Oracle OCI LogMiner adapter (ADR-0013).
 //!
 //! Production Incremental Capture starts a `DBMS_LOGMNR` session over OCI and
-//! reads reconstructed change vectors from `V$LOGMNR_CONTENTS`. This module
-//! holds the session SQL surface and connection entry points. Linking/running
-//! against Instant Client is required; without it the adapter fails fast with
-//! a clear operator error (contract harness covers CI / local slices).
+//! reconstructs supplemental-logged row images into [`super::LogMinerContent`]
+//! (identity + after_image). The platform maps those contents to
+//! [`crate::ChangeEvent`]; it does **not** parse `SQL_REDO` text.
+//!
+//! Until Oracle Instant Client / OCI bindings are linked into the runtime, this
+//! adapter fails fast. Operator-seam and CI coverage for issue #13 use the
+//! LogMiner **contract** harness (`host: contract` / `stub`).
 
 use crate::oracle_prerequisites::OracleSourcePrerequisiteState;
 use crate::{CaptureError, CapturePosition, ChangeEvent};
 
 use super::source::OracleSourceConnect;
 
-/// SQL used to start a LogMiner session for Incremental Capture from an SCN.
+/// Start a LogMiner session for Incremental Capture from an SCN.
 ///
-/// Kept as named constants so the OCI binding layer (ODPI-C / rust-oracle) calls
-/// the same surface a JDBC client would, without leaking DBMS details into CLI.
+/// Bound parameters: `:start_scn`.
 pub const DBMS_LOGMNR_START_LOGMNR: &str = "BEGIN DBMS_LOGMNR.START_LOGMNR(\
     STARTSCN => :start_scn, \
     OPTIONS => DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG + DBMS_LOGMNR.CONTINUOUS_MINE \
 ); END;";
 
-/// Contents query projecting the fields mapped by [`super::contents`].
-pub const V_LOGMNR_CONTENTS_QUERY: &str = "SELECT SCN, OPERATION, SEG_OWNER, TABLE_NAME, \
-     SQL_REDO, ROW_ID, CS_INFO \
+/// Contents query projecting fields the OCI binding reconstructs into
+/// [`super::LogMinerContent`].
+///
+/// Bound parameters: `:table_name`, `:start_scn`.
+/// Column values / PK identity come from supplemental logging reconstruction in
+/// the OCI layer — not from scraping `SQL_REDO`.
+pub const V_LOGMNR_CONTENTS_QUERY: &str = "SELECT SCN, OPERATION, SEG_OWNER, TABLE_NAME \
      FROM V$LOGMNR_CONTENTS \
      WHERE SEG_NAME = :table_name \
        AND SCN >= :start_scn \
@@ -31,12 +37,20 @@ pub const V_LOGMNR_CONTENTS_QUERY: &str = "SELECT SCN, OPERATION, SEG_OWNER, TAB
 
 pub const DBMS_LOGMNR_END_LOGMNR: &str = "BEGIN DBMS_LOGMNR.END_LOGMNR; END;";
 
+/// Documented OCI session steps for a future Instant Client binding.
+pub fn oci_logminer_session_sql() -> [&'static str; 3] {
+    [
+        DBMS_LOGMNR_START_LOGMNR,
+        V_LOGMNR_CONTENTS_QUERY,
+        DBMS_LOGMNR_END_LOGMNR,
+    ]
+}
+
 /// OCI-backed LogMiner Incremental Capture.
 ///
-/// Constructed for non-contract Oracle Source hosts. Until Instant Client + OCI
-/// bindings are available in the runtime environment, [`Self::fetch_changes`]
-/// and [`Self::probe_prerequisites`] fail fast rather than silently falling
-/// back to stub fixtures.
+/// Constructed for non-contract Oracle Source hosts. Without Instant Client,
+/// [`Self::fetch_changes`] and [`Self::probe_prerequisites`] fail fast rather
+/// than falling back to a stub change catalog.
 #[derive(Debug, Clone)]
 pub struct OciLogMiner {
     connect: OracleSourceConnect,
@@ -58,6 +72,9 @@ impl OciLogMiner {
         _table: &str,
         _from_position: CapturePosition,
     ) -> Result<Vec<ChangeEvent>, CaptureError> {
+        // Keep the session SQL surface referenced so the adapter documents the
+        // real OCI work remaining (bindings + supplemental-log reconstruction).
+        let _sql = oci_logminer_session_sql();
         Err(CaptureError::OciUnavailable {
             host: self.connect.host.clone(),
             detail: "Oracle Instant Client / OCI LogMiner bindings are not available in this runtime; \

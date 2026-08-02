@@ -13,6 +13,9 @@ pub use logminer::{
     ContractLogMiner, IncrementalCapture, LogMinerContent, LogMinerOperation, OciLogMiner,
     OracleSourceConnect, DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR, V_LOGMNR_CONTENTS_QUERY,
 };
+
+// Re-export session helper used by the OCI adapter surface.
+pub use logminer::oci_logminer_session_sql;
 pub use oracle_prerequisites::{
     check_oracle_source_prerequisites, probe_oracle_source_prerequisites_stub,
     OracleSourcePrerequisiteState, PrerequisiteError, MIN_REDO_RETENTION_HOURS,
