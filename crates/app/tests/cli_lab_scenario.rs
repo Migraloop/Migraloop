@@ -1,9 +1,12 @@
 //! Operator-visible seam: Lab Scenario list / run / remove (Namespace cleanup).
 //!
-//! Agreed seam (issues #60–#64 / PRD #55): CLI Lab Scenario commands. Always-on
-//! tests cover catalog listing, help surface, one-at-a-time rejection, and
-//! Namespace cleanup control surface. Full Scenario run / re-run / remove against
-//! the Lab Fixture is ignored by default (Docker + Instant Client).
+//! Agreed seam (issues #60–#64, #63 / PRD #55): CLI Lab Scenario commands.
+//! Always-on tests cover catalog listing (including bulk-load), help surface,
+//! one-at-a-time rejection, and Namespace cleanup control surface. Metric
+//! threshold vs correctness fail-axis reporting for bulk-load is covered in
+//! `migraloop-cli` unit tests (`lab_scenario::tests`). Full Scenario run /
+//! re-run / remove against the Lab Fixture is ignored by default (Docker +
+//! Instant Client).
 
 use std::fs;
 use std::process::Command;
@@ -101,6 +104,24 @@ async fn lab_scenario_list_includes_concurrent_source_workload() {
     assert!(
         out.contains("concurrent-source-workload"),
         "catalog must list intra-Scenario concurrent Source workload Scenario, got:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn lab_scenario_list_includes_bulk_load() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("bulk-load"),
+        "catalog must list bulk-load Lab Scenario (~100k Source inserts), got:\n{out}"
     );
 }
 
@@ -999,6 +1020,165 @@ async fn lab_scenario_concurrent_source_workload_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove concurrent-source-workload failed:\n{remove_out}"
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Full bulk-load Lab Scenario (~100k Source inserts + metric thresholds) against
+/// Docker Lab Fixture + Instant Client (issue #63).
+///
+/// ```bash
+/// export LD_LIBRARY_PATH=/path/to/instantclient
+/// cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_bulk_load_run_and_inspect() {
+    let lab = lab_dir();
+    let store_url = "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop";
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args(["lab", "scenario", "run", "bulk-load", "--lab-dir", &lab])
+        .output()
+        .expect("lab scenario run bulk-load");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run bulk-load failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("correctness=pass"),
+        "expected correctness alongside metrics, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("thresholds=pass"),
+        "expected equal-weight thresholds, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("lag=") && run_out.contains("max_lag="),
+        "expected lag metric + threshold, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("duration_ms=") && run_out.contains("max_duration_ms="),
+        "expected duration metric + threshold, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("rows_per_s=") && run_out.contains("min_rows_per_s="),
+        "expected throughput metric + threshold, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("100000") || run_out.contains("100k") || run_out.contains("rows_applied="),
+        "expected ~100k-scale bulk volume signal, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("namespace=left in place")
+            || run_out.to_ascii_lowercase().contains("left in place"),
+        "default completed run must keep Namespace, got:\n{run_out}"
+    );
+
+    let base = Command::new(bin())
+        .args([
+            "base",
+            "--platform-store-url",
+            store_url,
+            "--table",
+            "LAB_BL_ITEMS",
+        ])
+        .output()
+        .expect("base inspect");
+    let base_out = String::from_utf8_lossy(&base.stdout);
+    assert!(
+        base.status.success(),
+        "base inspect failed: {}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+    assert!(
+        base_out.contains("rows=100000"),
+        "Base must retain bulk-load Namespace rows, got:\n{base_out}"
+    );
+
+    let lock_path = format!("{lab}/.migraloop-scenario.lock");
+    assert!(
+        !std::path::Path::new(&lock_path).exists(),
+        "finished Scenario must release the active-run lock (Namespace stays)"
+    );
+
+    // Re-run: wipe Namespace then recreate (keep/re-run semantics).
+    let rerun = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args(["lab", "scenario", "run", "bulk-load", "--lab-dir", &lab])
+        .output()
+        .expect("lab scenario re-run bulk-load");
+    let rerun_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rerun.stdout),
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    assert!(
+        rerun.status.success(),
+        "lab scenario re-run bulk-load should wipe Namespace then succeed:\n{rerun_out}"
+    );
+    assert!(
+        rerun_out.contains("Lab Scenario: PASS"),
+        "expected re-run PASS, got:\n{rerun_out}"
+    );
+
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "bulk-load",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove bulk-load");
+    let remove_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert!(
+        remove.status.success(),
+        "lab scenario remove bulk-load failed:\n{remove_out}"
     );
 
     let _ = Command::new(bin())

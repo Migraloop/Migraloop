@@ -39,12 +39,13 @@ migraloop lab scenario list
 migraloop lab scenario run direct-pipeline   # 需要 host Instant Client（LD_LIBRARY_PATH）
 migraloop lab scenario run transform-pipeline   # 多表 Transform → Derived → Delivery
 migraloop lab scenario run concurrent-source-workload   # Scenario 内并行 Source contention
+migraloop lab scenario run bulk-load   # ~100k Source inserts + lag/throughput/duration thresholds
 migraloop lab scenario remove direct-pipeline   # 清除 Namespace，不重跑
 # 或：migraloop lab scenario run direct-pipeline --auto-remove
 migraloop lab down    # 移除 containers 与 volumes
 ```
 
-Compose 定义：`lab/compose.yaml`（project `migraloop-lab`）。Lab `app` image（`lab/Dockerfile`）会复制 host 建好的 `migraloop` binary，避免在 Docker 内重编；`migraloop lab up` 若缺少 binary 会先构建。Lab Oracle init 会启用 ARCHIVELOG 与 database supplemental logging 以供 LogMiner；**不会**预先套用任何 Deployment 或 Pipelines—那些来自 Lab Scenario 或你自己的 `migraloop apply`。Catalog Scenarios 包含 `direct-pipeline`（Direct Pipeline insert/update/delete）、`transform-pipeline`（多表 customers + orders，Rich Transform `groupBy`/`sum` → Derived → Delivery），以及 `concurrent-source-workload`（相同多表形状，但在单一 Scenario 内以 recipe 驱动并行 Source sessions；跨 Scenario 并行仍禁止）。各自会准备 Scenario Namespace、以真实 product path 套用，并默认保留 Namespace 供实时 `base`/`derived`/`target` 检查。重跑同一 Scenario 会先完整移除 Namespace 再重建；`scenario remove` 与 `--auto-remove` 分别提供手动与 opt-in 清理。与上方默认双 container 安装（root `Dockerfile`）、以及 CI 使用的 contract/stub harness 都不同。
+Compose 定义：`lab/compose.yaml`（project `migraloop-lab`）。Lab `app` image（`lab/Dockerfile`）会复制 host 建好的 `migraloop` binary，避免在 Docker 内重编；`migraloop lab up` 若缺少 binary 会先构建。Lab Oracle init 会启用 ARCHIVELOG 与 database supplemental logging 以供 LogMiner；**不会**预先套用任何 Deployment 或 Pipelines—那些来自 Lab Scenario 或你自己的 `migraloop apply`。Catalog Scenarios 包含 `direct-pipeline`（Direct Pipeline insert/update/delete）、`transform-pipeline`（多表 customers + orders，Rich Transform `groupBy`/`sum` → Derived → Delivery），`concurrent-source-workload`（相同多表形状，但在单一 Scenario 内以 recipe 驱动并行 Source sessions；跨 Scenario 并行仍禁止），以及 `bulk-load`（约 100k Source inserts，经 Initial Load，并以可失败的 lag／throughput／duration thresholds 等权检查）。各自会准备 Scenario Namespace、以真实 product path 套用，并默认保留 Namespace 供实时 `base`/`derived`/`target` 检查。重跑同一 Scenario 会先完整移除 Namespace 再重建；`scenario remove` 与 `--auto-remove` 分别提供手动与 opt-in 清理。与上方默认双 container 安装（root `Dockerfile`）、以及 CI 使用的 contract/stub harness 都不同。
 
 资源提醒：Lab Oracle（Free）通常需要数 GB RAM，第一次拉 image／开机可能要数分钟。Lab Compose 使用 `network_mode: host`，以便在 bridge 网络被挡的嵌套 Docker 环境仍可运行。若嵌套 Docker 在 overlay whiteout 解压失败，可改用 dockerd `storage-driver: vfs`（并关闭 containerd snapshotter）。
 

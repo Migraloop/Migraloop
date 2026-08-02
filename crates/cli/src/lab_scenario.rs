@@ -1,10 +1,11 @@
 //! Lab Scenario catalog, run orchestration, and Namespace cleanup
-//! (issues #60–#64 / ADR-0025).
+//! (issues #60–#64, #63 / ADR-0025).
 //!
 //! Lab-specific machinery: catalog listing, Scenario Namespace lifecycle
 //! (prepare / re-run wipe / manual remove / opt-in auto-remove), Source workload
-//! driving (including recipe-authored intra-Scenario concurrency), one-at-a-time
-//! lock, and result reporting.
+//! driving (including recipe-authored intra-Scenario concurrency and ~100k bulk
+//! Source inserts), one-at-a-time lock, and result reporting with equal-weight
+//! correctness and operational metric thresholds (lag, throughput, duration).
 //! Apply / Sync / inspect use the real product CLI path.
 
 use std::fs::{self, OpenOptions};
@@ -56,6 +57,21 @@ const CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT: &str = "lab-concurrent-source-workl
 const CONCURRENT_MAX_SETTLE_MS: u128 = 300_000;
 const CONCURRENT_SETTLE_POLL: Duration = Duration::from_secs(2);
 
+const BULK_LOAD_ID: &str = "bulk-load";
+const BULK_LOAD_SUMMARY: &str =
+    "Bulk Source load (~100k inserts) with lag/throughput/duration thresholds (real apply Initial Load)";
+const BULK_LOAD_TABLE: &str = "LAB_BL_ITEMS";
+const BULK_LOAD_COLLECTION: &str = "lab_bl_items";
+const BULK_LOAD_DEPLOYMENT: &str = "lab-bulk-load";
+/// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
+const BULK_LOAD_ROW_COUNT: u64 = 100_000;
+/// Fail-able Sync Health lag after Delivery catch-up (US21).
+const BULK_LOAD_MAX_LAG: i32 = 0;
+/// Fail-able end-to-end duration for bulk Initial Load + Delivery (US21 / US47).
+const BULK_LOAD_MAX_DURATION_MS: u128 = 600_000;
+/// Fail-able minimum throughput (rows/s) for the bulk load (US21).
+const BULK_LOAD_MIN_ROWS_PER_S: f64 = 50.0;
+
 #[derive(Debug, Subcommand)]
 pub enum ScenarioCommand {
     /// List selectable Lab Scenarios in the catalog
@@ -66,7 +82,7 @@ pub enum ScenarioCommand {
     },
     /// Run a Lab Scenario by id (one Scenario at a time)
     Run {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`, `concurrent-source-workload`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`, `concurrent-source-workload`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -77,7 +93,7 @@ pub enum ScenarioCommand {
     },
     /// Fully remove a Scenario Namespace without starting a run
     Remove {
-        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`, `concurrent-source-workload`)
+        /// Scenario id from `lab scenario list` (for example `direct-pipeline`, `transform-pipeline`, `concurrent-source-workload`, `bulk-load`)
         scenario: String,
         /// Directory containing Lab `compose.yaml` (default: ./lab)
         #[arg(long, default_value = "lab")]
@@ -116,6 +132,7 @@ fn catalog() -> &'static [(&'static str, &'static str)] {
         (DIRECT_PIPELINE_ID, DIRECT_PIPELINE_SUMMARY),
         (TRANSFORM_PIPELINE_ID, TRANSFORM_PIPELINE_SUMMARY),
         (CONCURRENT_SOURCE_WORKLOAD_ID, CONCURRENT_SOURCE_WORKLOAD_SUMMARY),
+        (BULK_LOAD_ID, BULK_LOAD_SUMMARY),
     ]
 }
 
@@ -159,6 +176,7 @@ async fn scenario_run(
         DIRECT_PIPELINE_ID => run_direct_pipeline(lab_dir).await,
         TRANSFORM_PIPELINE_ID => run_transform_pipeline(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
+        BULK_LOAD_ID => run_bulk_load(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -180,12 +198,7 @@ async fn scenario_run(
                 Ok(())
             } else {
                 // US36: name correctness vs threshold (or both) — equal-weight fail axes.
-                let kind = match (report.correctness, report.thresholds_ok) {
-                    (false, false) => "correctness and threshold",
-                    (false, true) => "correctness",
-                    (true, false) => "threshold",
-                    (true, true) => "scenario",
-                };
+                let kind = scenario_failure_kind(report.correctness, report.thresholds_ok);
                 Err(CliError::Failed(format!(
                     "Lab Scenario {kind} failed: {}",
                     report.detail
@@ -201,6 +214,12 @@ async fn scenario_run(
                 capture_path_note: String::new(),
                 settle_ms: None,
                 max_settle_ms: None,
+                lag: None,
+                max_lag: None,
+                min_rows_per_s: None,
+                max_duration_ms: None,
+                measured_rows_per_s: None,
+                measured_duration_ms: None,
                 thresholds_ok: true,
             };
             print_scenario_report(entry.0, false, duration, &report, false);
@@ -243,6 +262,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         DIRECT_PIPELINE_ID => remove_direct_pipeline_namespace(lab_dir).await,
         TRANSFORM_PIPELINE_ID => remove_transform_pipeline_namespace(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
+        BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -258,8 +278,76 @@ struct ScenarioReport {
     settle_ms: Option<u128>,
     /// Scenario-defined max settle threshold that can fail the run (equal weight).
     max_settle_ms: Option<u128>,
+    /// Observed Sync Health lag after catch-up (bulk-load).
+    lag: Option<i32>,
+    /// Scenario-defined max lag threshold (bulk-load).
+    max_lag: Option<i32>,
+    /// Scenario-defined minimum throughput threshold (bulk-load).
+    min_rows_per_s: Option<f64>,
+    /// Scenario-defined max duration threshold (bulk-load).
+    max_duration_ms: Option<u128>,
+    /// Measured throughput used for threshold comparison when set.
+    measured_rows_per_s: Option<f64>,
+    /// Measured duration used for threshold comparison when set.
+    measured_duration_ms: Option<u128>,
     /// Operational threshold outcome; `true` when the Scenario defines none.
     thresholds_ok: bool,
+}
+
+fn scenario_failure_kind(correctness: bool, thresholds_ok: bool) -> &'static str {
+    match (correctness, thresholds_ok) {
+        (false, false) => "correctness and threshold",
+        (false, true) => "correctness",
+        (true, false) => "threshold",
+        (true, true) => "scenario",
+    }
+}
+
+fn report_defines_thresholds(report: &ScenarioReport) -> bool {
+    report.max_settle_ms.is_some()
+        || report.max_lag.is_some()
+        || report.min_rows_per_s.is_some()
+        || report.max_duration_ms.is_some()
+}
+
+/// Bulk-load metric sample for equal-weight threshold evaluation (US21 / US36).
+#[derive(Debug, Clone, PartialEq)]
+struct BulkLoadMetricSample {
+    lag: i32,
+    max_lag: i32,
+    duration_ms: u128,
+    max_duration_ms: u128,
+    rows_per_s: f64,
+    min_rows_per_s: f64,
+}
+
+/// Evaluate Scenario-defined lag / duration / throughput thresholds independently
+/// of row-level correctness.
+fn evaluate_bulk_load_thresholds(sample: &BulkLoadMetricSample) -> (bool, String) {
+    let mut failed = Vec::new();
+    if sample.lag > sample.max_lag {
+        failed.push(format!(
+            "lag={} exceeded max_lag={}",
+            sample.lag, sample.max_lag
+        ));
+    }
+    if sample.duration_ms > sample.max_duration_ms {
+        failed.push(format!(
+            "duration_ms={} exceeded max_duration_ms={}",
+            sample.duration_ms, sample.max_duration_ms
+        ));
+    }
+    if sample.rows_per_s < sample.min_rows_per_s {
+        failed.push(format!(
+            "rows_per_s={:.2} below min_rows_per_s={:.2}",
+            sample.rows_per_s, sample.min_rows_per_s
+        ));
+    }
+    if failed.is_empty() {
+        (true, String::new())
+    } else {
+        (false, format!("threshold: {}", failed.join("; ")))
+    }
 }
 
 fn print_scenario_report(
@@ -269,49 +357,83 @@ fn print_scenario_report(
     report: &ScenarioReport,
     namespace_removed: bool,
 ) {
-    let duration_ms = duration.as_millis();
-    let rows_per_s = if duration.as_secs_f64() > 0.0 {
-        report.rows_applied as f64 / duration.as_secs_f64()
-    } else {
-        report.rows_applied as f64
-    };
+    print!(
+        "{}",
+        format_scenario_report(scenario, overall_pass, duration, report, namespace_removed)
+    );
+}
+
+fn format_scenario_report(
+    scenario: &str,
+    overall_pass: bool,
+    duration: Duration,
+    report: &ScenarioReport,
+    namespace_removed: bool,
+) -> String {
+    let duration_ms = report
+        .measured_duration_ms
+        .unwrap_or_else(|| duration.as_millis());
+    let rows_per_s = report.measured_rows_per_s.unwrap_or_else(|| {
+        if duration.as_secs_f64() > 0.0 {
+            report.rows_applied as f64 / duration.as_secs_f64()
+        } else {
+            report.rows_applied as f64
+        }
+    });
     let outcome = if overall_pass && report.correctness && report.thresholds_ok {
         "PASS"
     } else {
         "FAIL"
     };
-    println!();
-    println!("Lab Scenario: {outcome}");
-    println!("  scenario={scenario}");
-    println!("  correctness={}", if report.correctness { "pass" } else { "fail" });
-    if report.max_settle_ms.is_some() {
-        println!(
-            "  thresholds={}",
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str(&format!("Lab Scenario: {outcome}\n"));
+    out.push_str(&format!("  scenario={scenario}\n"));
+    out.push_str(&format!(
+        "  correctness={}\n",
+        if report.correctness { "pass" } else { "fail" }
+    ));
+    if report_defines_thresholds(report) {
+        out.push_str(&format!(
+            "  thresholds={}\n",
             if report.thresholds_ok { "pass" } else { "fail" }
-        );
+        ));
         if let Some(settle_ms) = report.settle_ms {
-            println!("  settle_ms={settle_ms}");
+            out.push_str(&format!("  settle_ms={settle_ms}\n"));
         }
         if let Some(max_settle_ms) = report.max_settle_ms {
-            println!("  max_settle_ms={max_settle_ms}");
+            out.push_str(&format!("  max_settle_ms={max_settle_ms}\n"));
+        }
+        if let Some(lag) = report.lag {
+            out.push_str(&format!("  lag={lag}\n"));
+        }
+        if let Some(max_lag) = report.max_lag {
+            out.push_str(&format!("  max_lag={max_lag}\n"));
+        }
+        if let Some(min_rows_per_s) = report.min_rows_per_s {
+            out.push_str(&format!("  min_rows_per_s={min_rows_per_s:.2}\n"));
+        }
+        if let Some(max_duration_ms) = report.max_duration_ms {
+            out.push_str(&format!("  max_duration_ms={max_duration_ms}\n"));
         }
     }
-    println!("  duration_ms={duration_ms}");
-    println!("  rows_applied={}", report.rows_applied);
-    println!("  rows_per_s={rows_per_s:.2}");
+    out.push_str(&format!("  duration_ms={duration_ms}\n"));
+    out.push_str(&format!("  rows_applied={}\n", report.rows_applied));
+    out.push_str(&format!("  rows_per_s={rows_per_s:.2}\n"));
     if !report.capture_path_note.is_empty() {
-        println!("  capture={}", report.capture_path_note);
+        out.push_str(&format!("  capture={}\n", report.capture_path_note));
     }
     if !report.detail.is_empty() && outcome == "FAIL" {
-        println!("  detail={}", report.detail);
+        out.push_str(&format!("  detail={}\n", report.detail));
     }
     if namespace_removed {
-        println!("  namespace=removed (--auto-remove)");
+        out.push_str("  namespace=removed (--auto-remove)\n");
     } else {
-        println!(
-            "  namespace=left in place (inspect with `migraloop base` / `migraloop derived` / `migraloop target`)"
+        out.push_str(
+            "  namespace=left in place (inspect with `migraloop base` / `migraloop derived` / `migraloop target`)\n",
         );
     }
+    out
 }
 
 async fn run_direct_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
@@ -431,6 +553,12 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
         capture_path_note: capture_note,
         settle_ms: None,
         max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
         thresholds_ok: true,
     })
 }
@@ -695,6 +823,12 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
         capture_path_note: capture_note,
         settle_ms: None,
         max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
         thresholds_ok: true,
     })
 }
@@ -1008,6 +1142,12 @@ max_settle_ms={CONCURRENT_MAX_SETTLE_MS} (elapsed settle_ms={settle_ms}). {last_
                 capture_path_note: capture_note,
                 settle_ms: Some(settle_ms),
                 max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
+                lag: None,
+                max_lag: None,
+                min_rows_per_s: None,
+                max_duration_ms: None,
+                measured_rows_per_s: None,
+                measured_duration_ms: None,
                 thresholds_ok: false,
             });
         }
@@ -1119,6 +1259,12 @@ after concurrent Source changes reached correct Target/Derived outcomes"
             capture_path_note: capture_note,
             settle_ms: Some(settle_ms),
             max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
+            lag: None,
+            max_lag: None,
+            min_rows_per_s: None,
+            max_duration_ms: None,
+            measured_rows_per_s: None,
+            measured_duration_ms: None,
             thresholds_ok: false,
         });
     }
@@ -1130,6 +1276,12 @@ after concurrent Source changes reached correct Target/Derived outcomes"
         capture_path_note: capture_note,
         settle_ms: Some(settle_ms),
         max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
         thresholds_ok: true,
     })
 }
@@ -1295,6 +1447,301 @@ EXIT;\n"
     })?;
 
     Ok(())
+}
+
+async fn run_bulk_load(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {BULK_LOAD_ID}");
+    println!(
+        "Scenario Namespace: table={BULK_LOAD_TABLE} collection={BULK_LOAD_COLLECTION} \
+deployment={BULK_LOAD_DEPLOYMENT}"
+    );
+    println!(
+        "Lab Scenario: bulk Source volume rows={BULK_LOAD_ROW_COUNT}; \
+thresholds max_lag={BULK_LOAD_MAX_LAG} max_duration_ms={BULK_LOAD_MAX_DURATION_MS} \
+min_rows_per_s={BULK_LOAD_MIN_ROWS_PER_S}"
+    );
+
+    prepare_bulk_load_namespace(lab_dir).await?;
+    println!(
+        "Lab Scenario: Scenario Namespace prepared \
+(schema + ~{BULK_LOAD_ROW_COUNT} Source inserts + supplemental logging)"
+    );
+
+    let config_path = deployment_config_path(lab_dir, BULK_LOAD_ID)?;
+    let bin = lab_migraloop_bin();
+    let load_started = Instant::now();
+
+    println!("Lab Scenario: apply Deployment via real product path (Initial Load of bulk volume)...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_path.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+
+    let load_duration = load_started.elapsed();
+    let measured_duration_ms = load_duration.as_millis();
+    let measured_rows_per_s = if load_duration.as_secs_f64() > 0.0 {
+        BULK_LOAD_ROW_COUNT as f64 / load_duration.as_secs_f64()
+    } else {
+        BULK_LOAD_ROW_COUNT as f64
+    };
+
+    let base_after = run_product_cli(
+        &bin,
+        &[
+            "base",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            BULK_LOAD_TABLE,
+        ],
+    )
+    .await?;
+    let target_after = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            BULK_LOAD_COLLECTION,
+        ],
+    )
+    .await?;
+    let status_out = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+
+    let base_rows = parse_inspect_row_count(&base_after).ok_or_else(|| {
+        CliError::Failed(format!(
+            "Lab Scenario could not parse Base row count after bulk Initial Load:\n{base_after}"
+        ))
+    })?;
+    let target_rows = parse_target_document_count(&target_after).ok_or_else(|| {
+        CliError::Failed(format!(
+            "Lab Scenario could not parse Target document count after bulk Delivery:\n{target_after}"
+        ))
+    })?;
+    let lag = parse_sync_lag_for_table(&status_out, BULK_LOAD_TABLE).ok_or_else(|| {
+        CliError::Failed(format!(
+            "Lab Scenario could not parse Sync Health lag for {BULK_LOAD_TABLE}:\n{status_out}"
+        ))
+    })?;
+
+    let rows_applied = count_delivery_ops(&apply_out).max(base_rows);
+    let correctness =
+        base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
+    let sample = BulkLoadMetricSample {
+        lag,
+        max_lag: BULK_LOAD_MAX_LAG,
+        duration_ms: measured_duration_ms,
+        max_duration_ms: BULK_LOAD_MAX_DURATION_MS,
+        rows_per_s: measured_rows_per_s,
+        min_rows_per_s: BULK_LOAD_MIN_ROWS_PER_S,
+    };
+    let (thresholds_ok, threshold_detail) = evaluate_bulk_load_thresholds(&sample);
+
+    let mut detail_parts = Vec::new();
+    if !correctness {
+        detail_parts.push(format!(
+            "correctness: expected rows={BULK_LOAD_ROW_COUNT} \
+base_rows={base_rows} target_rows={target_rows}"
+        ));
+    }
+    if !thresholds_ok {
+        detail_parts.push(threshold_detail);
+    }
+    let detail = detail_parts.join("; ");
+
+    if correctness && thresholds_ok {
+        println!(
+            "Lab Scenario: correctness and metric thresholds passed \
+(base/target rows={BULK_LOAD_ROW_COUNT}, lag={lag}, \
+duration_ms={measured_duration_ms}, rows_per_s={measured_rows_per_s:.2})"
+        );
+    } else if correctness {
+        println!(
+            "Lab Scenario: correctness passed; metric thresholds failed \
+(lag={lag}, duration_ms={measured_duration_ms}, rows_per_s={measured_rows_per_s:.2})"
+        );
+    } else {
+        println!(
+            "Lab Scenario: correctness failed (base_rows={base_rows} target_rows={target_rows}); \
+metrics lag={lag} duration_ms={measured_duration_ms} rows_per_s={measured_rows_per_s:.2}"
+        );
+    }
+
+    Ok(ScenarioReport {
+        correctness,
+        rows_applied,
+        detail,
+        capture_path_note: "Initial Load".to_string(),
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: Some(lag),
+        max_lag: Some(BULK_LOAD_MAX_LAG),
+        min_rows_per_s: Some(BULK_LOAD_MIN_ROWS_PER_S),
+        max_duration_ms: Some(BULK_LOAD_MAX_DURATION_MS),
+        measured_rows_per_s: Some(measured_rows_per_s),
+        measured_duration_ms: Some(measured_duration_ms),
+        thresholds_ok,
+    })
+}
+
+/// Fully remove bulk-load Scenario Namespace. Idempotent.
+async fn remove_bulk_load_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={BULK_LOAD_TABLE}, collection={BULK_LOAD_COLLECTION}, \
+          deployment={BULK_LOAD_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {BULK_LOAD_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table {BULK_LOAD_TABLE}:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{BULK_LOAD_COLLECTION}').drop()");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection {BULK_LOAD_COLLECTION}:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, BULK_LOAD_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{BULK_LOAD_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_bulk_load_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    // Re-run wipe-before-recreate: fully remove leftovers, then create fresh Namespace.
+    remove_bulk_load_namespace(lab_dir).await?;
+
+    // Bulk insert via CONNECT BY before apply so Initial Load exercises ~100k volume (US17).
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {BULK_LOAD_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  VALUE NUMBER(10) NOT NULL\n\
+);\n\
+ALTER TABLE {BULK_LOAD_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {BULK_LOAD_TABLE} (ID, NAME, VALUE)\n\
+SELECT LEVEL, 'item-' || LEVEL, MOD(LEVEL, 100)\n\
+FROM dual\n\
+CONNECT BY LEVEL <= {BULK_LOAD_ROW_COUNT};\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare bulk-load Scenario Namespace (~{BULK_LOAD_ROW_COUNT} inserts):\n{err}"
+            ))
+        })
+}
+
+fn parse_inspect_row_count(inspect: &str) -> Option<u64> {
+    for line in inspect.lines() {
+        if let Some(idx) = line.find("rows=") {
+            let digits: String = line[idx + "rows=".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+fn parse_target_document_count(inspect: &str) -> Option<u64> {
+    for line in inspect.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("documents:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Parse `Sync Health: ... lag=N ...` for the Base Dataset line matching `table`.
+fn parse_sync_lag_for_table(status_out: &str, table: &str) -> Option<i32> {
+    let mut lines = status_out.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.contains("Base Dataset:") && line.contains(table) {
+            // Sync Health may appear on following indented lines.
+            for _ in 0..8 {
+                let Some(next) = lines.next() else {
+                    break;
+                };
+                if let Some(lag) = parse_labeled_i32(next, "lag=") {
+                    return Some(lag);
+                }
+                if next.contains("Base Dataset:") {
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_labeled_i32(line: &str, label: &str) -> Option<i32> {
+    let idx = line.find(label)?;
+    let rest = &line[idx + label.len()..];
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    if digits.is_empty() || digits == "-" {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Fully remove Direct Pipeline Scenario Namespace (Source table, Target collection,
@@ -1539,5 +1986,145 @@ impl ScenarioLock {
 impl Drop for ScenarioLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn catalog_includes_bulk_load() {
+        assert!(
+            catalog()
+                .iter()
+                .any(|(id, summary)| *id == BULK_LOAD_ID && summary.contains("100k")),
+            "catalog must list bulk-load (~100k) Scenario"
+        );
+    }
+
+    #[test]
+    fn bulk_thresholds_fail_independently_of_correctness() {
+        // Metrics miss the bar while row-level correctness would pass (US21 / US36).
+        let (ok, detail) = evaluate_bulk_load_thresholds(&BulkLoadMetricSample {
+            lag: 0,
+            max_lag: 0,
+            duration_ms: 900_000,
+            max_duration_ms: 600_000,
+            rows_per_s: 10.0,
+            min_rows_per_s: 50.0,
+        });
+        assert!(!ok, "threshold sample must fail");
+        assert!(detail.contains("threshold:"), "detail={detail}");
+        assert!(detail.contains("duration_ms"), "detail={detail}");
+        assert!(detail.contains("rows_per_s"), "detail={detail}");
+
+        let report = ScenarioReport {
+            correctness: true,
+            rows_applied: BULK_LOAD_ROW_COUNT,
+            detail: detail.clone(),
+            capture_path_note: "Initial Load".to_string(),
+            settle_ms: None,
+            max_settle_ms: None,
+            lag: Some(0),
+            max_lag: Some(0),
+            min_rows_per_s: Some(50.0),
+            max_duration_ms: Some(600_000),
+            measured_rows_per_s: Some(10.0),
+            measured_duration_ms: Some(900_000),
+            thresholds_ok: false,
+        };
+        assert_eq!(
+            scenario_failure_kind(report.correctness, report.thresholds_ok),
+            "threshold"
+        );
+        let rendered = format_scenario_report(
+            BULK_LOAD_ID,
+            true,
+            Duration::from_millis(900_000),
+            &report,
+            false,
+        );
+        assert!(rendered.contains("Lab Scenario: FAIL"), "{rendered}");
+        assert!(rendered.contains("correctness=pass"), "{rendered}");
+        assert!(rendered.contains("thresholds=fail"), "{rendered}");
+        assert!(rendered.contains("lag=0"), "{rendered}");
+        assert!(rendered.contains("duration_ms=900000"), "{rendered}");
+        assert!(rendered.contains("rows_per_s=10.00"), "{rendered}");
+        assert!(
+            rendered.contains("detail=threshold:"),
+            "CLI report seam must surface threshold detail; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn correctness_fail_even_when_metrics_pass() {
+        // Row counts wrong, but lag/duration/throughput would pass (US36).
+        let (ok, detail) = evaluate_bulk_load_thresholds(&BulkLoadMetricSample {
+            lag: 0,
+            max_lag: 0,
+            duration_ms: 120_000,
+            max_duration_ms: 600_000,
+            rows_per_s: 800.0,
+            min_rows_per_s: 50.0,
+        });
+        assert!(ok, "metrics should pass, detail={detail}");
+
+        let report = ScenarioReport {
+            correctness: false,
+            rows_applied: 99_000,
+            detail: format!(
+                "correctness: expected rows={BULK_LOAD_ROW_COUNT} base_rows=99000 target_rows=99000"
+            ),
+            capture_path_note: "Initial Load".to_string(),
+            settle_ms: None,
+            max_settle_ms: None,
+            lag: Some(0),
+            max_lag: Some(0),
+            min_rows_per_s: Some(50.0),
+            max_duration_ms: Some(600_000),
+            measured_rows_per_s: Some(800.0),
+            measured_duration_ms: Some(120_000),
+            thresholds_ok: true,
+        };
+        assert_eq!(
+            scenario_failure_kind(report.correctness, report.thresholds_ok),
+            "correctness"
+        );
+        let rendered = format_scenario_report(
+            BULK_LOAD_ID,
+            true,
+            Duration::from_millis(120_000),
+            &report,
+            false,
+        );
+        assert!(rendered.contains("Lab Scenario: FAIL"), "{rendered}");
+        assert!(rendered.contains("correctness=fail"), "{rendered}");
+        assert!(rendered.contains("thresholds=pass"), "{rendered}");
+        assert!(rendered.contains("lag=0"), "{rendered}");
+        assert!(rendered.contains("detail=correctness:"), "{rendered}");
+        assert!(
+            rendered.contains("namespace=left in place"),
+            "fail keeps Namespace for inspect; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn parse_sync_lag_and_row_counts_from_cli_shaped_output() {
+        let status = "\
+Base Dataset: LAB_BL_ITEMS status=ready rows=100000 columns=[ID, NAME, VALUE] omittedUnsupported=[(none)]\n\
+  Initial Load complete\n\
+  Cutover: low-watermark=1 checkpoint=1\n\
+  Sync Health: ok appliedChanges=0 lag=0 checkpoint=1\n\
+Base Dataset: OTHER status=ready rows=2 columns=[ID] omittedUnsupported=[(none)]\n\
+  Sync Health: ok appliedChanges=1 lag=3 checkpoint=9\n";
+        assert_eq!(parse_sync_lag_for_table(status, BULK_LOAD_TABLE), Some(0));
+        assert_eq!(parse_sync_lag_for_table(status, "OTHER"), Some(3));
+
+        let base = "Base Dataset: LAB_BL_ITEMS status=ready rows=100000 columns=[ID]";
+        assert_eq!(parse_inspect_row_count(base), Some(100_000));
+        let target = "documents: 100000\n{\"_id\": 1}\n";
+        assert_eq!(parse_target_document_count(target), Some(100_000));
     }
 }
