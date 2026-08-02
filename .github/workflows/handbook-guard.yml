@@ -1,0 +1,27 @@
+name: Handbook guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  locale-parity:
+    name: Locale parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Handbook guard tests (black-box fixtures)
+        run: cargo test -p handbook-guard --test locale_parity
+
+      - name: Handbook guard entrypoint (repo handbook tree)
+        run: cargo run -p handbook-guard -- check --handbook handbook
