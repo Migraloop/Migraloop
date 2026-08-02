@@ -119,9 +119,9 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `up` | 启动可丢弃 Fixture；就绪时打印连接细节 |
 | `status` | 报告 Fixture 就绪状态（engines + Oracle prerequisites + Platform Store）。在你套用配置或运行 Lab Scenario 之前显示 `Deployment: (none)` / `Pipeline: (none)` |
 | `down` | 拆除 containers 与 volumes |
-| `scenario list` | 列出 catalog 中可选的 Lab Scenarios（例如 `direct-pipeline`） |
-| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms` 与 rows/throughput。默认 keep-on-finish 保留 Namespace 供实时 `base`/`target` 检查；成功后若要删除可传 `--auto-remove` |
-| `scenario remove` | 完整移除 Scenario Namespace（Source table、Target collection、Platform Store Deployment），且不启动 run。若已有 Scenario 作用中则拒绝。已不存在时为 idempotent |
+| `scenario list` | 列出 catalog 中可选的 Lab Scenarios（例如 `direct-pipeline`、`transform-pipeline`） |
+| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms` 与 rows/throughput（correctness 与 operational metrics 等权）。默认 keep-on-finish 保留 Namespace 供实时 `base`/`derived`/`target` 检查；成功后若要删除可传 `--auto-remove` |
+| `scenario remove` | 完整移除 Scenario Namespace（Source tables、Target collections、Platform Store Deployment），且不启动 run。若已有 Scenario 作用中则拒绝。已不存在时为 idempotent |
 
 | Flag | 含义 |
 | --- | --- |

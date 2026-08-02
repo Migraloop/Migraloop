@@ -37,12 +37,13 @@ migraloop lab up      # 在 repo 根目录（或传 --lab-dir）
 migraloop lab status  # Fixture 就绪状态 + 连接细节；没有默认 Pipeline
 migraloop lab scenario list
 migraloop lab scenario run direct-pipeline   # 需要 host Instant Client（LD_LIBRARY_PATH）
+migraloop lab scenario run transform-pipeline   # 多表 Transform → Derived → Delivery
 migraloop lab scenario remove direct-pipeline   # 清除 Namespace，不重跑
 # 或：migraloop lab scenario run direct-pipeline --auto-remove
 migraloop lab down    # 移除 containers 与 volumes
 ```
 
-Compose 定义：`lab/compose.yaml`（project `migraloop-lab`）。Lab `app` image（`lab/Dockerfile`）会复制 host 建好的 `migraloop` binary，避免在 Docker 内重编；`migraloop lab up` 若缺少 binary 会先构建。Lab Oracle init 会启用 ARCHIVELOG 与 database supplemental logging 以供 LogMiner；**不会**预先套用任何 Deployment 或 Pipelines—那些来自 Lab Scenario 或你自己的 `migraloop apply`。第一个 catalog Scenario（`direct-pipeline`）会准备 Scenario Namespace、以真实 product path 套用 Direct Pipeline、演练 Source insert/update/delete，并默认保留 Namespace 供实时 `base`/`target` 检查。重跑同一 Scenario 会先完整移除 Namespace 再重建；`scenario remove` 与 `--auto-remove` 分别提供手动与 opt-in 清理。与上方默认双 container 安装（root `Dockerfile`）、以及 CI 使用的 contract/stub harness 都不同。
+Compose 定义：`lab/compose.yaml`（project `migraloop-lab`）。Lab `app` image（`lab/Dockerfile`）会复制 host 建好的 `migraloop` binary，避免在 Docker 内重编；`migraloop lab up` 若缺少 binary 会先构建。Lab Oracle init 会启用 ARCHIVELOG 与 database supplemental logging 以供 LogMiner；**不会**预先套用任何 Deployment 或 Pipelines—那些来自 Lab Scenario 或你自己的 `migraloop apply`。Catalog Scenarios 包含 `direct-pipeline`（Direct Pipeline insert/update/delete）与 `transform-pipeline`（多表 customers + orders，Rich Transform `groupBy`/`sum` → Derived → Delivery）。各自会准备 Scenario Namespace、以真实 product path 套用，并默认保留 Namespace 供实时 `base`/`derived`/`target` 检查。重跑同一 Scenario 会先完整移除 Namespace 再重建；`scenario remove` 与 `--auto-remove` 分别提供手动与 opt-in 清理。与上方默认双 container 安装（root `Dockerfile`）、以及 CI 使用的 contract/stub harness 都不同。
 
 资源提醒：Lab Oracle（Free）通常需要数 GB RAM，第一次拉 image／开机可能要数分钟。Lab Compose 使用 `network_mode: host`，以便在 bridge 网络被挡的嵌套 Docker 环境仍可运行。若嵌套 Docker 在 overlay whiteout 解压失败，可改用 dockerd `storage-driver: vfs`（并关闭 containerd snapshotter）。
 
