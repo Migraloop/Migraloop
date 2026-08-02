@@ -43,15 +43,15 @@ const TRANSFORM_ORDER_TOTALS_COLLECTION: &str = "lab_tp_order_totals";
 const TRANSFORM_ORDER_TOTALS_PIPELINE: &str = "lab-tp-order-totals";
 const TRANSFORM_PIPELINE_DEPLOYMENT: &str = "lab-transform-pipeline";
 
-const CONCURRENT_SOURCE_ID: &str = "concurrent-source-workload";
-const CONCURRENT_SOURCE_SUMMARY: &str =
+const CONCURRENT_SOURCE_WORKLOAD_ID: &str = "concurrent-source-workload";
+const CONCURRENT_SOURCE_WORKLOAD_SUMMARY: &str =
     "Intra-Scenario concurrent Source workload: parallel multi-table changes → Target/Derived under contention";
 const CONCURRENT_CUSTOMERS_TABLE: &str = "LAB_CW_CUSTOMERS";
 const CONCURRENT_ORDERS_TABLE: &str = "LAB_CW_ORDERS";
 const CONCURRENT_CUSTOMERS_COLLECTION: &str = "lab_cw_customers";
 const CONCURRENT_ORDER_TOTALS_COLLECTION: &str = "lab_cw_order_totals";
 const CONCURRENT_ORDER_TOTALS_PIPELINE: &str = "lab-cw-order-totals";
-const CONCURRENT_SOURCE_DEPLOYMENT: &str = "lab-concurrent-source-workload";
+const CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT: &str = "lab-concurrent-source-workload";
 /// Fail-able settle threshold after concurrent Source changes (US21 / US47).
 const CONCURRENT_MAX_SETTLE_MS: u128 = 300_000;
 const CONCURRENT_SETTLE_POLL: Duration = Duration::from_secs(2);
@@ -115,7 +115,7 @@ fn catalog() -> &'static [(&'static str, &'static str)] {
     &[
         (DIRECT_PIPELINE_ID, DIRECT_PIPELINE_SUMMARY),
         (TRANSFORM_PIPELINE_ID, TRANSFORM_PIPELINE_SUMMARY),
-        (CONCURRENT_SOURCE_ID, CONCURRENT_SOURCE_SUMMARY),
+        (CONCURRENT_SOURCE_WORKLOAD_ID, CONCURRENT_SOURCE_WORKLOAD_SUMMARY),
     ]
 }
 
@@ -158,7 +158,7 @@ async fn scenario_run(
     let result = match scenario {
         DIRECT_PIPELINE_ID => run_direct_pipeline(lab_dir).await,
         TRANSFORM_PIPELINE_ID => run_transform_pipeline(lab_dir).await,
-        CONCURRENT_SOURCE_ID => run_concurrent_source_workload(lab_dir).await,
+        CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -178,14 +178,16 @@ async fn scenario_run(
             print_scenario_report(entry.0, true, duration, &report, namespace_removed);
             if passed {
                 Ok(())
-            } else if !report.correctness {
-                Err(CliError::Failed(format!(
-                    "Lab Scenario correctness failed: {}",
-                    report.detail
-                )))
             } else {
+                // US36: name correctness vs threshold (or both) — equal-weight fail axes.
+                let kind = match (report.correctness, report.thresholds_ok) {
+                    (false, false) => "correctness and threshold",
+                    (false, true) => "correctness",
+                    (true, false) => "threshold",
+                    (true, true) => "scenario",
+                };
                 Err(CliError::Failed(format!(
-                    "Lab Scenario threshold failed: {}",
+                    "Lab Scenario {kind} failed: {}",
                     report.detail
                 )))
             }
@@ -240,7 +242,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
     match scenario {
         DIRECT_PIPELINE_ID => remove_direct_pipeline_namespace(lab_dir).await,
         TRANSFORM_PIPELINE_ID => remove_transform_pipeline_namespace(lab_dir).await,
-        CONCURRENT_SOURCE_ID => remove_concurrent_source_namespace(lab_dir).await,
+        CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -873,11 +875,11 @@ EXIT;\n"
 }
 
 async fn run_concurrent_source_workload(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
-    println!("Lab Scenario: {CONCURRENT_SOURCE_ID}");
+    println!("Lab Scenario: {CONCURRENT_SOURCE_WORKLOAD_ID}");
     println!(
         "Scenario Namespace: tables={CONCURRENT_CUSTOMERS_TABLE},{CONCURRENT_ORDERS_TABLE} \
 collections={CONCURRENT_CUSTOMERS_COLLECTION},{CONCURRENT_ORDER_TOTALS_COLLECTION} \
-deployment={CONCURRENT_SOURCE_DEPLOYMENT}"
+deployment={CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT}"
     );
     println!(
         "Lab Scenario: recipe uses intra-Scenario parallel Source sessions \
@@ -889,7 +891,7 @@ deployment={CONCURRENT_SOURCE_DEPLOYMENT}"
         "Lab Scenario: Scenario Namespace prepared (multi-table schema + seed + supplemental logging)"
     );
 
-    let config_path = deployment_config_path(lab_dir, CONCURRENT_SOURCE_ID)?;
+    let config_path = deployment_config_path(lab_dir, CONCURRENT_SOURCE_WORKLOAD_ID)?;
     let bin = lab_migraloop_bin();
 
     println!("Lab Scenario: apply Deployment via real product path...");
@@ -1105,6 +1107,22 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
+    // Threshold can fail even when Managed outcomes are already correct (US21 / US36).
+    if settle_ms > CONCURRENT_MAX_SETTLE_MS {
+        return Ok(ScenarioReport {
+            correctness: true,
+            rows_applied,
+            detail: format!(
+                "threshold: settle_ms={settle_ms} exceeded max_settle_ms={CONCURRENT_MAX_SETTLE_MS} \
+after concurrent Source changes reached correct Target/Derived outcomes"
+            ),
+            capture_path_note: capture_note,
+            settle_ms: Some(settle_ms),
+            max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
+            thresholds_ok: false,
+        });
+    }
+
     Ok(ScenarioReport {
         correctness: true,
         rows_applied,
@@ -1122,7 +1140,7 @@ async fn remove_concurrent_source_namespace(lab_dir: &Path) -> Result<(), CliErr
         "Lab Scenario: removing Namespace \
          (tables={CONCURRENT_CUSTOMERS_TABLE},{CONCURRENT_ORDERS_TABLE}, \
           collections={CONCURRENT_CUSTOMERS_COLLECTION},{CONCURRENT_ORDER_TOTALS_COLLECTION}, \
-          deployment={CONCURRENT_SOURCE_DEPLOYMENT})"
+          deployment={CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT})"
     );
 
     let sql = format!(
@@ -1166,11 +1184,11 @@ EXIT;\n"
         })?;
     }
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, CONCURRENT_SOURCE_DEPLOYMENT)
+    delete_deployment(LAB_PLATFORM_STORE_URL, CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{CONCURRENT_SOURCE_DEPLOYMENT}` \
+                "Failed to delete Platform Store Deployment `{CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT}` \
                  for Scenario Namespace cleanup:\n{err}"
             ))
         })?;
