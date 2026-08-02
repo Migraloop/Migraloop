@@ -478,16 +478,17 @@ pub fn analyze_affect(
             if changed.is_empty() || changed.is_disjoint(&used) {
                 return Ok(AffectOutcome::SkipUnusedFields);
             }
-            let mut identities = Vec::new();
+            // Always derive after-image identity, and always derive pre-apply identity
+            // (required for group-key moves: old + new Output Identities). Do not depend
+            // on reading the prior key after Base has already been overwritten.
             let after_id = identity_from_row(after, group_keys.as_deref(), &used)?;
-            identities.push(after_id.clone());
-            if let Ok(pre_id) = identity_from_row(pre, group_keys.as_deref(), &used) {
-                if !identities
-                    .iter()
-                    .any(|existing| identity_maps_eq(existing, &pre_id))
-                {
-                    identities.push(pre_id);
-                }
+            let pre_id = identity_from_row(pre, group_keys.as_deref(), &used)?;
+            let mut identities = vec![after_id];
+            if !identities
+                .iter()
+                .any(|existing| identity_maps_eq(existing, &pre_id))
+            {
+                identities.push(pre_id);
             }
             Ok(AffectOutcome::Recompute { identities })
         }
@@ -973,5 +974,79 @@ mod tests {
             }
             other => panic!("expected Recompute, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn affect_analysis_recomputes_old_and_new_identities_on_group_key_change() {
+        // US38 / issue #18: group-key change must use pre-apply Base visibility so both
+        // old and new Output Identities are returned — never only the after-image key.
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
+            }
+        })])
+        .unwrap();
+        let pre = row(&[
+            ("ORDER_ID", json!(200)),
+            ("CUSTOMER_ID", json!(2)),
+            ("AMOUNT", json!("5.00")),
+            ("ADDRESS", json!("2 Side Rd")),
+        ]);
+        let after = row(&[
+            ("ORDER_ID", json!(200)),
+            ("CUSTOMER_ID", json!(3)),
+            ("AMOUNT", json!("5.00")),
+            ("ADDRESS", json!("2 Side Rd")),
+        ]);
+        let outcome = analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after)).unwrap();
+        match outcome {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 2, "expected old+new identities, got {identities:?}");
+                let ids: BTreeSet<i64> = identities
+                    .iter()
+                    .filter_map(|id| id.get("CUSTOMER_ID")?.as_i64())
+                    .collect();
+                assert_eq!(ids, BTreeSet::from([2, 3]));
+            }
+            other => panic!("expected Recompute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_for_identities_omits_empty_old_group_after_key_move() {
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
+            }
+        })])
+        .unwrap();
+        // After moving order 200 from customer 2 → 3, Base no longer has customer 2 rows.
+        let base_rows = vec![
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("50.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(200)),
+                ("CUSTOMER_ID", json!(3)),
+                ("AMOUNT", json!("5.00")),
+            ]),
+        ];
+        let identities = vec![
+            row(&[("CUSTOMER_ID", json!(3))]),
+            row(&[("CUSTOMER_ID", json!(2))]),
+        ];
+        let out = evaluate_transform_for_identities(&ops, &base_rows, &identities).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("CUSTOMER_ID"), Some(&json!(3)));
+        assert_eq!(out[0].get("TOTAL_AMOUNT"), Some(&json!("5.00")));
     }
 }

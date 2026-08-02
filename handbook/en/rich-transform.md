@@ -57,6 +57,8 @@ Domain roadmap also names operators such as rename/remove, equiLookup, unwind, c
 
 **Affect Analysis** decides, from the transform definition and an incoming Base change, which Output Identities (if any) need Derived recomputation. Unused fields must not trigger recompute (for example an address-only update must not recompute a sum-of-amount-by-customer). Operator semantics decide value-level cases (e.g. distinct/count style updates).
 
+When a `groupBy` key changes on a Base row, Affect Analysis reads the Base row **before** applying the change so both the old and new Output Identities are updated (adjust or remove the old identity; upsert the new one). It must not rely on overwriting Base first and then trying to recover the prior key.
+
 Steady-state full recompute of an entire Derived Dataset is unacceptable. Prefer operator-equivalent fast paths when correct; otherwise recompute only affected identities from platform Base inputs.
 
 Inspect Derived rows:

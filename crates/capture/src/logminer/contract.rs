@@ -113,6 +113,7 @@ fn orders_logminer_fixture() -> Vec<LogMinerContent> {
     // After ORDERS low-watermark (500):
     // 1) ADDRESS-only update (unused by sum(AMOUNT) Affect Analysis)
     // 2) AMOUNT update for customer 1 (used field → recompute that Output Identity)
+    // 3) CUSTOMER_ID group-key move order 200: customer 2 → 3 (old+new identities; #18)
     vec![
         LogMinerContent {
             scn: 510,
@@ -138,6 +139,19 @@ fn orders_logminer_fixture() -> Vec<LogMinerContent> {
                 ("CUSTOMER_ID", json_num(1)),
                 ("AMOUNT", json_str("50.00")),
                 ("ADDRESS", json_str("1 Main Ave")),
+            ])),
+        },
+        LogMinerContent {
+            scn: 530,
+            operation: LogMinerOperation::Update,
+            seg_owner: "APP".to_string(),
+            table_name: "ORDERS".to_string(),
+            identity: row(&[("ORDER_ID", json_num(200))]),
+            after_image: Some(row(&[
+                ("ORDER_ID", json_num(200)),
+                ("CUSTOMER_ID", json_num(3)),
+                ("AMOUNT", json_str("5.00")),
+                ("ADDRESS", json_str("2 Side Rd")),
             ])),
         },
     ]

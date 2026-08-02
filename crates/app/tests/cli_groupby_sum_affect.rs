@@ -1,8 +1,9 @@
-//! Operator-visible seam: groupBy/sum + Affect Analysis (issue #17 / PRD).
+//! Operator-visible seam: groupBy/sum + Affect Analysis (issues #17 / #18 / PRD).
 //!
 //! Agreed seam: CLI config/status + Derived Dataset + Target documents.
 //! Unused Base fields must not recompute Derived; used-field changes update only
-//! affected Output Identities for Delivery.
+//! affected Output Identities for Delivery. Group-key changes update old + new
+//! identities using pre-apply Base visibility.
 
 mod common;
 
@@ -330,17 +331,15 @@ async fn groupby_sum_affect_analysis_skips_unused_and_updates_affected_identitie
     );
 
     // Change 2 (ORDERS SCN 520): AMOUNT update on order 100 → customer 1 sum becomes 60.00.
-    let sync_used = run_sync(&url);
-    assert!(
-        sync_used.status.success(),
-        "sync after used-field change failed: stdout={} stderr={}",
+    // fail_after=1 so later SCN 530 group-key move stays for issue #18 coverage.
+    let sync_used = run_sync_fail_after(&url, 1);
+    let used_out = format!(
+        "{}{}",
         String::from_utf8_lossy(&sync_used.stdout),
         String::from_utf8_lossy(&sync_used.stderr)
     );
-    let used_out = String::from_utf8_lossy(&sync_used.stdout);
     assert!(
-        used_out.to_ascii_lowercase().contains("affect")
-            || used_out.contains("order-totals"),
+        used_out.to_ascii_lowercase().contains("affect") || used_out.contains("order-totals"),
         "used-field sync should mention Affect Analysis / Pipeline, got:\n{used_out}"
     );
 
@@ -375,5 +374,104 @@ async fn groupby_sum_affect_analysis_skips_unused_and_updates_affected_identitie
         applied_after_used,
         applied_initial + 1,
         "Delivery must update only the affected Output Identity (+1), before unused-stable={applied_initial} after={applied_after_used}:\n{status_after_used}"
+    );
+}
+
+#[tokio::test]
+async fn groupby_key_change_updates_old_and_new_output_identities() {
+    // Issue #18 / US38 — Agreed seam: CLI + Derived + Target (same as #17).
+    // Group-key change must use pre-apply Base visibility: remove/adjust old identity
+    // and upsert the new identity. Must not lose the prior key by overwriting Base first.
+    let url = ephemeral_database_url().await;
+    let mongo_database = unique_mongo_database();
+    let dir = TempDir::new().expect("tempdir");
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &order_totals_deployment(&mongo_database),
+    );
+
+    migrate_and_apply(&url, &config);
+
+    // Advance past ADDRESS (510) + AMOUNT (520); leave SCN 530 for the group-key move.
+    let _ = run_sync_fail_after(&url, 1);
+    let _ = run_sync_fail_after(&url, 1);
+
+    let derived_before = derived_stdout(&url);
+    assert!(
+        derived_before.contains("60.00") && derived_before.contains("5.00"),
+        "precondition: customer 1=60.00 and customer 2=5.00 before group-key move, got:\n{derived_before}"
+    );
+    let status_before = status_stdout(&url);
+    let applied_before = delivery_applied_changes(&status_before, "order-totals")
+        .expect("Delivery Health before group-key change");
+
+    // Non-Managed field on unaffected identity 1 must survive Delivery of identities 2/3.
+    seed_mongo_document(
+        &mongo_database,
+        "order_totals",
+        r#"{"_id": 1, "EXTRA": "keep-c1", "TOTAL_AMOUNT": "60.00"}"#,
+    );
+
+    // Change 3 (ORDERS SCN 530): order 200 CUSTOMER_ID 2 → 3 (group key change).
+    let sync_key = run_sync(&url);
+    assert!(
+        sync_key.status.success(),
+        "sync after group-key change failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&sync_key.stdout),
+        String::from_utf8_lossy(&sync_key.stderr)
+    );
+    let key_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&sync_key.stdout),
+        String::from_utf8_lossy(&sync_key.stderr)
+    );
+    assert!(
+        key_out.to_ascii_lowercase().contains("affect")
+            && (key_out.contains("identities=2")
+                || key_out.contains("affected identities=2")
+                || key_out.contains("deletes=1")),
+        "group-key change must Affect-analyze both old+new identities (and delete empty old), got:\n{key_out}"
+    );
+
+    let derived_after = derived_stdout(&url);
+    assert!(
+        derived_after.contains("60.00"),
+        "unaffected customer 1 sum must remain 60.00, got:\n{derived_after}"
+    );
+    assert!(
+        derived_after.contains("\"CUSTOMER_ID\": 3"),
+        "new identity customer 3 must appear in Derived, got:\n{derived_after}"
+    );
+    assert!(
+        derived_after.contains("5.00"),
+        "new identity customer 3 sum must be 5.00, got:\n{derived_after}"
+    );
+    assert!(
+        !derived_after.contains("\"CUSTOMER_ID\": 2"),
+        "old identity customer 2 must be removed from Derived after group-key move, got:\n{derived_after}"
+    );
+
+    let target_out = target_stdout(&url);
+    assert!(
+        target_out.contains("keep-c1"),
+        "unaffected identity Delivery must leave non-Managed EXTRA alone, got:\n{target_out}"
+    );
+    assert!(
+        target_out.contains("\"_id\": 3"),
+        "Delivery must upsert new Output Identity 3, got:\n{target_out}"
+    );
+    assert!(
+        !target_out.contains("\"_id\": 2"),
+        "Delivery must delete old Output Identity 2 when its group becomes empty, got:\n{target_out}"
+    );
+
+    let status_after = status_stdout(&url);
+    let applied_after = delivery_applied_changes(&status_after, "order-totals")
+        .expect("Delivery Health after group-key change");
+    assert_eq!(
+        applied_after,
+        applied_before + 2,
+        "Delivery must touch old delete + new upsert (+2), before={applied_before} after={applied_after}:\n{status_after}\n{key_out}"
     );
 }

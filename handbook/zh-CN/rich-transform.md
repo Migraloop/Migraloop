@@ -57,6 +57,8 @@ Group keys 加上 aggregates。v1 aggregate op：`sum`。
 
 **Affect Analysis** 依 transform 定义与进来的 Base change，决定哪些 Output Identities（若有）需要 Derived 重算。未使用的字段不得触发重算（例如只改地址不应重算按客户加总金额）。Operator 语义决定 value-level 情况（例如 distinct/count 类更新）。
 
+当 Base 行的 `groupBy` key 变更时，Affect Analysis 会在应用 change **之前**读取 Base 行，以便同时更新旧与新的 Output Identity（调整或移除旧 identity；upsert 新 identity）。不可先覆盖 Base 再尝试找回先前的 key。
+
 稳态下对整个 Derived Dataset 做 full recompute 不可接受。在正确时优先走 operator-equivalent 快速路径；否则只对受影响 identities 从平台 Base 输入重算。
 
 检查 Derived 行：
