@@ -60,3 +60,7 @@ Rules:
 - Omitting this line is an incomplete closeout.
 - Only `CI: pass` may be paired with language like “everything passed”, “all done”, or “ready to merge”.
 - For any other CI status, state the status and facts; do **not** claim the implement finished successfully.
+
+## Related
+
+- Spec: GitHub issue #75
