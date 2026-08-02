@@ -1,10 +1,11 @@
 //! Operator-visible seam: Lab Scenario list / run / remove (Namespace cleanup).
 //!
-//! Agreed seam (issues #60–#66, #63, #84 / PRD #55): CLI Lab Scenario commands.
+//! Agreed seam (issues #60–#66, #63, #84, #85 / PRD #55): CLI Lab Scenario commands.
 //! Always-on tests cover catalog listing from on-disk `recipe.yaml` packages
 //! (including bulk-load, rt-project, rt-filter), shipped-capability coverage
-//! visibility, help surface, one-at-a-time rejection, Namespace cleanup control
-//! surface, and CLI-seam bulk-load correctness-fail / metrics-fail probes
+//! visibility, help surface, one-at-a-time rejection, refusal of non-Lab /
+//! production engine bindings, Namespace cleanup control surface, and CLI-seam
+//! bulk-load correctness-fail / metrics-fail probes
 //! (`MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE`). Full Scenario run / re-run / remove
 //! against the Lab Fixture (including leftover Namespace naming on `lab status`)
 //! is ignored by default (Docker + Instant Client) — not a Release Quality Gate.
@@ -40,15 +41,53 @@ fn write_minimal_scenario_package(lab: &Path, id: &str) {
 }
 
 fn write_scenario_package(lab: &Path, id: &str, summary: &str) {
+    write_scenario_package_with_deployment(
+        lab,
+        id,
+        summary,
+        &format!("apiVersion: migraloop.dev/v1\nkind: Deployment\nmetadata:\n  name: lab-{id}\n"),
+    );
+}
+
+/// Full Deployment shape with Source/Target bindings (for Lab engine isolation probes).
+fn lab_fixture_deployment_yaml(id: &str, source_host: &str, target_host: &str) -> String {
+    format!(
+        r#"apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-{id}
+spec:
+  source:
+    kind: oracle
+    host: {source_host}
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: {target_host}
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-test
+      mode: direct
+      source:
+        table: LAB_TEST
+      target:
+        collection: lab_test
+"#
+    )
+}
+
+fn write_scenario_package_with_deployment(lab: &Path, id: &str, summary: &str, deployment: &str) {
     let scenario_dir = lab.join("scenarios").join(id);
     fs::create_dir_all(&scenario_dir).expect("scenario dir");
-    fs::write(
-        scenario_dir.join("deployment.yaml"),
-        format!(
-            "apiVersion: migraloop.dev/v1\nkind: Deployment\nmetadata:\n  name: lab-{id}\n"
-        ),
-    )
-    .expect("deployment.yaml");
+    fs::write(scenario_dir.join("deployment.yaml"), deployment).expect("deployment.yaml");
     fs::write(
         scenario_dir.join("recipe.yaml"),
         format!(
@@ -446,6 +485,137 @@ async fn lab_scenario_run_unknown_id_fails() {
             || out.contains("not-a-real-scenario")
             || out.contains("Lab Scenario"),
         "expected clear unknown-scenario error, got:\n{out}"
+    );
+}
+
+/// US44 / issue #85: Lab Scenario run refuses non-Lab / production-looking Source hosts.
+#[tokio::test]
+async fn lab_scenario_run_rejects_non_lab_source_engine() {
+    let (tmp, lab) = temp_lab_dir();
+    write_scenario_package_with_deployment(
+        tmp.path(),
+        "direct-pipeline",
+        "isolation probe — production Source",
+        &lab_fixture_deployment_yaml("direct-pipeline", "prod-oracle.example.com", "127.0.0.1"),
+    );
+
+    let run = Command::new(bin())
+        .args(["lab", "scenario", "run", "direct-pipeline", "--lab-dir", &lab])
+        .output()
+        .expect("run with non-Lab Source");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    assert!(
+        !run.status.success(),
+        "non-Lab Source must fail the Scenario run, got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("lab")
+            && (lower.contains("refused")
+                || lower.contains("reject")
+                || lower.contains("production")
+                || lower.contains("non-lab")
+                || lower.contains("lab-provisioned")
+                || lower.contains("fixture")),
+        "error must make Lab isolation rule obvious, got:\n{out}"
+    );
+    assert!(
+        out.contains("prod-oracle.example.com"),
+        "rejection should name the non-Lab Source host, got:\n{out}"
+    );
+    assert!(
+        !lower.contains("docker") && !lower.contains("compose"),
+        "engine isolation must fail before Fixture/Docker probes, got:\n{out}"
+    );
+}
+
+/// US44 / issue #85: Lab Scenario run refuses non-Lab / production-looking Target hosts.
+#[tokio::test]
+async fn lab_scenario_run_rejects_non_lab_target_engine() {
+    let (tmp, lab) = temp_lab_dir();
+    write_scenario_package_with_deployment(
+        tmp.path(),
+        "direct-pipeline",
+        "isolation probe — production Target",
+        &lab_fixture_deployment_yaml("direct-pipeline", "127.0.0.1", "prod-mongo.example.com"),
+    );
+
+    let run = Command::new(bin())
+        .args(["lab", "scenario", "run", "direct-pipeline", "--lab-dir", &lab])
+        .output()
+        .expect("run with non-Lab Target");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    assert!(
+        !run.status.success(),
+        "non-Lab Target must fail the Scenario run, got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("lab")
+            && (lower.contains("refused")
+                || lower.contains("reject")
+                || lower.contains("production")
+                || lower.contains("non-lab")
+                || lower.contains("lab-provisioned")
+                || lower.contains("fixture")),
+        "error must make Lab isolation rule obvious, got:\n{out}"
+    );
+    assert!(
+        out.contains("prod-mongo.example.com"),
+        "rejection should name the non-Lab Target host, got:\n{out}"
+    );
+}
+
+/// US44 / issue #85: disposable Lab Fixture engine bindings still pass the isolation guard.
+#[tokio::test]
+async fn lab_scenario_run_allows_lab_fixture_engines_past_isolation_guard() {
+    let (tmp, lab) = temp_lab_dir();
+    write_scenario_package_with_deployment(
+        tmp.path(),
+        "direct-pipeline",
+        "isolation probe — Lab Fixture engines",
+        &lab_fixture_deployment_yaml("direct-pipeline", "127.0.0.1", "127.0.0.1"),
+    );
+
+    let run = Command::new(bin())
+        .args(["lab", "scenario", "run", "direct-pipeline", "--lab-dir", &lab])
+        .output()
+        .expect("run with Lab Fixture engines");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        !lower.contains("prod-")
+            && !lower.contains("customer/production")
+            && !(lower.contains("refused") && lower.contains("engine")),
+        "Lab Fixture engines must not hit the isolation refusal, got:\n{out}"
+    );
+    // Without Docker the run still fails later on Fixture readiness — that is expected.
+    assert!(
+        !run.status.success(),
+        "stub lab-dir without Docker should still fail after the isolation guard, got:\n{out}"
+    );
+    assert!(
+        lower.contains("docker")
+            || lower.contains("compose")
+            || lower.contains("fixture")
+            || lower.contains("not ready")
+            || lower.contains("ready"),
+        "expected Fixture readiness failure after isolation guard, got:\n{out}"
     );
 }
 

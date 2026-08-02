@@ -65,7 +65,7 @@ A first-class capability is incomplete until Lab Scenario coverage is designed w
 
 1. Create `lab/scenarios/<id>/` with:
    - `recipe.yaml` — catalog metadata: `id`, `summary`, **Scenario Namespace** (`source_tables`, `target_collections`, `deployment`, `pipelines`), `workload` (`concurrency`: `serial`|`parallel`, ordered `steps`), `checks.correctness`, optional equal-weight `thresholds` (`max_settle_ms`, `max_lag`, `max_duration_ms`, `min_rows_per_s`)
-   - `deployment.yaml` — real product Deployment config (same format Operators apply)
+   - `deployment.yaml` — real product Deployment config (same format Operators apply), bound only to Lab Fixture engines (`127.0.0.1` / `localhost` Oracle + Mongo endpoints from `migraloop lab status`). Scenario `run` refuses non-Lab / production engine targets before apply/sync.
 2. Implement Namespace prepare/remove, Source workload, checks, and thresholds in `crates/cli/src/lab_scenario.rs`, and register the Scenario id with the other runners.
 3. Confirm `migraloop lab scenario list` shows the new id and **summary from `recipe.yaml`**. Selectable catalog = registered runners that have both recipe + deployment files under `--lab-dir`.
 4. Manually verify with `migraloop lab scenario run <id>` on a Lab Fixture. Keep always-on CLI-seam tests for list/control-plane behavior; full Fixture runs stay `#[ignore]` — not Release Quality Gate.
