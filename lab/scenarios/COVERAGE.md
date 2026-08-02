@@ -26,6 +26,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Poison Change quarantine on Operator `status` | `poison-quarantine` |
 | Blocking DDL Schema Change warn+pause | `schema-change-pause` |
 | Source Alignment Check for Base Datasets | `source-alignment` |
+| Drift Check with Managed-field auto-repair | `drift-check` |
 
 ## Visible gaps (not yet shipped)
 

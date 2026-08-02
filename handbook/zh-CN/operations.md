@@ -36,6 +36,16 @@ migraloop align [--table CUSTOMERS] [--max-rows 1000]
 
 检查最多读取 `--max-rows` 行 Source（默认 `1000`—不是全表 slam），按主键与 Base 比对，并在不一致时用这些 Source reads 修复 Base。**从不写入 Source**。`status` 显示上次执行的 `Source Alignment: aligned|partial|unknown` 与 checked/mismatched 计数（`partial` = budget 被截断）。见 [CLI 与 Config](cli-and-config.md) 与 [Observability](observability.md)。
 
+## Drift Check
+
+单靠 Delivery Health 不能证明 Target 上的 Managed fields 匹配平台 expected dataset。Operator 在 Direct Pipelines 完成 Source Alignment 后，应运行可调度、resource-gated 的 **Drift Check**，使 Base/Derived 成为可信 baseline：
+
+```bash
+migraloop drift [--pipeline customers] [--max-rows 1000]
+```
+
+检查最多读取 `--max-rows` 个 expected Output Identities（默认 `1000`—不是全表 slam），比对 Target 的 Managed fields，并默认以 Managed-only upsert **auto-repair** Managed drift。**non-Managed Target fields 会被忽略**且保持不动。不会在 Alignment baseline 之外再增加 Source load。`status` 显示 `Drift: ok|partial|unknown` 与 checked/mismatched 计数（`partial` = budget 被截断）。见 [CLI 与 Config](cli-and-config.md) 与 [Observability](observability.md)。
+
 ## Backpressure
 
 当 Platform Store apply、Derived maintenance 或 Target Delivery 跟不上时（ADR-0020）：

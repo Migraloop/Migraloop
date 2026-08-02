@@ -133,6 +133,13 @@ const SOURCE_ALIGNMENT_COLLECTION: &str = "lab_sa_customers";
 const SOURCE_ALIGNMENT_PIPELINE: &str = "lab-sa-customers";
 const SOURCE_ALIGNMENT_DEPLOYMENT: &str = "lab-source-alignment";
 
+const DRIFT_CHECK_ID: &str = "drift-check";
+const DRIFT_CHECK_TABLE: &str = "LAB_DC_CUSTOMERS";
+const DRIFT_CHECK_COLLECTION: &str = "lab_dc_customers";
+const DRIFT_CHECK_PIPELINE: &str = "lab-dc-customers";
+const DRIFT_CHECK_DEPLOYMENT: &str = "lab-drift-check";
+const DRIFT_CHECK_EXTRA_FIELD: &str = "keep-me-non-managed";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -217,6 +224,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         POISON_QUARANTINE_ID,
         SCHEMA_CHANGE_PAUSE_ID,
         SOURCE_ALIGNMENT_ID,
+        DRIFT_CHECK_ID,
     ]
 }
 
@@ -264,6 +272,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             SOURCE_ALIGNMENT_ID,
             "Source Alignment Check for Base Datasets",
+        ),
+        (
+            DRIFT_CHECK_ID,
+            "Drift Check with Managed-field auto-repair",
         ),
     ]
 }
@@ -559,6 +571,7 @@ async fn scenario_run(
         POISON_QUARANTINE_ID => run_poison_quarantine(lab_dir).await,
         SCHEMA_CHANGE_PAUSE_ID => run_schema_change_pause(lab_dir).await,
         SOURCE_ALIGNMENT_ID => run_source_alignment(lab_dir).await,
+        DRIFT_CHECK_ID => run_drift_check(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -651,6 +664,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         POISON_QUARANTINE_ID => remove_poison_quarantine_namespace(lab_dir).await,
         SCHEMA_CHANGE_PAUSE_ID => remove_schema_change_pause_namespace(lab_dir).await,
         SOURCE_ALIGNMENT_ID => remove_source_alignment_namespace(lab_dir).await,
+        DRIFT_CHECK_ID => remove_drift_check_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -4289,6 +4303,328 @@ EXIT;\n"
             ))
         })?;
 
+    Ok(())
+}
+
+async fn run_drift_check(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {DRIFT_CHECK_ID}");
+    println!(
+        "Scenario Namespace: table={DRIFT_CHECK_TABLE} \
+collection={DRIFT_CHECK_COLLECTION} deployment={DRIFT_CHECK_DEPLOYMENT} \
+pipeline={DRIFT_CHECK_PIPELINE}"
+    );
+
+    prepare_drift_check_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, DRIFT_CHECK_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!("Lab Scenario: align Base as trusted Drift baseline...");
+    let align_out = run_product_cli(
+        &bin,
+        &[
+            "align",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--table",
+            DRIFT_CHECK_TABLE,
+        ],
+    )
+    .await?;
+    if !align_out.to_ascii_lowercase().contains("source alignment") {
+        return Err(CliError::Failed(format!(
+            "align must establish Drift baseline:\n{align_out}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: mutating Target Managed NAME→DRIFTED + planting non-Managed EXTRA..."
+    );
+    plant_drift_check_target_drift(lab_dir, 1, "DRIFTED", true).await?;
+
+    println!("Lab Scenario: running Drift Check (default resource-gated budget)...");
+    let drift_out = run_product_cli(
+        &bin,
+        &[
+            "drift",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            DRIFT_CHECK_PIPELINE,
+        ],
+    )
+    .await?;
+    let drift_lower = drift_out.to_ascii_lowercase();
+    if !(drift_lower.contains("drift")
+        && (drift_lower.contains("mismatched") || drift_lower.contains("drifted"))
+        && drift_lower.contains("repaired"))
+    {
+        return Err(CliError::Failed(format!(
+            "drift must detect Managed mismatch and auto-repair:\n{drift_out}"
+        )));
+    }
+
+    let target_out = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            DRIFT_CHECK_COLLECTION,
+        ],
+    )
+    .await?;
+    if !managed_name_present(&target_out, "Alice") || managed_name_present(&target_out, "DRIFTED")
+    {
+        return Err(CliError::Failed(format!(
+            "Managed fields must be auto-repaired to Alice:\n{target_out}"
+        )));
+    }
+    if !(target_out.contains(DRIFT_CHECK_EXTRA_FIELD) || target_out.contains("EXTRA")) {
+        return Err(CliError::Failed(format!(
+            "non-Managed EXTRA must survive Managed auto-repair:\n{target_out}"
+        )));
+    }
+
+    let status_out = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !(status_out.contains("Drift:")
+        && (status_out.to_ascii_lowercase().contains("ok")
+            || status_out.to_ascii_lowercase().contains("partial")))
+    {
+        return Err(CliError::Failed(format!(
+            "status must show Drift after check:\n{status_out}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: mutating Target ID=2 → CORRUPT_BOB; drift --max-rows 1 (resource gate)..."
+    );
+    plant_drift_check_target_drift(lab_dir, 2, "CORRUPT_BOB", false).await?;
+    let gated_out = run_product_cli(
+        &bin,
+        &[
+            "drift",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            DRIFT_CHECK_PIPELINE,
+            "--max-rows",
+            "1",
+        ],
+    )
+    .await?;
+    let gated_lower = gated_out.to_ascii_lowercase();
+    if !(gated_lower.contains("maxrows=1")
+        && (gated_lower.contains("partial") || gated_lower.contains("truncated")))
+    {
+        return Err(CliError::Failed(format!(
+            "resource-gated drift must report maxRows=1 and partial/truncated:\n{gated_out}"
+        )));
+    }
+    let target_gated = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            DRIFT_CHECK_COLLECTION,
+        ],
+    )
+    .await?;
+    if !target_gated.contains("CORRUPT_BOB") {
+        return Err(CliError::Failed(format!(
+            "max-rows=1 must not full-slam repair Bob:\n{target_gated}"
+        )));
+    }
+
+    println!("Lab Scenario: drift with larger budget to repair remaining Managed drift...");
+    let full_out = run_product_cli(
+        &bin,
+        &[
+            "drift",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            DRIFT_CHECK_PIPELINE,
+            "--max-rows",
+            "1000",
+        ],
+    )
+    .await?;
+    let target_full = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            DRIFT_CHECK_COLLECTION,
+        ],
+    )
+    .await?;
+    if !managed_name_present(&target_full, "Bob") || target_full.contains("CORRUPT_BOB") {
+        return Err(CliError::Failed(format!(
+            "larger budget must repair Bob Managed fields:\n{full_out}\n{target_full}"
+        )));
+    }
+    if !(target_full.contains(DRIFT_CHECK_EXTRA_FIELD) || target_full.contains("EXTRA")) {
+        return Err(CliError::Failed(format!(
+            "non-Managed EXTRA must still be preserved after full drift:\n{target_full}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out);
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (detect + Managed auto-repair; non-Managed preserved; resource-gated max-rows)"
+    );
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: "Drift Check (Managed-field Target repair)".to_string(),
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_drift_check_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={DRIFT_CHECK_TABLE}, collection={DRIFT_CHECK_COLLECTION}, \
+          deployment={DRIFT_CHECK_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {DRIFT_CHECK_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for drift-check:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{DRIFT_CHECK_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for drift-check:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, DRIFT_CHECK_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{DRIFT_CHECK_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_drift_check_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_drift_check_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {DRIFT_CHECK_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {DRIFT_CHECK_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {DRIFT_CHECK_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {DRIFT_CHECK_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare drift-check Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn plant_drift_check_target_drift(
+    lab_dir: &Path,
+    id: i64,
+    name: &str,
+    plant_extra: bool,
+) -> Result<(), CliError> {
+    let extra = if plant_extra {
+        format!(", EXTRA: '{DRIFT_CHECK_EXTRA_FIELD}'")
+    } else {
+        String::new()
+    };
+    let js = format!(
+        "const r = db.getCollection('{DRIFT_CHECK_COLLECTION}').updateOne(\n\
+  {{ _id: {id} }},\n\
+  {{ $set: {{ NAME: '{name}'{extra} }} }}\n\
+);\n\
+if (r.matchedCount !== 1) {{ throw new Error('expected to match Output Identity {id}, got ' + JSON.stringify(r)); }}\n"
+    );
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to plant Target Managed drift for drift-check:\n{err}"
+        ))
+    })?;
     Ok(())
 }
 

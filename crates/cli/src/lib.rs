@@ -27,10 +27,10 @@ use migraloop_platform_store::{
     list_deployments, list_derived_datasets, list_pipelines, list_quarantined_changes,
     list_schema_change_impacts, migrate, record_applied_source_changes, replace_base_dataset,
     replace_derived_dataset, replace_pipelines, set_pipeline_paused, update_base_primary_key,
-    update_pipeline_delivery_progress, upsert_deployment, upsert_quarantined_change,
-    upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment, DerivedDataset,
-    FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, QuarantinedChange,
-    SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection,
+    update_pipeline_delivery_progress, update_pipeline_drift_status, upsert_deployment,
+    upsert_quarantined_change, upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment,
+    DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth,
+    QuarantinedChange, SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection,
 };
 use migraloop_transform::{
     analyze_affect, derived_projected_fields, evaluate_transform,
@@ -131,6 +131,21 @@ pub enum Command {
         #[arg(long)]
         deployment: Option<String>,
         /// Max Source rows to read per Base (resource gate; default 1000 — not a full slam)
+        #[arg(long, default_value = "1000")]
+        max_rows: u32,
+    },
+    /// Run Drift Check: verify Managed fields on Target match platform expected dataset; auto-repair Managed
+    Drift {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Pipeline name (default: all Pipelines with a Target Binding)
+        #[arg(long)]
+        pipeline: Option<String>,
+        /// Deployment name when multiple Pipelines share a name
+        #[arg(long)]
+        deployment: Option<String>,
+        /// Max Output Identities to check per Pipeline (resource gate; default 1000 — not a full slam)
         #[arg(long, default_value = "1000")]
         max_rows: u32,
     },
@@ -291,6 +306,9 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
         field_mappings,
         output_identity,
         transform_json,
+        drift_status: "unknown".to_string(),
+        drift_checked_rows: 0,
+        drift_mismatched_rows: 0,
     }
 }
 
@@ -834,6 +852,9 @@ fn preserve_unchanged_pipeline_delivery(existing: &[Pipeline], pipelines: &mut [
             pipeline.delivery_status = previous.delivery_status.clone();
             pipeline.delivery_applied_changes = previous.delivery_applied_changes;
             pipeline.paused = previous.paused;
+            pipeline.drift_status = previous.drift_status.clone();
+            pipeline.drift_checked_rows = previous.drift_checked_rows;
+            pipeline.drift_mismatched_rows = previous.drift_mismatched_rows;
         }
     }
 }
@@ -1542,6 +1563,9 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
                 "not_configured".to_string()
             };
             pipeline.delivery_applied_changes = 0;
+            pipeline.drift_status = "unknown".to_string();
+            pipeline.drift_checked_rows = 0;
+            pipeline.drift_mismatched_rows = 0;
         }
     }
 
@@ -2002,6 +2026,9 @@ fn base_with_sync_progress(
 /// Default Source Alignment Check read budget (resource gate; not a full slam).
 const DEFAULT_ALIGNMENT_MAX_ROWS: u32 = 1000;
 
+/// Default Drift Check identity budget (resource gate; not a full slam).
+const DEFAULT_DRIFT_MAX_ROWS: u32 = 1000;
+
 fn supported_row_projection(
     row: &serde_json::Map<String, serde_json::Value>,
     supported: &BTreeSet<String>,
@@ -2254,6 +2281,352 @@ async fn align_one_base(
         base.source_table
     );
     Ok(())
+}
+
+async fn drift_check(
+    platform_store_url: &str,
+    pipeline_name: Option<&str>,
+    deployment: Option<&str>,
+    max_rows: u32,
+) -> Result<(), CliError> {
+    ensure_store_healthy(platform_store_url).await?;
+    let max_rows = if max_rows == 0 {
+        DEFAULT_DRIFT_MAX_ROWS
+    } else {
+        max_rows
+    };
+
+    let deployments = list_deployments(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    if deployments.is_empty() {
+        return Err(CliError::Failed(
+            "no Deployments applied; run `migraloop apply` first".to_string(),
+        ));
+    }
+
+    let pipelines = list_pipelines(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let targets: Vec<Pipeline> = pipelines
+        .into_iter()
+        .filter(|p| {
+            pipeline_has_target(p)
+                && pipeline_name
+                    .map(|n| p.name == n)
+                    .unwrap_or(true)
+                && deployment
+                    .map(|d| p.deployment_name == d)
+                    .unwrap_or(true)
+        })
+        .collect();
+    if targets.is_empty() {
+        return Err(CliError::Failed(match (pipeline_name, deployment) {
+            (Some(n), Some(d)) => {
+                format!("no Pipeline with Target Binding named {n} in Deployment {d}")
+            }
+            (Some(n), None) => format!("no Pipeline with Target Binding named {n}"),
+            (None, Some(d)) => {
+                format!("no Pipelines with Target Binding found for Deployment {d}")
+            }
+            (None, None) => {
+                "no Pipelines with Target Binding found; run `migraloop apply` first".to_string()
+            }
+        }));
+    }
+
+    for pipeline in targets {
+        let deployment = deployments
+            .iter()
+            .find(|d| d.name == pipeline.deployment_name)
+            .ok_or_else(|| {
+                CliError::Failed(format!(
+                    "Deployment {} missing for Pipeline {}",
+                    pipeline.deployment_name, pipeline.name
+                ))
+            })?;
+        drift_one_pipeline(platform_store_url, deployment, &pipeline, max_rows).await?;
+    }
+    Ok(())
+}
+
+async fn drift_one_pipeline(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    pipeline: &Pipeline,
+    max_rows: u32,
+) -> Result<(), CliError> {
+    ensure_drift_baseline_ready(platform_store_url, pipeline).await?;
+
+    let mongo = mongo_target_from_deployment(deployment)?;
+    let (expected_docs, truncated) =
+        expected_delivery_documents_for_drift(platform_store_url, pipeline, max_rows).await?;
+
+    let target_docs = list_target_documents(&mongo, &pipeline.target_collection)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let mut target_by_id: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for doc in target_docs {
+        if let Some(key) = target_document_identity_key(&doc) {
+            target_by_id.insert(key, doc);
+        }
+    }
+
+    let mut mismatched = 0i32;
+    let mut repaired_count = 0i32;
+    let mut repair_docs: Vec<DeliveryDocument> = Vec::new();
+
+    for expected in &expected_docs {
+        let key = identity_key(&expected.identity);
+        let managed_keys: Vec<&str> = expected
+            .managed_fields
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        let drifted = match target_by_id.get(&key) {
+            Some(target_doc) => {
+                !managed_fields_match_target(target_doc, &expected.managed_fields, &managed_keys)
+            }
+            None => true,
+        };
+        if drifted {
+            mismatched += 1;
+            repaired_count += 1;
+            repair_docs.push(expected.clone());
+        }
+    }
+
+    if !repair_docs.is_empty() {
+        upsert_managed_documents(&mongo, &pipeline.target_collection, &repair_docs)
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+    }
+
+    let checked = expected_docs.len() as i32;
+    let drift_status = if truncated { "partial" } else { "ok" };
+    update_pipeline_drift_status(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
+        drift_status,
+        checked,
+        mismatched,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?;
+
+    let truncated_note = if truncated { " truncated=true" } else { "" };
+    let detect_status = if mismatched > 0 {
+        "drifted"
+    } else if truncated {
+        "partial"
+    } else {
+        "ok"
+    };
+    println!(
+        "Drift Check: Pipeline {} status={detect_status} checked={checked} \
+         mismatched={mismatched} repaired={repaired_count} maxRows={max_rows}{truncated_note} \
+         (Managed fields auto-repaired; non-Managed Target fields ignored)",
+        pipeline.name
+    );
+    Ok(())
+}
+
+async fn ensure_drift_baseline_ready(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+) -> Result<(), CliError> {
+    match pipeline.mode.as_str() {
+        "direct" => {
+            let bases = list_base_datasets(platform_store_url)
+                .await
+                .map_err(|err| CliError::Failed(err.to_string()))?;
+            let base = bases
+                .iter()
+                .find(|b| {
+                    b.deployment_name == pipeline.deployment_name
+                        && b.source_table.eq_ignore_ascii_case(&pipeline.source_table)
+                })
+                .ok_or_else(|| {
+                    CliError::Failed(format!(
+                        "no Base Dataset for Pipeline {} source table {}",
+                        pipeline.name, pipeline.source_table
+                    ))
+                })?;
+            if base.source_alignment == "unknown" {
+                return Err(CliError::Failed(format!(
+                    "Drift Check refuses Pipeline {}: Base {} Source Alignment is unknown; \
+                     run `migraloop align --table {}` first so Base is a trusted Drift baseline",
+                    pipeline.name, base.source_table, base.source_table
+                )));
+            }
+            Ok(())
+        }
+        "transform" => {
+            let derived = list_derived_datasets(platform_store_url)
+                .await
+                .map_err(|err| CliError::Failed(err.to_string()))?;
+            let dataset = derived.iter().find(|d| {
+                d.deployment_name == pipeline.deployment_name && d.pipeline_name == pipeline.name
+            });
+            match dataset {
+                Some(d) if !d.status.is_empty() => Ok(()),
+                _ => Err(CliError::Failed(format!(
+                    "Drift Check refuses Pipeline {}: Derived Dataset not materialized yet",
+                    pipeline.name
+                ))),
+            }
+        }
+        other => Err(CliError::Failed(format!(
+            "unsupported pipeline.mode {other:?} for Drift Check"
+        ))),
+    }
+}
+
+async fn expected_delivery_documents_for_drift(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+    max_rows: u32,
+) -> Result<(Vec<DeliveryDocument>, bool), CliError> {
+    let mut documents = match pipeline.mode.as_str() {
+        "direct" => {
+            let (dataset, rows) = get_base_rows(
+                platform_store_url,
+                &pipeline.source_table,
+                Some(&pipeline.deployment_name),
+            )
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+            if dataset.primary_key.is_empty() {
+                return Err(CliError::Failed(format!(
+                    "Base Dataset {} has no primary key for Drift Check Output Identity",
+                    pipeline.source_table
+                )));
+            }
+            // Drift reads the platform expected dataset only — no extra Source load
+            // (alignment already established the Base baseline).
+            let mut docs = Vec::with_capacity(rows.len());
+            for row in &rows {
+                docs.push(delivery_document_for_row(
+                    &row.data,
+                    &dataset.primary_key,
+                    &dataset.columns,
+                    pipeline,
+                )?);
+            }
+            docs
+        }
+        "transform" => {
+            if pipeline.output_identity.is_empty() {
+                return Err(CliError::Failed(format!(
+                    "Transform Pipeline {} requires outputIdentity for Drift Check",
+                    pipeline.name
+                )));
+            }
+            let (dataset, rows) = get_derived_rows(
+                platform_store_url,
+                &pipeline.name,
+                Some(&pipeline.deployment_name),
+            )
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+            let mut docs = Vec::with_capacity(rows.len());
+            for row in &rows {
+                docs.push(delivery_document_for_row(
+                    &row.data,
+                    &dataset.output_identity,
+                    &dataset.columns,
+                    pipeline,
+                )?);
+            }
+            docs
+        }
+        other => {
+            return Err(CliError::Failed(format!(
+                "unsupported pipeline.mode {other:?} for Drift Check"
+            )));
+        }
+    };
+
+    documents.sort_by(|a, b| identity_key(&a.identity).cmp(&identity_key(&b.identity)));
+    let truncated = documents.len() > max_rows as usize;
+    if truncated {
+        documents.truncate(max_rows as usize);
+    }
+    Ok((documents, truncated))
+}
+
+/// Compare Managed fields on a Target document to the platform expected map.
+/// Non-Managed Target keys are ignored.
+fn managed_fields_match_target(
+    target_doc: &serde_json::Value,
+    expected_managed: &serde_json::Map<String, serde_json::Value>,
+    managed_keys: &[&str],
+) -> bool {
+    for key in managed_keys {
+        let expected = expected_managed.get(*key);
+        let actual = target_doc.get(*key);
+        match (expected, actual) {
+            (Some(exp), Some(act)) if json_values_equal_for_drift(exp, act) => {}
+            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => return false,
+            (None, None) => {}
+        }
+    }
+    true
+}
+
+fn json_values_equal_for_drift(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    let left_n = normalize_json_for_drift(left);
+    let right_n = normalize_json_for_drift(right);
+    left_n == right_n
+}
+
+fn normalize_json_for_drift(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(n) = map.get("$numberLong").and_then(|v| v.as_str()) {
+                if let Ok(parsed) = n.parse::<i64>() {
+                    return serde_json::Value::Number(parsed.into());
+                }
+            }
+            if let Some(n) = map.get("$numberInt").and_then(|v| v.as_str()) {
+                if let Ok(parsed) = n.parse::<i64>() {
+                    return serde_json::Value::Number(parsed.into());
+                }
+            }
+            if let Some(n) = map.get("$numberDouble").and_then(|v| v.as_str()) {
+                if let Ok(parsed) = n.parse::<f64>() {
+                    if let Some(num) = serde_json::Number::from_f64(parsed) {
+                        return serde_json::Value::Number(num);
+                    }
+                }
+            }
+            if let Some(n) = map.get("$numberDecimal").and_then(|v| v.as_str()) {
+                return serde_json::Value::String(n.to_string());
+            }
+            if let Some(d) = map.get("$date") {
+                return normalize_json_for_drift(d);
+            }
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), normalize_json_for_drift(v));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::Value::Number(i.into())
+            } else if let Some(u) = n.as_u64() {
+                serde_json::Value::Number(u.into())
+            } else {
+                value.clone()
+            }
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items.iter().map(normalize_json_for_drift).collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
@@ -2970,6 +3343,13 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                 pipeline_quarantines.len()
             );
         }
+        println!(
+            "  Drift: {} Pipeline={} checkedRows={} mismatchedRows={}",
+            pipeline.drift_status,
+            pipeline.name,
+            pipeline.drift_checked_rows,
+            pipeline.drift_mismatched_rows
+        );
         if !pipeline_schema_blocks.is_empty() {
             println!(
                 "  Schema Change: Pipeline={} blocking={} paused (stream-wide DDL; not poison quarantine)",
@@ -3395,6 +3775,20 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             source_alignment_check(
                 &platform_store_url,
                 table.as_deref(),
+                deployment.as_deref(),
+                max_rows,
+            )
+            .await
+        }
+        Command::Drift {
+            platform_store_url,
+            pipeline,
+            deployment,
+            max_rows,
+        } => {
+            drift_check(
+                &platform_store_url,
+                pipeline.as_deref(),
                 deployment.as_deref(),
                 max_rows,
             )

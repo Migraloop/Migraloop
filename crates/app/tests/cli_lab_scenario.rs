@@ -424,6 +424,30 @@ async fn lab_scenario_list_includes_source_alignment() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_drift_check() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("drift-check"),
+        "catalog must list drift-check Lab Scenario (#25), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("drift")
+            && (lower.contains("managed") || lower.contains("repair") || lower.contains("auto")),
+        "drift-check summary should mention Managed drift/repair, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {
@@ -2536,6 +2560,113 @@ async fn lab_scenario_source_alignment_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove source-alignment failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Lab Scenario `drift-check` (issue #25 / ADR-0025): Managed-field Target drift
+/// detect + default auto-repair; non-Managed preserved; resource-gated max-rows.
+///
+/// Ignored in Release Quality Gate — CI twin is `cli_drift_check.rs`.
+///
+/// ```bash
+/// export LD_LIBRARY_PATH=/path/to/instantclient
+/// cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_drift_check_run_and_inspect() {
+    let lab = lab_dir();
+    let store_url = "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop";
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "drift-check",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario run drift-check");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run drift-check failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+    let run_lower = run_out.to_ascii_lowercase();
+    assert!(
+        run_lower.contains("drift")
+            && (run_lower.contains("repaired") || run_lower.contains("mismatched"))
+            && (run_lower.contains("maxrows=1") || run_lower.contains("partial")),
+        "Scenario must detect/repair Managed drift and exercise resource gate, got:\n{run_out}"
+    );
+
+    let status = Command::new(bin())
+        .args(["status", "--platform-store-url", store_url])
+        .output()
+        .expect("status after drift-check");
+    let status_out = String::from_utf8_lossy(&status.stdout);
+    assert!(status.status.success());
+    assert!(
+        status_out.contains("Drift:")
+            && (status_out.to_ascii_lowercase().contains("ok")
+                || status_out.to_ascii_lowercase().contains("partial")),
+        "status must show Drift after Scenario, got:\n{status_out}"
+    );
+
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "drift-check",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove drift-check");
+    assert!(
+        remove.status.success(),
+        "lab scenario remove drift-check failed: {}",
         String::from_utf8_lossy(&remove.stderr)
     );
 
