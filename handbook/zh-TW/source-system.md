@@ -59,7 +59,7 @@ Live OCI probe 要求 **ARCHIVELOG** 模式。可讀時會回報可用 archived-
 3. 執行 `migraloop apply` / `migraloop sync`。未滿足的 prerequisites 會在執行前失敗並指出缺什麼。
 4. 修好指名的 Oracle 設定後再重跑。平台絕不會自動執行 `ALTER DATABASE` / `ALTER TABLE` 來「修復」失敗。
 
-**Local Sync Lab：** `migraloop lab up` 會佈建可拋棄的 Oracle Source，並已滿足 Lab 使用所需的 database-level prerequisites（ARCHIVELOG + database supplemental logging + sync-user grants）。當 Lab Scenario（或你）建立 Pipeline 參照的資料表時，仍須套用 table-level supplemental logging。Lab 不會變更客戶／正式環境資料庫。
+**Local Sync Lab：** `migraloop lab up` 會佈建可拋棄的 Oracle Source，並已滿足 Lab 使用所需的 database-level prerequisites（ARCHIVELOG + database supplemental logging + sync-user grants）。當 Lab Scenario（或你）建立 Pipeline 參照的資料表時，仍須套用 table-level supplemental logging—例如 `migraloop lab scenario run direct-pipeline` 會在其 Scenario Namespace 資料表加上 `SUPPLEMENTAL LOG DATA (ALL) COLUMNS`，再走真實 `apply` / LogMiner `sync`（需要 host Instant Client / `LD_LIBRARY_PATH`）。Lab 不會變更客戶／正式環境資料庫。
 
 ### Contract LogMiner harness（測試 / 本機切片）
 

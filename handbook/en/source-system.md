@@ -59,7 +59,7 @@ Live OCI probes require **ARCHIVELOG** mode. They report the available archived-
 3. Run `migraloop apply` / `migraloop sync`. Unmet prerequisites produce a pre-run failure naming what is missing.
 4. Fix the named Oracle settings, then re-run. The platform never auto-runs `ALTER DATABASE` / `ALTER TABLE` to "fix" failures.
 
-**Local Sync Lab:** `migraloop lab up` provisions a disposable Oracle Source that already satisfies database-level prerequisites for Lab use (ARCHIVELOG + database supplemental logging + sync-user grants). Table-level supplemental logging still applies when Lab Scenarios (or you) create Pipeline-referenced tables. Lab does not mutate customer/production databases.
+**Local Sync Lab:** `migraloop lab up` provisions a disposable Oracle Source that already satisfies database-level prerequisites for Lab use (ARCHIVELOG + database supplemental logging + sync-user grants). Table-level supplemental logging still applies when Lab Scenarios (or you) create Pipeline-referenced tables—for example `migraloop lab scenario run direct-pipeline` prepares its Scenario Namespace table with `SUPPLEMENTAL LOG DATA (ALL) COLUMNS`, then runs real `apply` / LogMiner `sync` (host Instant Client / `LD_LIBRARY_PATH` required). Lab does not mutate customer/production databases.
 
 ### Contract LogMiner harness (tests / local slices)
 
