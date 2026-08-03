@@ -38,7 +38,7 @@ migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployme
 
 ### `status`
 
-报告 Platform Store 健康、Deployments、Pipelines、Base Datasets、Sync Health、Source Alignment、Delivery Health、Quarantine 行、Schema Change impacts，与 Derived Datasets。Sync Health 与 Delivery Health 都暴露 `lag=`（当前 bounded Incremental window 的剩余工作）。Downstream 变慢时，lag 会在 backpressure 下上升，但不会因此 pause Pipeline（ADR-0020）。当 Poison Change quarantine 作用中时，Delivery Health 为 `unhealthy`，并把每个被 quarantine 的 Output Identity 标为 unhealthy / not aligned（ADR-0015）。当 blocking Schema Change pause 作用中时，Delivery Health 为 `paused`，且 `status` 会列出 Schema Change blocking 行（ADR-0009）—与 quarantine 不同。
+报告 Platform Store 健康、Deployments、Pipelines、Base Datasets、Sync Health、Source Alignment、Delivery Health、Quarantine 行、Schema Change impacts，与 Derived Datasets。Sync Health 与 Delivery Health 都暴露 `lag=`（从 capture resume position 起算的剩余 pending 工作）。Downstream 变慢时，lag 会在 backpressure 下上升，但不会因此 pause Pipeline；capture 一次仍只填满一个 bounded queue window（ADR-0020）。当 Poison Change quarantine 作用中时，Delivery Health 为 `unhealthy`，并把每个被 quarantine 的 Output Identity 标为 unhealthy / not aligned（ADR-0015）。当 blocking Schema Change pause 作用中时，Delivery Health 为 `paused`，且 `status` 会列出 Schema Change blocking 行（ADR-0009）—与 quarantine 不同。
 
 ```bash
 migraloop status --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"

@@ -3907,9 +3907,9 @@ collection={BOUNDED_BACKPRESSURE_COLLECTION} deployment={BOUNDED_BACKPRESSURE_DE
             ))
         },
     )?;
-    if sync_lag <= 0 {
+    if sync_lag < 10 {
         return Err(CliError::Failed(format!(
-            "Sync Health lag must reflect delay under backpressure, got {sync_lag}:\n{status_mid}"
+            "Sync Health lag must reflect Source backlog under backpressure (not only window remainder), got {sync_lag}:\n{status_mid}"
         )));
     }
     let delivery_lag = parse_delivery_lag_for_pipeline(&status_mid, BOUNDED_BACKPRESSURE_PIPELINE)
@@ -3918,9 +3918,9 @@ collection={BOUNDED_BACKPRESSURE_COLLECTION} deployment={BOUNDED_BACKPRESSURE_DE
                 "could not parse Delivery Health lag under backpressure:\n{status_mid}"
             ))
         })?;
-    if delivery_lag <= 0 {
+    if delivery_lag < 10 {
         return Err(CliError::Failed(format!(
-            "Delivery Health lag must reflect Downstream delay, got {delivery_lag}:\n{status_mid}"
+            "Delivery Health lag must reflect Downstream backlog under delay, got {delivery_lag}:\n{status_mid}"
         )));
     }
     if status_mid.contains("Delivery Health: paused") {

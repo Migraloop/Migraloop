@@ -15,7 +15,8 @@ use crate::oracle_prerequisites::{
 use crate::{CaptureError, CapturePosition, ChangeEvent, CUSTOMERS_LOW_WATERMARK};
 
 use super::contents::{
-    change_events_from_logminer_contents_limited, LogMinerContent, LogMinerOperation,
+    change_events_from_logminer_contents_limited, count_logminer_contents, LogMinerContent,
+    LogMinerOperation,
 };
 use super::inject::load_injected_logminer_contents;
 
@@ -77,6 +78,19 @@ impl ContractLogMiner {
             table,
             from_position,
             limit,
+        ))
+    }
+
+    /// Count pending Incremental changes without materializing row images (ADR-0020 lag).
+    pub fn count_changes(
+        &self,
+        table: &str,
+        from_position: CapturePosition,
+    ) -> Result<usize, CaptureError> {
+        Ok(count_logminer_contents(
+            &self.contents,
+            table,
+            from_position,
         ))
     }
 

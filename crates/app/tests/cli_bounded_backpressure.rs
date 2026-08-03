@@ -285,14 +285,15 @@ async fn downstream_slowness_applies_bounded_backpressure_with_visible_lag() {
     );
     let status_out = String::from_utf8_lossy(&status.stdout);
     let sync_lag = extract_sync_lag(&status_out).expect("Sync Health lag=");
+    // 20 injected + remaining default fixture changes − 1 applied ≫ window size.
     assert!(
-        sync_lag > 0,
-        "Sync Health lag must reflect delay under backpressure, got lag={sync_lag}:\n{status_out}"
+        sync_lag >= 10,
+        "Sync Health lag must reflect Source backlog under backpressure (not only window remainder), got lag={sync_lag}:\n{status_out}"
     );
     let delivery_lag = extract_delivery_lag(&status_out).expect("Delivery Health lag=");
     assert!(
-        delivery_lag > 0,
-        "Delivery Health lag must reflect Downstream delay, got lag={delivery_lag}:\n{status_out}"
+        delivery_lag >= 10,
+        "Delivery Health lag must reflect Downstream backlog under delay, got lag={delivery_lag}:\n{status_out}"
     );
     assert!(
         !status_out.contains("Delivery Health: paused"),

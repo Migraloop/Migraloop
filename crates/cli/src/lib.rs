@@ -2814,6 +2814,11 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             // queue_capacity; Downstream slowness drains slowly and backpressures
             // further fetch instead of buffering the full backlog in RAM.
             loop {
+                // Count Source backlog without materializing row images so Sync/
+                // Delivery Health lag can reflect delay under a bounded window.
+                let source_pending = capture
+                    .count_changes_in_schema(&schema, &table, resume_from)
+                    .map_err(|err| CliError::Failed(err.to_string()))?;
                 let candidate_changes = capture
                     .fetch_changes_in_schema_limited(
                         &schema,
@@ -2847,6 +2852,13 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 .await
                 .map_err(|err| CliError::Failed(err.to_string()))?;
                 let unapplied_set: BTreeSet<_> = unapplied_ids.into_iter().collect();
+                let schema_pending = table_schema_changes
+                    .iter()
+                    .filter(|c| unapplied_set.contains(&c.change_id))
+                    .count();
+                // Source count is from resume_from (exclusive of durable checkpoint).
+                // Window fetch may be smaller; lag uses full Source+schema pending.
+                let pending_at_window_start = source_pending.saturating_add(schema_pending);
                 let mut items: Vec<IncrementalItem> = candidate_changes
                     .into_iter()
                     .filter(|c| unapplied_set.contains(&c.change_id))
@@ -2913,11 +2925,13 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 
                 let queue_depth = items.len();
                 let fetched_full_window = queue_depth >= queue_capacity;
-                let lag_floor = queue_depth as i32 + if fetched_full_window { 1 } else { 0 };
-                if downstream_delay || fetched_full_window {
+                let reported_lag = pending_at_window_start as i32;
+                // Backpressure is the bounded window under Downstream delay or a
+                // full queue (capture cannot pull more until the window drains).
+                if (downstream_delay && fetched_full_window) || fetched_full_window {
                     println!(
                         "Backpressure: queue_depth={queue_depth} capacity={queue_capacity} \
-                         lag={lag_floor}"
+                         lag={reported_lag}"
                     );
                 }
 
@@ -2937,8 +2951,9 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 }
 
                 for (index, item) in items.iter().enumerate() {
-                    let remaining_in_window = queue_depth as i32 - (index as i32 + 1);
-                    let lag = remaining_in_window + if fetched_full_window { 1 } else { 0 };
+                    // Remaining Source+schema pending after this durable apply.
+                    let lag = (pending_at_window_start as i32) - (index as i32 + 1);
+                    let lag = lag.max(0);
                     match item {
                         IncrementalItem::Schema(schema_change) => {
                             apply_schema_change_impacts(

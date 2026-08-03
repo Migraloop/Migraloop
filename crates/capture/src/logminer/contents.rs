@@ -116,6 +116,19 @@ pub fn change_events_from_logminer_contents_limited(
     }
 }
 
+/// Count matching LogMiner contents at or after `from_position` without materializing events.
+pub fn count_logminer_contents(
+    contents: &[LogMinerContent],
+    table: &str,
+    from_position: CapturePosition,
+) -> usize {
+    contents
+        .iter()
+        .filter(|row| row.table_name.eq_ignore_ascii_case(table))
+        .filter(|row| CapturePosition(row.scn) >= from_position)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

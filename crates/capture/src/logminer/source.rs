@@ -77,6 +77,22 @@ impl IncrementalCapture {
         }
     }
 
+    /// Count pending Incremental changes for Sync/Delivery Health lag (ADR-0020).
+    ///
+    /// Does not materialize full row images — used so lag can reflect backlog under
+    /// bounded windows without defeating the queue capacity bound.
+    pub fn count_changes_in_schema(
+        &self,
+        schema: &str,
+        table: &str,
+        from_position: CapturePosition,
+    ) -> Result<usize, CaptureError> {
+        match self {
+            Self::Contract(c) => c.count_changes(table, from_position),
+            Self::Oci(o) => o.count_changes_in_schema(schema, table, from_position),
+        }
+    }
+
     pub fn probe_prerequisites(&self) -> Result<OracleSourcePrerequisiteState, CaptureError> {
         match self {
             Self::Contract(c) => Ok(c.probe_prerequisites()),

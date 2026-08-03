@@ -41,7 +41,7 @@ migraloop status
 
 - **Sync Health** — 從 Source capture 到 Base Dataset 是否跟上且成功套用。必要但不充分證明 Base 符合 Source。
 - **Source Alignment** — 該 Base 上次 Source Alignment Check 結果（`unknown` / `aligned` / `partial`）。在把 Base 當作 Drift baseline 前執行 `migraloop align`（resource-gated；用 Source reads 修復 Base；從不寫入 Source）。`partial` 表示上次檢查碰到 `--max-rows` budget。
-- **Delivery Health** — Pipeline 的 Target Binding change stream 是否跟上且成功套用。對 non-Managed 欄位的編輯與此訊號無關。Downstream backpressure 下，`lag=` 反映目前 bounded Incremental window 的剩餘 pending Delivery 工作（ADR-0020）—不是整條 Pipeline pause。
+- **Delivery Health** — Pipeline 的 Target Binding change stream 是否跟上且成功套用。對 non-Managed 欄位的編輯與此訊號無關。Downstream backpressure 下，`lag=` 反映從 capture resume position 起算的剩餘 pending Delivery 工作（ADR-0020）—不是整條 Pipeline pause。Capture 一次仍最多只 materialize 一個 bounded queue window。
 - **Drift** — 該 Pipeline 上次 Drift Check 結果（`unknown` / `ok` / `partial`）。在 Alignment 之後執行 `migraloop drift`（resource-gated；預設 Managed-field auto-repair；忽略 non-Managed fields）。`partial` 表示上次檢查碰到 `--max-rows` budget。
 
 ## Logs 與 metrics

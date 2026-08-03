@@ -38,7 +38,7 @@ migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployme
 
 ### `status`
 
-Report Platform Store health, Deployments, Pipelines, Base Datasets, Sync Health, Source Alignment, Delivery Health, Quarantine rows, Schema Change impacts, and Derived Datasets. Sync Health and Delivery Health both expose `lag=` (remaining work in the current bounded Incremental window). When Downstream is slow, lag rises under backpressure without pausing the Pipeline (ADR-0020). When Poison Change quarantine is active, Delivery Health is `unhealthy` and each quarantined Output Identity is listed as unhealthy / not aligned (ADR-0015). When blocking Schema Change pause is active, Delivery Health is `paused` and `status` lists Schema Change blocking rows (ADR-0009)—distinct from quarantine.
+Report Platform Store health, Deployments, Pipelines, Base Datasets, Sync Health, Source Alignment, Delivery Health, Quarantine rows, Schema Change impacts, and Derived Datasets. Sync Health and Delivery Health both expose `lag=` (remaining pending work from the capture resume position). When Downstream is slow, lag rises under backpressure without pausing the Pipeline; capture still fills only a bounded queue window (ADR-0020). When Poison Change quarantine is active, Delivery Health is `unhealthy` and each quarantined Output Identity is listed as unhealthy / not aligned (ADR-0015). When blocking Schema Change pause is active, Delivery Health is `paused` and `status` lists Schema Change blocking rows (ADR-0009)—distinct from quarantine.
 
 ```bash
 migraloop status --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"

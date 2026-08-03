@@ -125,10 +125,58 @@ impl OciLogMiner {
         ))
     }
 
+    /// Count pending Incremental DML rows for Sync/Delivery Health lag (ADR-0020).
+    pub fn count_changes_in_schema(
+        &self,
+        schema: &str,
+        table: &str,
+        from_position: CapturePosition,
+    ) -> Result<usize, CaptureError> {
+        let conn = connect_oracle(&self.connect, &self.password)?;
+        let owner = resolve_oracle_schema(&self.connect, schema);
+        count_logminer_contents(&conn, &self.connect.host, &owner, table, from_position)
+    }
+
     pub fn probe_prerequisites(&self) -> Result<OracleSourcePrerequisiteState, CaptureError> {
         let conn = connect_oracle(&self.connect, &self.password)?;
         probe_prerequisites_oci(&conn, &self.connect.host)
     }
+}
+
+fn count_logminer_contents(
+    conn: &Connection,
+    host: &str,
+    owner: &str,
+    table: &str,
+    from_position: CapturePosition,
+) -> Result<usize, CaptureError> {
+    let table = table.trim().to_ascii_uppercase();
+    let owner = owner.trim().to_ascii_uppercase();
+    let end_scn = current_scn(conn, host)?;
+    let start_scn = from_position.as_i64();
+    let end_scn_i64 = end_scn.as_i64();
+    if end_scn_i64 < start_scn {
+        return Ok(0);
+    }
+
+    conn.execute(DBMS_LOGMNR_START_LOGMNR, &[&start_scn, &end_scn_i64])
+        .map_err(|err| map_oracle_error(host, err))?;
+
+    let result = (|| {
+        let sql = "SELECT COUNT(*) FROM V$LOGMNR_CONTENTS \
+             WHERE UPPER(SEG_OWNER) = :1 \
+               AND UPPER(SEG_NAME) = :2 \
+               AND SCN >= :3 \
+               AND OPERATION IN ('INSERT', 'UPDATE', 'DELETE')";
+        let row = conn
+            .query_row(sql, &[&owner, &table, &start_scn])
+            .map_err(|err| map_oracle_error(host, err))?;
+        let count: i64 = row.get(0).map_err(|err| map_oracle_error(host, err))?;
+        Ok(count.max(0) as usize)
+    })();
+
+    let _ = conn.execute(DBMS_LOGMNR_END_LOGMNR, &[]);
+    result
 }
 
 fn fetch_logminer_contents(
