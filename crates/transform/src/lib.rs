@@ -1,12 +1,12 @@
 //! Rich Transform operators and Affect Analysis.
 //!
 //! Declarative project, addFields, rename, remove, filter (eq), equiLookup,
-//! unwind, groupBy (sum/count/min/max/avg), distinct, and addToSet over Base
-//! Dataset rows. Free-form scripts and unanalyzable operators (including
-//! `$lookup` / `$unwind` shorthands) are rejected at parse time. Affect
-//! Analysis skips Derived recompute when only unused Base fields change, and
-//! (with Maintenance State) when distinct/addToSet value-level semantics prove
-//! no Derived change.
+//! unwind, union, groupBy (sum/count/min/max/avg), distinct, and addToSet over
+//! Base Dataset rows. Free-form scripts and unanalyzable operators (including
+//! `$lookup` / `$unwind` / `$unionWith` shorthands) are rejected at parse time.
+//! Affect Analysis skips Derived recompute when only unused Base fields change,
+//! and (with Maintenance State) when distinct/addToSet value-level semantics
+//! prove no Derived change.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -18,15 +18,15 @@ pub const SEAM: &str = "transform";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransformError {
-    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/equiLookup/unwind/groupBy/distinct/addToSet)")]
+    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/equiLookup/unwind/union/groupBy/distinct/addToSet)")]
     FreeFormScript,
-    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, equiLookup, unwind, groupBy, distinct, and addToSet")]
+    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, equiLookup, unwind, union, groupBy, distinct, and addToSet")]
     UnsupportedOperator(String),
     #[error("invalid Rich Transform: {0}")]
     Invalid(String),
 }
 
-/// Secondary Base Dataset referenced by an `equiLookup` step.
+/// Secondary Base Dataset referenced by an `equiLookup` or `union` step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecondaryBaseRef {
@@ -102,6 +102,14 @@ pub enum TransformOp {
     /// Identity can key Delivery on unwound fields. Scalar elements replace
     /// the path value (Mongo-style). Missing / null / empty arrays emit no rows.
     Unwind { path: String },
+    /// Concatenate another Base Dataset into the stream (SQL UNION ALL / Mongo
+    /// `$unionWith` without a nested pipeline). Primary `source.table` rows
+    /// (after prior steps) are followed by `from` Base rows; later steps shape
+    /// both sides. Optional `from_schema` overrides the secondary schema.
+    Union {
+        from: String,
+        from_schema: Option<String>,
+    },
     GroupBy {
         keys: Vec<String>,
         aggregates: Vec<AggregateSpec>,
@@ -169,6 +177,7 @@ pub struct MaintenanceState {
 /// - `{ "filter": { "field": "...", "eq": ... } }`
 /// - `{ "equiLookup": { "from": "...", "localField": "...", "foreignField": "...", "as": "...", "fromSchema?": "..." } }`
 /// - `{ "unwind": { "path": "..." } }`
+/// - `{ "union": { "from": "...", "fromSchema?": "..." } }`
 /// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum"|"count"|"min"|"max"|"avg", "field": "...", "as": "..." }] } }`
 /// - `{ "distinct": { "fields": [...] } }`
 /// - `{ "addToSet": { "keys": [...], "field": "...", "as": "..." } }`
@@ -176,6 +185,7 @@ pub struct MaintenanceState {
 /// - `{ "script": "..." }` / `{ "function": "..." }`
 /// - `{ "$lookup": ... }` (use declarative `equiLookup`)
 /// - `{ "$unwind": ... }` (use declarative `unwind`)
+/// - `{ "$unionWith": ... }` (use declarative `union`)
 /// - any other operator object
 /// - malformed operators (reported as invalid, not unsupported)
 pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, TransformError> {
@@ -197,6 +207,12 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
     if obj.contains_key("$unwind") {
         return Err(TransformError::Invalid(
             "$unwind is not supported; use declarative unwind ({ path }) so Affect Analysis stays correct".to_string(),
+        ));
+    }
+
+    if obj.contains_key("$unionWith") {
+        return Err(TransformError::Invalid(
+            "$unionWith is not supported; use declarative union ({ from }) so Affect Analysis stays correct".to_string(),
         ));
     }
 
@@ -263,6 +279,15 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
         return parse_unwind(obj.get("unwind").expect("unwind key"));
     }
 
+    if obj.contains_key("union") {
+        if obj.len() != 1 {
+            return Err(TransformError::Invalid(
+                "union step must not mix other operators in the same step".to_string(),
+            ));
+        }
+        return parse_union(obj.get("union").expect("union key"));
+    }
+
     if obj.contains_key("groupBy") {
         if obj.len() != 1 {
             return Err(TransformError::Invalid(
@@ -296,6 +321,61 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
         .cloned()
         .unwrap_or_else(|| "(empty)".to_string());
     Err(TransformError::UnsupportedOperator(name))
+}
+
+fn parse_union(value: &Value) -> Result<TransformOp, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid("union must be an object with from".to_string())
+    })?;
+
+    // Reject free-form / Mongo $unionWith extensions (nested pipeline, coll alias).
+    for banned in ["pipeline", "let", "coll", "$unionWith"] {
+        if obj.contains_key(banned) {
+            return Err(TransformError::Invalid(format!(
+                "union does not support `{banned}`; only declarative from (optional fromSchema)"
+            )));
+        }
+    }
+
+    let from = obj
+        .get("from")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TransformError::Invalid("union.from is required".to_string()))?
+        .trim();
+    if from.is_empty() {
+        return Err(TransformError::Invalid(
+            "union.from must not be empty".to_string(),
+        ));
+    }
+
+    let from_schema = match obj.get("fromSchema") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                TransformError::Invalid("union.fromSchema must be a string".to_string())
+            })?;
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+    };
+
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "from" | "fromSchema") {
+            return Err(TransformError::Invalid(format!(
+                "union only supports from and fromSchema (unknown `{key}`)"
+            )));
+        }
+    }
+
+    Ok(TransformOp::Union {
+        from: from.to_string(),
+        from_schema,
+    })
 }
 
 fn parse_unwind(value: &Value) -> Result<TransformOp, TransformError> {
@@ -939,6 +1019,14 @@ pub fn parse_transform_steps(steps: &[Value]) -> Result<Vec<TransformOp>, Transf
             "v1 does not allow unwind together with distinct or addToSet".to_string(),
         ));
     }
+    let has_union = ops
+        .iter()
+        .any(|op| matches!(op, TransformOp::Union { .. }));
+    if has_union && ms_ops > 0 {
+        return Err(TransformError::Invalid(
+            "v1 does not allow union together with distinct or addToSet".to_string(),
+        ));
+    }
     Ok(ops)
 }
 
@@ -1002,33 +1090,42 @@ pub fn derived_output_field_names(ops: &[TransformOp], base_field_names: &[Strin
                 cur.retain(|n| n != path);
                 fields = Some(cur);
             }
+            TransformOp::Union { .. } => {
+                // Concatenation does not rename fields; secondary columns may add
+                // names at evaluation time and are merged by callers.
+            }
             TransformOp::FilterEq { .. } => {}
         }
     }
     fields.unwrap_or_else(|| base_field_names.to_vec())
 }
 
-/// Secondary Base tables referenced by `equiLookup` steps (capture / Initial Load scope).
+/// Secondary Base tables referenced by `equiLookup` / `union` steps (capture / Initial Load scope).
 pub fn secondary_base_refs(ops: &[TransformOp]) -> Vec<SecondaryBaseRef> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for op in ops {
-        if let TransformOp::EquiLookup {
-            from,
-            from_schema,
-            ..
-        } = op
-        {
-            let key = (
-                from_schema.clone().unwrap_or_default(),
-                from.to_ascii_uppercase(),
-            );
-            if seen.insert(key) {
-                out.push(SecondaryBaseRef {
-                    table: from.clone(),
-                    schema: from_schema.clone(),
-                });
+        let (from, from_schema) = match op {
+            TransformOp::EquiLookup {
+                from,
+                from_schema,
+                ..
             }
+            | TransformOp::Union {
+                from,
+                from_schema,
+            } => (from, from_schema),
+            _ => continue,
+        };
+        let key = (
+            from_schema.clone().unwrap_or_default(),
+            from.to_ascii_uppercase(),
+        );
+        if seen.insert(key) {
+            out.push(SecondaryBaseRef {
+                table: from.clone(),
+                schema: from_schema.clone(),
+            });
         }
     }
     out
@@ -1123,6 +1220,10 @@ fn affect_deps(ops: &[TransformOp]) -> AffectDeps {
                 let deps = resolve_field_deps(&lineage, closed, &removed, local_field);
                 lineage.insert(as_name.clone(), deps);
                 removed.remove(as_name);
+            }
+            TransformOp::Union { .. } => {
+                // Primary-side field lineage is unchanged; secondary Base deps are
+                // analyzed via analyze_affect_on_base when `from` changes.
             }
             TransformOp::Unwind { path } => {
                 // Expanding `path` keeps its Base deps used; object flatten drops
@@ -1219,8 +1320,8 @@ pub fn used_base_fields(ops: &[TransformOp]) -> BTreeSet<String> {
 
 /// Evaluate a Rich Transform over primary Base rows, producing Derived rows.
 ///
-/// Single-Base transforms may omit secondary Bases. `equiLookup` requires the
-/// matching secondary table rows in [`evaluate_transform_with_bases`].
+/// Single-Base transforms may omit secondary Bases. `equiLookup` / `union`
+/// require the matching secondary table rows in [`evaluate_transform_with_bases`].
 pub fn evaluate_transform(
     ops: &[TransformOp],
     rows: &[Map<String, Value>],
@@ -1228,9 +1329,9 @@ pub fn evaluate_transform(
     evaluate_transform_with_bases(ops, rows, &BTreeMap::new())
 }
 
-/// Evaluate a Rich Transform with secondary Base Datasets for `equiLookup`.
+/// Evaluate a Rich Transform with secondary Base Datasets for `equiLookup` / `union`.
 ///
-/// `secondary_bases` is keyed by Base table name (`equiLookup.from`).
+/// `secondary_bases` is keyed by Base table name (`equiLookup.from` / `union.from`).
 pub fn evaluate_transform_with_bases(
     ops: &[TransformOp],
     primary_rows: &[Map<String, Value>],
@@ -1255,7 +1356,7 @@ pub fn evaluate_transform_for_identities(
     evaluate_transform_for_identities_with_bases(ops, base_rows, &BTreeMap::new(), identities)
 }
 
-/// Like [`evaluate_transform_for_identities`] with secondary Bases for `equiLookup`.
+/// Like [`evaluate_transform_for_identities`] with secondary Bases for `equiLookup` / `union`.
 pub fn evaluate_transform_for_identities_with_bases(
     ops: &[TransformOp],
     primary_rows: &[Map<String, Value>],
@@ -1265,6 +1366,11 @@ pub fn evaluate_transform_for_identities_with_bases(
     if identities.is_empty() {
         return Ok(Vec::new());
     }
+    // `union` concatenates secondary Bases into the stream — group-key filtering of
+    // primary rows alone would drop secondary contributors. Full eval then filter.
+    let has_union = ops
+        .iter()
+        .any(|op| matches!(op, TransformOp::Union { .. }));
     let Some(group_keys) = output_grouping_keys(ops) else {
         // Row-grain transforms: filter full evaluation to matching Output Identity.
         let all = evaluate_transform_with_bases(ops, primary_rows, secondary_bases)?;
@@ -1273,6 +1379,18 @@ pub fn evaluate_transform_for_identities_with_bases(
             .filter(|row| identities.iter().any(|id| identity_matches_row(id, row)))
             .collect());
     };
+
+    if has_union {
+        let all = evaluate_transform_with_bases(ops, primary_rows, secondary_bases)?;
+        return Ok(all
+            .into_iter()
+            .filter(|row| {
+                identities
+                    .iter()
+                    .any(|id| row_matches_group_keys(row, id, &group_keys))
+            })
+            .collect());
+    }
 
     let mut filtered = Vec::new();
     for row in primary_rows {
@@ -1331,7 +1449,8 @@ pub fn analyze_affect(
     analyze_primary_affect(ops, kind, pre_apply, after, &BTreeMap::new())
 }
 
-/// Affect Analysis when the changed Base table is known (primary or equiLookup `from`).
+/// Affect Analysis when the changed Base table is known (primary, equiLookup `from`,
+/// or `union.from`).
 ///
 /// `primary_table` is the Pipeline `source.table`. `primary_rows` are current primary
 /// Base rows (needed to resolve Output Identities when a foreign Base changes).
@@ -1359,7 +1478,7 @@ pub fn analyze_affect_on_base(
     )
 }
 
-/// Like [`analyze_affect_on_base`] with secondary Bases for `equiLookup` + `unwind`.
+/// Like [`analyze_affect_on_base`] with secondary Bases for `equiLookup` / `union` / `unwind`.
 pub fn analyze_affect_on_base_with_bases(
     ops: &[TransformOp],
     changed_table: &str,
@@ -1370,20 +1489,25 @@ pub fn analyze_affect_on_base_with_bases(
     primary_rows: &[Map<String, Value>],
     secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
 ) -> Result<AffectOutcome, TransformError> {
-    if table_names_eq(changed_table, primary_table)
-        || !is_equi_lookup_from_table(ops, changed_table)
-    {
+    if table_names_eq(changed_table, primary_table) {
         return analyze_primary_affect(ops, kind, pre_apply, after, secondary_bases);
     }
-    analyze_foreign_equi_lookup_affect(
-        ops,
-        changed_table,
-        kind,
-        pre_apply,
-        after,
-        primary_rows,
-        secondary_bases,
-    )
+    if is_equi_lookup_from_table(ops, changed_table) {
+        return analyze_foreign_equi_lookup_affect(
+            ops,
+            changed_table,
+            kind,
+            pre_apply,
+            after,
+            primary_rows,
+            secondary_bases,
+        );
+    }
+    if is_union_from_table(ops, changed_table) {
+        return analyze_union_secondary_affect(ops, changed_table, kind, pre_apply, after);
+    }
+    // Unknown table name — fall back to primary-side analysis (legacy callers).
+    analyze_primary_affect(ops, kind, pre_apply, after, secondary_bases)
 }
 
 fn analyze_primary_affect(
@@ -2290,7 +2414,8 @@ fn shape_row_until_equi_lookup(
             }
             TransformOp::FilterEq { .. }
             | TransformOp::GroupBy { .. }
-            | TransformOp::Unwind { .. } => {}
+            | TransformOp::Unwind { .. }
+            | TransformOp::Union { .. } => {}
             TransformOp::EquiLookup { .. } => {
                 // Prior equiLookup against another table still needs secondary Bases;
                 // for join-key matching we only need field shaping, so skip.
@@ -2318,6 +2443,34 @@ fn is_equi_lookup_from_table(ops: &[TransformOp], table: &str) -> bool {
         TransformOp::EquiLookup { from, .. } => table_names_eq(from, table),
         _ => false,
     })
+}
+
+fn is_union_from_table(ops: &[TransformOp], table: &str) -> bool {
+    ops.iter().any(|op| match op {
+        TransformOp::Union { from, .. } => table_names_eq(from, table),
+        _ => false,
+    })
+}
+
+/// Affect Analysis when a `union.from` secondary Base changes.
+///
+/// Secondary rows enter the stream at the matching `union` step; only operators
+/// after that step shape the contributed row (Mongo `$unionWith` without pipeline).
+fn analyze_union_secondary_affect(
+    ops: &[TransformOp],
+    changed_table: &str,
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+) -> Result<AffectOutcome, TransformError> {
+    let Some(idx) = ops.iter().position(|op| match op {
+        TransformOp::Union { from, .. } => table_names_eq(from, changed_table),
+        _ => false,
+    }) else {
+        return Ok(AffectOutcome::SkipUnusedFields);
+    };
+    let suffix = &ops[idx + 1..];
+    analyze_primary_affect(suffix, kind, pre_apply, after, &BTreeMap::new())
 }
 
 /// Whether an equiLookup `as` field (possibly renamed) still contributes to Derived output.
@@ -2395,12 +2548,12 @@ fn identity_from_row(
     Ok(identity)
 }
 
-/// Apply field-shaping operators (not filter/groupBy/distinct/addToSet/equiLookup/unwind)
+/// Apply field-shaping operators (not filter/groupBy/distinct/addToSet/equiLookup/unwind/union)
 /// so identity keys match Derived.
 ///
-/// `equiLookup` / `unwind` are skipped: Output Identity for non-expanding row-grain is
-/// on primary-side fields; joining/expanding would require secondary Bases and is
-/// handled by [`expands_output_grain`] Affect paths instead.
+/// `equiLookup` / `unwind` / `union` are skipped: Output Identity for non-expanding
+/// row-grain is on primary-side fields; joining/expanding/concatenating would
+/// require secondary Bases and is handled by multi-Base Affect paths instead.
 fn shape_row_for_identity(
     ops: &[TransformOp],
     row: &Map<String, Value>,
@@ -2414,7 +2567,8 @@ fn shape_row_for_identity(
             | TransformOp::Distinct { .. }
             | TransformOp::AddToSet { .. }
             | TransformOp::EquiLookup { .. }
-            | TransformOp::Unwind { .. } => {}
+            | TransformOp::Unwind { .. }
+            | TransformOp::Union { .. } => {}
             other => {
                 current = apply_op(other, current, &empty)?;
             }
@@ -2510,6 +2664,7 @@ fn apply_op(
             ..
         } => apply_equi_lookup(rows, secondary_bases, from, local_field, foreign_field, as_name),
         TransformOp::Unwind { path } => apply_unwind(path, rows),
+        TransformOp::Union { from, .. } => apply_union(rows, secondary_bases, from),
         TransformOp::GroupBy { keys, aggregates } => apply_group_by(keys, aggregates, rows),
         TransformOp::Distinct { fields } => Ok(apply_distinct(fields, rows)),
         TransformOp::AddToSet {
@@ -2518,6 +2673,29 @@ fn apply_op(
             as_name,
         } => apply_add_to_set(keys, field, as_name, rows),
     }
+}
+
+fn apply_union(
+    rows: Vec<Map<String, Value>>,
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
+    from: &str,
+) -> Result<Vec<Map<String, Value>>, TransformError> {
+    let secondary_rows = secondary_bases
+        .get(from)
+        .or_else(|| {
+            secondary_bases
+                .iter()
+                .find(|(name, _)| table_names_eq(name, from))
+                .map(|(_, rows)| rows)
+        })
+        .ok_or_else(|| {
+            TransformError::Invalid(format!(
+                "union.from Base Dataset `{from}` was not loaded for evaluation"
+            ))
+        })?;
+    let mut out = rows;
+    out.extend(secondary_rows.iter().cloned());
+    Ok(out)
 }
 
 fn apply_unwind(
@@ -4648,6 +4826,193 @@ mod tests {
             err.to_string().to_ascii_lowercase().contains("distinct")
                 || err.to_string().to_ascii_lowercase().contains("addtoset"),
             "unwind+distinct must fail clearly, got: {err}"
+        );
+    }
+
+    #[test]
+    fn union_parse_evaluate_and_affect_both_bases() {
+        // Issue #130: declarative multi-Base union.
+        let ops = parse_transform_steps(&[
+            json!({
+                "union": {
+                    "from": "WEST_CUSTOMERS"
+                }
+            }),
+            json!({"project": {"fields": ["ID", "NAME"]}}),
+        ])
+        .unwrap();
+        match &ops[0] {
+            TransformOp::Union { from, from_schema } => {
+                assert_eq!(from, "WEST_CUSTOMERS");
+                assert!(from_schema.is_none());
+            }
+            other => panic!("expected Union, got {other:?}"),
+        }
+        assert_eq!(
+            secondary_base_refs(&ops),
+            vec![SecondaryBaseRef {
+                table: "WEST_CUSTOMERS".into(),
+                schema: None,
+            }]
+        );
+
+        let east = vec![
+            row(&[("ID", json!(1)), ("NAME", json!("Alice")), ("EMAIL", json!("a@x"))]),
+            row(&[("ID", json!(2)), ("NAME", json!("Bob")), ("EMAIL", json!("b@x"))]),
+        ];
+        let west = vec![row(&[
+            ("ID", json!(10)),
+            ("NAME", json!("Zoe")),
+            ("EMAIL", json!("z@x")),
+        ])];
+        let mut secondary = BTreeMap::new();
+        secondary.insert("WEST_CUSTOMERS".to_string(), west.clone());
+
+        let out = evaluate_transform_with_bases(&ops, &east, &secondary).unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|r| r.contains_key("ID") && r.contains_key("NAME")));
+        assert!(out.iter().all(|r| !r.contains_key("EMAIL")));
+        assert!(out.iter().any(|r| r.get("NAME") == Some(&json!("Alice"))));
+        assert!(out.iter().any(|r| r.get("NAME") == Some(&json!("Zoe"))));
+
+        // Primary unused EMAIL (projected away after union) skips.
+        let pre = row(&[("ID", json!(1)), ("NAME", json!("Alice")), ("EMAIL", json!("a@x"))]);
+        let after_email = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alice")),
+            ("EMAIL", json!("new@x")),
+        ]);
+        assert_eq!(
+            analyze_affect_on_base(
+                &ops,
+                "EAST_CUSTOMERS",
+                "EAST_CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&pre),
+                Some(&after_email),
+                &east,
+            )
+            .unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
+
+        // Primary NAME change recomputes identity 1.
+        let after_name = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alicia")),
+            ("EMAIL", json!("a@x")),
+        ]);
+        match analyze_affect_on_base(
+            &ops,
+            "EAST_CUSTOMERS",
+            "EAST_CUSTOMERS",
+            BaseChangeKind::Update,
+            Some(&pre),
+            Some(&after_name),
+            &east,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("ID"), Some(&json!(1)));
+            }
+            other => panic!("expected primary Recompute, got {other:?}"),
+        }
+
+        // Secondary WEST unused EMAIL skips (project after union).
+        let west_pre = row(&[("ID", json!(10)), ("NAME", json!("Zoe")), ("EMAIL", json!("z@x"))]);
+        let west_email = row(&[
+            ("ID", json!(10)),
+            ("NAME", json!("Zoe")),
+            ("EMAIL", json!("zoe@x")),
+        ]);
+        assert_eq!(
+            analyze_affect_on_base(
+                &ops,
+                "WEST_CUSTOMERS",
+                "EAST_CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&west_pre),
+                Some(&west_email),
+                &east,
+            )
+            .unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
+
+        // Secondary WEST NAME change recomputes identity 10.
+        let west_name = row(&[
+            ("ID", json!(10)),
+            ("NAME", json!("Zora")),
+            ("EMAIL", json!("z@x")),
+        ]);
+        match analyze_affect_on_base(
+            &ops,
+            "WEST_CUSTOMERS",
+            "EAST_CUSTOMERS",
+            BaseChangeKind::Update,
+            Some(&west_pre),
+            Some(&west_name),
+            &east,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("ID"), Some(&json!(10)));
+            }
+            other => panic!("expected secondary Recompute, got {other:?}"),
+        }
+
+        secondary.insert("WEST_CUSTOMERS".to_string(), vec![west_name]);
+        let recomputed = evaluate_transform_for_identities_with_bases(
+            &ops,
+            &east,
+            &secondary,
+            &[row(&[("ID", json!(10)), ("NAME", json!("Zora"))])],
+        )
+        .unwrap();
+        assert_eq!(recomputed.len(), 1);
+        assert_eq!(recomputed[0].get("NAME"), Some(&json!("Zora")));
+    }
+
+    #[test]
+    fn dollar_union_with_and_unsupported_forms_fail_clearly() {
+        let err = parse_transform_steps(&[json!({
+            "$unionWith": {
+                "coll": "WEST_CUSTOMERS"
+            }
+        })])
+        .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("$unionwith") && msg.contains("union"),
+            "expected clear $unionWith → union guidance, got: {err}"
+        );
+
+        let err = parse_transform_steps(&[json!({
+            "union": {
+                "from": "WEST_CUSTOMERS",
+                "pipeline": [{"$match": {}}]
+            }
+        })])
+        .unwrap_err();
+        assert!(
+            matches!(err, TransformError::Invalid(_)),
+            "pipeline-style union must be Invalid, got {err:?}"
+        );
+        assert!(err.to_string().to_ascii_lowercase().contains("pipeline"));
+
+        let err = parse_transform_steps(&[
+            json!({"union": {"from": "WEST_CUSTOMERS"}}),
+            json!({"distinct": {"fields": ["ID"]}}),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("distinct")
+                || err.to_string().to_ascii_lowercase().contains("addtoset"),
+            "union+distinct must fail clearly, got: {err}"
         );
     }
 }

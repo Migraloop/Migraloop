@@ -439,7 +439,7 @@ fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformOp>, 
 }
 
 /// Base Dataset (schema, table) pairs a Pipeline references — primary `source.table`
-/// plus every `equiLookup.from` secondary Base.
+/// plus every `equiLookup.from` / `union.from` secondary Base.
 fn pipeline_base_table_refs(pipeline: &Pipeline) -> Vec<(String, String)> {
     let mut tables = BTreeSet::new();
     if !pipeline.source_table.is_empty() {
@@ -464,7 +464,7 @@ fn pipeline_references_table(pipeline: &Pipeline, table: &str) -> bool {
         .any(|(_, t)| t.eq_ignore_ascii_case(table))
 }
 
-/// Load secondary Base rows for all `equiLookup.from` tables on this Pipeline.
+/// Load secondary Base rows for all `equiLookup.from` / `union.from` tables on this Pipeline.
 /// Secondary Base rows plus column metadata (for unwind-flattened foreign fields).
 async fn load_secondary_bases_and_columns_for_pipeline(
     platform_store_url: &str,
@@ -489,7 +489,7 @@ async fn load_secondary_bases_and_columns_for_pipeline(
         .await
         .map_err(|err| {
             CliError::Failed(format!(
-                "Transform Pipeline {}: equiLookup.from Base Dataset `{}` unavailable: {err}",
+                "Transform Pipeline {}: secondary Base Dataset `{}` (equiLookup/union.from) unavailable: {err}",
                 pipeline.name, sec.table
             ))
         })?;
@@ -1747,12 +1747,12 @@ async fn deliver_transform_pipeline_with_options(
     Ok(())
 }
 
-/// Columns for a Derived Dataset after project/addFields/rename/remove/equiLookup/unwind/groupBy,
-/// unioned with keys observed in Derived rows. Works for empty Derived results.
+/// Columns for a Derived Dataset after project/addFields/rename/remove/equiLookup/unwind/union/groupBy,
+/// merged with keys observed in Derived rows. Works for empty Derived results.
 /// Aggregate/`addFields`/`rename` aliases inherit the source field's Oracle type metadata.
 /// `equiLookup` `as` arrays are nested documents (no Oracle scalar type). `unwind` of that
 /// path flattens object elements so the path is no longer nested — foreign Base column
-/// metadata in `secondary_columns` supplies types for those flattened fields.
+/// metadata in `secondary_columns` supplies types for those flattened / unioned fields.
 fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
     ops: &[TransformOp],
@@ -1941,7 +1941,7 @@ fn base_change_kind(op: ChangeOp) -> BaseChangeKind {
 /// Incremental Transform maintenance for one Base change (Affect Analysis driven).
 ///
 /// `changed_table` / `changed_base_rows` are the Base that just received the change
-/// (primary `source.table` or an `equiLookup.from` secondary).
+/// (primary `source.table` or an `equiLookup.from` / `union.from` secondary).
 async fn maintain_transform_pipeline_for_change(
     platform_store_url: &str,
     pipeline: &Pipeline,
@@ -2004,8 +2004,8 @@ async fn maintain_transform_pipeline_for_change(
         None
     };
 
-    // Load secondary Bases before Affect Analysis so equiLookup+unwind can expand
-    // 1→N Output Identities (including disappeared identities on foreign delete).
+    // Load secondary Bases before Affect Analysis so equiLookup/union/unwind can
+    // resolve multi-Base Output Identities (including disappeared identities).
     let (mut secondary, secondary_columns) =
         load_secondary_bases_and_columns_for_pipeline(platform_store_url, pipeline, &ops).await?;
     if !is_primary {
@@ -2706,8 +2706,28 @@ fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineS
                 for field in &pipeline.output_identity {
                     dependency_columns.insert(field.clone());
                 }
+            } else if let Ok(ops) = transform_ops_from_pipeline(pipeline) {
+                if let Some(suffix) = union_suffix_ops_for_table(&ops, &dataset.source_table) {
+                    // union.from rows are shaped only by steps after the union —
+                    // Schema Change deps match Affect Analysis used fields.
+                    let used = used_base_fields(suffix);
+                    if used.is_empty() {
+                        for col in &dataset.columns {
+                            dependency_columns.insert(col.name.clone());
+                        }
+                    } else {
+                        dependency_columns.extend(used);
+                    }
+                    for field in &pipeline.output_identity {
+                        dependency_columns.insert(field.clone());
+                    }
+                } else {
+                    // equiLookup embeds full foreign rows — any column drop/type change blocks.
+                    for col in &dataset.columns {
+                        dependency_columns.insert(col.name.clone());
+                    }
+                }
             } else {
-                // equiLookup embeds full foreign rows — any column drop/type change blocks.
                 for col in &dataset.columns {
                     dependency_columns.insert(col.name.clone());
                 }
@@ -2726,6 +2746,15 @@ fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineS
     }
 }
 
+/// Operators after the `union.from` step for `table` (secondary contribution shape).
+fn union_suffix_ops_for_table<'a>(ops: &'a [TransformOp], table: &str) -> Option<&'a [TransformOp]> {
+    let idx = ops.iter().position(|op| match op {
+        TransformOp::Union { from, .. } => from.eq_ignore_ascii_case(table),
+        _ => false,
+    })?;
+    Some(&ops[idx + 1..])
+}
+
 /// Classify Schema Change impact for Pipelines on this table; warn+pause on Blocking.
 async fn apply_schema_change_impacts(
     platform_store_url: &str,
@@ -2739,7 +2768,7 @@ async fn apply_schema_change_impacts(
         if !pipeline_references_table(pipeline, table) {
             continue;
         }
-        // Schema must match the referenced Base (primary schema or equiLookup fromSchema).
+        // Schema must match the referenced Base (primary schema or equiLookup/union fromSchema).
         let refs = pipeline_base_table_refs(pipeline);
         let schema_ok = refs.iter().any(|(ref_schema, ref_table)| {
             ref_table.eq_ignore_ascii_case(table)
