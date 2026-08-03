@@ -151,9 +151,26 @@ updates only the affected primary Output Identities; unused primary fields (for 
 EMAIL after `project`) still skip recompute. Embedded foreign rows include full Base
 fields, so foreign-side field changes recompute matching identities.
 
-Domain roadmap also names operators such as unwind and union. Until those land in the
-CLI config parser, declare only the operators above—unsupported operator names fail
-apply.
+### `unwind`
+
+Expand an array field into one Derived row per element (1→N grain). Typical composition
+is `equiLookup` then `unwind` so Delivery can key documents by unwound Output Identity
+(for example `ORDER_ID`).
+
+```yaml
+- unwind:
+    path: orders
+```
+
+When an array element is an object, its fields are **merged into the parent row** and the
+array path is removed (Delivery-friendly flatten). Scalar elements replace the path value
+(Mongo-style). Missing, null, or empty arrays emit no rows. Free-form `$unwind` and
+options such as `preserveNullAndEmptyArrays` / `includeArrayIndex` are rejected so
+**Affect Analysis** can expand only the affected Output Identities—including deletes when
+array members disappear.
+
+Domain roadmap also names **union**. Until that lands in the CLI config parser, declare
+only the operators above—unsupported operator names fail apply.
 
 ## Output Identity
 

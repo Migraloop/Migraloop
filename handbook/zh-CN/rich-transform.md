@@ -148,8 +148,23 @@ Base；`from` 命名 secondary Base（Initial Load 与 Incremental Capture 都�
 Output Identities；未使用的 primary 字段（例如 `project` 之后的 EMAIL）仍会跳过重算。
 嵌入的 foreign rows 包含完整 Base 字段，因此 foreign 侧字段变更会重算匹配的 identities。
 
-领域 roadmap 也提到 unwind、union 等 operators。在它们进入 CLI config parser
-之前，请只声明上面的 operators—不支持的 operator 名称会让 apply 失败。
+### `unwind`
+
+把数组字段展开成每个元素一行 Derived（1→N 粒度）。常见组合是先 `equiLookup`
+再 `unwind`，让 Delivery 能以展开后的 Output Identity（例如 `ORDER_ID`）为文档键。
+
+```yaml
+- unwind:
+    path: orders
+```
+
+当数组元素是对象时，其字段会**合并进 parent 行**，并移除数组 path（利于 Delivery 的 flatten）。
+标量元素则替换该 path 的值（Mongo 风格）。缺失、null 或空数组不产生行。自由形式的
+`$unwind` 以及 `preserveNullAndEmptyArrays` / `includeArrayIndex` 等选项会被拒绝，以便
+**Affect Analysis** 只展开受影响的 Output Identities—包括数组成员消失时的 deletes。
+
+领域 roadmap 也提到 **union**。在它进入 CLI config parser 之前，请只声明上面的
+operators—不支持的 operator 名称会让 apply 失败。
 
 ## Output Identity
 
