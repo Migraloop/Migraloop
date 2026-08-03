@@ -119,6 +119,11 @@ GRANT SELECT ON V_$PARAMETER TO SYNC_USER;
 -- plus SELECT on Pipeline tables and CREATE/ALTER SESSION as above
 ```
 
+Dictionary views on the narrower path:
+
+- `ALL_TAB_COLUMNS`, `ALL_CONSTRAINTS` / `ALL_CONS_COLUMNS` — normally readable for tables the sync user already `SELECT`s (no extra grant once table `SELECT` is in place).
+- `ALL_LOG_GROUPS` — required for table-level supplemental-logging Prerequisites. If those rows are not visible without catalog access on your edition, keep `SELECT_CATALOG_ROLE` (or your DBA’s equivalent dictionary grant); the `V_$…` list alone does not replace it.
+
 Edition notes: `LOGMINING` may be absent on some older editions—use the `EXECUTE` grants on `DBMS_LOGMNR` / `DBMS_LOGMNR_D` plus the `V_$…` selects. Exact role names can vary by Oracle version; the capability list above is the contract.
 
 ### Optional / not required for production Sync

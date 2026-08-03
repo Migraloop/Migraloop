@@ -119,6 +119,11 @@ GRANT SELECT ON V_$PARAMETER TO SYNC_USER;
 -- 外加上方的 Pipeline 表 SELECT 与 CREATE/ALTER SESSION
 ```
 
+更窄路径上的 dictionary views：
+
+- `ALL_TAB_COLUMNS`、`ALL_CONSTRAINTS` / `ALL_CONS_COLUMNS`—sync 用户已能 `SELECT` 的表通常可直接读取（表级 `SELECT` 到位后无需额外 grant）。
+- `ALL_LOG_GROUPS`—表级 supplemental-logging Prerequisites 需要。若你的 edition 在没有 catalog 访问时看不到这些行，请保留 `SELECT_CATALOG_ROLE`（或 DBA 提供的同等 dictionary grant）；单靠 `V_$…` 清单无法取代。
+
 Edition 备注：部分旧版可能没有 `LOGMINING`—改用 `DBMS_LOGMNR` / `DBMS_LOGMNR_D` 的 `EXECUTE` 加上 `V_$…` SELECT。角色名称可能随 Oracle 版本而异；以上能力清单才是契约。
 
 ### 选用／生产 Sync 不需要
