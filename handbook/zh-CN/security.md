@@ -29,12 +29,52 @@ Compose 中的 Platform Store URL 可能为随附 lab 风格 store 内嵌本地�
 
 ## TLS / Connection Security
 
-TLS **支持** Source、Target 与 Platform Store 连接，并在生产环境 **建议启用**（ADR-0017）。本地/开发或明确选择的环境仍允许 cleartext—v1 不会对每个非 TLS 连接硬性失败。
+TLS **支持** Source、Target 与 Platform Store 连接，并在生产环境 **建议启用**（ADR-0017）。本地/开发或明确选择的环境仍允许 cleartext—v1 不会对每个非 TLS 连接硬性失败。一旦请求 TLS，配置错误会在 apply/run 明确失败，**不会静默回退到 cleartext**。
+
+### Source / Target（`spec.source.tls` / `spec.target.tls`）
+
+各系统可选的块。省略该块（或设 `enabled: false`）即为 cleartext Lab/开发。
+
+| 字段 | Source（Oracle） | Target（MongoDB） | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | `true` 要求 TCPS | `true` 要求 Mongo TLS | 省略时默认：禁用（允许 cleartext） |
+| `caFile` | **无效**（apply 会拒绝；请用 `walletLocation`） | CA 路径（`tlsCAFile`） | 仅文件系统路径—绝不要把 PEM 贴进 YAML 或 `password` |
+| `walletLocation` | Instant Client wallet 目录 | **无效**（apply 会拒绝） | Oracle `MY_WALLET_DIRECTORY` |
+| `insecureSkipVerify` | 可选（`SSL_SERVER_DN_MATCH=no`） | 可选（允许无效证书） | 仅供开发/Lab；生产环境保持 `false` |
+
+示例（路径是引用，不是密钥本体）：
+
+```yaml
+source:
+  # ...
+  tls:
+    enabled: true
+    walletLocation: /etc/oracle/wallet
+target:
+  # ...
+  tls:
+    enabled: true
+    caFile: /etc/migraloop/certs/mongo-ca.pem
+```
+
+`migraloop status` 会显示非密钥的 TLS 标志/路径（`tls=enabled|disabled`、`caFile=…`、`walletLocation=…`），绝不打印 PEM 本体或密码。
+
+### Platform Store
+
+在 `MIGRALOOP_PLATFORM_STORE_URL` 以 Postgres libpq 风格查询参数配置 TLS：
+
+| 参数 | 用途 |
+| --- | --- |
+| `sslmode=require` / `verify-ca` / `verify-full` | 要求 TLS（不回退 cleartext） |
+| `sslmode=prefer` / `disable`（或省略） | 方便本地/开发的 cleartext |
+| `sslrootcert=/path/to/ca.pem` | 验证模式用的 CA 文件 |
+
+示例：`postgres://migraloop:***@db:5432/migraloop?sslmode=require&sslrootcert=/run/certs/pg-ca.pem`
 
 Operator 指引：
 
 - 生产网络中优先为 Oracle、MongoDB、Postgres 使用可 TLS 的连接路径
-- 密钥材料不要进 shell history 或已提交的配置
+- 密钥材料与证书 PEM 本体不要进 shell history 或已提交的配置—使用挂载路径与 secret references
 - 限制 Source/Target 账号的 Required Privileges（具体 grants 见下方）
 
 ## Required Privileges (pointer)

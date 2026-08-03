@@ -7,7 +7,7 @@ Clone, build, run the Platform Store, and exercise tests in this modular Rust mo
 - Rust toolchain matching `rust-toolchain.toml` (stable)
 - Docker / Docker Compose (Platform Store and optional integration dependencies)
 - Git
-- **Optional (live Oracle Source):** Oracle Instant Client Basic or Basic Light on the machine that runs `migraloop`, with `LD_LIBRARY_PATH` pointing at the Instant Client directory. Required for real-host Initial Load and LogMiner (OCI); not needed for `host: contract` / `stub` CI slices.
+- **Optional (live Oracle Source):** Oracle Instant Client Basic or Basic Light on the machine that runs `migraloop`, with `LD_LIBRARY_PATH` pointing at the Instant Client directory. Required for real-host Initial Load and LogMiner (OCI); not needed for `host: contract` / `stub` CI slices. For Source TLS (TCPS), also mount an Instant Client wallet and set `spec.source.tls` (`enabled` + `walletLocation`)—see [Security](security.md).
 - **Optional (contract/stub CI slices):** point `MIGRALOOP_CONTRACT_SOURCE_CATALOG` at a JSON file of harness catalog tables for schema discovery + Initial Load, and `MIGRALOOP_INJECT_LOGMINER_CONTENTS` at Incremental LogMiner contents when needed (see [Source System](source-system.md) / [CLI and config](cli-and-config.md)). Named scenario fixtures belong in those inject files for tests—not in the shipped product path.
 
 ## Clone and build
@@ -25,6 +25,7 @@ Workspace members: `crates/app` (binary `migraloop`), `cli`, `capture`, `platfor
 ```bash
 docker compose up -d platform-store
 export MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
+# Local cleartext is fine. Production store TLS: add ?sslmode=require&sslrootcert=/path/to/ca.pem
 cargo run -p migraloop-app -- migrate
 cargo run -p migraloop-app -- status
 ```

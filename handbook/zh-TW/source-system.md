@@ -15,8 +15,9 @@
 | `username` | Sync 帳號（最小 Required Privileges；不是預設就要 admin） |
 | `password` | Secret reference：`fromEnv`、`fromFile` 或 `fromDockerSecret` |
 | `timezone` | 可選 IANA 名稱或 Oracle 風格 offset（`+09:00`）。在 naive DATE/TIMESTAMP 需要解讀且 Source DB timezone 不可讀時使用 |
+| `tls` | 可選。設 `enabled: true` 以使用 TCPS；用 `walletLocation` 指向 Instant Client wallet 目錄（`caFile` 會被拒絕—Oracle 此處不使用 PEM CA 檔）。僅路徑—禁止 inline PEM。見 [Security](security.md) |
 
-真實 Oracle host 的 **Initial Load**（schema discovery + snapshot）與 **LogMiner Incremental Capture** 都走 **OCI** 路徑。若 runtime 沒有 Oracle Instant Client / OCI libraries，apply/sync 會以 LogMiner/OCI 名稱 fail fast—不會默默退回 stub catalog。對 live Source 執行前請安裝 Instant Client（Basic 或 Basic Light），並將 `LD_LIBRARY_PATH` 指向其目錄。
+真實 Oracle host 的 **Initial Load**（schema discovery + snapshot）與 **LogMiner Incremental Capture** 都走 **OCI** 路徑。若 runtime 沒有 Oracle Instant Client / OCI libraries，apply/sync 會以 LogMiner/OCI 名稱 fail fast—不會默默退回 stub catalog。當 `tls.enabled: true` 時，連線字串使用 TCPS，設定錯誤會明確失敗（不靜默回退 cleartext）。對 live Source 執行前請安裝 Instant Client（Basic 或 Basic Light），並將 `LD_LIBRARY_PATH` 指向其目錄。
 
 在 live Source 上，Pipeline 的 `source.schema` 選擇 Oracle owner；省略時平台以 Source `username`（大寫）作為預設 schema。contract/stub harness 會忽略 schema，僅在 CI 切片使用**注入的 contract Source catalog**（`MIGRALOOP_CONTRACT_SOURCE_CATALOG` JSON 供 schema discovery + Initial Load；`MIGRALOOP_INJECT_LOGMINER_CONTENTS` 供 Incremental Capture）—不是 binary 內建的業務資料表 catalog、不是 Lab／真實路徑的定義真相，也不是受支援的 production Source 機制。
 

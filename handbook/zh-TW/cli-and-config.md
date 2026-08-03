@@ -216,7 +216,7 @@ Lab 是手動驗證—不是 Release Quality Gate，也不是 contract/stub LogM
 
 | 變數 | 意義 |
 | --- | --- |
-| `MIGRALOOP_PLATFORM_STORE_URL` | Operator CLI 與 compose `app` 使用的 Platform Store 連線 URL（`postgres://...`） |
+| `MIGRALOOP_PLATFORM_STORE_URL` | Operator CLI 與 compose `app` 使用的 Platform Store 連線 URL（`postgres://...`）。TLS 請用 `sslmode=require\|verify-ca\|verify-full`，可選 `sslrootcert=/path/to/ca.pem` |
 | `MIGRALOOP_PLATFORM_STORE_DATA_DIR` | app filesystem 上用來觀測 Platform Store 可用磁碟的路徑（compose 會把 store data volume 以 read-only 掛在 `/var/lib/migraloop/platform-store-data`） |
 | `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES` | 選用：當無法做 filesystem probe 時，由 Operator／orchestrator 提供的可用磁碟位元組數（覆寫目錄探測以供 warn threshold） |
 | `MIGRALOOP_METRICS_ADDR` | `migraloop run` 的 Prometheus scrape listen address（預設 `0.0.0.0:9090`） |
@@ -257,6 +257,18 @@ Lab 是手動驗證—不是 Release Quality Gate，也不是 contract/stub LogM
 | `username` | 是 | 是 | 省略 Pipeline `source.schema` 時，也作為預設 Oracle schema/owner |
 | `password` | 是 | 是 | 恰好一個 `fromEnv`、`fromFile`、`fromDockerSecret` |
 | `timezone` | 可選 | n/a | IANA 或 `±HH:MM`，供 naive 時間 |
+| `tls` | 可選 | 可選 | 見下；省略／`enabled: false` 仍允許 cleartext |
+
+#### `tls`（可選）
+
+| 欄位 | Source | Target | 說明 |
+| --- | --- | --- | --- |
+| `enabled` | 可選 | 可選 | 為 `true` 時以 TLS 連線；設定錯誤會明確失敗（不靜默回退 cleartext） |
+| `caFile` | **無效**（請用 `walletLocation`） | 可選路徑 | Mongo CA 檔；僅檔案系統路徑（不可 inline PEM） |
+| `walletLocation` | 可選目錄 | **無效** | Oracle Instant Client wallet 目錄 |
+| `insecureSkipVerify` | 可選 bool | 可選 bool | 僅供開發/Lab；預設 `false` |
+
+Platform Store TLS 設定在 `MIGRALOOP_PLATFORM_STORE_URL`（`sslmode=require|verify-ca|verify-full`，可選 `sslrootcert=…`）—見 [Security](security.md)。
 
 Docker secrets 從 `/run/secrets/<name>` 解析。
 

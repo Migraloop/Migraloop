@@ -406,6 +406,7 @@ mod tests {
             port: 1521,
             database: "ORCL".into(),
             username: "sync_user".into(),
+            tls: Default::default(),
         };
         let err = initial_load_for_source(&source, "unused", "APP", "CUSTOMERS", None)
             .expect_err("no in-binary fixture catalog");
@@ -424,6 +425,7 @@ mod tests {
             port: 1521,
             database: "STUB".into(),
             username: "sync_user".into(),
+            tls: Default::default(),
         };
         let sample = alignment_check_read_for_source(&source, "unused", "APP", "CUSTOMERS", 1, None)
             .expect("gated alignment read");
@@ -460,6 +462,7 @@ mod tests {
             port: 1521,
             database: "ORCL".into(),
             username: "sync_user".into(),
+            tls: Default::default(),
         };
         let columns = discover_source_schema(&source, "unused", "APP", "WIDGETS")
             .expect("discover injected table");
@@ -483,6 +486,7 @@ mod tests {
             port: 1,
             database: "NOPE".into(),
             username: "sync_user".into(),
+            tls: Default::default(),
         };
         let err = initial_load_for_source(&source, "bad", "APP", "CUSTOMERS", None)
             .expect_err("must not fall back to stub catalog");

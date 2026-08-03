@@ -5,13 +5,35 @@ use oracle::{Connection, Connector};
 use crate::logminer::OracleSourceConnect;
 use crate::CaptureError;
 
-/// Build an Easy Connect / service connect string for Instant Client.
+/// Build an Easy Connect / Easy Connect Plus string for Instant Client.
+///
+/// Cleartext uses `//host:port/service`. When TLS is enabled, builds a TCPS
+/// DESCRIPTION connect string so Instant Client cannot silently fall back to TCP.
 pub fn oracle_connect_string(source: &OracleSourceConnect) -> String {
+    let host = source.host.trim();
+    let service = source.database.trim();
+    if !source.tls.enabled {
+        return format!("//{host}:{}/{}", source.port, service);
+    }
+
+    let dn_match = if source.tls.insecure_skip_verify {
+        "no"
+    } else {
+        "yes"
+    };
+    let mut security = format!("(SECURITY=(SSL_SERVER_DN_MATCH={dn_match})");
+    let wallet = source.tls.wallet_location.trim();
+    if !wallet.is_empty() {
+        // Escape closing parens in path by rejecting them elsewhere; paths are
+        // operator-supplied filesystem locations without DESCRIPTION metachar intent.
+        security.push_str(&format!("(MY_WALLET_DIRECTORY={wallet})"));
+    }
+    security.push(')');
+
     format!(
-        "//{}:{}/{}",
-        source.host.trim(),
-        source.port,
-        source.database.trim()
+        "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcps)(HOST={host})(PORT={}))\
+         (CONNECT_DATA=(SERVICE_NAME={service})){security})",
+        source.port
     )
 }
 
@@ -24,7 +46,7 @@ pub fn connect_oracle(
     let connect_string = oracle_connect_string(source);
     Connector::new(source.username.trim(), password, &connect_string)
         .connect()
-        .map_err(|err| map_oracle_error(&source.host, err))
+        .map_err(|err| map_oracle_connect_error(&source.host, source.tls.enabled, err))
 }
 
 /// Resolve Pipeline `source.schema` (empty → Oracle username as default schema).
@@ -37,7 +59,12 @@ pub fn resolve_oracle_schema(source: &OracleSourceConnect, schema: &str) -> Stri
     }
 }
 
+/// Map post-connect OCI errors (TLS already negotiated or cleartext session).
 pub fn map_oracle_error(host: &str, err: oracle::Error) -> CaptureError {
+    map_oracle_connect_error(host, false, err)
+}
+
+fn map_oracle_connect_error(host: &str, tls_enabled: bool, err: oracle::Error) -> CaptureError {
     let detail = err.to_string();
     let lower = detail.to_ascii_lowercase();
     if lower.contains("dpi-1047")
@@ -54,6 +81,14 @@ pub fn map_oracle_error(host: &str, err: oracle::Error) -> CaptureError {
                  or install Instant Client and set LD_LIBRARY_PATH for real OCI capture"
             ),
         }
+    } else if tls_enabled {
+        CaptureError::OciUnavailable {
+            host: host.to_string(),
+            detail: format!(
+                "Oracle Source TLS (TCPS) was requested but could not be established: {detail} \
+                 (no silent cleartext fallback)"
+            ),
+        }
     } else {
         CaptureError::OciUnavailable {
             host: host.to_string(),
@@ -65,26 +100,59 @@ pub fn map_oracle_error(host: &str, err: oracle::Error) -> CaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logminer::OracleTlsSettings;
 
-    #[test]
-    fn connect_string_uses_easy_connect() {
-        let source = OracleSourceConnect {
+    fn base_source() -> OracleSourceConnect {
+        OracleSourceConnect {
             host: "db.example".into(),
             port: 1521,
             database: "FREEPDB1".into(),
             username: "sync_user".into(),
-        };
+            tls: OracleTlsSettings::default(),
+        }
+    }
+
+    #[test]
+    fn connect_string_uses_easy_connect_when_cleartext() {
+        let source = base_source();
         assert_eq!(oracle_connect_string(&source), "//db.example:1521/FREEPDB1");
     }
 
     #[test]
-    fn empty_schema_defaults_to_username() {
-        let source = OracleSourceConnect {
-            host: "db.example".into(),
-            port: 1521,
-            database: "FREEPDB1".into(),
-            username: "Sync_User".into(),
+    fn connect_string_uses_tcps_description_when_tls_enabled() {
+        let mut source = base_source();
+        source.port = 2484;
+        source.tls = OracleTlsSettings {
+            enabled: true,
+            wallet_location: "/etc/oracle/wallet".into(),
+            insecure_skip_verify: false,
         };
+        let s = oracle_connect_string(&source);
+        assert!(s.contains("PROTOCOL=tcps"), "got {s}");
+        assert!(s.contains("HOST=db.example"), "got {s}");
+        assert!(s.contains("PORT=2484"), "got {s}");
+        assert!(s.contains("SERVICE_NAME=FREEPDB1"), "got {s}");
+        assert!(s.contains("SSL_SERVER_DN_MATCH=yes"), "got {s}");
+        assert!(s.contains("MY_WALLET_DIRECTORY=/etc/oracle/wallet"), "got {s}");
+        assert!(!s.starts_with("//"), "must not use cleartext Easy Connect: {s}");
+    }
+
+    #[test]
+    fn tls_insecure_skip_verify_disables_dn_match() {
+        let mut source = base_source();
+        source.tls = OracleTlsSettings {
+            enabled: true,
+            wallet_location: String::new(),
+            insecure_skip_verify: true,
+        };
+        let s = oracle_connect_string(&source);
+        assert!(s.contains("SSL_SERVER_DN_MATCH=no"), "got {s}");
+    }
+
+    #[test]
+    fn empty_schema_defaults_to_username() {
+        let mut source = base_source();
+        source.username = "Sync_User".into();
         assert_eq!(resolve_oracle_schema(&source, ""), "SYNC_USER");
         assert_eq!(resolve_oracle_schema(&source, "  app  "), "APP");
     }

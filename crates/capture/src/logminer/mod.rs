@@ -25,5 +25,5 @@ pub use oci::{
     V_LOGMNR_CONTENTS_QUERY,
 };
 pub use source::{
-    open_oracle_incremental_capture, IncrementalCapture, OracleSourceConnect,
+    open_oracle_incremental_capture, IncrementalCapture, OracleSourceConnect, OracleTlsSettings,
 };

@@ -6,6 +6,16 @@ use crate::{CaptureError, CapturePosition, ChangeEvent};
 use super::contract::ContractLogMiner;
 use super::oci::OciLogMiner;
 
+/// Non-secret TLS settings for an Oracle Source connection (ADR-0017).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OracleTlsSettings {
+    pub enabled: bool,
+    /// Instant Client wallet directory (`MY_WALLET_DIRECTORY`).
+    pub wallet_location: String,
+    /// When true, set `SSL_SERVER_DN_MATCH=no` (dev/lab only).
+    pub insecure_skip_verify: bool,
+}
+
 /// Non-secret Oracle Source connection identity used to select a capture backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleSourceConnect {
@@ -13,6 +23,7 @@ pub struct OracleSourceConnect {
     pub port: u16,
     pub database: String,
     pub username: String,
+    pub tls: OracleTlsSettings,
 }
 
 impl OracleSourceConnect {

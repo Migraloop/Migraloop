@@ -108,6 +108,23 @@ pub struct SystemSpec {
     /// IANA timezone for naive DATE/TIMESTAMP when Source DB timezone is unreadable.
     #[serde(default)]
     pub timezone: Option<String>,
+    /// Optional TLS settings (ADR-0017). Omitted / disabled keeps cleartext allowed.
+    #[serde(default)]
+    pub tls: Option<TlsSpec>,
+}
+
+/// Operator-facing TLS block on `spec.source` / `spec.target`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", default)]
+pub struct TlsSpec {
+    /// When true, the product path must establish TLS (no silent cleartext fallback).
+    pub enabled: bool,
+    /// Path to a CA certificate file (Mongo). Optional for Oracle when using a wallet.
+    pub ca_file: Option<String>,
+    /// Oracle Instant Client wallet directory. Invalid on Mongo Target.
+    pub wallet_location: Option<String>,
+    /// Skip certificate verification (dev/lab only). Default false.
+    pub insecure_skip_verify: bool,
 }
 
 /// Password must be a secret reference — never a plaintext string in config.
@@ -271,6 +288,8 @@ pub fn load_deployment_config(path: &Path) -> Result<DeploymentDocument, CliErro
     validate_source_timezone(doc.spec.source.timezone.as_deref())?;
     doc.spec.source.password.validate("source.password")?;
     doc.spec.target.password.validate("target.password")?;
+    validate_tls_spec("source", &doc.spec.source)?;
+    validate_tls_spec("target", &doc.spec.target)?;
     Ok(doc)
 }
 
@@ -551,4 +570,93 @@ pub fn validate_source_timezone(timezone: Option<&str>) -> Result<(), CliError> 
         )));
     }
     Ok(())
+}
+
+fn validate_tls_spec(system: &str, spec: &SystemSpec) -> Result<(), CliError> {
+    let Some(tls) = &spec.tls else {
+        return Ok(());
+    };
+    if let Some(ca) = tls.ca_file.as_deref() {
+        if ca.trim().is_empty() {
+            return Err(CliError::Failed(format!(
+                "{system}.tls.caFile must not be empty when set"
+            )));
+        }
+        if system == "source" || spec.kind == V1_SOURCE_KIND {
+            return Err(CliError::Failed(
+                "source.tls.caFile is not used for Oracle TCPS; set \
+                 source.tls.walletLocation to an Instant Client wallet directory \
+                 (MongoDB Target uses tls.caFile)"
+                    .to_string(),
+            ));
+        }
+    }
+    if let Some(wallet) = tls.wallet_location.as_deref() {
+        if wallet.trim().is_empty() {
+            return Err(CliError::Failed(format!(
+                "{system}.tls.walletLocation must not be empty when set"
+            )));
+        }
+        if system == "target" || spec.kind == V1_TARGET_KIND {
+            return Err(CliError::Failed(
+                "target.tls.walletLocation is only valid for Oracle Source; \
+                 MongoDB Target uses tls.caFile"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve TLS settings from config and verify referenced paths exist when enabled.
+pub fn resolve_tls_settings(
+    field_prefix: &str,
+    tls: Option<&TlsSpec>,
+) -> Result<migraloop_platform_store::TlsSettings, CliError> {
+    let Some(tls) = tls else {
+        return Ok(migraloop_platform_store::TlsSettings::default());
+    };
+    let ca_file = tls
+        .ca_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let wallet_location = tls
+        .wallet_location
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string();
+
+    if tls.enabled {
+        if !ca_file.is_empty() {
+            let path = Path::new(&ca_file);
+            if !path.is_file() {
+                return Err(CliError::Failed(format!(
+                    "{field_prefix}.tls.caFile {ca_file:?} does not exist or is not a file; \
+                     TLS was requested and will not silently fall back to cleartext"
+                )));
+            }
+        }
+        if !wallet_location.is_empty() {
+            let path = Path::new(&wallet_location);
+            if !path.is_dir() {
+                return Err(CliError::Failed(format!(
+                    "{field_prefix}.tls.walletLocation {wallet_location:?} does not exist \
+                     or is not a directory; TLS was requested and will not silently \
+                     fall back to cleartext"
+                )));
+            }
+        }
+    }
+
+    Ok(migraloop_platform_store::TlsSettings {
+        enabled: tls.enabled,
+        ca_file,
+        wallet_location,
+        insecure_skip_verify: tls.insecure_skip_verify,
+    })
 }

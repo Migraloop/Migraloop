@@ -71,6 +71,8 @@ Stream-wide blockers（例如無法解除的 DDL）仍依 [Operations](operation
 
 哪些 Source 資料表進入 Sync，由 Pipeline 的 `source.table` 參照決定。每張表在每個 Deployment 至多一個 Base Dataset，跨 Pipelines 共用。新表只做 table-level Initial Load。
 
+Source/Target 的 TLS 與 secrets 屬於外層 Deployment 的 `spec.source` / `spec.target`（不在 Pipeline 項目上）—見 [Security](security.md) 與 [CLI 與 Config](cli-and-config.md)。
+
 ## 相關章節
 
 - Source prerequisites 與型別：[Source System](source-system.md)

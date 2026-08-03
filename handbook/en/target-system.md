@@ -12,6 +12,7 @@ Under `spec.target` in the Deployment config:
 | `host` / `port` / `database` | MongoDB connection identity |
 | `username` | Delivery account with rights to upsert/delete in bound collections |
 | `password` | Secret reference (`fromEnv`, `fromFile`, or `fromDockerSecret`) |
+| `tls` | Optional. Set `enabled: true` for Mongo TLS; `caFile` is a filesystem CA path (not PEM inline). See [Security](security.md) |
 
 Target timezone is not configured in v1—Delivery writes UTC datetime for temporal Managed fields.
 

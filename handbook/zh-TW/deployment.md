@@ -138,6 +138,9 @@ spec:
     password:
       fromEnv: ORACLE_PASSWORD
     timezone: Asia/Taipei          # 可選；naive DATE/TIMESTAMP 後備
+    # tls:                         # 可選；省略即 cleartext Lab/開發
+    #   enabled: true
+    #   walletLocation: /etc/oracle/wallet
   target:
     kind: mongodb
     host: mongo.example.com
@@ -146,10 +149,13 @@ spec:
     username: deliver_user
     password:
       fromEnv: MONGO_PASSWORD
+    # tls:
+    #   enabled: true
+    #   caFile: /etc/migraloop/certs/mongo-ca.pem
   pipelines: []                    # 見 Pipeline 章節
 ```
 
-v1 要求 `source.kind: oracle` 與 `target.kind: mongodb`。密碼必須是 secret reference—禁止明文。
+v1 要求 `source.kind: oracle` 與 `target.kind: mongodb`。密碼必須是 secret reference—禁止明文。可選的 `tls` 區塊（以及 Platform Store 在 `MIGRALOOP_PLATFORM_STORE_URL` 上的 `sslmode`）見 [Security](security.md) 與 [CLI 與 Config](cli-and-config.md)。
 
 以 `migraloop apply -f <file>` 套用。`pipelines` 為空時只套用 Deployment metadata（尚不 capture）。
 
@@ -158,4 +164,5 @@ v1 要求 `source.kind: oracle` 與 `target.kind: mongodb`。密碼必須是 sec
 - Source 連線與 prerequisites：[Source System](source-system.md)
 - Target Binding 與 Delivery：[Target System](target-system.md)
 - Deployment 內的 Pipelines：[Pipeline](pipeline.md)
+- Secrets 與 TLS：[Security](security.md)
 - 完整欄位/旗標清單：[CLI 與 Config 參考](cli-and-config.md)
