@@ -177,7 +177,6 @@ const BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG: &str = "deployment-v1.0.0.yaml"
 const INITIAL_LOAD_THROTTLED_ID: &str = "initial-load-throttled";
 const INITIAL_LOAD_THROTTLED_TABLE: &str = "LAB_IL_ITEMS";
 const INITIAL_LOAD_THROTTLED_COLLECTION: &str = "lab_il_items";
-const INITIAL_LOAD_THROTTLED_PIPELINE: &str = "lab-il-items";
 const INITIAL_LOAD_THROTTLED_DEPLOYMENT: &str = "lab-initial-load-throttled";
 /// Non-trivial Source volume for chunked Initial Load (issue #124).
 const INITIAL_LOAD_THROTTLED_ROW_COUNT: i64 = 500;
