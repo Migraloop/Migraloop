@@ -151,6 +151,16 @@ const BOUNDED_BACKPRESSURE_DELAY_MS: &str = "80";
 const BOUNDED_BACKPRESSURE_FAIL_AFTER: &str = "1";
 const BOUNDED_BACKPRESSURE_BACKLOG: i64 = 20;
 
+const OBSERVABILITY_SURFACE_ID: &str = "observability-surface";
+const OBSERVABILITY_SURFACE_TABLE: &str = "LAB_OBS_CUSTOMERS";
+const OBSERVABILITY_SURFACE_COLLECTION: &str = "lab_obs_customers";
+const OBSERVABILITY_SURFACE_PIPELINE: &str = "lab-obs-customers";
+const OBSERVABILITY_SURFACE_DEPLOYMENT: &str = "lab-observability-surface";
+const OBSERVABILITY_SURFACE_CAPACITY: &str = "2";
+const OBSERVABILITY_SURFACE_DELAY_MS: &str = "80";
+const OBSERVABILITY_SURFACE_FAIL_AFTER: &str = "1";
+const OBSERVABILITY_SURFACE_BACKLOG: i64 = 20;
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -237,6 +247,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         SOURCE_ALIGNMENT_ID,
         DRIFT_CHECK_ID,
         BOUNDED_BACKPRESSURE_ID,
+        OBSERVABILITY_SURFACE_ID,
     ]
 }
 
@@ -292,6 +303,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             BOUNDED_BACKPRESSURE_ID,
             "Bounded backpressure with visible lag",
+        ),
+        (
+            OBSERVABILITY_SURFACE_ID,
+            "Observability Surface (logs, health, Prometheus)",
         ),
     ]
 }
@@ -589,6 +604,7 @@ async fn scenario_run(
         SOURCE_ALIGNMENT_ID => run_source_alignment(lab_dir).await,
         DRIFT_CHECK_ID => run_drift_check(lab_dir).await,
         BOUNDED_BACKPRESSURE_ID => run_bounded_backpressure(lab_dir).await,
+        OBSERVABILITY_SURFACE_ID => run_observability_surface(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -683,6 +699,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         SOURCE_ALIGNMENT_ID => remove_source_alignment_namespace(lab_dir).await,
         DRIFT_CHECK_ID => remove_drift_check_namespace(lab_dir).await,
         BOUNDED_BACKPRESSURE_ID => remove_bounded_backpressure_namespace(lab_dir).await,
+        OBSERVABILITY_SURFACE_ID => remove_observability_surface_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -4114,6 +4131,423 @@ EXIT;\n"
         })
 }
 
+async fn run_observability_surface(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {OBSERVABILITY_SURFACE_ID}");
+    println!(
+        "Scenario Namespace: table={OBSERVABILITY_SURFACE_TABLE} \
+collection={OBSERVABILITY_SURFACE_COLLECTION} deployment={OBSERVABILITY_SURFACE_DEPLOYMENT}"
+    );
+
+    prepare_observability_surface_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, OBSERVABILITY_SURFACE_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !(apply_out.contains("\"event\":\"initial_load_complete\"")
+        || apply_out.contains("\"event\": \"initial_load_complete\"")
+        || apply_out.contains("\"event\":\"delivery_complete\"")
+        || apply_out.contains("\"event\": \"delivery_complete\""))
+    {
+        return Err(CliError::Failed(format!(
+            "expected structured Initial Load / Delivery operator events on apply:\n{apply_out}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: inserting Source backlog ({OBSERVABILITY_SURFACE_BACKLOG} rows)..."
+    );
+    insert_observability_surface_backlog(lab_dir).await?;
+
+    println!(
+        "Lab Scenario: sync under Downstream delay with queue capacity={} \
+(fail after {} durable checkpoint)...",
+        OBSERVABILITY_SURFACE_CAPACITY, OBSERVABILITY_SURFACE_FAIL_AFTER
+    );
+    let (slow_ok, slow_out) = run_product_cli_allow_fail(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[
+            (
+                "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+                OBSERVABILITY_SURFACE_CAPACITY,
+            ),
+            (
+                "MIGRALOOP_DELIVERY_DELAY_MS",
+                OBSERVABILITY_SURFACE_DELAY_MS,
+            ),
+            (
+                "MIGRALOOP_SYNC_FAIL_AFTER_CHANGES",
+                OBSERVABILITY_SURFACE_FAIL_AFTER,
+            ),
+        ],
+    )
+    .await?;
+    if slow_ok {
+        return Err(CliError::Failed(format!(
+            "expected mid-sync stop under Downstream slowness (FAIL_AFTER), got success:\n{slow_out}"
+        )));
+    }
+    if !slow_out.to_ascii_lowercase().contains("logminer") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{slow_out}"
+        )));
+    }
+    if !(slow_out.contains("\"event\":\"backpressure\"")
+        || slow_out.contains("\"event\": \"backpressure\""))
+    {
+        return Err(CliError::Failed(format!(
+            "expected structured backpressure event JSON:\n{slow_out}"
+        )));
+    }
+    if !(slow_out.contains("\"event\":\"incremental_capture\"")
+        || slow_out.contains("\"event\": \"incremental_capture\""))
+    {
+        return Err(CliError::Failed(format!(
+            "expected structured incremental_capture event JSON:\n{slow_out}"
+        )));
+    }
+
+    let status_mid = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !(status_mid.contains("Sync Health:")
+        && status_mid.contains("Delivery Health:")
+        && status_mid.contains(&format!("Pipeline: {OBSERVABILITY_SURFACE_PIPELINE}")))
+    {
+        return Err(CliError::Failed(format!(
+            "status must include Sync Health, Delivery Health, and Pipeline status:\n{status_mid}"
+        )));
+    }
+    let sync_lag = parse_sync_lag_for_table(&status_mid, OBSERVABILITY_SURFACE_TABLE).ok_or_else(
+        || {
+            CliError::Failed(format!(
+                "could not parse Sync Health lag under Observability Surface probe:\n{status_mid}"
+            ))
+        },
+    )?;
+    if sync_lag < 10 {
+        return Err(CliError::Failed(format!(
+            "Sync Health lag must reflect Source backlog, got {sync_lag}:\n{status_mid}"
+        )));
+    }
+    let delivery_lag =
+        parse_delivery_lag_for_pipeline(&status_mid, OBSERVABILITY_SURFACE_PIPELINE).ok_or_else(
+            || {
+                CliError::Failed(format!(
+                    "could not parse Delivery Health lag under Observability Surface probe:\n{status_mid}"
+                ))
+            },
+        )?;
+    if delivery_lag < 10 {
+        return Err(CliError::Failed(format!(
+            "Delivery Health lag must reflect Downstream backlog, got {delivery_lag}:\n{status_mid}"
+        )));
+    }
+
+    println!("Lab Scenario: scraping Prometheus /metrics via migraloop run...");
+    let metrics_body = scrape_run_metrics(&bin, LAB_PLATFORM_STORE_URL).await?;
+    if !(metrics_body.contains("migraloop_sync_lag")
+        && metrics_body.contains("migraloop_delivery_lag")
+        && (metrics_body.contains("migraloop_quarantined_changes")
+            || metrics_body.contains("migraloop_failures")))
+    {
+        return Err(CliError::Failed(format!(
+            "Prometheus /metrics must expose lag and failure counters:\n{metrics_body}"
+        )));
+    }
+    let metric_sync_lag = parse_prometheus_gauge(&metrics_body, "migraloop_sync_lag").ok_or_else(
+        || {
+            CliError::Failed(format!(
+                "could not parse migraloop_sync_lag from metrics:\n{metrics_body}"
+            ))
+        },
+    )?;
+    if metric_sync_lag < 1.0 {
+        return Err(CliError::Failed(format!(
+            "migraloop_sync_lag must reflect backlog, got {metric_sync_lag}:\n{metrics_body}"
+        )));
+    }
+
+    println!("Lab Scenario: catch-up sync without Downstream delay...");
+    let catch_out = run_product_cli_with_env(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[(
+            "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+            OBSERVABILITY_SURFACE_CAPACITY,
+        )],
+    )
+    .await?;
+    let capture_note = if catch_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario catch-up sync must use real LogMiner path:\n{catch_out}"
+        )));
+    };
+
+    let status_after = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let sync_lag_after =
+        parse_sync_lag_for_table(&status_after, OBSERVABILITY_SURFACE_TABLE).unwrap_or(-1);
+    let delivery_lag_after =
+        parse_delivery_lag_for_pipeline(&status_after, OBSERVABILITY_SURFACE_PIPELINE).unwrap_or(-1);
+    if sync_lag_after != 0 || delivery_lag_after != 0 {
+        return Err(CliError::Failed(format!(
+            "lag must return to 0 after catch-up (sync={sync_lag_after}, delivery={delivery_lag_after}):\n{status_after}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out)
+        + count_delivery_ops(&slow_out)
+        + count_delivery_ops(&catch_out);
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (structured logs; Sync/Delivery Health; Prometheus lag/failures)"
+    );
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: Some(sync_lag_after),
+        max_lag: Some(0),
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_observability_surface_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={OBSERVABILITY_SURFACE_TABLE}, collection={OBSERVABILITY_SURFACE_COLLECTION}, \
+          deployment={OBSERVABILITY_SURFACE_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {OBSERVABILITY_SURFACE_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for observability-surface:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{OBSERVABILITY_SURFACE_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for observability-surface:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, OBSERVABILITY_SURFACE_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{OBSERVABILITY_SURFACE_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_observability_surface_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_observability_surface_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {OBSERVABILITY_SURFACE_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {OBSERVABILITY_SURFACE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {OBSERVABILITY_SURFACE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {OBSERVABILITY_SURFACE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare observability-surface Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn insert_observability_surface_backlog(lab_dir: &Path) -> Result<(), CliError> {
+    let mut inserts = String::new();
+    for i in 0..OBSERVABILITY_SURFACE_BACKLOG {
+        let id = 100 + i;
+        inserts.push_str(&format!(
+            "INSERT INTO {OBSERVABILITY_SURFACE_TABLE} (ID, NAME, EMAIL, ACTIVE) \
+VALUES ({id}, 'User{id}', 'user{id}@example.com', 1);\n"
+        ));
+    }
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+{inserts}\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to insert Source backlog for observability-surface:\n{err}"
+            ))
+        })
+}
+
+/// Start `migraloop run --metrics-addr`, scrape `/metrics`, then stop the process.
+async fn scrape_run_metrics(bin: &Path, platform_store_url: &str) -> Result<String, CliError> {
+    use std::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, timeout};
+
+    let port = TcpListener::bind("127.0.0.1:0")
+        .map_err(|err| CliError::Failed(format!("bind ephemeral metrics port: {err}")))?
+        .local_addr()
+        .map_err(|err| CliError::Failed(format!("read ephemeral metrics port: {err}")))?
+        .port();
+    let metrics_addr = format!("127.0.0.1:{port}");
+
+    let mut child = Command::new(bin)
+        .args([
+            "run",
+            "--platform-store-url",
+            platform_store_url,
+            "--metrics-addr",
+            &metrics_addr,
+        ])
+        .env(LAB_ORACLE_PASSWORD_ENV, LAB_ORACLE_PASSWORD_DEFAULT)
+        .env(LAB_MONGO_PASSWORD_ENV, LAB_MONGO_PASSWORD_DEFAULT)
+        .env("MIGRALOOP_PLATFORM_STORE_URL", platform_store_url)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|err| CliError::Failed(format!("failed to spawn migraloop run for metrics: {err}")))?;
+
+    let scrape = async {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if Instant::now() > deadline {
+                return Err(CliError::Failed(format!(
+                    "metrics endpoint at {metrics_addr} did not become ready"
+                )));
+            }
+            match TcpStream::connect(&metrics_addr).await {
+                Ok(mut stream) => {
+                    if stream
+                        .write_all(
+                            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        let mut buf = Vec::new();
+                        if stream.read_to_end(&mut buf).await.is_ok() {
+                            let body = String::from_utf8_lossy(&buf).to_string();
+                            if body.contains("HTTP/1.1 200") && body.contains("migraloop_") {
+                                return Ok(body);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    let body = match timeout(Duration::from_secs(20), scrape).await {
+        Ok(result) => result,
+        Err(_) => Err(CliError::Failed(
+            "timed out waiting for Observability metrics scrape".to_string(),
+        )),
+    };
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    body
+}
+
+fn parse_prometheus_gauge(body: &str, metric: &str) -> Option<f64> {
+    for line in body.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(metric) {
+            let value_str = if rest.starts_with('{') {
+                rest.split('}').nth(1)?.trim()
+            } else {
+                rest.trim()
+            };
+            if let Some(tok) = value_str.split_whitespace().next() {
+                return tok.parse().ok();
+            }
+        }
+    }
+    None
+}
+
 fn parse_delivery_lag_for_pipeline(status_out: &str, pipeline: &str) -> Option<i32> {
     status_out.lines().find_map(|line| {
         if !(line.contains("Delivery Health") && line.contains(&format!("Pipeline={pipeline}"))) {
@@ -6118,6 +6552,10 @@ mod tests {
         assert!(
             ids.iter().any(|id| id == CHANGE_PIPELINE_ID),
             "catalog must include change-pipeline for Pipeline revision change"
+        );
+        assert!(
+            ids.iter().any(|id| id == OBSERVABILITY_SURFACE_ID),
+            "catalog must include observability-surface for Observability Surface"
         );
         let coverage = lab.join("scenarios/COVERAGE.md");
         let body = fs::read_to_string(&coverage).expect("COVERAGE.md");

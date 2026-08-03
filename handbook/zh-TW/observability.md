@@ -46,8 +46,9 @@ migraloop status
 
 ## Logs 與 metrics
 
-- App/CLI 在 Initial Load、Incremental Capture、Delivery 與失敗時輸出結構化維運訊息（`migraloop` 行程 / container logs 的 stdout/stderr）。
-- Prometheus scrape endpoint 與告警 counters 屬 Observability Surface **契約**（ADR-0008），尚非主要 Operator 介面—在你的 build 提供 metrics 之前，請使用 `status` 的 lag/checkpoint/error 行。
+- App/CLI 在 Initial Load、Incremental Capture、Delivery、Backpressure、Poison Change quarantine，以及 blocking Schema Change 會發出 **structured JSON** operator event lines（並保留 human-readable 對應行）（`migraloop` 行程 / container logs 的 stdout/stderr）。請找 `"event":"…"` 欄位，例如 `initial_load_complete`、`incremental_capture`、`delivery_complete`、`backpressure`、`poison_quarantine`、`schema_change_blocked`。
+- `migraloop run` 在 `http://<metrics-addr>/metrics` 提供 Prometheus scrape endpoint（預設 `0.0.0.0:9090`，可用 `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` 覆寫）。Compose 會公布 host port `9090`。Metrics 包含 Sync/Delivery lag（`migraloop_sync_lag`、`migraloop_delivery_lag`）、Pipeline pause，以及可告警 failure gauges（`migraloop_quarantined_changes`、`migraloop_failures_total`），皆自耐久 Platform Store state 讀取。
+- `status` 仍是 Operator 解讀 lag/checkpoint/error 的主要迴圈；用 scrape `/metrics` 做 alerting 與 dashboards。
 
 ## 相關章節
 

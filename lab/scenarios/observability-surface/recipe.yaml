@@ -1,0 +1,29 @@
+# Lab Scenario recipe (ADR-0025 / issue #27 / ADR-0008).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: observability-surface
+summary: Prometheus /metrics lag+failures, structured operator logs, Sync/Delivery Health on status
+namespace:
+  source_tables:
+    - LAB_OBS_CUSTOMERS
+  target_collections:
+    - lab_obs_customers
+  deployment: lab-observability-surface
+  pipelines:
+    - lab-obs-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery; structured logs)
+    - insert Source backlog
+    - sync with Downstream delay + small queue; stop mid-window (Backpressure structured log)
+    - assert status Sync/Delivery Health lag; scrape Prometheus /metrics via migraloop run
+    - sync catch-up; lag metrics return toward 0
+checks:
+  correctness:
+    - "Apply/sync emit structured JSON operator events (initial_load / backpressure / incremental_capture)"
+    - "status includes Sync Health, Delivery Health, and Pipeline status"
+    - "Prometheus /metrics exposes migraloop_sync_lag, migraloop_delivery_lag, failure counters"
+    - "Catch-up completes with lag=0 on status and metrics"
+thresholds: {}

@@ -30,6 +30,7 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Source Alignment Check for Base Datasets | `source-alignment` | `cli_source_alignment.rs` | Detect Base≠Source; repair Base from Source reads (never write Source); resource-gated `--max-rows` (default 1000); `status` shows Source Alignment |
 | Drift Check with Managed-field auto-repair | `drift-check` | `cli_drift_check.rs` | Detect Managed-field Target drift; default auto-repair via Managed upsert; non-Managed fields preserved; resource-gated `--max-rows` (default 1000); requires Source Alignment baseline for Direct; `status` shows Drift |
 | Bounded backpressure with visible lag | `bounded-backpressure` | `cli_bounded_backpressure.rs` | Downstream Delivery delay + tiny queue capacity → Backpressure signal; queue_depth ≤ capacity; Sync/Delivery Health lag > 0 mid-sync; Pipeline not paused; catch-up lag → 0 |
+| Observability Surface (logs, health, Prometheus) | `observability-surface` | `cli_observability_surface.rs` | Structured JSON operator events on sync; `status` Sync/Delivery Health + Pipeline; `run --metrics-addr` Prometheus `/metrics` exposes lag + alertable failure counters |
 
 ## Explicitly not gate evidence
 

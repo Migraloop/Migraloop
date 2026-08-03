@@ -3,8 +3,10 @@
 mod config;
 mod lab;
 mod lab_scenario;
+mod observability;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -41,6 +43,7 @@ use migraloop_transform::{
 use thiserror::Error;
 
 use crate::config::{load_deployment_config, DeploymentDocument, PipelineSpec, ResolvedSecretRef};
+use crate::observability::{emit_event, EventValue};
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -186,11 +189,14 @@ pub enum Command {
         #[arg(long)]
         deployment: Option<String>,
     },
-    /// Run the app: migrate on startup, then keep the process alive
+    /// Run the app: migrate on startup, expose Observability metrics, keep alive
     Run {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
+        /// Prometheus scrape listen address (host:port) for Observability Surface
+        #[arg(long, env = "MIGRALOOP_METRICS_ADDR", default_value = "0.0.0.0:9090")]
+        metrics_addr: String,
     },
     /// Local Sync Lab Fixture and Lab Scenarios (disposable Oracle, MongoDB, Platform Store, app)
     Lab {
@@ -702,6 +708,18 @@ async fn sync_base_datasets_for_pipelines(
             "Initial Load complete: Base Dataset {table} ({} rows) low-watermark={}",
             dataset.row_count, low_watermark
         );
+        emit_event(
+            "initial_load_complete",
+            &[
+                ("table", EventValue::from(table.as_str())),
+                ("rows", EventValue::from(dataset.row_count)),
+                ("low_watermark", EventValue::from(low_watermark.as_i64())),
+                (
+                    "deployment",
+                    EventValue::from(dataset.deployment_name.as_str()),
+                ),
+            ],
+        );
     }
 
     Ok(())
@@ -1084,6 +1102,22 @@ async fn deliver_direct_pipeline_with_options(
             delivered
         );
     }
+    emit_event(
+        "delivery_complete",
+        &[
+            ("pipeline", EventValue::from(pipeline.name.as_str())),
+            (
+                "deployment",
+                EventValue::from(pipeline.deployment_name.as_str()),
+            ),
+            (
+                "collection",
+                EventValue::from(pipeline.target_collection.as_str()),
+            ),
+            ("documents", EventValue::from(delivered)),
+            ("deletes", EventValue::from(deleted)),
+        ],
+    );
     Ok(())
 }
 
@@ -1910,6 +1944,17 @@ async fn quarantine_poison_change(
          attempts={attempts} unhealthy / not aligned",
         pipeline.name, identity_label, change.change_id
     );
+    emit_event(
+        "poison_quarantine",
+        &[
+            ("level", EventValue::from("alert")),
+            ("pipeline", EventValue::from(pipeline.name.as_str())),
+            ("identity", EventValue::from(identity_label.as_str())),
+            ("change_id", EventValue::from(change.change_id.as_str())),
+            ("stage", EventValue::from(stage)),
+            ("attempts", EventValue::from(attempts as i64)),
+        ],
+    );
     Ok(())
 }
 
@@ -2028,6 +2073,16 @@ async fn apply_schema_change_impacts(
                 println!(
                     "Schema Change: Pipeline={} impact=blocking change_id={} ddl={} paused",
                     pipeline.name, change.change_id, change.summary
+                );
+                emit_event(
+                    "schema_change_blocked",
+                    &[
+                        ("level", EventValue::from("warn")),
+                        ("pipeline", EventValue::from(pipeline.name.as_str())),
+                        ("change_id", EventValue::from(change.change_id.as_str())),
+                        ("ddl", EventValue::from(change.summary.as_str())),
+                        ("impact", EventValue::from("blocking")),
+                    ],
                 );
             }
             SchemaImpact::NonBlocking => {
@@ -2933,6 +2988,19 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                         "Backpressure: queue_depth={queue_depth} capacity={queue_capacity} \
                          lag={reported_lag}"
                     );
+                    emit_event(
+                        "backpressure",
+                        &[
+                            ("table", EventValue::from(table.as_str())),
+                            ("queue_depth", EventValue::from(queue_depth)),
+                            ("capacity", EventValue::from(queue_capacity)),
+                            ("lag", EventValue::from(reported_lag)),
+                            (
+                                "deployment",
+                                EventValue::from(deployment.name.as_str()),
+                            ),
+                        ],
+                    );
                 }
 
                 if windows_processed == 0 {
@@ -2949,6 +3017,23 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                          capacity={queue_capacity}"
                     );
                 }
+                emit_event(
+                    "incremental_capture",
+                    &[
+                        ("table", EventValue::from(table.as_str())),
+                        ("queue_depth", EventValue::from(queue_depth)),
+                        ("capacity", EventValue::from(queue_capacity)),
+                        ("lag", EventValue::from(reported_lag)),
+                        (
+                            "deployment",
+                            EventValue::from(deployment.name.as_str()),
+                        ),
+                        (
+                            "resume_from",
+                            EventValue::from(resume_from.to_string()),
+                        ),
+                    ],
+                );
 
                 for (index, item) in items.iter().enumerate() {
                     // Remaining Source+schema pending after this durable apply.
@@ -3998,13 +4083,19 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         } => {
             remove_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await
         }
-        Command::Run { platform_store_url } => {
+        Command::Run {
+            platform_store_url,
+            metrics_addr,
+        } => {
             apply_migrations(&platform_store_url).await?;
             println!("migraloop is running");
-            // Keep the single app instance alive for the compose one-install setup.
-            // Future slices attach Deployment runtime work here.
-            std::future::pending::<()>().await;
-            Ok(())
+            let addr: SocketAddr = metrics_addr.parse().map_err(|err| {
+                CliError::Failed(format!(
+                    "invalid --metrics-addr / MIGRALOOP_METRICS_ADDR `{metrics_addr}`: {err}"
+                ))
+            })?;
+            // Keep the single app instance alive and serve Prometheus /metrics (ADR-0008).
+            observability::serve_prometheus_metrics(addr, platform_store_url).await
         }
         Command::Lab { command } => run_lab(command).await,
     }

@@ -472,6 +472,32 @@ async fn lab_scenario_list_includes_bounded_backpressure() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_observability_surface() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("observability-surface"),
+        "catalog must list observability-surface Lab Scenario (#27), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("prometheus")
+            || lower.contains("metrics")
+            || lower.contains("structured")
+            || lower.contains("health"),
+        "observability-surface summary should mention metrics/logs/health, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {
@@ -2781,6 +2807,95 @@ async fn lab_scenario_bounded_backpressure_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove bounded-backpressure failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Full Lab Scenario run for Observability Surface (issue #27 / ADR-0008).
+///
+/// ```bash
+/// export LD_LIBRARY_PATH=/path/to/instantclient
+/// cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_observability_surface_run_and_inspect() {
+    let lab = lab_dir();
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "observability-surface",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario run observability-surface");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run observability-surface failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("migraloop_sync_lag")
+            || run_out.contains("\"event\":\"backpressure\"")
+            || run_out.to_ascii_lowercase().contains("prometheus"),
+        "Scenario must exercise metrics/structured logs surface, got:\n{run_out}"
+    );
+
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "observability-surface",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove observability-surface");
+    assert!(
+        remove.status.success(),
+        "lab scenario remove observability-surface failed: {}",
         String::from_utf8_lossy(&remove.stderr)
     );
 
