@@ -11,7 +11,7 @@
 
 ## 声明 Pipelines
 
-Pipelines 位于 Deployment 文档的 `spec.pipelines`：
+Pipelines 位于 Deployment 文档的 `spec.pipelines`。外层 Deployment 的 `apiVersion` 必须是 major `1` 内 SemVer 较旧或相等（正式写法 `migraloop.dev/v1`；较旧可接受形式如 `migraloop.dev/v1.0.0` 仍可套用 Pipeline 声明且无需 wipe-rebuild — 见 [Operations](operations.md) Upgrades 与 [CLI 与 Config](cli-and-config.md)）：
 
 ```yaml
 pipelines:
