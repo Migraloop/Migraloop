@@ -1840,10 +1840,31 @@ async fn recompute_and_deliver_affected_identities(
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
 
+    // Row-grain transforms: match Derived rows by Pipeline Output Identity only.
+    // Affect Analysis identities may include shaped Managed fields (rename/addFields)
+    // whose values changed — those must not leave stale Derived duplicates behind.
+    let group_by = ops
+        .iter()
+        .any(|op| matches!(op, TransformOp::GroupBy { .. }));
+    let identity_targets_row =
+        |identity: &serde_json::Map<String, serde_json::Value>,
+         row: &serde_json::Map<String, serde_json::Value>| {
+            if group_by {
+                identity_matches_row(identity, row)
+            } else {
+                pipeline.output_identity.iter().all(|key| {
+                    match (identity.get(key), row.get(key)) {
+                        (Some(a), Some(b)) => migraloop_transform::json_values_eq(a, b),
+                        _ => false,
+                    }
+                })
+            }
+        };
+
     let mut merged: Vec<serde_json::Map<String, serde_json::Value>> = existing_rows
         .into_iter()
         .map(|r| r.data)
-        .filter(|row| !identities.iter().any(|id| identity_matches_row(id, row)))
+        .filter(|row| !identities.iter().any(|id| identity_targets_row(id, row)))
         .collect();
     merged.extend(recomputed.clone());
 
@@ -1868,7 +1889,7 @@ async fn recompute_and_deliver_affected_identities(
     for identity in identities {
         let still_present = recomputed
             .iter()
-            .any(|row| identity_matches_row(identity, row));
+            .any(|row| identity_targets_row(identity, row));
         if !still_present {
             deletes.push(output_identity_from_row(identity, &pipeline.output_identity)?);
         }

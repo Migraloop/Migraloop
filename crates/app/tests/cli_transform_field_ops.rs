@@ -434,6 +434,17 @@ async fn transform_remove_affect_analysis_skips_unused_address_only_update() {
         derived_after.contains("50.00") || derived_after.contains("50"),
         "used AMOUNT change must update orderAmount in Derived, got:\n{derived_after}"
     );
+    // Output Identity merge: renamed field value change must replace, not duplicate.
+    let order_100_hits = derived_after.matches("\"ORDER_ID\": 100").count()
+        + derived_after.matches("\"ORDER_ID\":100").count();
+    assert_eq!(
+        order_100_hits, 1,
+        "Derived must keep one row per Output Identity after rename-path update, got:\n{derived_after}"
+    );
+    assert!(
+        !derived_after.contains("42.50"),
+        "stale pre-update orderAmount must not remain in Derived, got:\n{derived_after}"
+    );
 }
 
 #[tokio::test]

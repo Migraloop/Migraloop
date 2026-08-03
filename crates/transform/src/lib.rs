@@ -563,64 +563,6 @@ pub fn parse_transform_steps(steps: &[Value]) -> Result<Vec<TransformOp>, Transf
     Ok(ops)
 }
 
-/// Field names present in Derived output after applying ops.
-///
-/// When no project/groupBy/addFields/rename/remove is present, returns `None`
-/// (Derived keeps Base field shape). Prefer [`derived_output_field_names`] when
-/// Base column names are known — open `remove`/`rename`/`addFields` need them.
-pub fn derived_projected_fields(ops: &[TransformOp]) -> Option<Vec<String>> {
-    let mut fields: Option<Vec<String>> = None;
-    let mut shaped = false;
-    for op in ops {
-        match op {
-            TransformOp::Project { fields: projected } => {
-                fields = Some(projected.clone());
-                shaped = true;
-            }
-            TransformOp::GroupBy { keys, aggregates } => {
-                let mut names = keys.clone();
-                for agg in aggregates {
-                    names.push(agg.as_name.clone());
-                }
-                fields = Some(names);
-                shaped = true;
-            }
-            TransformOp::AddFields { fields: adds } => {
-                if let Some(cur) = fields.as_mut() {
-                    for spec in adds {
-                        if !cur.iter().any(|n| n == &spec.as_name) {
-                            cur.push(spec.as_name.clone());
-                        }
-                    }
-                    shaped = true;
-                }
-            }
-            TransformOp::Rename { fields: renames } => {
-                if let Some(cur) = fields.as_mut() {
-                    for spec in renames {
-                        if let Some(pos) = cur.iter().position(|n| n == &spec.from) {
-                            cur[pos] = spec.to.clone();
-                        }
-                    }
-                    shaped = true;
-                }
-            }
-            TransformOp::Remove { fields: remove } => {
-                if let Some(cur) = fields.as_mut() {
-                    cur.retain(|n| !remove.iter().any(|r| r == n));
-                    shaped = true;
-                }
-            }
-            TransformOp::FilterEq { .. } => {}
-        }
-    }
-    if shaped {
-        fields
-    } else {
-        None
-    }
-}
-
 /// Derived Managed field names given Base column names (handles open remove/rename/addFields).
 pub fn derived_output_field_names(ops: &[TransformOp], base_field_names: &[String]) -> Vec<String> {
     let mut fields: Option<Vec<String>> = None;
