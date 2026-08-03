@@ -283,6 +283,29 @@ async fn lab_scenario_list_includes_rt_field_ops() {
 }
 
 #[tokio::test]
+async fn lab_scenario_list_includes_rt_equilookup() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("rt-equilookup"),
+        "catalog must list Rich Transform equiLookup Scenario, got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("equilookup") || lower.contains("multi-base") || lower.contains("join"),
+        "rt-equilookup summary should mention equiLookup/multi-Base, got:\n{out}"
+    );
+}
+
+#[tokio::test]
 async fn lab_scenario_list_includes_idempotent_redelivery() {
     let list = Command::new(bin())
         .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])

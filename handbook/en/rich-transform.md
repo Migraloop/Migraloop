@@ -100,9 +100,31 @@ These aggregations do **not** invent Maintenance State: incremental updates reco
 only affected Output Identities from Base. Unused-field changes (for example ADDRESS
 when aggregates read ORDER_ID/AMOUNT) skip Derived recompute.
 
-Domain roadmap also names operators such as equiLookup, unwind, distinct/addToSet, and
-union. Until those land in the CLI config parser, declare only the operators above—
-unsupported operator names fail apply.
+### `equiLookup`
+
+Left-outer equijoin against another **Base Dataset** in the same Deployment. Matching
+foreign rows are embedded as an array under `as`. The Pipeline's `source.table` is the
+left (primary) Base; `from` names the secondary Base (Initial Load + Incremental Capture
+include both). Optional `fromSchema` overrides the secondary schema (defaults to the
+Pipeline source schema).
+
+```yaml
+- equiLookup:
+    from: ORDERS
+    localField: ID
+    foreignField: CUSTOMER_ID
+    as: orders
+```
+
+Free-form Mongo `$lookup` (including `pipeline` / `let` extensions) is rejected—use this
+declarative form so **Affect Analysis** stays correct. A change on either Base side
+updates only the affected primary Output Identities; unused primary fields (for example
+EMAIL after `project`) still skip recompute. Embedded foreign rows include full Base
+fields, so foreign-side field changes recompute matching identities.
+
+Domain roadmap also names operators such as unwind, distinct/addToSet, and union. Until
+those land in the CLI config parser, declare only the operators above—unsupported
+operator names fail apply.
 
 ## Output Identity
 

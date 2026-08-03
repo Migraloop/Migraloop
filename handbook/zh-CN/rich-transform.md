@@ -100,9 +100,28 @@ Group keys 加上 aggregates。v1 aggregate ops：`sum`、`count`、`min`、`max
 重算受影响的 Output Identities。未使用字段变更（例如 aggregates 读 ORDER_ID/AMOUNT
 时只改 ADDRESS）会跳过 Derived 重算。
 
-领域 roadmap 也提到 equiLookup、unwind、distinct/addToSet、union 等 operators。在它们
-进入 CLI config parser 之前，请只声明上面的 operators—不支持的 operator 名称会让
-apply 失败。
+### `equiLookup`
+
+对同一 Deployment 内另一个 **Base Dataset** 做 left-outer equijoin。匹配的
+foreign rows 会嵌成数组放在 `as` 之下。Pipeline 的 `source.table` 是左侧（primary）
+Base；`from` 命名 secondary Base（Initial Load 与 Incremental Capture 都会覆盖两者）。
+可选的 `fromSchema` 覆盖 secondary schema（默认为 Pipeline source schema）。
+
+```yaml
+- equiLookup:
+    from: ORDERS
+    localField: ID
+    foreignField: CUSTOMER_ID
+    as: orders
+```
+
+自由形式的 Mongo `$lookup`（含 `pipeline` / `let` 扩展）会被拒绝—请用此声明式
+形式，以便 **Affect Analysis** 保持正确。任一侧 Base 变更只更新受影响的 primary
+Output Identities；未使用的 primary 字段（例如 `project` 之后的 EMAIL）仍会跳过重算。
+嵌入的 foreign rows 包含完整 Base 字段，因此 foreign 侧字段变更会重算匹配的 identities。
+
+领域 roadmap 也提到 unwind、distinct/addToSet、union 等 operators。在它们进入 CLI
+config parser 之前，请只声明上面的 operators—不支持的 operator 名称会让 apply 失败。
 
 ## Output Identity
 

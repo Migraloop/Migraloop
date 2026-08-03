@@ -39,9 +39,9 @@ use migraloop_platform_store::{
     SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
 };
 use migraloop_transform::{
-    analyze_affect, derived_output_field_names, evaluate_transform,
-    evaluate_transform_for_identities, identity_matches_row, parse_transform_steps, used_base_fields,
-    AffectOutcome, BaseChangeKind, TransformOp,
+    analyze_affect_on_base, derived_output_field_names, evaluate_transform_with_bases,
+    evaluate_transform_for_identities_with_bases, identity_matches_row, parse_transform_steps,
+    secondary_base_refs, used_base_fields, AffectOutcome, BaseChangeKind, TransformOp,
 };
 use thiserror::Error;
 
@@ -435,6 +435,60 @@ fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformOp>, 
     })
 }
 
+/// Base Dataset (schema, table) pairs a Pipeline references — primary `source.table`
+/// plus every `equiLookup.from` secondary Base.
+fn pipeline_base_table_refs(pipeline: &Pipeline) -> Vec<(String, String)> {
+    let mut tables = BTreeSet::new();
+    if !pipeline.source_table.is_empty() {
+        tables.insert((pipeline.source_schema.clone(), pipeline.source_table.clone()));
+    }
+    if pipeline.mode == "transform" {
+        if let Ok(ops) = transform_ops_from_pipeline(pipeline) {
+            for sec in secondary_base_refs(&ops) {
+                let schema = sec
+                    .schema
+                    .unwrap_or_else(|| pipeline.source_schema.clone());
+                tables.insert((schema, sec.table));
+            }
+        }
+    }
+    tables.into_iter().collect()
+}
+
+fn pipeline_references_table(pipeline: &Pipeline, table: &str) -> bool {
+    pipeline_base_table_refs(pipeline)
+        .iter()
+        .any(|(_, t)| t.eq_ignore_ascii_case(table))
+}
+
+/// Load secondary Base rows for all `equiLookup.from` tables on this Pipeline.
+async fn load_secondary_bases_for_pipeline(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+    ops: &[TransformOp],
+) -> Result<BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>>, CliError> {
+    let mut secondary = BTreeMap::new();
+    for sec in secondary_base_refs(ops) {
+        let (_base, rows) = get_base_rows(
+            platform_store_url,
+            &sec.table,
+            Some(&pipeline.deployment_name),
+        )
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Transform Pipeline {}: equiLookup.from Base Dataset `{}` unavailable: {err}",
+                pipeline.name, sec.table
+            ))
+        })?;
+        secondary.insert(
+            sec.table,
+            rows.into_iter().map(|r| r.data).collect(),
+        );
+    }
+    Ok(secondary)
+}
+
 fn mongo_target_from_deployment(deployment: &Deployment) -> Result<MongoTargetConnection, CliError> {
     if deployment.target.port <= 0 || deployment.target.port > u16::MAX as i32 {
         return Err(CliError::Failed(
@@ -678,10 +732,9 @@ async fn sync_base_datasets_for_pipelines(
     let configured_tz = source_timezone_opt(deployment);
     let mut tables = BTreeSet::new();
     for pipeline in pipelines {
-        tables.insert((
-            pipeline.source_schema.clone(),
-            pipeline.source_table.clone(),
-        ));
+        for (schema, table) in pipeline_base_table_refs(pipeline) {
+            tables.insert((schema, table));
+        }
     }
     let keep: Vec<(String, String)> = tables.iter().cloned().collect();
 
@@ -1022,9 +1075,11 @@ async fn initial_load_should_pause(
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     for pipeline in pipelines {
-        if pipeline.source_table != table || pipeline.deployment_name != deployment_name {
+        if !pipeline_references_table(pipeline, table)
+            || (pipeline.deployment_name != deployment_name && !pipeline.deployment_name.is_empty())
+        {
             // `pipelines` arg may still have deployment_name unset before persist; match by name.
-            if pipeline.source_table != table {
+            if !pipeline_references_table(pipeline, table) {
                 continue;
             }
         }
@@ -1202,8 +1257,10 @@ fn ensure_oracle_source_prerequisites(
 fn pipeline_source_tables(pipelines: &[Pipeline]) -> Vec<String> {
     let mut tables = BTreeSet::new();
     for pipeline in pipelines {
-        if !pipeline.source_table.is_empty() {
-            tables.insert(pipeline.source_table.clone());
+        for (_, table) in pipeline_base_table_refs(pipeline) {
+            if !table.is_empty() {
+                tables.insert(table);
+            }
         }
     }
     tables.into_iter().collect()
@@ -1556,8 +1613,9 @@ async fn deliver_transform_pipeline_with_options(
     .map_err(|err| CliError::Failed(err.to_string()))?;
 
     let ops = transform_ops_from_pipeline(pipeline)?;
+    let secondary = load_secondary_bases_for_pipeline(platform_store_url, pipeline, &ops).await?;
     let base_maps: Vec<_> = base_rows.iter().map(|r| r.data.clone()).collect();
-    let derived_rows = evaluate_transform(&ops, &base_maps)
+    let derived_rows = evaluate_transform_with_bases(&ops, &base_maps, &secondary)
         .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
 
     let derived_columns = derived_columns_for_ops(&base.columns, &ops, &derived_rows);
@@ -1662,9 +1720,10 @@ async fn deliver_transform_pipeline_with_options(
     Ok(())
 }
 
-/// Columns for a Derived Dataset after project/addFields/rename/remove/groupBy,
+/// Columns for a Derived Dataset after project/addFields/rename/remove/equiLookup/groupBy,
 /// unioned with keys observed in Derived rows. Works for empty Derived results.
 /// Aggregate/`addFields`/`rename` aliases inherit the source field's Oracle type metadata.
+/// `equiLookup` `as` arrays are nested documents (no Oracle scalar type).
 fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
     ops: &[TransformOp],
@@ -1682,6 +1741,7 @@ fn derived_columns_for_ops(
         .map(|c| (c.name.as_str(), c))
         .collect();
     let mut alias_source: BTreeMap<String, String> = BTreeMap::new();
+    let mut nested_document_fields: BTreeSet<String> = BTreeSet::new();
     for op in ops {
         match op {
             TransformOp::GroupBy { aggregates, .. } => {
@@ -1709,7 +1769,13 @@ fn derived_columns_for_ops(
                         .cloned()
                         .unwrap_or_else(|| spec.from.clone());
                     alias_source.insert(spec.to.clone(), src);
+                    if nested_document_fields.remove(&spec.from) {
+                        nested_document_fields.insert(spec.to.clone());
+                    }
                 }
+            }
+            TransformOp::EquiLookup { as_name, .. } => {
+                nested_document_fields.insert(as_name.clone());
             }
             _ => {}
         }
@@ -1717,7 +1783,14 @@ fn derived_columns_for_ops(
     names
         .into_iter()
         .map(|name| {
-            if let Some(col) = by_name.get(name.as_str()) {
+            if nested_document_fields.contains(&name) {
+                BaseColumn {
+                    name,
+                    oracle_type: "JSON".to_string(),
+                    precision: None,
+                    scale: None,
+                }
+            } else if let Some(col) = by_name.get(name.as_str()) {
                 (*col).clone()
             } else if let Some(source) = alias_source.get(&name) {
                 if let Some(col) = by_name.get(source.as_str()) {
@@ -1756,12 +1829,15 @@ fn base_change_kind(op: ChangeOp) -> BaseChangeKind {
 }
 
 /// Incremental Transform maintenance for one Base change (Affect Analysis driven).
+///
+/// `changed_table` / `changed_base_rows` are the Base that just received the change
+/// (primary `source.table` or an `equiLookup.from` secondary).
 async fn maintain_transform_pipeline_for_change(
     platform_store_url: &str,
     pipeline: &Pipeline,
     mongo: &MongoTargetConnection,
-    base_columns: &[BaseColumn],
-    base_rows: &[serde_json::Map<String, serde_json::Value>],
+    changed_table: &str,
+    changed_base_rows: &[serde_json::Map<String, serde_json::Value>],
     change: &ChangeEvent,
     pre_apply: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<(), CliError> {
@@ -1769,14 +1845,14 @@ async fn maintain_transform_pipeline_for_change(
     let after = match change.op {
         ChangeOp::Insert | ChangeOp::Update => {
             Some(
-                base_rows
+                changed_base_rows
                     .iter()
                     .find(|row| row_matches_identity(row, &change.identity))
                     .cloned()
                     .ok_or_else(|| {
                         CliError::Failed(format!(
-                            "Base Dataset {} missing row for change identity {:?} after apply",
-                            pipeline.source_table, change.identity
+                            "Base Dataset {changed_table} missing row for change identity {:?} after apply",
+                            change.identity
                         ))
                     })?,
             )
@@ -1784,11 +1860,38 @@ async fn maintain_transform_pipeline_for_change(
         ChangeOp::Delete => None,
     };
 
-    let outcome = analyze_affect(
+    let (primary_columns, primary_rows) = if changed_table.eq_ignore_ascii_case(&pipeline.source_table)
+    {
+        let (base, _) = get_base_rows(
+            platform_store_url,
+            &pipeline.source_table,
+            Some(&pipeline.deployment_name),
+        )
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+        (base.columns, changed_base_rows.to_vec())
+    } else {
+        let (base, rows) = get_base_rows(
+            platform_store_url,
+            &pipeline.source_table,
+            Some(&pipeline.deployment_name),
+        )
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+        (
+            base.columns,
+            rows.into_iter().map(|r| r.data).collect(),
+        )
+    };
+
+    let outcome = analyze_affect_on_base(
         &ops,
+        changed_table,
+        &pipeline.source_table,
         base_change_kind(change.op),
         pre_apply,
         after.as_ref(),
+        &primary_rows,
     )
     .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
 
@@ -1806,12 +1909,24 @@ async fn maintain_transform_pipeline_for_change(
                 pipeline.name,
                 identities.len()
             );
+            let mut secondary =
+                load_secondary_bases_for_pipeline(platform_store_url, pipeline, &ops).await?;
+            // Incremental Delivery runs before the changed Base is persisted — prefer
+            // the in-memory after-image for the table that just changed.
+            if !changed_table.eq_ignore_ascii_case(&pipeline.source_table) {
+                for sec in secondary_base_refs(&ops) {
+                    if sec.table.eq_ignore_ascii_case(changed_table) {
+                        secondary.insert(sec.table, changed_base_rows.to_vec());
+                    }
+                }
+            }
             recompute_and_deliver_affected_identities(
                 platform_store_url,
                 pipeline,
                 mongo,
-                base_columns,
-                base_rows,
+                &primary_columns,
+                &primary_rows,
+                &secondary,
                 &ops,
                 &identities,
             )
@@ -1825,12 +1940,18 @@ async fn recompute_and_deliver_affected_identities(
     pipeline: &Pipeline,
     mongo: &MongoTargetConnection,
     base_columns: &[BaseColumn],
-    base_rows: &[serde_json::Map<String, serde_json::Value>],
+    primary_rows: &[serde_json::Map<String, serde_json::Value>],
+    secondary_bases: &BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
     ops: &[TransformOp],
     identities: &[serde_json::Map<String, serde_json::Value>],
 ) -> Result<(), CliError> {
-    let recomputed = evaluate_transform_for_identities(ops, base_rows, identities)
-        .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
+    let recomputed = evaluate_transform_for_identities_with_bases(
+        ops,
+        primary_rows,
+        secondary_bases,
+        identities,
+    )
+    .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
 
     let (mut dataset, existing_rows) = get_derived_rows(
         platform_store_url,
@@ -2219,7 +2340,7 @@ async fn set_delivery_lag_for_table(
     delivery_lag: i32,
 ) -> Result<(), CliError> {
     for pipeline in pipelines {
-        if pipeline.target_collection.is_empty() || pipeline.source_table != table {
+        if pipeline.target_collection.is_empty() || !pipeline_references_table(pipeline, table) {
             continue;
         }
         update_pipeline_delivery_lag(
@@ -2404,6 +2525,9 @@ impl IncrementalItem {
 /// Dependency columns for Schema Change impact classification.
 fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineSchemaDeps {
     let mut dependency_columns: BTreeSet<String> = dataset.primary_key.iter().cloned().collect();
+    let is_primary = dataset
+        .source_table
+        .eq_ignore_ascii_case(&pipeline.source_table);
     match pipeline.mode.as_str() {
         "direct" => {
             for col in &dataset.columns {
@@ -2414,15 +2538,22 @@ fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineS
             }
         }
         "transform" => {
-            if let Some(transform) = &pipeline.transform_json {
-                if let Some(steps) = transform.as_array() {
-                    if let Ok(ops) = parse_transform_steps(steps) {
-                        dependency_columns.extend(used_base_fields(&ops));
+            if is_primary {
+                if let Some(transform) = &pipeline.transform_json {
+                    if let Some(steps) = transform.as_array() {
+                        if let Ok(ops) = parse_transform_steps(steps) {
+                            dependency_columns.extend(used_base_fields(&ops));
+                        }
                     }
                 }
-            }
-            for field in &pipeline.output_identity {
-                dependency_columns.insert(field.clone());
+                for field in &pipeline.output_identity {
+                    dependency_columns.insert(field.clone());
+                }
+            } else {
+                // equiLookup embeds full foreign rows — any column drop/type change blocks.
+                for col in &dataset.columns {
+                    dependency_columns.insert(col.name.clone());
+                }
             }
         }
         _ => {
@@ -2432,8 +2563,8 @@ fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineS
         }
     }
     PipelineSchemaDeps {
-        source_table: pipeline.source_table.clone(),
-        source_schema: pipeline.source_schema.clone(),
+        source_table: dataset.source_table.clone(),
+        source_schema: dataset.source_schema.clone(),
         dependency_columns,
     }
 }
@@ -2448,13 +2579,18 @@ async fn apply_schema_change_impacts(
     change: &SchemaChangeEvent,
 ) -> Result<(), CliError> {
     for pipeline in deployment_pipelines.iter_mut() {
-        if pipeline.source_table != table {
+        if !pipeline_references_table(pipeline, table) {
             continue;
         }
-        if !pipeline.source_schema.is_empty()
-            && !schema.is_empty()
-            && !pipeline.source_schema.eq_ignore_ascii_case(schema)
-        {
+        // Schema must match the referenced Base (primary schema or equiLookup fromSchema).
+        let refs = pipeline_base_table_refs(pipeline);
+        let schema_ok = refs.iter().any(|(ref_schema, ref_table)| {
+            ref_table.eq_ignore_ascii_case(table)
+                && (ref_schema.is_empty()
+                    || schema.is_empty()
+                    || ref_schema.eq_ignore_ascii_case(schema))
+        });
+        if !schema_ok {
             continue;
         }
         let deps = pipeline_schema_deps(pipeline, dataset);
@@ -3197,10 +3333,9 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 
         let mut tables = BTreeSet::new();
         for pipeline in &deployment_pipelines {
-            tables.insert((
-                pipeline.source_schema.clone(),
-                pipeline.source_table.clone(),
-            ));
+            for (schema, table) in pipeline_base_table_refs(pipeline) {
+                tables.insert((schema, table));
+            }
         }
 
         // ADR-0021: fail-fast Source Prerequisites before Incremental Capture.
@@ -3274,7 +3409,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             for pipeline in &deployment_pipelines {
                 if pipeline.paused
                     && !pipeline.target_collection.is_empty()
-                    && pipeline.source_table == table
+                    && pipeline_references_table(pipeline, &table)
                 {
                     println!(
                         "Pipeline {} paused — skipping Delivery/processing for {table}",
@@ -3530,7 +3665,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                             // Delivery before durable checkpoint so retries prefer duplicate applies.
                             for pipeline in &deployment_pipelines {
                                 if pipeline.target_collection.is_empty()
-                                    || pipeline.source_table != table
+                                    || !pipeline_references_table(pipeline, &table)
                                 {
                                     continue;
                                 }
@@ -3540,7 +3675,12 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                                 }
 
                                 match pipeline.mode.as_str() {
-                                    "direct" => match change.op {
+                                    "direct" => {
+                                        // Direct Pipelines only Deliver their primary source.table.
+                                        if !pipeline.source_table.eq_ignore_ascii_case(&table) {
+                                            continue;
+                                        }
+                                        match change.op {
                                         ChangeOp::Insert | ChangeOp::Update => {
                                             let Some(base_row) = rows.iter().find(|row| {
                                                 row_matches_identity(row, &change.identity)
@@ -3667,7 +3807,8 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                                                 }
                                             }
                                         }
-                                    },
+                                        }
+                                    }
                                     "transform" => {
                                         let mut last_error = String::new();
                                         let mut succeeded = false;
@@ -3677,7 +3818,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                                                 platform_store_url,
                                                 pipeline,
                                                 &mongo,
-                                                &dataset.columns,
+                                                &table,
                                                 &rows,
                                                 change,
                                                 pre_apply.as_ref(),
@@ -4433,10 +4574,9 @@ async fn remove_pipeline_command(
         .collect::<Vec<_>>();
     let mut keep = BTreeSet::new();
     for remaining_pipeline in &remaining {
-        keep.insert((
-            remaining_pipeline.source_schema.clone(),
-            remaining_pipeline.source_table.clone(),
-        ));
+        for (schema, table) in pipeline_base_table_refs(remaining_pipeline) {
+            keep.insert((schema, table));
+        }
     }
     let keep_tables: Vec<(String, String)> = keep.into_iter().collect();
     delete_base_datasets_not_in(

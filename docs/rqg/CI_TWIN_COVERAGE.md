@@ -19,6 +19,7 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Rich Transform `project` | `rt-project` | `cli_transform_pipeline.rs` (`project` paths) | |
 | Rich Transform `filter` | `rt-filter` | `cli_transform_pipeline.rs` (`filter` paths) | |
 | Rich Transform `addFields` / `rename` / `remove` | `rt-field-ops` | `cli_transform_field_ops.rs` | Affect Analysis unused-field skip after `remove` |
+| Rich Transform `equiLookup` (multi-Base Transform Pipeline) | `rt-equilookup` | `cli_equilookup_affect.rs` | Multi-Base Initial Load + Derived join array; Affect Analysis on primary and foreign Bases; `$lookup`/script reject |
 | Rich Transform `groupBy` / `sum` (also under contention) | `transform-pipeline`, `concurrent-source-workload` | `cli_groupby_sum_affect.rs`, `cli_multi_table_incremental.rs` | CI: multi-table settle after both Bases change. OS-parallel Source sessions stay Lab-manual |
 | Rich Transform `groupBy` `count` / `min` / `max` / `avg` | `transform-pipeline` | `cli_groupby_rich_aggs_affect.rs` | Affect Analysis unused-field skip + incremental Derived for new aggregations |
 | Intra-Scenario concurrent Source workload | `concurrent-source-workload` | `cli_multi_table_incremental.rs` | CI twin = same multi-table Pipeline shape settling after Incremental on both tables (correctness where sensible). Parallel sqlplus / contention timing stay Lab-manual |
