@@ -26,11 +26,12 @@ use migraloop_delivery::{
 };
 use migraloop_platform_store::{
     append_base_dataset_chunk, base_dataset_exists, check_store_settings,
-    clear_schema_change_impacts, delete_base_datasets_not_in, delete_pipeline, disk_warn_message,
-    filter_unapplied_change_ids, get_base_rows, get_derived_rows, health, list_base_datasets,
-    list_deployments, list_derived_datasets, list_pipelines, list_quarantined_changes,
-    list_schema_change_impacts, migrate, probe_store_resources, probe_store_settings,
-    record_applied_source_changes, replace_base_dataset, replace_derived_dataset, replace_pipelines,
+    clear_schema_change_impacts, delete_base_datasets_not_in, delete_maintenance_state,
+    delete_pipeline, disk_warn_message, filter_unapplied_change_ids, get_base_rows,
+    get_derived_rows, get_maintenance_state_json, health, list_base_datasets, list_deployments,
+    list_derived_datasets, list_pipelines, list_quarantined_changes, list_schema_change_impacts,
+    migrate, probe_store_resources, probe_store_settings, record_applied_source_changes,
+    replace_base_dataset, replace_derived_dataset, replace_maintenance_state, replace_pipelines,
     set_pipeline_paused, update_base_primary_key, update_pipeline_delivery_lag,
     update_pipeline_delivery_progress, update_pipeline_delivery_progress_with_lag,
     update_pipeline_drift_status, upsert_deployment, upsert_quarantined_change,
@@ -39,9 +40,11 @@ use migraloop_platform_store::{
     SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
 };
 use migraloop_transform::{
-    analyze_affect_on_base, derived_output_field_names, evaluate_transform_with_bases,
-    evaluate_transform_for_identities_with_bases, identity_matches_row, parse_transform_steps,
-    secondary_base_refs, used_base_fields, AffectOutcome, BaseChangeKind, TransformOp,
+    analyze_affect_on_base, analyze_affect_with_maintenance, build_maintenance_state,
+    derived_output_field_names, evaluate_transform_with_bases,
+    evaluate_transform_for_identities_with_bases, identity_matches_row, maintain_state_for_change,
+    parse_transform_steps, requires_maintenance_state, secondary_base_refs, used_base_fields,
+    AffectOutcome, BaseChangeKind, MaintenanceState, TransformOp,
 };
 use thiserror::Error;
 
@@ -1657,6 +1660,14 @@ async fn deliver_transform_pipeline_with_options(
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
+    persist_maintenance_state_for_pipeline(
+        platform_store_url,
+        pipeline,
+        &ops,
+        &base_maps,
+    )
+    .await?;
+
     println!(
         "Derived Dataset materialized: Pipeline {} ({} rows)",
         pipeline.name, dataset.row_count
@@ -1777,6 +1788,10 @@ fn derived_columns_for_ops(
             TransformOp::EquiLookup { as_name, .. } => {
                 nested_document_fields.insert(as_name.clone());
             }
+            TransformOp::AddToSet { as_name, .. } => {
+                // Distinct values collected into a JSON array.
+                nested_document_fields.insert(as_name.clone());
+            }
             _ => {}
         }
     }
@@ -1818,6 +1833,74 @@ fn derived_columns_for_ops(
             }
         })
         .collect()
+}
+
+async fn persist_maintenance_state_for_pipeline(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+    ops: &[TransformOp],
+    base_rows: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<(), CliError> {
+    if !requires_maintenance_state(ops) {
+        delete_maintenance_state(
+            platform_store_url,
+            &pipeline.deployment_name,
+            &pipeline.name,
+        )
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+        return Ok(());
+    }
+    let state = build_maintenance_state(ops, base_rows).map_err(|err| {
+        CliError::Failed(format!(
+            "Transform Pipeline {}: failed to build Maintenance State: {err}",
+            pipeline.name
+        ))
+    })?;
+    persist_maintenance_state_json(platform_store_url, pipeline, &state).await
+}
+
+async fn persist_maintenance_state_json(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+    state: &MaintenanceState,
+) -> Result<(), CliError> {
+    let state_json = serde_json::to_string(state).map_err(|err| {
+        CliError::Failed(format!(
+            "Transform Pipeline {}: failed to serialize Maintenance State: {err}",
+            pipeline.name
+        ))
+    })?;
+    replace_maintenance_state(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
+        &state_json,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))
+}
+
+async fn load_maintenance_state_for_pipeline(
+    platform_store_url: &str,
+    pipeline: &Pipeline,
+) -> Result<MaintenanceState, CliError> {
+    match get_maintenance_state_json(
+        platform_store_url,
+        &pipeline.deployment_name,
+        &pipeline.name,
+    )
+    .await
+    .map_err(|err| CliError::Failed(err.to_string()))?
+    {
+        Some(json) => serde_json::from_str(&json).map_err(|err| {
+            CliError::Failed(format!(
+                "Transform Pipeline {}: invalid Maintenance State JSON: {err}",
+                pipeline.name
+            ))
+        }),
+        None => Ok(MaintenanceState::default()),
+    }
 }
 
 fn base_change_kind(op: ChangeOp) -> BaseChangeKind {
@@ -1884,21 +1967,55 @@ async fn maintain_transform_pipeline_for_change(
         )
     };
 
-    let outcome = analyze_affect_on_base(
-        &ops,
-        changed_table,
-        &pipeline.source_table,
-        base_change_kind(change.op),
-        pre_apply,
-        after.as_ref(),
-        &primary_rows,
-    )
-    .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
+    let kind = base_change_kind(change.op);
+    let is_primary = changed_table.eq_ignore_ascii_case(&pipeline.source_table);
+    let needs_ms = requires_maintenance_state(&ops);
+
+    let mut maintenance = if needs_ms {
+        Some(load_maintenance_state_for_pipeline(platform_store_url, pipeline).await?)
+    } else {
+        None
+    };
+
+    let outcome = if let (true, Some(state)) = (is_primary && needs_ms, maintenance.as_ref()) {
+        analyze_affect_with_maintenance(&ops, kind, pre_apply, after.as_ref(), state).map_err(
+            |err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)),
+        )?
+    } else {
+        analyze_affect_on_base(
+            &ops,
+            changed_table,
+            &pipeline.source_table,
+            kind,
+            pre_apply,
+            after.as_ref(),
+            &primary_rows,
+        )
+        .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?
+    };
+
+    // Value-level distinct/addToSet skips still update Maintenance State refcounts.
+    if let (true, Some(state)) = (is_primary && needs_ms, maintenance.as_mut()) {
+        maintain_state_for_change(&ops, state, kind, pre_apply, after.as_ref()).map_err(|err| {
+            CliError::Failed(format!(
+                "Transform Pipeline {}: Maintenance State update failed: {err}",
+                pipeline.name
+            ))
+        })?;
+        persist_maintenance_state_json(platform_store_url, pipeline, state).await?;
+    }
 
     match outcome {
         AffectOutcome::SkipUnusedFields => {
             println!(
                 "Affect Analysis: Pipeline {} skipped (unused fields only)",
+                pipeline.name
+            );
+            Ok(())
+        }
+        AffectOutcome::SkipValueUnchanged => {
+            println!(
+                "Affect Analysis: Pipeline {} skipped (value-level; no Derived change)",
                 pipeline.name
             );
             Ok(())
@@ -1913,7 +2030,7 @@ async fn maintain_transform_pipeline_for_change(
                 load_secondary_bases_for_pipeline(platform_store_url, pipeline, &ops).await?;
             // Incremental Delivery runs before the changed Base is persisted — prefer
             // the in-memory after-image for the table that just changed.
-            if !changed_table.eq_ignore_ascii_case(&pipeline.source_table) {
+            if !is_primary {
                 for sec in secondary_base_refs(&ops) {
                     if sec.table.eq_ignore_ascii_case(changed_table) {
                         secondary.insert(sec.table, changed_base_rows.to_vec());
@@ -1961,16 +2078,22 @@ async fn recompute_and_deliver_affected_identities(
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
 
+    // Grouped transforms (groupBy/distinct/addToSet): match by grouping keys.
     // Row-grain transforms: match Derived rows by Pipeline Output Identity only.
     // Affect Analysis identities may include shaped Managed fields (rename/addFields)
     // whose values changed — those must not leave stale Derived duplicates behind.
-    let group_by = ops
-        .iter()
-        .any(|op| matches!(op, TransformOp::GroupBy { .. }));
+    let grouped = ops.iter().any(|op| {
+        matches!(
+            op,
+            TransformOp::GroupBy { .. }
+                | TransformOp::Distinct { .. }
+                | TransformOp::AddToSet { .. }
+        )
+    });
     let identity_targets_row =
         |identity: &serde_json::Map<String, serde_json::Value>,
          row: &serde_json::Map<String, serde_json::Value>| {
-            if group_by {
+            if grouped {
                 identity_matches_row(identity, row)
             } else {
                 pipeline.output_identity.iter().all(|key| {

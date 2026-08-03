@@ -1,10 +1,11 @@
 //! Rich Transform operators and Affect Analysis.
 //!
 //! Declarative project, addFields, rename, remove, filter (eq), equiLookup,
-//! and groupBy (sum/count/min/max/avg) over Base Dataset rows. Free-form
-//! scripts and unanalyzable operators (including `$lookup` pipelines) are
-//! rejected at parse time. Affect Analysis skips Derived recompute when only
-//! unused Base fields change.
+//! groupBy (sum/count/min/max/avg), distinct, and addToSet over Base Dataset
+//! rows. Free-form scripts and unanalyzable operators (including `$lookup`
+//! pipelines) are rejected at parse time. Affect Analysis skips Derived
+//! recompute when only unused Base fields change, and (with Maintenance State)
+//! when distinct/addToSet value-level semantics prove no Derived change.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -16,9 +17,9 @@ pub const SEAM: &str = "transform";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransformError {
-    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/equiLookup/groupBy)")]
+    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/equiLookup/groupBy/distinct/addToSet)")]
     FreeFormScript,
-    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, equiLookup, and groupBy")]
+    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, equiLookup, groupBy, distinct, and addToSet")]
     UnsupportedOperator(String),
     #[error("invalid Rich Transform: {0}")]
     Invalid(String),
@@ -98,6 +99,14 @@ pub enum TransformOp {
         keys: Vec<String>,
         aggregates: Vec<AggregateSpec>,
     },
+    /// One Derived row per unique combination of `fields` (SQL DISTINCT).
+    Distinct { fields: Vec<String> },
+    /// Group by `keys`; collect unique non-null values of `field` into array `as_name`.
+    AddToSet {
+        keys: Vec<String>,
+        field: String,
+        as_name: String,
+    },
 }
 
 /// Kind of Base change for Affect Analysis (mirrors capture ChangeOp without coupling).
@@ -113,10 +122,34 @@ pub enum BaseChangeKind {
 pub enum AffectOutcome {
     /// Only unused fields changed; Derived must not recompute for this transform.
     SkipUnusedFields,
+    /// Value-level semantics (distinct/addToSet + Maintenance State) prove no Derived change.
+    SkipValueUnchanged,
     /// Recompute Derived for these Output Identity maps (group key → value).
     Recompute {
         identities: Vec<Map<String, Value>>,
     },
+}
+
+/// One Maintenance State entry: refcount for a distinct identity or an addToSet member.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceEntry {
+    /// Distinct fields, or addToSet group keys.
+    pub identity: Map<String, Value>,
+    /// `None` for distinct; `Some(member)` for addToSet value membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    pub refcount: i64,
+}
+
+/// Platform-internal Maintenance State for operators that need value-level Affect Analysis.
+///
+/// Created only when [`requires_maintenance_state`] is true (distinct / addToSet).
+/// Simple groupBy sum/count/min/max/avg must not invent this structure.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceState {
+    pub entries: Vec<MaintenanceEntry>,
 }
 
 /// Parse one declarative transform step JSON object into an analyzable operator.
@@ -129,6 +162,8 @@ pub enum AffectOutcome {
 /// - `{ "filter": { "field": "...", "eq": ... } }`
 /// - `{ "equiLookup": { "from": "...", "localField": "...", "foreignField": "...", "as": "...", "fromSchema?": "..." } }`
 /// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum"|"count"|"min"|"max"|"avg", "field": "...", "as": "..." }] } }`
+/// - `{ "distinct": { "fields": [...] } }`
+/// - `{ "addToSet": { "keys": [...], "field": "...", "as": "..." } }`
 /// Rejected shapes (clear errors):
 /// - `{ "script": "..." }` / `{ "function": "..." }`
 /// - `{ "$lookup": ... }` (use declarative `equiLookup`)
@@ -211,6 +246,24 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
             ));
         }
         return parse_group_by(obj.get("groupBy").expect("groupBy key"));
+    }
+
+    if obj.contains_key("distinct") {
+        if obj.len() != 1 {
+            return Err(TransformError::Invalid(
+                "distinct step must not mix other operators in the same step".to_string(),
+            ));
+        }
+        return parse_distinct(obj.get("distinct").expect("distinct key"));
+    }
+
+    if obj.contains_key("addToSet") {
+        if obj.len() != 1 {
+            return Err(TransformError::Invalid(
+                "addToSet step must not mix other operators in the same step".to_string(),
+            ));
+        }
+        return parse_add_to_set(obj.get("addToSet").expect("addToSet key"));
     }
 
     let name = obj
@@ -678,6 +731,103 @@ fn parse_aggregate(value: &Value, index: usize) -> Result<AggregateSpec, Transfo
     })
 }
 
+fn parse_distinct(value: &Value) -> Result<TransformOp, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid("distinct must be an object with fields".to_string())
+    })?;
+    let fields_value = obj.get("fields").ok_or_else(|| {
+        TransformError::Invalid("distinct.fields is required".to_string())
+    })?;
+    let fields_arr = fields_value.as_array().ok_or_else(|| {
+        TransformError::Invalid("distinct.fields must be an array of field names".to_string())
+    })?;
+    if fields_arr.is_empty() {
+        return Err(TransformError::Invalid(
+            "distinct.fields must not be empty".to_string(),
+        ));
+    }
+    let mut fields = Vec::with_capacity(fields_arr.len());
+    for entry in fields_arr {
+        let name = entry.as_str().ok_or_else(|| {
+            TransformError::Invalid("distinct.fields entries must be strings".to_string())
+        })?;
+        if name.trim().is_empty() {
+            return Err(TransformError::Invalid(
+                "distinct.fields entries must not be empty".to_string(),
+            ));
+        }
+        fields.push(name.to_string());
+    }
+    if obj.keys().any(|k| k != "fields") {
+        return Err(TransformError::Invalid(
+            "distinct only supports fields".to_string(),
+        ));
+    }
+    Ok(TransformOp::Distinct { fields })
+}
+
+fn parse_add_to_set(value: &Value) -> Result<TransformOp, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid(
+            "addToSet must be an object with keys, field, and as".to_string(),
+        )
+    })?;
+    let keys_value = obj.get("keys").ok_or_else(|| {
+        TransformError::Invalid("addToSet.keys is required".to_string())
+    })?;
+    let keys_arr = keys_value.as_array().ok_or_else(|| {
+        TransformError::Invalid("addToSet.keys must be an array of field names".to_string())
+    })?;
+    if keys_arr.is_empty() {
+        return Err(TransformError::Invalid(
+            "addToSet.keys must not be empty".to_string(),
+        ));
+    }
+    let mut keys = Vec::with_capacity(keys_arr.len());
+    for entry in keys_arr {
+        let name = entry.as_str().ok_or_else(|| {
+            TransformError::Invalid("addToSet.keys entries must be strings".to_string())
+        })?;
+        if name.trim().is_empty() {
+            return Err(TransformError::Invalid(
+                "addToSet.keys entries must not be empty".to_string(),
+            ));
+        }
+        keys.push(name.to_string());
+    }
+    let field = obj
+        .get("field")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TransformError::Invalid("addToSet.field is required".to_string()))?;
+    if field.trim().is_empty() {
+        return Err(TransformError::Invalid(
+            "addToSet.field must not be empty".to_string(),
+        ));
+    }
+    let as_name = obj
+        .get("as")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TransformError::Invalid("addToSet.as is required".to_string()))?;
+    if as_name.trim().is_empty() {
+        return Err(TransformError::Invalid(
+            "addToSet.as must not be empty".to_string(),
+        ));
+    }
+    if obj
+        .keys()
+        .any(|k| k != "keys" && k != "field" && k != "as")
+    {
+        return Err(TransformError::Invalid(
+            "addToSet only supports keys, field, and as".to_string(),
+        ));
+    }
+    Ok(TransformOp::AddToSet {
+        keys,
+        field: field.to_string(),
+        as_name: as_name.to_string(),
+    })
+}
+
 /// Parse a list of declarative transform step JSON values.
 pub fn parse_transform_steps(steps: &[Value]) -> Result<Vec<TransformOp>, TransformError> {
     if steps.is_empty() {
@@ -698,6 +848,15 @@ pub fn parse_transform_steps(steps: &[Value]) -> Result<Vec<TransformOp>, Transf
             Err(other) => return Err(other),
         }
     }
+    let ms_ops = ops
+        .iter()
+        .filter(|op| matches!(op, TransformOp::Distinct { .. } | TransformOp::AddToSet { .. }))
+        .count();
+    if ms_ops > 1 {
+        return Err(TransformError::Invalid(
+            "v1 allows at most one distinct or addToSet operator per transform".to_string(),
+        ));
+    }
     Ok(ops)
 }
 
@@ -714,6 +873,14 @@ pub fn derived_output_field_names(ops: &[TransformOp], base_field_names: &[Strin
                 for agg in aggregates {
                     names.push(agg.as_name.clone());
                 }
+                fields = Some(names);
+            }
+            TransformOp::Distinct { fields: distinct } => {
+                fields = Some(distinct.clone());
+            }
+            TransformOp::AddToSet { keys, as_name, .. } => {
+                let mut names = keys.clone();
+                names.push(as_name.clone());
                 fields = Some(names);
             }
             TransformOp::AddFields { fields: adds } => {
@@ -886,6 +1053,38 @@ fn affect_deps(ops: &[TransformOp]) -> AffectDeps {
                 closed = true;
                 removed.clear();
             }
+            TransformOp::Distinct { fields } => {
+                let mut next = BTreeMap::new();
+                for field in fields {
+                    next.insert(
+                        field.clone(),
+                        resolve_field_deps(&lineage, closed, &removed, field),
+                    );
+                }
+                lineage = next;
+                closed = true;
+                removed.clear();
+            }
+            TransformOp::AddToSet {
+                keys,
+                field,
+                as_name,
+            } => {
+                let mut next = BTreeMap::new();
+                for key in keys {
+                    next.insert(
+                        key.clone(),
+                        resolve_field_deps(&lineage, closed, &removed, key),
+                    );
+                }
+                next.insert(
+                    as_name.clone(),
+                    resolve_field_deps(&lineage, closed, &removed, field),
+                );
+                lineage = next;
+                closed = true;
+                removed.clear();
+            }
         }
     }
 
@@ -966,8 +1165,8 @@ pub fn evaluate_transform_for_identities_with_bases(
     if identities.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(group_keys) = group_by_keys(ops) else {
-        // Non-groupBy transforms: filter full evaluation to matching Output Identity.
+    let Some(group_keys) = output_grouping_keys(ops) else {
+        // Row-grain transforms: filter full evaluation to matching Output Identity.
         let all = evaluate_transform_with_bases(ops, primary_rows, secondary_bases)?;
         return Ok(all
             .into_iter()
@@ -984,11 +1183,23 @@ pub fn evaluate_transform_for_identities_with_bases(
     evaluate_transform_with_bases(ops, &filtered, secondary_bases)
 }
 
-fn group_by_keys(ops: &[TransformOp]) -> Option<Vec<String>> {
+/// Grouping / distinct keys that define Output Identity grain for incremental recompute.
+fn output_grouping_keys(ops: &[TransformOp]) -> Option<Vec<String>> {
     ops.iter().rev().find_map(|op| match op {
         TransformOp::GroupBy { keys, .. } => Some(keys.clone()),
+        TransformOp::Distinct { fields } => Some(fields.clone()),
+        TransformOp::AddToSet { keys, .. } => Some(keys.clone()),
         _ => None,
     })
+}
+
+/// Whether this transform requires Maintenance State for correct value-level Affect Analysis.
+///
+/// True for `distinct` / `addToSet`. False for simple groupBy sum/count/min/max/avg and
+/// row-grain operators — those must not invent blind side tables.
+pub fn requires_maintenance_state(ops: &[TransformOp]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, TransformOp::Distinct { .. } | TransformOp::AddToSet { .. }))
 }
 
 fn row_matches_group_keys(
@@ -1045,8 +1256,32 @@ fn analyze_primary_affect(
     pre_apply: Option<&Map<String, Value>>,
     after: Option<&Map<String, Value>>,
 ) -> Result<AffectOutcome, TransformError> {
+    analyze_primary_affect_inner(ops, kind, pre_apply, after, None)
+}
+
+/// Affect Analysis with Maintenance State for value-level distinct/addToSet skips.
+///
+/// Callers must pass the *pre-change* Maintenance State. Update refcounts via
+/// [`maintain_state_for_change`] after deciding the outcome (including skips).
+pub fn analyze_affect_with_maintenance(
+    ops: &[TransformOp],
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+    state: &MaintenanceState,
+) -> Result<AffectOutcome, TransformError> {
+    analyze_primary_affect_inner(ops, kind, pre_apply, after, Some(state))
+}
+
+fn analyze_primary_affect_inner(
+    ops: &[TransformOp],
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+    state: Option<&MaintenanceState>,
+) -> Result<AffectOutcome, TransformError> {
     let deps = affect_deps(ops);
-    let group_keys = group_by_keys(ops);
+    let group_keys = output_grouping_keys(ops);
 
     match kind {
         BaseChangeKind::Insert => {
@@ -1054,6 +1289,11 @@ fn analyze_primary_affect(
                 TransformError::Invalid("Insert Affect Analysis requires after-image".into())
             })?;
             let identity = identity_from_row(ops, after, group_keys.as_deref())?;
+            if let Some(outcome) =
+                value_level_affect(ops, kind, None, Some(after), state, &identity, None)?
+            {
+                return Ok(outcome);
+            }
             Ok(AffectOutcome::Recompute {
                 identities: vec![identity],
             })
@@ -1065,6 +1305,11 @@ fn analyze_primary_affect(
                 )
             })?;
             let identity = identity_from_row(ops, pre, group_keys.as_deref())?;
+            if let Some(outcome) =
+                value_level_affect(ops, kind, Some(pre), None, state, &identity, None)?
+            {
+                return Ok(outcome);
+            }
             Ok(AffectOutcome::Recompute {
                 identities: vec![identity],
             })
@@ -1089,11 +1334,21 @@ fn analyze_primary_affect(
                 return Ok(AffectOutcome::SkipUnusedFields);
             }
             let after_id = identity_from_row(ops, after, group_keys.as_deref())?;
-            // groupBy key moves need pre-apply + after identities. Row-grain transforms
-            // (project/addFields/rename/remove/filter/equiLookup) keep a single after-image
-            // identity — shaped field renames must not invent a second delete identity.
+            // groupBy/distinct/addToSet key moves need pre-apply + after identities.
+            // Row-grain transforms keep a single after-image identity.
             if group_keys.is_some() {
                 let pre_id = identity_from_row(ops, pre, group_keys.as_deref())?;
+                if let Some(outcome) = value_level_affect(
+                    ops,
+                    kind,
+                    Some(pre),
+                    Some(after),
+                    state,
+                    &after_id,
+                    Some(&pre_id),
+                )? {
+                    return Ok(outcome);
+                }
                 let mut identities = vec![after_id];
                 if !identities
                     .iter()
@@ -1108,6 +1363,441 @@ fn analyze_primary_affect(
                 })
             }
         }
+    }
+}
+
+/// Value-level Affect Analysis using Maintenance State refcounts.
+///
+/// Returns `Some(SkipValueUnchanged)` or `Some(Recompute{…})` when MS applies;
+/// `None` when the caller should use the default recompute path (no MS / no state).
+fn value_level_affect(
+    ops: &[TransformOp],
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+    state: Option<&MaintenanceState>,
+    after_identity: &Map<String, Value>,
+    pre_identity: Option<&Map<String, Value>>,
+) -> Result<Option<AffectOutcome>, TransformError> {
+    if !requires_maintenance_state(ops) {
+        return Ok(None);
+    }
+    let Some(state) = state else {
+        // Without state, fall back to always-recompute (correct, not optimal).
+        return Ok(None);
+    };
+
+    if let Some(TransformOp::Distinct { .. }) = ms_operator(ops) {
+        return Ok(Some(distinct_value_level_affect(
+            kind,
+            state,
+            after_identity,
+            pre_identity,
+        )));
+    }
+    if let Some(TransformOp::AddToSet { field, .. }) = ms_operator(ops) {
+        return Ok(Some(add_to_set_value_level_affect(
+            kind,
+            state,
+            field,
+            pre_apply,
+            after,
+            after_identity,
+            pre_identity,
+        )));
+    }
+    Ok(None)
+}
+
+fn ms_operator(ops: &[TransformOp]) -> Option<&TransformOp> {
+    ops.iter()
+        .find(|op| matches!(op, TransformOp::Distinct { .. } | TransformOp::AddToSet { .. }))
+}
+
+fn distinct_value_level_affect(
+    kind: BaseChangeKind,
+    state: &MaintenanceState,
+    after_identity: &Map<String, Value>,
+    pre_identity: Option<&Map<String, Value>>,
+) -> AffectOutcome {
+    match kind {
+        BaseChangeKind::Insert => {
+            if state_refcount(state, after_identity, None) > 0 {
+                AffectOutcome::SkipValueUnchanged
+            } else {
+                AffectOutcome::Recompute {
+                    identities: vec![after_identity.clone()],
+                }
+            }
+        }
+        BaseChangeKind::Delete => {
+            if state_refcount(state, after_identity, None) > 1 {
+                AffectOutcome::SkipValueUnchanged
+            } else {
+                AffectOutcome::Recompute {
+                    identities: vec![after_identity.clone()],
+                }
+            }
+        }
+        BaseChangeKind::Update => {
+            let pre_id = pre_identity.unwrap_or(after_identity);
+            let mut identities = Vec::new();
+            // Leaving the old identity: only when this was the last contributor.
+            if !identity_maps_eq(pre_id, after_identity)
+                && state_refcount(state, pre_id, None) <= 1
+            {
+                identities.push(pre_id.clone());
+            }
+            // Entering a new identity: only when it was absent before.
+            if !identity_maps_eq(pre_id, after_identity)
+                && state_refcount(state, after_identity, None) == 0
+            {
+                identities.push(after_identity.clone());
+            }
+            // Same-identity updates cannot change distinct Derived output.
+            if identities.is_empty() {
+                AffectOutcome::SkipValueUnchanged
+            } else {
+                AffectOutcome::Recompute { identities }
+            }
+        }
+    }
+}
+
+fn add_to_set_value_level_affect(
+    kind: BaseChangeKind,
+    state: &MaintenanceState,
+    field: &str,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+    after_identity: &Map<String, Value>,
+    pre_identity: Option<&Map<String, Value>>,
+) -> AffectOutcome {
+    let after_value = after.and_then(|row| {
+        row.get(field)
+            .cloned()
+            .filter(|v| !v.is_null())
+    });
+    let pre_value = pre_apply.and_then(|row| {
+        row.get(field)
+            .cloned()
+            .filter(|v| !v.is_null())
+    });
+
+    match kind {
+        BaseChangeKind::Insert => match after_value {
+            None => AffectOutcome::SkipValueUnchanged,
+            Some(ref v) if state_refcount(state, after_identity, Some(v)) > 0 => {
+                AffectOutcome::SkipValueUnchanged
+            }
+            Some(_) => AffectOutcome::Recompute {
+                identities: vec![after_identity.clone()],
+            },
+        },
+        BaseChangeKind::Delete => match pre_value {
+            None => AffectOutcome::SkipValueUnchanged,
+            Some(ref v) if state_refcount(state, after_identity, Some(v)) > 1 => {
+                AffectOutcome::SkipValueUnchanged
+            }
+            Some(_) => AffectOutcome::Recompute {
+                identities: vec![after_identity.clone()],
+            },
+        },
+        BaseChangeKind::Update => {
+            let pre_id = pre_identity.unwrap_or(after_identity);
+            let mut identities = Vec::new();
+            let key_moved = !identity_maps_eq(pre_id, after_identity);
+            let value_changed = match (&pre_value, &after_value) {
+                (Some(a), Some(b)) => !json_values_eq(a, b),
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => false,
+            };
+
+            if key_moved {
+                // Old group: remove old value from set if last ref.
+                if let Some(ref v) = pre_value {
+                    if state_refcount(state, pre_id, Some(v)) <= 1 {
+                        identities.push(pre_id.clone());
+                    }
+                }
+                // New group: add value if new to that set.
+                if let Some(ref v) = after_value {
+                    if state_refcount(state, after_identity, Some(v)) == 0
+                        && !identities
+                            .iter()
+                            .any(|id| identity_maps_eq(id, after_identity))
+                    {
+                        identities.push(after_identity.clone());
+                    }
+                }
+            } else if value_changed {
+                let mut set_changes = false;
+                if let Some(ref v) = pre_value {
+                    if state_refcount(state, after_identity, Some(v)) <= 1 {
+                        set_changes = true;
+                    }
+                }
+                if let Some(ref v) = after_value {
+                    if state_refcount(state, after_identity, Some(v)) == 0 {
+                        set_changes = true;
+                    }
+                }
+                if set_changes {
+                    identities.push(after_identity.clone());
+                }
+            }
+
+            if identities.is_empty() {
+                AffectOutcome::SkipValueUnchanged
+            } else {
+                AffectOutcome::Recompute { identities }
+            }
+        }
+    }
+}
+
+fn state_refcount(
+    state: &MaintenanceState,
+    identity: &Map<String, Value>,
+    value: Option<&Value>,
+) -> i64 {
+    state
+        .entries
+        .iter()
+        .find(|e| {
+            identity_maps_eq(&e.identity, identity)
+                && match (value, &e.value) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => json_values_eq(a, b),
+                    _ => false,
+                }
+        })
+        .map(|e| e.refcount)
+        .unwrap_or(0)
+}
+
+/// Build Maintenance State from current Base rows for distinct / addToSet.
+pub fn build_maintenance_state(
+    ops: &[TransformOp],
+    rows: &[Map<String, Value>],
+) -> Result<MaintenanceState, TransformError> {
+    let mut state = MaintenanceState::default();
+    if !requires_maintenance_state(ops) {
+        return Ok(state);
+    }
+    // Evaluate shaping ops before the MS operator so keys/fields match operator inputs.
+    let (prefix, ms_op) = split_at_ms_operator(ops)?;
+    let shaped = if prefix.is_empty() {
+        rows.to_vec()
+    } else {
+        evaluate_transform_with_bases(prefix, rows, &BTreeMap::new())?
+    };
+    match ms_op {
+        TransformOp::Distinct { fields } => {
+            for row in &shaped {
+                let identity = identity_map_from_fields(fields, row);
+                bump_state(&mut state, identity, None, 1);
+            }
+        }
+        TransformOp::AddToSet { keys, field, .. } => {
+            for row in &shaped {
+                let identity = identity_map_from_fields(keys, row);
+                if let Some(value) = row.get(field).cloned().filter(|v| !v.is_null()) {
+                    bump_state(&mut state, identity, Some(value), 1);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(state)
+}
+
+/// Apply a Base change to Maintenance State refcounts (call after Affect Analysis).
+pub fn maintain_state_for_change(
+    ops: &[TransformOp],
+    state: &mut MaintenanceState,
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+) -> Result<(), TransformError> {
+    if !requires_maintenance_state(ops) {
+        return Ok(());
+    }
+    let (prefix, ms_op) = split_at_ms_operator(ops)?;
+    let shape = |row: &Map<String, Value>| -> Result<Option<Map<String, Value>>, TransformError> {
+        if prefix.is_empty() {
+            return Ok(Some(row.clone()));
+        }
+        let out = evaluate_transform_with_bases(prefix, &[row.clone()], &BTreeMap::new())?;
+        Ok(out.into_iter().next())
+    };
+
+    match ms_op {
+        TransformOp::Distinct { fields } => match kind {
+            BaseChangeKind::Insert => {
+                let after = after.ok_or_else(|| {
+                    TransformError::Invalid("Insert Maintenance State requires after-image".into())
+                })?;
+                if let Some(shaped) = shape(after)? {
+                    bump_state(state, identity_map_from_fields(fields, &shaped), None, 1);
+                }
+            }
+            BaseChangeKind::Delete => {
+                let pre = pre_apply.ok_or_else(|| {
+                    TransformError::Invalid(
+                        "Delete Maintenance State requires pre-apply Base row".into(),
+                    )
+                })?;
+                if let Some(shaped) = shape(pre)? {
+                    bump_state(state, identity_map_from_fields(fields, &shaped), None, -1);
+                }
+            }
+            BaseChangeKind::Update => {
+                let pre = pre_apply.ok_or_else(|| {
+                    TransformError::Invalid(
+                        "Update Maintenance State requires pre-apply Base row".into(),
+                    )
+                })?;
+                let after = after.ok_or_else(|| {
+                    TransformError::Invalid("Update Maintenance State requires after-image".into())
+                })?;
+                if let Some(pre_shaped) = shape(pre)? {
+                    bump_state(
+                        state,
+                        identity_map_from_fields(fields, &pre_shaped),
+                        None,
+                        -1,
+                    );
+                }
+                if let Some(after_shaped) = shape(after)? {
+                    bump_state(
+                        state,
+                        identity_map_from_fields(fields, &after_shaped),
+                        None,
+                        1,
+                    );
+                }
+            }
+        },
+        TransformOp::AddToSet { keys, field, .. } => match kind {
+            BaseChangeKind::Insert => {
+                let after = after.ok_or_else(|| {
+                    TransformError::Invalid("Insert Maintenance State requires after-image".into())
+                })?;
+                if let Some(shaped) = shape(after)? {
+                    if let Some(value) = shaped.get(field).cloned().filter(|v| !v.is_null()) {
+                        bump_state(
+                            state,
+                            identity_map_from_fields(keys, &shaped),
+                            Some(value),
+                            1,
+                        );
+                    }
+                }
+            }
+            BaseChangeKind::Delete => {
+                let pre = pre_apply.ok_or_else(|| {
+                    TransformError::Invalid(
+                        "Delete Maintenance State requires pre-apply Base row".into(),
+                    )
+                })?;
+                if let Some(shaped) = shape(pre)? {
+                    if let Some(value) = shaped.get(field).cloned().filter(|v| !v.is_null()) {
+                        bump_state(
+                            state,
+                            identity_map_from_fields(keys, &shaped),
+                            Some(value),
+                            -1,
+                        );
+                    }
+                }
+            }
+            BaseChangeKind::Update => {
+                let pre = pre_apply.ok_or_else(|| {
+                    TransformError::Invalid(
+                        "Update Maintenance State requires pre-apply Base row".into(),
+                    )
+                })?;
+                let after = after.ok_or_else(|| {
+                    TransformError::Invalid("Update Maintenance State requires after-image".into())
+                })?;
+                if let Some(pre_shaped) = shape(pre)? {
+                    if let Some(value) = pre_shaped.get(field).cloned().filter(|v| !v.is_null()) {
+                        bump_state(
+                            state,
+                            identity_map_from_fields(keys, &pre_shaped),
+                            Some(value),
+                            -1,
+                        );
+                    }
+                }
+                if let Some(after_shaped) = shape(after)? {
+                    if let Some(value) = after_shaped.get(field).cloned().filter(|v| !v.is_null()) {
+                        bump_state(
+                            state,
+                            identity_map_from_fields(keys, &after_shaped),
+                            Some(value),
+                            1,
+                        );
+                    }
+                }
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn split_at_ms_operator(
+    ops: &[TransformOp],
+) -> Result<(&[TransformOp], &TransformOp), TransformError> {
+    let idx = ops
+        .iter()
+        .position(|op| matches!(op, TransformOp::Distinct { .. } | TransformOp::AddToSet { .. }))
+        .ok_or_else(|| {
+            TransformError::Invalid(
+                "Maintenance State requested but transform has no distinct/addToSet".into(),
+            )
+        })?;
+    Ok((&ops[..idx], &ops[idx]))
+}
+
+fn identity_map_from_fields(fields: &[String], row: &Map<String, Value>) -> Map<String, Value> {
+    let mut identity = Map::new();
+    for field in fields {
+        identity.insert(
+            field.clone(),
+            row.get(field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    identity
+}
+
+fn bump_state(
+    state: &mut MaintenanceState,
+    identity: Map<String, Value>,
+    value: Option<Value>,
+    delta: i64,
+) {
+    let entry_matches = |e: &MaintenanceEntry| {
+        identity_maps_eq(&e.identity, &identity)
+            && match (&value, &e.value) {
+                (None, None) => true,
+                (Some(a), Some(b)) => json_values_eq(a, b),
+                _ => false,
+            }
+    };
+    if let Some(pos) = state.entries.iter().position(entry_matches) {
+        state.entries[pos].refcount += delta;
+        if state.entries[pos].refcount <= 0 {
+            state.entries.remove(pos);
+        }
+    } else if delta > 0 {
+        state.entries.push(MaintenanceEntry {
+            identity,
+            value,
+            refcount: delta,
+        });
     }
 }
 
@@ -1193,7 +1883,7 @@ fn analyze_foreign_equi_lookup_affect(
         });
     }
 
-    let group_keys = group_by_keys(ops);
+    let group_keys = output_grouping_keys(ops);
     let mut identities = Vec::new();
     for op in &lookups {
         let TransformOp::EquiLookup { local_field, from, .. } = op else {
@@ -1295,6 +1985,12 @@ fn equi_lookup_as_survives(ops: &[TransformOp], as_name: &str) -> bool {
                         || aggregates.iter().any(|a| a.as_name == *n || a.field == *n)
                 });
             }
+            TransformOp::Distinct { fields } => {
+                names.retain(|n| fields.iter().any(|f| f == n));
+            }
+            TransformOp::AddToSet { keys, as_name, .. } => {
+                names.retain(|n| keys.iter().any(|k| k == n) || n == as_name);
+            }
             _ => {}
         }
     }
@@ -1311,14 +2007,14 @@ fn identity_from_row(
         for key in keys {
             let value = row.get(key).cloned().ok_or_else(|| {
                 TransformError::Invalid(format!(
-                    "Base row missing groupBy key {key} for Affect Analysis"
+                    "Base row missing grouping key {key} for Affect Analysis"
                 ))
             })?;
             identity.insert(key.clone(), value);
         }
         return Ok(identity);
     }
-    // Non-groupBy: shape the Base row through project/addFields/rename/remove so
+    // Row-grain: shape the Base row through project/addFields/rename/remove so
     // recompute identity keys match Derived field names (rename-safe).
     let identity = shape_row_for_identity(ops, row)?;
     if identity.is_empty() {
@@ -1329,7 +2025,8 @@ fn identity_from_row(
     Ok(identity)
 }
 
-/// Apply field-shaping operators (not filter/groupBy/equiLookup) so identity keys match Derived.
+/// Apply field-shaping operators (not filter/groupBy/distinct/addToSet/equiLookup)
+/// so identity keys match Derived.
 ///
 /// `equiLookup` is skipped: Output Identity is on primary-side fields; joining would
 /// require secondary Bases and is unnecessary for identity key shaping.
@@ -1343,6 +2040,8 @@ fn shape_row_for_identity(
         match op {
             TransformOp::FilterEq { .. }
             | TransformOp::GroupBy { .. }
+            | TransformOp::Distinct { .. }
+            | TransformOp::AddToSet { .. }
             | TransformOp::EquiLookup { .. } => {}
             other => {
                 current = apply_op(other, current, &empty)?;
@@ -1439,7 +2138,62 @@ fn apply_op(
             ..
         } => apply_equi_lookup(rows, secondary_bases, from, local_field, foreign_field, as_name),
         TransformOp::GroupBy { keys, aggregates } => apply_group_by(keys, aggregates, rows),
+        TransformOp::Distinct { fields } => Ok(apply_distinct(fields, rows)),
+        TransformOp::AddToSet {
+            keys,
+            field,
+            as_name,
+        } => apply_add_to_set(keys, field, as_name, rows),
     }
+}
+
+fn apply_distinct(fields: &[String], rows: Vec<Map<String, Value>>) -> Vec<Map<String, Value>> {
+    let mut seen: BTreeSet<Vec<ValueKey>> = BTreeSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let key_parts: Vec<ValueKey> = fields
+            .iter()
+            .map(|field| ValueKey(row.get(field).cloned().unwrap_or(Value::Null)))
+            .collect();
+        if seen.insert(key_parts.clone()) {
+            let mut derived = Map::new();
+            for (index, field) in fields.iter().enumerate() {
+                derived.insert(field.clone(), key_parts[index].0.clone());
+            }
+            out.push(derived);
+        }
+    }
+    out
+}
+
+fn apply_add_to_set(
+    keys: &[String],
+    field: &str,
+    as_name: &str,
+    rows: Vec<Map<String, Value>>,
+) -> Result<Vec<Map<String, Value>>, TransformError> {
+    let mut groups: BTreeMap<Vec<ValueKey>, BTreeSet<ValueKey>> = BTreeMap::new();
+    for row in rows {
+        let mut key_parts = Vec::with_capacity(keys.len());
+        for key in keys {
+            key_parts.push(ValueKey(row.get(key).cloned().unwrap_or(Value::Null)));
+        }
+        let values = groups.entry(key_parts).or_default();
+        if let Some(value) = row.get(field).cloned().filter(|v| !v.is_null()) {
+            values.insert(ValueKey(value));
+        }
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for (key_parts, values) in groups {
+        let mut derived = Map::new();
+        for (index, key) in keys.iter().enumerate() {
+            derived.insert(key.clone(), key_parts[index].0.clone());
+        }
+        let arr: Vec<Value> = values.into_iter().map(|v| v.0).collect();
+        derived.insert(as_name.to_string(), Value::Array(arr));
+        out.push(derived);
+    }
+    Ok(out)
 }
 
 fn apply_equi_lookup(
@@ -2864,5 +3618,343 @@ mod tests {
             .unwrap(),
             AffectOutcome::SkipUnusedFields
         );
+    }
+
+    #[test]
+    fn distinct_and_add_to_set_parse_and_evaluate() {
+        // Issue #128: declarative distinct / addToSet.
+        let distinct_ops = parse_transform_steps(&[json!({
+            "distinct": { "fields": ["CUSTOMER_ID"] }
+        })])
+        .unwrap();
+        match &distinct_ops[0] {
+            TransformOp::Distinct { fields } => assert_eq!(fields, &["CUSTOMER_ID".to_string()]),
+            other => panic!("expected Distinct, got {other:?}"),
+        }
+
+        let add_ops = parse_transform_steps(&[json!({
+            "addToSet": {
+                "keys": ["CUSTOMER_ID"],
+                "field": "AMOUNT",
+                "as": "AMOUNTS"
+            }
+        })])
+        .unwrap();
+        match &add_ops[0] {
+            TransformOp::AddToSet {
+                keys,
+                field,
+                as_name,
+            } => {
+                assert_eq!(keys, &["CUSTOMER_ID".to_string()]);
+                assert_eq!(field, "AMOUNT");
+                assert_eq!(as_name, "AMOUNTS");
+            }
+            other => panic!("expected AddToSet, got {other:?}"),
+        }
+
+        let rows = vec![
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("42.50")),
+                ("ADDRESS", json!("1 Main St")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+                ("ADDRESS", json!("1 Main St")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(102)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("42.50")),
+                ("ADDRESS", json!("1 Main St")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(200)),
+                ("CUSTOMER_ID", json!(2)),
+                ("AMOUNT", json!("5.00")),
+                ("ADDRESS", json!("2 Side Rd")),
+            ]),
+        ];
+
+        let distinct_out = evaluate_transform(&distinct_ops, &rows).unwrap();
+        assert_eq!(distinct_out.len(), 2);
+        assert!(distinct_out
+            .iter()
+            .any(|r| r.get("CUSTOMER_ID") == Some(&json!(1))));
+        assert!(distinct_out
+            .iter()
+            .any(|r| r.get("CUSTOMER_ID") == Some(&json!(2))));
+
+        let add_out = evaluate_transform(&add_ops, &rows).unwrap();
+        let c1 = add_out
+            .iter()
+            .find(|r| r.get("CUSTOMER_ID") == Some(&json!(1)))
+            .expect("customer 1");
+        let amounts = c1.get("AMOUNTS").and_then(|v| v.as_array()).expect("array");
+        assert_eq!(amounts.len(), 2);
+        assert!(amounts.iter().any(|v| v == &json!("10.00")));
+        assert!(amounts.iter().any(|v| v == &json!("42.50")));
+    }
+
+    #[test]
+    fn group_by_sum_does_not_require_maintenance_state() {
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
+            }
+        })])
+        .unwrap();
+        assert!(!requires_maintenance_state(&ops));
+        assert!(build_maintenance_state(&ops, &[]).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn distinct_value_level_affect_skips_duplicate_keys_via_maintenance_state() {
+        let ops = parse_transform_steps(&[json!({
+            "distinct": { "fields": ["CUSTOMER_ID"] }
+        })])
+        .unwrap();
+        assert!(requires_maintenance_state(&ops));
+
+        let base = vec![
+            row(&[("ORDER_ID", json!(100)), ("CUSTOMER_ID", json!(1))]),
+            row(&[("ORDER_ID", json!(101)), ("CUSTOMER_ID", json!(1))]),
+            row(&[("ORDER_ID", json!(200)), ("CUSTOMER_ID", json!(2))]),
+        ];
+        let mut state = build_maintenance_state(&ops, &base).unwrap();
+        assert_eq!(state_refcount(&state, &row(&[("CUSTOMER_ID", json!(1))]), None), 2);
+        assert_eq!(state_refcount(&state, &row(&[("CUSTOMER_ID", json!(2))]), None), 1);
+
+        // Unused ADDRESS-style field is not in distinct.fields — skip unused.
+        let pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("ADDRESS", json!("1 Main St")),
+        ]);
+        let after_addr = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("ADDRESS", json!("1 Main Ave")),
+        ]);
+        assert_eq!(
+            analyze_affect_with_maintenance(
+                &ops,
+                BaseChangeKind::Update,
+                Some(&pre),
+                Some(&after_addr),
+                &state,
+            )
+            .unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
+
+        // Duplicate CUSTOMER_ID insert: value-level skip (already counted).
+        let dup = row(&[("ORDER_ID", json!(103)), ("CUSTOMER_ID", json!(1))]);
+        assert_eq!(
+            analyze_affect_with_maintenance(
+                &ops,
+                BaseChangeKind::Insert,
+                None,
+                Some(&dup),
+                &state,
+            )
+            .unwrap(),
+            AffectOutcome::SkipValueUnchanged
+        );
+        maintain_state_for_change(&ops, &mut state, BaseChangeKind::Insert, None, Some(&dup))
+            .unwrap();
+        assert_eq!(state_refcount(&state, &row(&[("CUSTOMER_ID", json!(1))]), None), 3);
+
+        // New CUSTOMER_ID insert: recompute.
+        let neu = row(&[("ORDER_ID", json!(300)), ("CUSTOMER_ID", json!(3))]);
+        match analyze_affect_with_maintenance(
+            &ops,
+            BaseChangeKind::Insert,
+            None,
+            Some(&neu),
+            &state,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("CUSTOMER_ID"), Some(&json!(3)));
+            }
+            other => panic!("expected Recompute for new distinct key, got {other:?}"),
+        }
+        maintain_state_for_change(&ops, &mut state, BaseChangeKind::Insert, None, Some(&neu))
+            .unwrap();
+
+        // Delete non-last contributor: skip.
+        let del_dup = row(&[("ORDER_ID", json!(103)), ("CUSTOMER_ID", json!(1))]);
+        assert_eq!(
+            analyze_affect_with_maintenance(
+                &ops,
+                BaseChangeKind::Delete,
+                Some(&del_dup),
+                None,
+                &state,
+            )
+            .unwrap(),
+            AffectOutcome::SkipValueUnchanged
+        );
+        maintain_state_for_change(&ops, &mut state, BaseChangeKind::Delete, Some(&del_dup), None)
+            .unwrap();
+
+        // Delete last contributor for customer 2: recompute (caller deletes identity).
+        let del_last = row(&[("ORDER_ID", json!(200)), ("CUSTOMER_ID", json!(2))]);
+        match analyze_affect_with_maintenance(
+            &ops,
+            BaseChangeKind::Delete,
+            Some(&del_last),
+            None,
+            &state,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities[0].get("CUSTOMER_ID"), Some(&json!(2)));
+            }
+            other => panic!("expected Recompute for last distinct delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_to_set_value_level_affect_skips_duplicate_members() {
+        let ops = parse_transform_steps(&[json!({
+            "addToSet": {
+                "keys": ["CUSTOMER_ID"],
+                "field": "AMOUNT",
+                "as": "AMOUNTS"
+            }
+        })])
+        .unwrap();
+        let base = vec![
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("42.50")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(102)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("42.50")),
+            ]),
+        ];
+        let mut state = build_maintenance_state(&ops, &base).unwrap();
+        assert_eq!(
+            state_refcount(
+                &state,
+                &row(&[("CUSTOMER_ID", json!(1))]),
+                Some(&json!("42.50"))
+            ),
+            2
+        );
+
+        // Insert duplicate AMOUNT already in set → skip Derived.
+        let dup = row(&[
+            ("ORDER_ID", json!(103)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("10.00")),
+        ]);
+        assert_eq!(
+            analyze_affect_with_maintenance(
+                &ops,
+                BaseChangeKind::Insert,
+                None,
+                Some(&dup),
+                &state,
+            )
+            .unwrap(),
+            AffectOutcome::SkipValueUnchanged
+        );
+        maintain_state_for_change(&ops, &mut state, BaseChangeKind::Insert, None, Some(&dup))
+            .unwrap();
+
+        // Insert new AMOUNT → recompute.
+        let neu = row(&[
+            ("ORDER_ID", json!(104)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("7.00")),
+        ]);
+        assert!(matches!(
+            analyze_affect_with_maintenance(
+                &ops,
+                BaseChangeKind::Insert,
+                None,
+                Some(&neu),
+                &state,
+            )
+            .unwrap(),
+            AffectOutcome::Recompute { .. }
+        ));
+
+        // AMOUNT change that keeps the set unchanged (42.50→10.00 while both remain):
+        // pre count(42.50)=2 → still 1 after; after count(10.00)=1 → still present.
+        // Wait: after maintain of neu we'd have 7.00; rebuild for clarity.
+        let mut state = build_maintenance_state(&ops, &base).unwrap();
+        let pre = row(&[
+            ("ORDER_ID", json!(102)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("42.50")),
+        ]);
+        let after = row(&[
+            ("ORDER_ID", json!(102)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("10.00")),
+        ]);
+        // 42.50 refcount 2 → 1 (still in set); 10.00 refcount 1 → 2 (already in set) → skip.
+        assert_eq!(
+            analyze_affect_with_maintenance(
+                &ops,
+                BaseChangeKind::Update,
+                Some(&pre),
+                Some(&after),
+                &state,
+            )
+            .unwrap(),
+            AffectOutcome::SkipValueUnchanged
+        );
+        maintain_state_for_change(
+            &ops,
+            &mut state,
+            BaseChangeKind::Update,
+            Some(&pre),
+            Some(&after),
+        )
+        .unwrap();
+
+        // Change last 42.50 → 50.00: remove 42.50 from set, add 50.00 → recompute.
+        let pre2 = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("42.50")),
+        ]);
+        let after2 = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("50.00")),
+        ]);
+        assert!(matches!(
+            analyze_affect_with_maintenance(
+                &ops,
+                BaseChangeKind::Update,
+                Some(&pre2),
+                Some(&after2),
+                &state,
+            )
+            .unwrap(),
+            AffectOutcome::Recompute { .. }
+        ));
     }
 }

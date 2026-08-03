@@ -53,6 +53,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run rt-filter
 ./target/debug/migraloop lab scenario run rt-field-ops
 ./target/debug/migraloop lab scenario run rt-equilookup
+./target/debug/migraloop lab scenario run rt-distinct-addtoset
 ./target/debug/migraloop lab scenario run transform-pipeline
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run bulk-load

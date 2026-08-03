@@ -100,6 +100,34 @@ Group keys 加上 aggregates。v1 aggregate ops：`sum`、`count`、`min`、`max
 重算受影響的 Output Identities。未使用欄位變更（例如 aggregates 讀 ORDER_ID/AMOUNT
 時只改 ADDRESS）會略過 Derived 重算。
 
+### `distinct`
+
+依 `fields` 的唯一組合各產生一列 Derived（SQL `DISTINCT` 語意）。Output Identity
+通常對應這些 fields。
+
+```yaml
+- distinct:
+    fields: [CUSTOMER_ID]
+```
+
+### `addToSet`
+
+依 `keys` 分組，把 `field` 的唯一非 null 值收集成 JSON 陣列 `as`（Mongo 風格
+`$addToSet`）。陣列內的值以決定性順序排列。
+
+```yaml
+- addToSet:
+    keys: [CUSTOMER_ID]
+    field: AMOUNT
+    as: AMOUNTS
+```
+
+`distinct` 與 `addToSet` **會**建立 **Maintenance State**（Platform Store 內的
+per-identity / per-member refcounts），讓 value-level Affect Analysis 能略過無用的
+Derived 更新—例如插入已計入的重複 `CUSTOMER_ID`，或 set 中已存在的 `AMOUNT`。v1
+每個 transform 最多允許一個 `distinct` 或 `addToSet`。簡單的 `groupBy`
+sum/count/min/max/avg 仍不得發明 Maintenance State。
+
 ### `equiLookup`
 
 對同一 Deployment 內另一個 **Base Dataset** 做 left-outer equijoin。符合條件的
@@ -120,8 +148,8 @@ Base；`from` 命名 secondary Base（Initial Load 與 Incremental Capture 都�
 Output Identities；未使用的 primary 欄位（例如 `project` 之後的 EMAIL）仍會略過重算。
 嵌入的 foreign rows 包含完整 Base 欄位，因此 foreign 側欄位變更會重算相符的 identities。
 
-領域 roadmap 也提到 unwind、distinct/addToSet、union 等 operators。在它們進入 CLI
-config parser 之前，請只宣告上面的 operators—不支援的 operator 名稱會讓 apply 失敗。
+領域 roadmap 也提到 unwind、union 等 operators。在它們進入 CLI config parser
+之前，請只宣告上面的 operators—不支援的 operator 名稱會讓 apply 失敗。
 
 ## Output Identity
 
@@ -129,7 +157,7 @@ config parser 之前，請只宣告上面的 operators—不支援的 operator �
 
 ## Affect Analysis
 
-**Affect Analysis** 依 transform 定義與進來的 Base change，決定哪些 Output Identities（若有）需要 Derived 重算。未使用的欄位不得觸發重算（例如只改地址不應重算依客戶加總金額）。Operator 語意決定 value-level 情況（例如 distinct/count 類更新）。
+**Affect Analysis** 依 transform 定義與進來的 Base change，決定哪些 Output Identities（若有）需要 Derived 重算。未使用的欄位不得觸發重算（例如只改地址不應重算依客戶加總金額）。對 `distinct` / `addToSet`，Maintenance State 可在重複 key 或 set member 已計入時（以及 delete 並非最後一個貢獻者時）做 value-level skip。
 
 當 Base 列的 `groupBy` key 變更時，Affect Analysis 會在套用 change **之前**讀取 Base 列，以便同時更新舊與新的 Output Identity（調整或移除舊 identity；upsert 新 identity）。不可先覆寫 Base 再嘗試找回先前的 key。
 

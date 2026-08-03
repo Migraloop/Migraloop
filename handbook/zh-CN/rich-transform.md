@@ -100,6 +100,34 @@ Group keys 加上 aggregates。v1 aggregate ops：`sum`、`count`、`min`、`max
 重算受影响的 Output Identities。未使用字段变更（例如 aggregates 读 ORDER_ID/AMOUNT
 时只改 ADDRESS）会跳过 Derived 重算。
 
+### `distinct`
+
+按 `fields` 的唯一组合各产生一行 Derived（SQL `DISTINCT` 语义）。Output Identity
+通常对应这些 fields。
+
+```yaml
+- distinct:
+    fields: [CUSTOMER_ID]
+```
+
+### `addToSet`
+
+按 `keys` 分组，把 `field` 的唯一非 null 值收集成 JSON 数组 `as`（Mongo 风格
+`$addToSet`）。数组内的值以确定性顺序排列。
+
+```yaml
+- addToSet:
+    keys: [CUSTOMER_ID]
+    field: AMOUNT
+    as: AMOUNTS
+```
+
+`distinct` 与 `addToSet` **会**创建 **Maintenance State**（Platform Store 内的
+per-identity / per-member refcounts），让 value-level Affect Analysis 能跳过无用的
+Derived 更新—例如插入已计入的重复 `CUSTOMER_ID`，或 set 中已存在的 `AMOUNT`。v1
+每个 transform 最多允许一个 `distinct` 或 `addToSet`。简单的 `groupBy`
+sum/count/min/max/avg 仍不得发明 Maintenance State。
+
 ### `equiLookup`
 
 对同一 Deployment 内另一个 **Base Dataset** 做 left-outer equijoin。匹配的
@@ -120,8 +148,8 @@ Base；`from` 命名 secondary Base（Initial Load 与 Incremental Capture 都�
 Output Identities；未使用的 primary 字段（例如 `project` 之后的 EMAIL）仍会跳过重算。
 嵌入的 foreign rows 包含完整 Base 字段，因此 foreign 侧字段变更会重算匹配的 identities。
 
-领域 roadmap 也提到 unwind、distinct/addToSet、union 等 operators。在它们进入 CLI
-config parser 之前，请只声明上面的 operators—不支持的 operator 名称会让 apply 失败。
+领域 roadmap 也提到 unwind、union 等 operators。在它们进入 CLI config parser
+之前，请只声明上面的 operators—不支持的 operator 名称会让 apply 失败。
 
 ## Output Identity
 
@@ -129,7 +157,7 @@ config parser 之前，请只声明上面的 operators—不支持的 operator �
 
 ## Affect Analysis
 
-**Affect Analysis** 依 transform 定义与进来的 Base change，决定哪些 Output Identities（若有）需要 Derived 重算。未使用的字段不得触发重算（例如只改地址不应重算按客户加总金额）。Operator 语义决定 value-level 情况（例如 distinct/count 类更新）。
+**Affect Analysis** 依 transform 定义与进来的 Base change，决定哪些 Output Identities（若有）需要 Derived 重算。未使用的字段不得触发重算（例如只改地址不应重算按客户加总金额）。对 `distinct` / `addToSet`，Maintenance State 可在重复 key 或 set member 已计入时（以及 delete 并非最后一个贡献者时）做 value-level skip。
 
 当 Base 行的 `groupBy` key 变更时，Affect Analysis 会在应用 change **之前**读取 Base 行，以便同时更新旧与新的 Output Identity（调整或移除旧 identity；upsert 新 identity）。不可先覆盖 Base 再尝试找回先前的 key。
 
