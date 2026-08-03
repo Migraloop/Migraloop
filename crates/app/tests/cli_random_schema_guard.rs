@@ -110,8 +110,8 @@ struct RandomSchema {
     pk: String,
     label: String,
     note: String,
-    /// Unsupported Source type column (omitted from Base / Managed Delivery).
-    blob: String,
+    /// Unsupported Source type column name (omitted from Base / Delivery Managed fields).
+    unsupported_col: String,
     collection: String,
     pipeline: String,
     low_watermark: u64,
@@ -124,9 +124,9 @@ impl RandomSchema {
         let pk = random_oracle_ident("K", &format!("{seed}a"));
         let label = random_oracle_ident("L", &format!("{seed}b"));
         let note = random_oracle_ident("N", &format!("{seed}c"));
-        let blob = random_oracle_ident("B", &format!("{seed}d"));
-        // Distinct identifiers — if any collide, reseed with another unique suffix.
-        let names = [&table, &pk, &label, &note, &blob];
+        let unsupported_col = random_oracle_ident("B", &format!("{seed}d"));
+        // Distinct identifiers — collision would mean the seed scrub collapsed names.
+        let names = [&table, &pk, &label, &note, &unsupported_col];
         let unique: BTreeSet<_> = names.iter().map(|s| s.as_str()).collect();
         assert_eq!(
             unique.len(),
@@ -139,28 +139,19 @@ impl RandomSchema {
                 "table must not be a named fixture: {table}"
             );
         }
-        let collection = format!(
-            "c{}",
-            seed.chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .take(20)
-                .collect::<String>()
-                .to_ascii_lowercase()
-        );
-        let pipeline = format!(
-            "p{}",
-            seed.chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .take(12)
-                .collect::<String>()
-                .to_ascii_lowercase()
-        );
+        let alnum: String = seed
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let collection = format!("c{}", alnum.chars().take(20).collect::<String>());
+        let pipeline = format!("p{}", alnum.chars().take(12).collect::<String>());
         Self {
             table,
             pk,
             label,
             note,
-            blob,
+            unsupported_col,
             collection,
             pipeline,
             low_watermark: 8_000,
@@ -192,7 +183,7 @@ impl RandomSchema {
                         "supported": true
                     },
                     {
-                        "name": self.blob,
+                        "name": self.unsupported_col,
                         "oracle_type": "BLOB",
                         "supported": false
                     }
@@ -202,13 +193,13 @@ impl RandomSchema {
                         self.pk.clone(): 1,
                         self.label.clone(): "seed-one",
                         self.note.clone(): "note-a",
-                        self.blob.clone(): "blob-bytes-one"
+                        self.unsupported_col.clone(): "blob-bytes-one"
                     },
                     {
                         self.pk.clone(): 2,
                         self.label.clone(): "seed-two",
                         self.note.clone(): "note-b",
-                        self.blob.clone(): "blob-bytes-two"
+                        self.unsupported_col.clone(): "blob-bytes-two"
                     }
                 ]
             }]
@@ -232,7 +223,7 @@ impl RandomSchema {
                         self.pk.clone(): 1,
                         self.label.clone(): "seed-one-updated",
                         self.note.clone(): "note-a-revised",
-                        self.blob.clone(): "blob-bytes-one-rev"
+                        self.unsupported_col.clone(): "blob-bytes-one-rev"
                     }
                 },
                 {
@@ -245,7 +236,7 @@ impl RandomSchema {
                         self.pk.clone(): 3,
                         self.label.clone(): "seed-three",
                         self.note.clone(): "note-c",
-                        self.blob.clone(): "blob-bytes-three"
+                        self.unsupported_col.clone(): "blob-bytes-three"
                     }
                 },
                 {
@@ -404,12 +395,12 @@ async fn random_schema_full_sync_delivery_path_on_operator_seam() {
         "expected Base Dataset for random table after Initial Load, got:\n{status_out}"
     );
     assert!(
-        status_out.contains(&schema.blob)
+        status_out.contains(&schema.unsupported_col)
             && (status_out.contains("BLOB")
                 || status_out.to_lowercase().contains("omitted")
                 || status_out.to_lowercase().contains("unsupported")),
         "unsupported {}/BLOB must be operator-visible, got:\n{status_out}",
-        schema.blob
+        schema.unsupported_col
     );
 
     let base_il = Command::new(bin())
@@ -442,7 +433,7 @@ async fn random_schema_full_sync_delivery_path_on_operator_seam() {
     assert!(
         !base_il_out.to_lowercase().contains("blob-bytes"),
         "unsupported {} payload must be omitted from Base rows, got:\n{base_il_out}",
-        schema.blob
+        schema.unsupported_col
     );
 
     let target_il = Command::new(bin())
@@ -467,20 +458,26 @@ async fn random_schema_full_sync_delivery_path_on_operator_seam() {
         target_il_out.contains("\"_id\": 1") || target_il_out.contains("\"_id\":1"),
         "expected Output Identity from random PK, got:\n{target_il_out}"
     );
+    for col in [&schema.label, &schema.note] {
+        assert!(
+            target_il_out.contains(col.as_str()),
+            "Target must expose Managed field name {col} for random schema, got:\n{target_il_out}"
+        );
+    }
     assert!(
         target_il_out.contains("seed-one") && target_il_out.contains("seed-two"),
-        "expected Managed fields delivered for random schema, got:\n{target_il_out}"
+        "expected Managed field values delivered for random schema, got:\n{target_il_out}"
     );
     assert!(
         target_il_out.contains("note-a") && target_il_out.contains("note-b"),
-        "expected Managed {} field on Target, got:\n{target_il_out}",
+        "expected Managed {} values on Target, got:\n{target_il_out}",
         schema.note
     );
     assert!(
         !target_il_out.to_lowercase().contains("blob-bytes")
-            && !target_il_out.contains(&schema.blob),
+            && !target_il_out.contains(&schema.unsupported_col),
         "unsupported {} must not be delivered, got:\n{target_il_out}",
-        schema.blob
+        schema.unsupported_col
     );
 
     // --- Incremental Capture (LogMiner contract + inject) → Base + Target ---
@@ -539,6 +536,12 @@ async fn random_schema_full_sync_delivery_path_on_operator_seam() {
         String::from_utf8_lossy(&target_inc.stderr)
     );
     let target_inc_out = String::from_utf8_lossy(&target_inc.stdout);
+    for col in [&schema.label, &schema.note] {
+        assert!(
+            target_inc_out.contains(col.as_str()),
+            "Target must still expose Managed field name {col} after Incremental, got:\n{target_inc_out}",
+        );
+    }
     assert!(
         target_inc_out.contains("seed-one-updated")
             && target_inc_out.contains("seed-three")
@@ -547,12 +550,12 @@ async fn random_schema_full_sync_delivery_path_on_operator_seam() {
     );
     assert!(
         target_inc_out.contains("note-a-revised") && target_inc_out.contains("note-c"),
-        "Target Managed fields must reflect Incremental for random schema, got:\n{target_inc_out}"
+        "Target Managed field values must reflect Incremental for random schema, got:\n{target_inc_out}"
     );
     assert!(
         !target_inc_out.to_lowercase().contains("blob-bytes")
-            && !target_inc_out.contains(&schema.blob),
+            && !target_inc_out.contains(&schema.unsupported_col),
         "unsupported {} must remain undelivered after Incremental, got:\n{target_inc_out}",
-        schema.blob
+        schema.unsupported_col
     );
 }
