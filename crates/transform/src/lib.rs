@@ -1288,10 +1288,21 @@ fn analyze_primary_affect_inner(
             let after = after.ok_or_else(|| {
                 TransformError::Invalid("Insert Affect Analysis requires after-image".into())
             })?;
-            let identity = identity_from_row(ops, after, group_keys.as_deref())?;
-            if let Some(outcome) =
-                value_level_affect(ops, kind, None, Some(after), state, &identity, None)?
-            {
+            // Shape through prefix ops so distinct/addToSet keys match Maintenance State.
+            let Some(shaped_after) = shape_row_before_ms_operator(ops, after)? else {
+                // Filtered out before distinct/addToSet — no Derived change.
+                return Ok(AffectOutcome::SkipValueUnchanged);
+            };
+            let identity = identity_from_row(ops, &shaped_after, group_keys.as_deref())?;
+            if let Some(outcome) = value_level_affect(
+                ops,
+                kind,
+                None,
+                Some(&shaped_after),
+                state,
+                &identity,
+                None,
+            )? {
                 return Ok(outcome);
             }
             Ok(AffectOutcome::Recompute {
@@ -1304,10 +1315,19 @@ fn analyze_primary_affect_inner(
                     "Delete Affect Analysis requires pre-apply Base row".into(),
                 )
             })?;
-            let identity = identity_from_row(ops, pre, group_keys.as_deref())?;
-            if let Some(outcome) =
-                value_level_affect(ops, kind, Some(pre), None, state, &identity, None)?
-            {
+            let Some(shaped_pre) = shape_row_before_ms_operator(ops, pre)? else {
+                return Ok(AffectOutcome::SkipValueUnchanged);
+            };
+            let identity = identity_from_row(ops, &shaped_pre, group_keys.as_deref())?;
+            if let Some(outcome) = value_level_affect(
+                ops,
+                kind,
+                Some(&shaped_pre),
+                None,
+                state,
+                &identity,
+                None,
+            )? {
                 return Ok(outcome);
             }
             Ok(AffectOutcome::Recompute {
@@ -1333,16 +1353,62 @@ fn analyze_primary_affect_inner(
             if skip {
                 return Ok(AffectOutcome::SkipUnusedFields);
             }
-            let after_id = identity_from_row(ops, after, group_keys.as_deref())?;
+            // For Maintenance State ops, shape both images so keys/values match refcounts.
+            let (pre_for_id, after_for_id) = if requires_maintenance_state(ops) {
+                let shaped_pre = shape_row_before_ms_operator(ops, pre)?;
+                let shaped_after = shape_row_before_ms_operator(ops, after)?;
+                match (shaped_pre, shaped_after) {
+                    (None, None) => return Ok(AffectOutcome::SkipValueUnchanged),
+                    (None, Some(after_shaped)) => {
+                        let after_id =
+                            identity_from_row(ops, &after_shaped, group_keys.as_deref())?;
+                        if let Some(outcome) = value_level_affect(
+                            ops,
+                            BaseChangeKind::Insert,
+                            None,
+                            Some(&after_shaped),
+                            state,
+                            &after_id,
+                            None,
+                        )? {
+                            return Ok(outcome);
+                        }
+                        return Ok(AffectOutcome::Recompute {
+                            identities: vec![after_id],
+                        });
+                    }
+                    (Some(pre_shaped), None) => {
+                        let pre_id = identity_from_row(ops, &pre_shaped, group_keys.as_deref())?;
+                        if let Some(outcome) = value_level_affect(
+                            ops,
+                            BaseChangeKind::Delete,
+                            Some(&pre_shaped),
+                            None,
+                            state,
+                            &pre_id,
+                            None,
+                        )? {
+                            return Ok(outcome);
+                        }
+                        return Ok(AffectOutcome::Recompute {
+                            identities: vec![pre_id],
+                        });
+                    }
+                    (Some(pre_shaped), Some(after_shaped)) => (pre_shaped, after_shaped),
+                }
+            } else {
+                (pre.clone(), after.clone())
+            };
+            let after_id = identity_from_row(ops, &after_for_id, group_keys.as_deref())?;
             // groupBy/distinct/addToSet key moves need pre-apply + after identities.
             // Row-grain transforms keep a single after-image identity.
             if group_keys.is_some() {
-                let pre_id = identity_from_row(ops, pre, group_keys.as_deref())?;
+                let pre_id = identity_from_row(ops, &pre_for_id, group_keys.as_deref())?;
                 if let Some(outcome) = value_level_affect(
                     ops,
                     kind,
-                    Some(pre),
-                    Some(after),
+                    Some(&pre_for_id),
+                    Some(&after_for_id),
                     state,
                     &after_id,
                     Some(&pre_id),
@@ -1364,6 +1430,24 @@ fn analyze_primary_affect_inner(
             }
         }
     }
+}
+
+/// Shape a Base row through operators before `distinct` / `addToSet` (filter/project/…).
+///
+/// Returns `None` when prefix ops drop the row (e.g. filter miss) — no MS contribution.
+fn shape_row_before_ms_operator(
+    ops: &[TransformOp],
+    row: &Map<String, Value>,
+) -> Result<Option<Map<String, Value>>, TransformError> {
+    if !requires_maintenance_state(ops) {
+        return Ok(Some(row.clone()));
+    }
+    let (prefix, _) = split_at_ms_operator(ops)?;
+    if prefix.is_empty() {
+        return Ok(Some(row.clone()));
+    }
+    let out = evaluate_transform_with_bases(prefix, &[row.clone()], &BTreeMap::new())?;
+    Ok(out.into_iter().next())
 }
 
 /// Value-level Affect Analysis using Maintenance State refcounts.
@@ -3956,5 +4040,84 @@ mod tests {
             .unwrap(),
             AffectOutcome::Recompute { .. }
         ));
+    }
+
+    #[test]
+    fn add_to_set_affect_shapes_through_rename_prefix() {
+        // Prefix rename must align Affect Analysis keys/values with Maintenance State.
+        let ops = parse_transform_steps(&[
+            json!({
+                "rename": {
+                    "fields": [
+                        {"from": "CUSTOMER_ID", "to": "CUST"},
+                        {"from": "AMOUNT", "to": "AMT"}
+                    ]
+                }
+            }),
+            json!({
+                "addToSet": {
+                    "keys": ["CUST"],
+                    "field": "AMT",
+                    "as": "AMTS"
+                }
+            }),
+        ])
+        .unwrap();
+        let base = vec![
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("42.50")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+            ]),
+        ];
+        let state = build_maintenance_state(&ops, &base).unwrap();
+        assert_eq!(
+            state_refcount(&state, &row(&[("CUST", json!(1))]), Some(&json!("42.50"))),
+            1
+        );
+
+        // Duplicate AMOUNT after rename shaping → value-level skip.
+        let dup = row(&[
+            ("ORDER_ID", json!(102)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("42.50")),
+        ]);
+        assert_eq!(
+            analyze_affect_with_maintenance(
+                &ops,
+                BaseChangeKind::Insert,
+                None,
+                Some(&dup),
+                &state,
+            )
+            .unwrap(),
+            AffectOutcome::SkipValueUnchanged
+        );
+
+        // New AMOUNT → recompute shaped identity CUST=1.
+        let neu = row(&[
+            ("ORDER_ID", json!(103)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("7.00")),
+        ]);
+        match analyze_affect_with_maintenance(
+            &ops,
+            BaseChangeKind::Insert,
+            None,
+            Some(&neu),
+            &state,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities[0].get("CUST"), Some(&json!(1)));
+            }
+            other => panic!("expected Recompute after rename+addToSet, got {other:?}"),
+        }
     }
 }

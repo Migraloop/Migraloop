@@ -150,6 +150,15 @@ fn distinct_addtoset_logminer_contents() -> Vec<LogMinerContent> {
                 ("ADDRESS", json_str("2 Side Rd")),
             ])),
         },
+        // 5) Delete last remaining order for customer 3 — both Pipelines drop identity 3.
+        LogMinerContent {
+            scn: 540,
+            operation: LogMinerOperation::Delete,
+            seg_owner: "APP".to_string(),
+            table_name: "ORDERS".to_string(),
+            identity: row(&[("ORDER_ID", json_num(200))]),
+            after_image: None,
+        },
     ]
 }
 
@@ -533,5 +542,30 @@ async fn distinct_addtoset_value_level_affect_skips_duplicates_and_keeps_deliver
     assert!(
         !add_after_move.contains("\"CUSTOMER_ID\": 2"),
         "customer 2 addToSet identity must be gone, got:\n{add_after_move}"
+    );
+
+    // Change 5: delete last order for customer 3 — both Pipelines remove that identity.
+    let sync_delete = run_sync_fail_after(&url, 1, &doubles);
+    let delete_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&sync_delete.stdout),
+        String::from_utf8_lossy(&sync_delete.stderr)
+    );
+    assert!(
+        delete_out.to_ascii_lowercase().contains("affect"),
+        "last-row delete must Affect Analysis recompute, got:\n{delete_out}"
+    );
+    let distinct_after_delete = derived_stdout(&url, "distinct-customers");
+    assert!(
+        distinct_after_delete.contains("\"CUSTOMER_ID\": 1")
+            && !distinct_after_delete.contains("\"CUSTOMER_ID\": 3")
+            && !distinct_after_delete.contains("\"CUSTOMER_ID\": 2"),
+        "delete must remove customer 3 from distinct, got:\n{distinct_after_delete}"
+    );
+    let add_after_delete = derived_stdout(&url, "amounts-by-customer");
+    assert!(
+        !add_after_delete.contains("\"CUSTOMER_ID\": 3")
+            && add_after_delete.contains("\"CUSTOMER_ID\": 1"),
+        "delete must remove customer 3 from addToSet, got:\n{add_after_delete}"
     );
 }
