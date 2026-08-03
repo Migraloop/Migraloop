@@ -15,8 +15,9 @@ use crate::oracle_prerequisites::{
 use crate::{CaptureError, CapturePosition, ChangeEvent, CUSTOMERS_LOW_WATERMARK};
 
 use super::contents::{
-    change_events_from_logminer_contents, LogMinerContent, LogMinerOperation,
+    change_events_from_logminer_contents_limited, LogMinerContent, LogMinerOperation,
 };
+use super::inject::load_injected_logminer_contents;
 
 /// In-process LogMiner contents provider for contract / stub Source hosts.
 #[derive(Debug, Clone)]
@@ -34,6 +35,15 @@ impl ContractLogMiner {
     pub fn with_default_fixtures() -> Self {
         let mut contents = customers_logminer_fixture();
         contents.extend(orders_logminer_fixture());
+        // Test/Lab inject merges extra Incremental backlog (ADR-0020 / issue #26).
+        if let Ok(extra) = load_injected_logminer_contents() {
+            contents.extend(extra);
+            contents.sort_by(|a, b| {
+                a.scn
+                    .cmp(&b.scn)
+                    .then_with(|| a.table_name.cmp(&b.table_name))
+            });
+        }
         Self { contents }
     }
 
@@ -50,12 +60,23 @@ impl ContractLogMiner {
         table: &str,
         from_position: CapturePosition,
     ) -> Result<Vec<ChangeEvent>, CaptureError> {
+        self.fetch_changes_limited(table, from_position, None)
+    }
+
+    /// Bounded Incremental fetch for backpressure windows (ADR-0020).
+    pub fn fetch_changes_limited(
+        &self,
+        table: &str,
+        from_position: CapturePosition,
+        limit: Option<usize>,
+    ) -> Result<Vec<ChangeEvent>, CaptureError> {
         // Unknown tables yield empty incremental streams (same as prior stub for
         // ORDERS/EVENTS/ACCOUNTS). Initial Load still owns table existence checks.
-        Ok(change_events_from_logminer_contents(
+        Ok(change_events_from_logminer_contents_limited(
             &self.contents,
             table,
             from_position,
+            limit,
         ))
     }
 

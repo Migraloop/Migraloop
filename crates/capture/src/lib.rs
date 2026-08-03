@@ -15,9 +15,11 @@ mod oracle_types;
 mod schema_change;
 
 pub use logminer::{
-    change_events_from_logminer_contents, logminer_change_id, open_oracle_incremental_capture,
-    ContractLogMiner, IncrementalCapture, LogMinerContent, LogMinerOperation, OciLogMiner,
-    OracleSourceConnect, DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR, V_LOGMNR_CONTENTS_QUERY,
+    change_events_from_logminer_contents, load_injected_logminer_contents, logminer_change_id,
+    open_oracle_incremental_capture, ContractLogMiner, IncrementalCapture, LogMinerContent,
+    LogMinerInjectError, LogMinerOperation, OciLogMiner, OracleSourceConnect,
+    DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR, INJECT_LOGMINER_CONTENTS_ENV,
+    V_LOGMNR_CONTENTS_QUERY,
 };
 
 // Re-export session helper used by the OCI adapter surface.

@@ -14,7 +14,7 @@ migraloop status
 - 每個 **Deployment**（Source/Target 識別、LogMiner 機制：contract 或 OCI）
 - 每條 **Pipeline**（mode、source 資料表、target collection、Delivery status）
 - 每個 **Base Dataset**（status、列數、欄位、省略的不支援型別、Initial Load / cutover watermarks、含 appliedChanges / lag / checkpoint 的 **Sync Health**、含 checked/mismatched 計數的 **Source Alignment**）
-- 每條 Pipeline 的 **Delivery Health**（已套用變更 / status；有 Poison Change quarantine 時為 `unhealthy`；有 blocking Schema Change pause 時為 `paused`）
+- 每條 Pipeline 的 **Delivery Health**（已套用變更 / lag / status；有 Poison Change quarantine 時為 `unhealthy`；有 blocking Schema Change pause 時為 `paused`；Downstream backpressure 下 lag 會上升但不會 pause Pipeline）
 - 作用中的 **Quarantine** 列（Output Identity、change id、attempts、last error — unhealthy / not aligned）
 - Transform Pipelines 的 **Derived Datasets**（若有）
 
@@ -41,7 +41,7 @@ migraloop status
 
 - **Sync Health** — 從 Source capture 到 Base Dataset 是否跟上且成功套用。必要但不充分證明 Base 符合 Source。
 - **Source Alignment** — 該 Base 上次 Source Alignment Check 結果（`unknown` / `aligned` / `partial`）。在把 Base 當作 Drift baseline 前執行 `migraloop align`（resource-gated；用 Source reads 修復 Base；從不寫入 Source）。`partial` 表示上次檢查碰到 `--max-rows` budget。
-- **Delivery Health** — Pipeline 的 Target Binding change stream 是否跟上且成功套用。對 non-Managed 欄位的編輯與此訊號無關。
+- **Delivery Health** — Pipeline 的 Target Binding change stream 是否跟上且成功套用。對 non-Managed 欄位的編輯與此訊號無關。Downstream backpressure 下，`lag=` 反映目前 bounded Incremental window 的剩餘 pending Delivery 工作（ADR-0020）—不是整條 Pipeline pause。
 - **Drift** — 該 Pipeline 上次 Drift Check 結果（`unknown` / `ok` / `partial`）。在 Alignment 之後執行 `migraloop drift`（resource-gated；預設 Managed-field auto-repair；忽略 non-Managed fields）。`partial` 表示上次檢查碰到 `--max-rows` budget。
 
 ## Logs 與 metrics

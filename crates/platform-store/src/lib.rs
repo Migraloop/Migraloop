@@ -117,6 +117,9 @@ pub struct Pipeline {
     pub delivery_status: String,
     /// Count of Output Identity Delivery applies (upserts + deletes) for progress.
     pub delivery_applied_changes: i32,
+    /// Remaining pending Delivery work in the current Incremental window (ADR-0020).
+    #[serde(default)]
+    pub delivery_lag: i32,
     /// Durable Operator pause (ADR-0007): when true, skip Delivery/processing.
     #[serde(default)]
     pub paused: bool,
@@ -396,10 +399,10 @@ pub async fn replace_pipelines(
             r#"
             INSERT INTO pipelines (
                 deployment_name, name, mode, source_table, source_schema,
-                target_collection, delivery_status, delivery_applied_changes, paused,
-                description, field_mappings_json, output_identity_json, transform_json,
+                target_collection, delivery_status, delivery_applied_changes, delivery_lag,
+                paused, description, field_mappings_json, output_identity_json, transform_json,
                 drift_status, drift_checked_rows, drift_mismatched_rows, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -410,6 +413,7 @@ pub async fn replace_pipelines(
         .bind(&pipeline.target_collection)
         .bind(&pipeline.delivery_status)
         .bind(pipeline.delivery_applied_changes)
+        .bind(pipeline.delivery_lag)
         .bind(pipeline.paused)
         .bind(&pipeline.description)
         .bind(&field_mappings_json)
@@ -558,8 +562,8 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
     let rows = sqlx::query_as::<_, PipelineRow>(
         r#"
         SELECT deployment_name, name, mode, source_table, source_schema,
-               target_collection, delivery_status, delivery_applied_changes, paused,
-               description, field_mappings_json, output_identity_json, transform_json,
+               target_collection, delivery_status, delivery_applied_changes, delivery_lag,
+               paused, description, field_mappings_json, output_identity_json, transform_json,
                drift_status, drift_checked_rows, drift_mismatched_rows
         FROM pipelines
         ORDER BY deployment_name, name
@@ -691,37 +695,126 @@ pub async fn update_pipeline_delivery_progress(
     delivery_status: &str,
     additional_applied_changes: Option<i32>,
 ) -> Result<(), PlatformStoreError> {
+    update_pipeline_delivery_progress_with_lag(
+        database_url,
+        deployment_name,
+        pipeline_name,
+        delivery_status,
+        additional_applied_changes,
+        None,
+    )
+    .await
+}
+
+/// Persist Delivery Health lag (remaining pending Delivery work; ADR-0020 / issue #26).
+pub async fn update_pipeline_delivery_lag(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+    delivery_lag: i32,
+) -> Result<(), PlatformStoreError> {
     let pool = connect(database_url).await?;
-    let result = if let Some(additional) = additional_applied_changes {
-        sqlx::query(
-            r#"
-            UPDATE pipelines
-            SET delivery_status = $3,
-                delivery_applied_changes = delivery_applied_changes + $4
-            WHERE deployment_name = $1 AND name = $2
-            "#,
-        )
-        .bind(deployment_name)
-        .bind(pipeline_name)
-        .bind(delivery_status)
-        .bind(additional)
-        .execute(&pool)
-        .await
-        .map_err(PlatformStoreError::Persist)?
-    } else {
-        sqlx::query(
-            r#"
-            UPDATE pipelines
-            SET delivery_status = $3
-            WHERE deployment_name = $1 AND name = $2
-            "#,
-        )
-        .bind(deployment_name)
-        .bind(pipeline_name)
-        .bind(delivery_status)
-        .execute(&pool)
-        .await
-        .map_err(PlatformStoreError::Persist)?
+    let result = sqlx::query(
+        r#"
+        UPDATE pipelines
+        SET delivery_lag = $3
+        WHERE deployment_name = $1 AND name = $2
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .bind(delivery_lag)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    if result.rows_affected() == 0 {
+        return Err(PlatformStoreError::NotFound(format!(
+            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+        )));
+    }
+    Ok(())
+}
+
+/// Update Delivery status, optional applied-count delta, and optional Delivery lag.
+pub async fn update_pipeline_delivery_progress_with_lag(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+    delivery_status: &str,
+    additional_applied_changes: Option<i32>,
+    delivery_lag: Option<i32>,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let result = match (additional_applied_changes, delivery_lag) {
+        (Some(additional), Some(lag)) => {
+            sqlx::query(
+                r#"
+                UPDATE pipelines
+                SET delivery_status = $3,
+                    delivery_applied_changes = delivery_applied_changes + $4,
+                    delivery_lag = $5
+                WHERE deployment_name = $1 AND name = $2
+                "#,
+            )
+            .bind(deployment_name)
+            .bind(pipeline_name)
+            .bind(delivery_status)
+            .bind(additional)
+            .bind(lag)
+            .execute(&pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?
+        }
+        (Some(additional), None) => {
+            sqlx::query(
+                r#"
+                UPDATE pipelines
+                SET delivery_status = $3,
+                    delivery_applied_changes = delivery_applied_changes + $4
+                WHERE deployment_name = $1 AND name = $2
+                "#,
+            )
+            .bind(deployment_name)
+            .bind(pipeline_name)
+            .bind(delivery_status)
+            .bind(additional)
+            .execute(&pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?
+        }
+        (None, Some(lag)) => {
+            sqlx::query(
+                r#"
+                UPDATE pipelines
+                SET delivery_status = $3,
+                    delivery_lag = $4
+                WHERE deployment_name = $1 AND name = $2
+                "#,
+            )
+            .bind(deployment_name)
+            .bind(pipeline_name)
+            .bind(delivery_status)
+            .bind(lag)
+            .execute(&pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?
+        }
+        (None, None) => {
+            sqlx::query(
+                r#"
+                UPDATE pipelines
+                SET delivery_status = $3
+                WHERE deployment_name = $1 AND name = $2
+                "#,
+            )
+            .bind(deployment_name)
+            .bind(pipeline_name)
+            .bind(delivery_status)
+            .execute(&pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?
+        }
     };
 
     if result.rows_affected() == 0 {
@@ -913,6 +1006,7 @@ struct PipelineRow {
     target_collection: String,
     delivery_status: String,
     delivery_applied_changes: i32,
+    delivery_lag: i32,
     paused: bool,
     description: String,
     field_mappings_json: String,
@@ -945,6 +1039,7 @@ impl PipelineRow {
             target_collection: self.target_collection,
             delivery_status: self.delivery_status,
             delivery_applied_changes: self.delivery_applied_changes,
+            delivery_lag: self.delivery_lag,
             paused: self.paused,
             description: self.description,
             field_mappings,

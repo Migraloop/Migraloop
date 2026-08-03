@@ -14,7 +14,7 @@ migraloop status
 - Each **Deployment** (Source/Target identity, LogMiner mechanism: contract vs OCI)
 - Each **Pipeline** (mode, source table, target collection, Delivery status)
 - Each **Base Dataset** (status, row count, columns, omitted unsupported types, Initial Load / cutover watermarks, **Sync Health** with appliedChanges / lag / checkpoint, **Source Alignment** with checked/mismatched counts)
-- **Delivery Health** per Pipeline (applied changes / status; `unhealthy` when Poison Change quarantine is active; `paused` when blocking Schema Change pause is active)
+- **Delivery Health** per Pipeline (applied changes / lag / status; `unhealthy` when Poison Change quarantine is active; `paused` when blocking Schema Change pause is active; lag rises under Downstream backpressure without pausing the Pipeline)
 - Active **Quarantine** rows (Output Identity, change id, attempts, last error — unhealthy / not aligned)
 - **Derived Datasets** for Transform Pipelines when present
 
@@ -41,7 +41,7 @@ Add `--deployment <name>` when multiple Deployments share table/collection/pipel
 
 - **Sync Health** — capture from Source into a Base Dataset is caught up and applying successfully. Necessary but not sufficient to claim Base matches Source.
 - **Source Alignment** — last Source Alignment Check result for that Base (`unknown` / `aligned` / `partial`). Run `migraloop align` (resource-gated; repairs Base from Source reads; never writes Source) before treating Base as a Drift baseline. `partial` means the last check hit its `--max-rows` budget.
-- **Delivery Health** — the change stream for a Pipeline’s Target Binding is caught up and applying successfully. Edits to non-Managed fields are irrelevant.
+- **Delivery Health** — the change stream for a Pipeline’s Target Binding is caught up and applying successfully. Edits to non-Managed fields are irrelevant. Under Downstream backpressure, `lag=` reflects remaining pending Delivery work in the current bounded Incremental window (ADR-0020)—not a whole-Pipeline pause.
 - **Drift** — last Drift Check result for that Pipeline (`unknown` / `ok` / `partial`). Run `migraloop drift` (resource-gated; default Managed-field auto-repair; non-Managed fields ignored) after Alignment. `partial` means the last check hit its `--max-rows` budget.
 
 ## Logs and metrics

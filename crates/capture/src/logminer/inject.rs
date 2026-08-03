@@ -1,0 +1,111 @@
+//! Test/Lab injection of extra LogMiner contents for contract Incremental Capture.
+//!
+//! Used to exercise bounded backpressure (ADR-0020 / issue #26) with a backlog
+//! larger than the default contract fixture. Not a production Operator control.
+
+use std::fs;
+use std::path::Path;
+
+use serde::Deserialize;
+use thiserror::Error;
+
+use super::contents::{LogMinerContent, LogMinerOperation};
+use crate::CaptureError;
+
+/// Env var: path to a JSON file of extra LogMiner contents to merge into the
+/// contract harness Incremental stream.
+pub const INJECT_LOGMINER_CONTENTS_ENV: &str = "MIGRALOOP_INJECT_LOGMINER_CONTENTS";
+
+#[derive(Debug, Error)]
+pub enum LogMinerInjectError {
+    #[error("logminer contents inject file error: {0}")]
+    Detail(String),
+}
+
+impl From<LogMinerInjectError> for CaptureError {
+    fn from(err: LogMinerInjectError) -> Self {
+        CaptureError::ContractCatalog {
+            detail: err.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct InjectFile {
+    contents: Vec<InjectContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InjectContent {
+    scn: u64,
+    operation: InjectOp,
+    #[serde(default)]
+    seg_owner: Option<String>,
+    table_name: String,
+    identity: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    after_image: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum InjectOp {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl InjectOp {
+    fn as_logminer(self) -> LogMinerOperation {
+        match self {
+            Self::Insert => LogMinerOperation::Insert,
+            Self::Update => LogMinerOperation::Update,
+            Self::Delete => LogMinerOperation::Delete,
+        }
+    }
+}
+
+/// Load injected LogMiner contents from [`INJECT_LOGMINER_CONTENTS_ENV`] when set.
+///
+/// Returns an empty list when the env var is unset.
+pub fn load_injected_logminer_contents() -> Result<Vec<LogMinerContent>, LogMinerInjectError> {
+    let Some(path) = std::env::var_os(INJECT_LOGMINER_CONTENTS_ENV) else {
+        return Ok(Vec::new());
+    };
+    load_logminer_contents_file(Path::new(&path))
+}
+
+/// Load LogMiner contents from a JSON inject file.
+pub fn load_logminer_contents_file(
+    path: &Path,
+) -> Result<Vec<LogMinerContent>, LogMinerInjectError> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        LogMinerInjectError::Detail(format!("failed to read {}: {err}", path.display()))
+    })?;
+    let file: InjectFile = serde_json::from_str(&raw).map_err(|err| {
+        LogMinerInjectError::Detail(format!(
+            "invalid logminer contents inject JSON {}: {err}",
+            path.display()
+        ))
+    })?;
+
+    let mut out = Vec::with_capacity(file.contents.len());
+    for entry in file.contents {
+        out.push(LogMinerContent {
+            scn: entry.scn,
+            operation: entry.operation.as_logminer(),
+            seg_owner: entry
+                .seg_owner
+                .unwrap_or_else(|| "APP".to_string()),
+            table_name: entry.table_name,
+            identity: entry.identity,
+            after_image: entry.after_image,
+        });
+    }
+    out.sort_by(|a, b| {
+        a.scn
+            .cmp(&b.scn)
+            .then_with(|| a.table_name.cmp(&b.table_name))
+    });
+    Ok(out)
+}
