@@ -28,11 +28,24 @@ The binding (with the Pipeline) also implies **Output Identity** and **Managed C
 
 ## Managed Columns / fields
 
-**Managed Columns** (document fields in v1) are the output shape Delivery will write.
+**Managed Columns** (document fields in v1) are the output shape Delivery will write. Delivery ownership differs by Target kind (ADR-0002). **v1 ships MongoDB document Delivery only**; the relational rules below are design continuity for later relational Target Systems—not a v1 Delivery runtime.
 
-- On MongoDB, the platform does **not** inventory non-managed fields—it simply never writes keys outside the Managed set, so other fields stay untouched.
+### Document targets (v1: MongoDB)
+
+- The platform does **not** inventory non-managed fields—it simply never writes keys outside the Managed set, so other fields stay untouched.
 - When an **Output Identity** no longer exists in the platform dataset, Delivery may **delete the entire target document**.
-- Reliability is **at-least-once with idempotent apply**: retries may rewrite the same identity; Managed results are upserted/deleted by identity.
+
+### Relational targets (future)
+
+On relational Target Systems, Managed Columns are **schema the platform must create and maintain** on the target table:
+
+- Delivery **creates/maintains** only Managed Columns in the table schema.
+- Non-managed columns stay **out of scope for updates**—the platform does not own, alter, or overwrite them.
+- When an **Output Identity** disappears, Delivery may still **delete the entire target row** (full-row delete by Output Identity), same as document targets.
+
+### Reliability
+
+Reliability is **at-least-once with idempotent apply**: retries may rewrite the same identity; Managed results are upserted/deleted by identity.
 
 ## Direct vs Transform Delivery
 

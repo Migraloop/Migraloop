@@ -28,11 +28,24 @@ Binding（连同 Pipeline）也隐含 **Output Identity** 与 **Managed Columns*
 
 ## Managed Columns / fields
 
-**Managed Columns**（v1 为 document fields）是 Delivery 会写入的输出形状。
+**Managed Columns**（v1 为 document fields）是 Delivery 会写入的输出形状。Delivery 所有权依 Target kind 而异（ADR-0002）。**v1 仅提供 MongoDB document Delivery**；下列 relational 规则是给后续 relational Target Systems 的 design continuity—不是 v1 Delivery runtime。
 
-- 在 MongoDB 上，平台**不会**盘点 non-managed 字段—只是从不写入 Managed 集合以外的 key，因此其他字段保持不动。
+### Document targets（v1：MongoDB）
+
+- 平台**不会**盘点 non-managed 字段—只是从不写入 Managed 集合以外的 key，因此其他字段保持不动。
 - 当某个 **Output Identity** 在平台 dataset 中不再存在时，Delivery 可能 **删除整个 target document**。
-- 可靠性是 **at-least-once 搭配 idempotent apply**：重试可能重写同一 identity；Managed 结果按 identity upsert/delete。
+
+### Relational targets（未来）
+
+在 relational Target Systems 上，Managed Columns 是平台必须在 target table **创建并维护的 schema**：
+
+- Delivery **只创建／维护** table schema 中的 Managed Columns。
+- Non-managed columns **不在 update 范围内**—平台不拥有、不变更、也不覆写它们。
+- 当某个 **Output Identity** 消失时，Delivery 仍可能 **删除整行 target row**（按 Output Identity 的 full-row delete），与 document targets 相同。
+
+### 可靠性
+
+可靠性是 **at-least-once 搭配 idempotent apply**：重试可能重写同一 identity；Managed 结果按 identity upsert/delete。
 
 ## Direct vs Transform Delivery
 
