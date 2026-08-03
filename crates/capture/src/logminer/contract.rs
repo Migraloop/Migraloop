@@ -65,11 +65,6 @@ impl ContractLogMiner {
         Self { contents }
     }
 
-    /// Borrow the in-memory Incremental stream (for test serialization helpers).
-    pub fn contents(&self) -> &[LogMinerContent] {
-        &self.contents
-    }
-
     pub fn mechanism_label(&self) -> &'static str {
         "LogMiner (contract)"
     }
