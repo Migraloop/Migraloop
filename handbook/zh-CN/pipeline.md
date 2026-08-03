@@ -50,7 +50,7 @@ pipelines:
 - Transform Pipelines 需要 `outputIdentity` 与非空的声明式 `transform`
 - `fields` 的 key 把 source/Managed 字段映射到 `{ as: string }` 或 `{ as: omit }`（ADR-0023）
 
-Operator 形状见 [Rich Transform](rich-transform.md)（`project`、`addFields`、`rename`、`remove`、`filter`、`groupBy`（含 sum/count/min/max/avg））。
+Operator 形状见 [Rich Transform](rich-transform.md)（`project`、`addFields`、`rename`、`remove`、`filter`、`equiLookup`、`groupBy`（含 sum/count/min/max/avg））。
 
 ## Lifecycle（control plane）
 
@@ -69,7 +69,7 @@ Stream-wide blockers（例如无法解除的 DDL）仍按 [Operations](operation
 
 ## Capture 范围
 
-哪些 Source 表进入 Sync，由 Pipeline 的 `source.table` 引用决定。每张表在每个 Deployment 至多一个 Base Dataset，跨 Pipelines 共用。新表只做 table-level Initial Load。
+哪些 Source 表进入 Sync，由 Pipeline 的 `source.table` 引用**以及** Transform Pipeline 中任何 `equiLookup.from` secondary Base 决定。每张表在每个 Deployment 至多一个 Base Dataset，跨 Pipelines 共用。新表只做 table-level Initial Load。
 
 Source/Target 的 TLS 与 secrets 属于外层 Deployment 的 `spec.source` / `spec.target`（不在 Pipeline 项上）—见 [Security](security.md) 与 [CLI 与 Config](cli-and-config.md)。
 

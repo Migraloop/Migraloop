@@ -1,9 +1,10 @@
 //! Rich Transform operators and Affect Analysis.
 //!
-//! Declarative project, addFields, rename, remove, filter (eq), and groupBy
-//! (sum/count/min/max/avg) over Base Dataset rows. Free-form scripts and
-//! unanalyzable operators are rejected at parse time. Affect Analysis skips
-//! Derived recompute when only unused Base fields change.
+//! Declarative project, addFields, rename, remove, filter (eq), equiLookup,
+//! and groupBy (sum/count/min/max/avg) over Base Dataset rows. Free-form
+//! scripts and unanalyzable operators (including `$lookup` pipelines) are
+//! rejected at parse time. Affect Analysis skips Derived recompute when only
+//! unused Base fields change.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -15,12 +16,20 @@ pub const SEAM: &str = "transform";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransformError {
-    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/groupBy)")]
+    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/equiLookup/groupBy)")]
     FreeFormScript,
-    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, and groupBy")]
+    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, equiLookup, and groupBy")]
     UnsupportedOperator(String),
     #[error("invalid Rich Transform: {0}")]
     Invalid(String),
+}
+
+/// Secondary Base Dataset referenced by an `equiLookup` step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecondaryBaseRef {
+    pub table: String,
+    pub schema: Option<String>,
 }
 
 /// One aggregation inside a groupBy operator.
@@ -77,6 +86,14 @@ pub enum TransformOp {
     Rename { fields: Vec<RenameSpec> },
     Remove { fields: Vec<String> },
     FilterEq { field: String, value: Value },
+    /// Left-outer equijoin against another Base Dataset (embedded match array).
+    EquiLookup {
+        from: String,
+        from_schema: Option<String>,
+        local_field: String,
+        foreign_field: String,
+        as_name: String,
+    },
     GroupBy {
         keys: Vec<String>,
         aggregates: Vec<AggregateSpec>,
@@ -110,9 +127,11 @@ pub enum AffectOutcome {
 /// - `{ "rename": { "fields": [{ "from": "...", "to": "..." }] } }`
 /// - `{ "remove": { "fields": [...] } }`
 /// - `{ "filter": { "field": "...", "eq": ... } }`
+/// - `{ "equiLookup": { "from": "...", "localField": "...", "foreignField": "...", "as": "...", "fromSchema?": "..." } }`
 /// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum"|"count"|"min"|"max"|"avg", "field": "...", "as": "..." }] } }`
 /// Rejected shapes (clear errors):
 /// - `{ "script": "..." }` / `{ "function": "..." }`
+/// - `{ "$lookup": ... }` (use declarative `equiLookup`)
 /// - any other operator object
 /// - malformed operators (reported as invalid, not unsupported)
 pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, TransformError> {
@@ -123,6 +142,12 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
     if obj.contains_key("script") || obj.contains_key("function") || obj.contains_key("$function")
     {
         return Err(TransformError::FreeFormScript);
+    }
+
+    if obj.contains_key("$lookup") {
+        return Err(TransformError::Invalid(
+            "$lookup is not supported; use declarative equiLookup (from/localField/foreignField/as) so Affect Analysis stays correct".to_string(),
+        ));
     }
 
     if obj.contains_key("project") {
@@ -170,6 +195,15 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
         return parse_filter(obj.get("filter").expect("filter key"));
     }
 
+    if obj.contains_key("equiLookup") {
+        if obj.len() != 1 {
+            return Err(TransformError::Invalid(
+                "equiLookup step must not mix other operators in the same step".to_string(),
+            ));
+        }
+        return parse_equi_lookup(obj.get("equiLookup").expect("equiLookup key"));
+    }
+
     if obj.contains_key("groupBy") {
         if obj.len() != 1 {
             return Err(TransformError::Invalid(
@@ -185,6 +219,102 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
         .cloned()
         .unwrap_or_else(|| "(empty)".to_string());
     Err(TransformError::UnsupportedOperator(name))
+}
+
+fn parse_equi_lookup(value: &Value) -> Result<TransformOp, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid(
+            "equiLookup must be an object with from, localField, foreignField, and as".to_string(),
+        )
+    })?;
+
+    // Reject free-form / Mongo pipeline-style lookup extensions.
+    for banned in ["pipeline", "let", "asOf", "$lookup"] {
+        if obj.contains_key(banned) {
+            return Err(TransformError::Invalid(format!(
+                "equiLookup does not support `{banned}`; only declarative from/localField/foreignField/as (optional fromSchema)"
+            )));
+        }
+    }
+
+    let from = obj
+        .get("from")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TransformError::Invalid("equiLookup.from is required".to_string()))?
+        .trim();
+    if from.is_empty() {
+        return Err(TransformError::Invalid(
+            "equiLookup.from must not be empty".to_string(),
+        ));
+    }
+
+    let local_field = obj
+        .get("localField")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TransformError::Invalid("equiLookup.localField is required".to_string()))?
+        .trim();
+    if local_field.is_empty() {
+        return Err(TransformError::Invalid(
+            "equiLookup.localField must not be empty".to_string(),
+        ));
+    }
+
+    let foreign_field = obj
+        .get("foreignField")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TransformError::Invalid("equiLookup.foreignField is required".to_string()))?
+        .trim();
+    if foreign_field.is_empty() {
+        return Err(TransformError::Invalid(
+            "equiLookup.foreignField must not be empty".to_string(),
+        ));
+    }
+
+    let as_name = obj
+        .get("as")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| TransformError::Invalid("equiLookup.as is required".to_string()))?
+        .trim();
+    if as_name.is_empty() {
+        return Err(TransformError::Invalid(
+            "equiLookup.as must not be empty".to_string(),
+        ));
+    }
+
+    let from_schema = match obj.get("fromSchema") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                TransformError::Invalid("equiLookup.fromSchema must be a string".to_string())
+            })?;
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+    };
+
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "from" | "localField" | "foreignField" | "as" | "fromSchema"
+        ) {
+            return Err(TransformError::Invalid(format!(
+                "equiLookup only supports from, localField, foreignField, as, and fromSchema (unknown `{key}`)"
+            )));
+        }
+    }
+
+    Ok(TransformOp::EquiLookup {
+        from: from.to_string(),
+        from_schema,
+        local_field: local_field.to_string(),
+        foreign_field: foreign_field.to_string(),
+        as_name: as_name.to_string(),
+    })
 }
 
 fn parse_project(value: &Value) -> Result<TransformOp, TransformError> {
@@ -609,10 +739,43 @@ pub fn derived_output_field_names(ops: &[TransformOp], base_field_names: &[Strin
                 cur.retain(|n| !remove.iter().any(|r| r == n));
                 fields = Some(cur);
             }
+            TransformOp::EquiLookup { as_name, .. } => {
+                let mut cur = fields.unwrap_or_else(|| base_field_names.to_vec());
+                if !cur.iter().any(|n| n == as_name) {
+                    cur.push(as_name.clone());
+                }
+                fields = Some(cur);
+            }
             TransformOp::FilterEq { .. } => {}
         }
     }
     fields.unwrap_or_else(|| base_field_names.to_vec())
+}
+
+/// Secondary Base tables referenced by `equiLookup` steps (capture / Initial Load scope).
+pub fn secondary_base_refs(ops: &[TransformOp]) -> Vec<SecondaryBaseRef> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for op in ops {
+        if let TransformOp::EquiLookup {
+            from,
+            from_schema,
+            ..
+        } = op
+        {
+            let key = (
+                from_schema.clone().unwrap_or_default(),
+                from.to_ascii_uppercase(),
+            );
+            if seen.insert(key) {
+                out.push(SecondaryBaseRef {
+                    table: from.clone(),
+                    schema: from_schema.clone(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Base-field dependency mode for Affect Analysis.
@@ -694,6 +857,17 @@ fn affect_deps(ops: &[TransformOp]) -> AffectDeps {
                     removed.insert(field.clone());
                 }
             }
+            TransformOp::EquiLookup {
+                local_field,
+                as_name,
+                ..
+            } => {
+                // Output array depends on the local join key (foreign deps handled
+                // separately via analyze_affect_on_base).
+                let deps = resolve_field_deps(&lineage, closed, &removed, local_field);
+                lineage.insert(as_name.clone(), deps);
+                removed.remove(as_name);
+            }
             TransformOp::GroupBy { keys, aggregates } => {
                 let mut next = BTreeMap::new();
                 for key in keys {
@@ -744,14 +918,28 @@ pub fn used_base_fields(ops: &[TransformOp]) -> BTreeSet<String> {
     }
 }
 
-/// Evaluate a Rich Transform over Base rows, producing Derived rows.
+/// Evaluate a Rich Transform over primary Base rows, producing Derived rows.
+///
+/// Single-Base transforms may omit secondary Bases. `equiLookup` requires the
+/// matching secondary table rows in [`evaluate_transform_with_bases`].
 pub fn evaluate_transform(
     ops: &[TransformOp],
     rows: &[Map<String, Value>],
 ) -> Result<Vec<Map<String, Value>>, TransformError> {
-    let mut current = rows.to_vec();
+    evaluate_transform_with_bases(ops, rows, &BTreeMap::new())
+}
+
+/// Evaluate a Rich Transform with secondary Base Datasets for `equiLookup`.
+///
+/// `secondary_bases` is keyed by Base table name (`equiLookup.from`).
+pub fn evaluate_transform_with_bases(
+    ops: &[TransformOp],
+    primary_rows: &[Map<String, Value>],
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<Vec<Map<String, Value>>, TransformError> {
+    let mut current = primary_rows.to_vec();
     for op in ops {
-        current = apply_op(op, current)?;
+        current = apply_op(op, current, secondary_bases)?;
     }
     Ok(current)
 }
@@ -765,12 +953,22 @@ pub fn evaluate_transform_for_identities(
     base_rows: &[Map<String, Value>],
     identities: &[Map<String, Value>],
 ) -> Result<Vec<Map<String, Value>>, TransformError> {
+    evaluate_transform_for_identities_with_bases(ops, base_rows, &BTreeMap::new(), identities)
+}
+
+/// Like [`evaluate_transform_for_identities`] with secondary Bases for `equiLookup`.
+pub fn evaluate_transform_for_identities_with_bases(
+    ops: &[TransformOp],
+    primary_rows: &[Map<String, Value>],
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
+    identities: &[Map<String, Value>],
+) -> Result<Vec<Map<String, Value>>, TransformError> {
     if identities.is_empty() {
         return Ok(Vec::new());
     }
     let Some(group_keys) = group_by_keys(ops) else {
         // Non-groupBy transforms: filter full evaluation to matching Output Identity.
-        let all = evaluate_transform(ops, base_rows)?;
+        let all = evaluate_transform_with_bases(ops, primary_rows, secondary_bases)?;
         return Ok(all
             .into_iter()
             .filter(|row| identities.iter().any(|id| identity_matches_row(id, row)))
@@ -778,12 +976,12 @@ pub fn evaluate_transform_for_identities(
     };
 
     let mut filtered = Vec::new();
-    for row in base_rows {
+    for row in primary_rows {
         if identities.iter().any(|id| row_matches_group_keys(row, id, &group_keys)) {
             filtered.push(row.clone());
         }
     }
-    evaluate_transform(ops, &filtered)
+    evaluate_transform_with_bases(ops, &filtered, secondary_bases)
 }
 
 fn group_by_keys(ops: &[TransformOp]) -> Option<Vec<String>> {
@@ -804,11 +1002,44 @@ fn row_matches_group_keys(
     })
 }
 
-/// Affect Analysis: which Output Identities (if any) need Derived recompute.
+/// Affect Analysis for a change on the Pipeline's primary Base Dataset.
 ///
 /// `pre_apply` is the Base row before applying the change (required for Update/Delete).
 /// `after` is the change after-image (required for Insert/Update).
+///
+/// For multi-Base `equiLookup` Pipelines, prefer [`analyze_affect_on_base`] so foreign
+/// Base changes resolve the correct primary Output Identities.
 pub fn analyze_affect(
+    ops: &[TransformOp],
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+) -> Result<AffectOutcome, TransformError> {
+    analyze_primary_affect(ops, kind, pre_apply, after)
+}
+
+/// Affect Analysis when the changed Base table is known (primary or equiLookup `from`).
+///
+/// `primary_table` is the Pipeline `source.table`. `primary_rows` are current primary
+/// Base rows (needed to resolve Output Identities when a foreign Base changes).
+pub fn analyze_affect_on_base(
+    ops: &[TransformOp],
+    changed_table: &str,
+    primary_table: &str,
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+    primary_rows: &[Map<String, Value>],
+) -> Result<AffectOutcome, TransformError> {
+    if table_names_eq(changed_table, primary_table)
+        || !is_equi_lookup_from_table(ops, changed_table)
+    {
+        return analyze_primary_affect(ops, kind, pre_apply, after);
+    }
+    analyze_foreign_equi_lookup_affect(ops, changed_table, kind, pre_apply, after, primary_rows)
+}
+
+fn analyze_primary_affect(
     ops: &[TransformOp],
     kind: BaseChangeKind,
     pre_apply: Option<&Map<String, Value>>,
@@ -859,8 +1090,8 @@ pub fn analyze_affect(
             }
             let after_id = identity_from_row(ops, after, group_keys.as_deref())?;
             // groupBy key moves need pre-apply + after identities. Row-grain transforms
-            // (project/addFields/rename/remove/filter) keep a single after-image identity —
-            // shaped field renames must not invent a second delete identity.
+            // (project/addFields/rename/remove/filter/equiLookup) keep a single after-image
+            // identity — shaped field renames must not invent a second delete identity.
             if group_keys.is_some() {
                 let pre_id = identity_from_row(ops, pre, group_keys.as_deref())?;
                 let mut identities = vec![after_id];
@@ -878,6 +1109,196 @@ pub fn analyze_affect(
             }
         }
     }
+}
+
+fn analyze_foreign_equi_lookup_affect(
+    ops: &[TransformOp],
+    changed_table: &str,
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+    primary_rows: &[Map<String, Value>],
+) -> Result<AffectOutcome, TransformError> {
+    let lookups: Vec<&TransformOp> = ops
+        .iter()
+        .filter(|op| match op {
+            TransformOp::EquiLookup { from, as_name, .. } => {
+                table_names_eq(from, changed_table) && equi_lookup_as_survives(ops, as_name)
+            }
+            _ => false,
+        })
+        .collect();
+    if lookups.is_empty() {
+        // equiLookup `as` was removed/projected away — foreign fields unused.
+        return Ok(AffectOutcome::SkipUnusedFields);
+    }
+
+    let mut join_values: Vec<Value> = Vec::new();
+    match kind {
+        BaseChangeKind::Insert => {
+            let after = after.ok_or_else(|| {
+                TransformError::Invalid("Insert Affect Analysis requires after-image".into())
+            })?;
+            for op in &lookups {
+                if let TransformOp::EquiLookup { foreign_field, .. } = op {
+                    if let Some(v) = after.get(foreign_field) {
+                        push_unique_join_value(&mut join_values, v.clone());
+                    }
+                }
+            }
+        }
+        BaseChangeKind::Delete => {
+            let pre = pre_apply.ok_or_else(|| {
+                TransformError::Invalid(
+                    "Delete Affect Analysis requires pre-apply Base row".into(),
+                )
+            })?;
+            for op in &lookups {
+                if let TransformOp::EquiLookup { foreign_field, .. } = op {
+                    if let Some(v) = pre.get(foreign_field) {
+                        push_unique_join_value(&mut join_values, v.clone());
+                    }
+                }
+            }
+        }
+        BaseChangeKind::Update => {
+            let pre = pre_apply.ok_or_else(|| {
+                TransformError::Invalid(
+                    "Update Affect Analysis requires pre-apply Base row".into(),
+                )
+            })?;
+            let after = after.ok_or_else(|| {
+                TransformError::Invalid("Update Affect Analysis requires after-image".into())
+            })?;
+            // Full foreign rows are embedded — any field change can affect Derived.
+            if changed_fields(pre, after).is_empty() {
+                return Ok(AffectOutcome::SkipUnusedFields);
+            }
+            for op in &lookups {
+                if let TransformOp::EquiLookup { foreign_field, .. } = op {
+                    if let Some(v) = pre.get(foreign_field) {
+                        push_unique_join_value(&mut join_values, v.clone());
+                    }
+                    if let Some(v) = after.get(foreign_field) {
+                        push_unique_join_value(&mut join_values, v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if join_values.is_empty() {
+        return Ok(AffectOutcome::Recompute {
+            identities: Vec::new(),
+        });
+    }
+
+    let group_keys = group_by_keys(ops);
+    let mut identities = Vec::new();
+    for op in &lookups {
+        let TransformOp::EquiLookup { local_field, from, .. } = op else {
+            continue;
+        };
+        for primary in primary_rows {
+            // localField is read from the shaped stream (after prior project/rename/…),
+            // not raw Base column names — match Mongo-style stage ordering.
+            let shaped = shape_row_until_equi_lookup(ops, primary, from)?;
+            let Some(local_val) = shaped.get(local_field) else {
+                continue;
+            };
+            if !join_values.iter().any(|jv| json_values_eq(jv, local_val)) {
+                continue;
+            }
+            let identity = identity_from_row(ops, primary, group_keys.as_deref())?;
+            if !identities
+                .iter()
+                .any(|existing| identity_maps_eq(existing, &identity))
+            {
+                identities.push(identity);
+            }
+        }
+    }
+    Ok(AffectOutcome::Recompute { identities })
+}
+
+/// Shape a primary Base row through operators before the target `equiLookup.from` step.
+fn shape_row_until_equi_lookup(
+    ops: &[TransformOp],
+    row: &Map<String, Value>,
+    from_table: &str,
+) -> Result<Map<String, Value>, TransformError> {
+    let mut current = vec![row.clone()];
+    let empty = BTreeMap::new();
+    for op in ops {
+        match op {
+            TransformOp::EquiLookup { from, .. } if table_names_eq(from, from_table) => {
+                break;
+            }
+            TransformOp::FilterEq { .. } | TransformOp::GroupBy { .. } => {}
+            TransformOp::EquiLookup { .. } => {
+                // Prior equiLookup against another table still needs secondary Bases;
+                // for join-key matching we only need field shaping, so skip.
+            }
+            other => {
+                current = apply_op(other, current, &empty)?;
+            }
+        }
+    }
+    Ok(current.into_iter().next().unwrap_or_default())
+}
+
+fn push_unique_join_value(values: &mut Vec<Value>, value: Value) {
+    if !values.iter().any(|existing| json_values_eq(existing, &value)) {
+        values.push(value);
+    }
+}
+
+fn table_names_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn is_equi_lookup_from_table(ops: &[TransformOp], table: &str) -> bool {
+    ops.iter().any(|op| match op {
+        TransformOp::EquiLookup { from, .. } => table_names_eq(from, table),
+        _ => false,
+    })
+}
+
+/// Whether an equiLookup `as` field (possibly renamed) still contributes to Derived output.
+fn equi_lookup_as_survives(ops: &[TransformOp], as_name: &str) -> bool {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for op in ops {
+        match op {
+            TransformOp::EquiLookup {
+                as_name: name, ..
+            } if name == as_name => {
+                names.insert(name.clone());
+            }
+            TransformOp::Project { fields } => {
+                names.retain(|n| fields.iter().any(|f| f == n));
+            }
+            TransformOp::Remove { fields } => {
+                for field in fields {
+                    names.remove(field);
+                }
+            }
+            TransformOp::Rename { fields } => {
+                for spec in fields {
+                    if names.remove(&spec.from) {
+                        names.insert(spec.to.clone());
+                    }
+                }
+            }
+            TransformOp::GroupBy { keys, aggregates } => {
+                names.retain(|n| {
+                    keys.iter().any(|k| k == n)
+                        || aggregates.iter().any(|a| a.as_name == *n || a.field == *n)
+                });
+            }
+            _ => {}
+        }
+    }
+    !names.is_empty()
 }
 
 fn identity_from_row(
@@ -908,17 +1329,23 @@ fn identity_from_row(
     Ok(identity)
 }
 
-/// Apply field-shaping operators (not filter/groupBy) so identity keys match Derived.
+/// Apply field-shaping operators (not filter/groupBy/equiLookup) so identity keys match Derived.
+///
+/// `equiLookup` is skipped: Output Identity is on primary-side fields; joining would
+/// require secondary Bases and is unnecessary for identity key shaping.
 fn shape_row_for_identity(
     ops: &[TransformOp],
     row: &Map<String, Value>,
 ) -> Result<Map<String, Value>, TransformError> {
     let mut current = vec![row.clone()];
+    let empty = BTreeMap::new();
     for op in ops {
         match op {
-            TransformOp::FilterEq { .. } | TransformOp::GroupBy { .. } => {}
+            TransformOp::FilterEq { .. }
+            | TransformOp::GroupBy { .. }
+            | TransformOp::EquiLookup { .. } => {}
             other => {
-                current = apply_op(other, current)?;
+                current = apply_op(other, current, &empty)?;
             }
         }
     }
@@ -950,6 +1377,7 @@ fn identity_maps_eq(left: &Map<String, Value>, right: &Map<String, Value>) -> bo
 fn apply_op(
     op: &TransformOp,
     rows: Vec<Map<String, Value>>,
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
 ) -> Result<Vec<Map<String, Value>>, TransformError> {
     match op {
         TransformOp::Project { fields } => Ok(rows
@@ -1003,8 +1431,58 @@ fn apply_op(
             .into_iter()
             .filter(|row| row.get(field).is_some_and(|v| json_values_eq(v, value)))
             .collect()),
+        TransformOp::EquiLookup {
+            from,
+            local_field,
+            foreign_field,
+            as_name,
+            ..
+        } => apply_equi_lookup(rows, secondary_bases, from, local_field, foreign_field, as_name),
         TransformOp::GroupBy { keys, aggregates } => apply_group_by(keys, aggregates, rows),
     }
+}
+
+fn apply_equi_lookup(
+    rows: Vec<Map<String, Value>>,
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
+    from: &str,
+    local_field: &str,
+    foreign_field: &str,
+    as_name: &str,
+) -> Result<Vec<Map<String, Value>>, TransformError> {
+    let foreign_rows = secondary_bases
+        .get(from)
+        .or_else(|| {
+            secondary_bases
+                .iter()
+                .find(|(name, _)| table_names_eq(name, from))
+                .map(|(_, rows)| rows)
+        })
+        .ok_or_else(|| {
+            TransformError::Invalid(format!(
+                "equiLookup.from Base Dataset `{from}` was not loaded for evaluation"
+            ))
+        })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|mut row| {
+            let matches: Vec<Value> = match row.get(local_field) {
+                Some(local_val) => foreign_rows
+                    .iter()
+                    .filter(|foreign| {
+                        foreign
+                            .get(foreign_field)
+                            .is_some_and(|fv| json_values_eq(fv, local_val))
+                    })
+                    .map(|foreign| Value::Object(foreign.clone()))
+                    .collect(),
+                None => Vec::new(),
+            };
+            row.insert(as_name.to_string(), Value::Array(matches));
+            row
+        })
+        .collect())
 }
 
 fn apply_group_by(
@@ -2079,5 +2557,312 @@ mod tests {
             );
             assert!(!err.to_string().to_ascii_lowercase().contains("unsupported"));
         }
+    }
+
+    #[test]
+    fn equi_lookup_parse_evaluate_and_affect_both_bases() {
+        let ops = parse_transform_steps(&[
+            json!({"project": {"fields": ["ID", "NAME"]}}),
+            json!({
+                "equiLookup": {
+                    "from": "ORDERS",
+                    "localField": "ID",
+                    "foreignField": "CUSTOMER_ID",
+                    "as": "orders"
+                }
+            }),
+        ])
+        .unwrap();
+        match &ops[1] {
+            TransformOp::EquiLookup {
+                from,
+                local_field,
+                foreign_field,
+                as_name,
+                from_schema,
+            } => {
+                assert_eq!(from, "ORDERS");
+                assert_eq!(local_field, "ID");
+                assert_eq!(foreign_field, "CUSTOMER_ID");
+                assert_eq!(as_name, "orders");
+                assert!(from_schema.is_none());
+            }
+            other => panic!("expected EquiLookup, got {other:?}"),
+        }
+        assert_eq!(
+            secondary_base_refs(&ops),
+            vec![SecondaryBaseRef {
+                table: "ORDERS".into(),
+                schema: None,
+            }]
+        );
+
+        let customers = vec![
+            row(&[("ID", json!(1)), ("NAME", json!("Alice")), ("EMAIL", json!("a@x"))]),
+            row(&[("ID", json!(2)), ("NAME", json!("Bob")), ("EMAIL", json!("b@x"))]),
+        ];
+        let orders = vec![
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("42.50")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(200)),
+                ("CUSTOMER_ID", json!(2)),
+                ("AMOUNT", json!("5.00")),
+            ]),
+        ];
+        let mut secondary = BTreeMap::new();
+        secondary.insert("ORDERS".to_string(), orders.clone());
+
+        let out = evaluate_transform_with_bases(&ops, &customers, &secondary).unwrap();
+        assert_eq!(out.len(), 2);
+        let alice = out
+            .iter()
+            .find(|r| r.get("ID") == Some(&json!(1)))
+            .expect("Alice");
+        assert_eq!(alice.get("NAME"), Some(&json!("Alice")));
+        let alice_orders = alice
+            .get("orders")
+            .and_then(|v| v.as_array())
+            .expect("orders array");
+        assert_eq!(alice_orders.len(), 2);
+        assert!(!alice.contains_key("EMAIL"));
+
+        let bob = out
+            .iter()
+            .find(|r| r.get("ID") == Some(&json!(2)))
+            .expect("Bob");
+        assert_eq!(
+            bob.get("orders").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+
+        let managed = derived_output_field_names(&ops, &["ID".into(), "NAME".into(), "EMAIL".into()]);
+        assert!(managed.contains(&"orders".to_string()));
+        assert!(managed.contains(&"ID".to_string()));
+        assert!(used_base_fields(&ops).contains("ID"));
+
+        // Primary unused EMAIL (projected away) skips.
+        let pre = row(&[("ID", json!(1)), ("NAME", json!("Alice")), ("EMAIL", json!("a@x"))]);
+        let after_email = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alice")),
+            ("EMAIL", json!("new@x")),
+        ]);
+        assert_eq!(
+            analyze_affect_on_base(
+                &ops,
+                "CUSTOMERS",
+                "CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&pre),
+                Some(&after_email),
+                &customers,
+            )
+            .unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
+
+        // Primary NAME change recomputes customer 1.
+        let after_name = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alicia")),
+            ("EMAIL", json!("a@x")),
+        ]);
+        match analyze_affect_on_base(
+            &ops,
+            "CUSTOMERS",
+            "CUSTOMERS",
+            BaseChangeKind::Update,
+            Some(&pre),
+            Some(&after_name),
+            &customers,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("ID"), Some(&json!(1)));
+            }
+            other => panic!("expected Recompute, got {other:?}"),
+        }
+
+        // Foreign ORDERS amount update recomputes matching customer identity.
+        let order_pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("42.50")),
+        ]);
+        let order_after = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("50.00")),
+        ]);
+        match analyze_affect_on_base(
+            &ops,
+            "ORDERS",
+            "CUSTOMERS",
+            BaseChangeKind::Update,
+            Some(&order_pre),
+            Some(&order_after),
+            &customers,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("ID"), Some(&json!(1)));
+            }
+            other => panic!("expected foreign Recompute, got {other:?}"),
+        }
+
+        let mut orders_after = orders;
+        orders_after[0] = order_after;
+        secondary.insert("ORDERS".to_string(), orders_after);
+        let recomputed = evaluate_transform_for_identities_with_bases(
+            &ops,
+            &customers,
+            &secondary,
+            &[row(&[("ID", json!(1))])],
+        )
+        .unwrap();
+        assert_eq!(recomputed.len(), 1);
+        let amounts: Vec<_> = recomputed[0]
+            .get("orders")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|o| o.get("AMOUNT"))
+            .collect();
+        assert!(amounts.contains(&&json!("50.00")));
+        assert!(amounts.contains(&&json!("10.00")));
+    }
+
+    #[test]
+    fn dollar_lookup_and_equi_lookup_pipeline_fail_clearly() {
+        let err = parse_transform_steps(&[json!({
+            "$lookup": {
+                "from": "ORDERS",
+                "localField": "ID",
+                "foreignField": "CUSTOMER_ID",
+                "as": "orders"
+            }
+        })])
+        .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("$lookup") && msg.contains("equilookup"),
+            "expected clear $lookup → equiLookup guidance, got: {err}"
+        );
+
+        let err = parse_transform_steps(&[json!({
+            "equiLookup": {
+                "from": "ORDERS",
+                "localField": "ID",
+                "foreignField": "CUSTOMER_ID",
+                "as": "orders",
+                "pipeline": [{"$match": {}}]
+            }
+        })])
+        .unwrap_err();
+        assert!(
+            matches!(err, TransformError::Invalid(_)),
+            "pipeline-style equiLookup must be Invalid, got {err:?}"
+        );
+        assert!(err.to_string().to_ascii_lowercase().contains("pipeline"));
+    }
+
+    #[test]
+    fn equi_lookup_foreign_affect_uses_shaped_local_field() {
+        // rename ID → customerId, then equiLookup on customerId — foreign Affect must
+        // still resolve primary Output Identities.
+        let ops = parse_transform_steps(&[
+            json!({"rename": {"fields": [{"from": "ID", "to": "customerId"}]}}),
+            json!({
+                "equiLookup": {
+                    "from": "ORDERS",
+                    "localField": "customerId",
+                    "foreignField": "CUSTOMER_ID",
+                    "as": "orders"
+                }
+            }),
+            json!({"rename": {"fields": [{"from": "orders", "to": "orderList"}]}}),
+        ])
+        .unwrap();
+        let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("Alice"))])];
+        let order_pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("42.50")),
+        ]);
+        let order_after = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("50.00")),
+        ]);
+        match analyze_affect_on_base(
+            &ops,
+            "ORDERS",
+            "CUSTOMERS",
+            BaseChangeKind::Update,
+            Some(&order_pre),
+            Some(&order_after),
+            &customers,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("customerId"), Some(&json!(1)));
+            }
+            other => panic!("expected shaped-localField Recompute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn equi_lookup_removed_as_skips_foreign_affect() {
+        let ops = parse_transform_steps(&[
+            json!({
+                "equiLookup": {
+                    "from": "ORDERS",
+                    "localField": "ID",
+                    "foreignField": "CUSTOMER_ID",
+                    "as": "orders"
+                }
+            }),
+            json!({"remove": {"fields": ["orders"]}}),
+        ])
+        .unwrap();
+        let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("Alice"))])];
+        let order_pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("42.50")),
+        ]);
+        let order_after = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("50.00")),
+        ]);
+        assert_eq!(
+            analyze_affect_on_base(
+                &ops,
+                "ORDERS",
+                "CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&order_pre),
+                Some(&order_after),
+                &customers,
+            )
+            .unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
     }
 }

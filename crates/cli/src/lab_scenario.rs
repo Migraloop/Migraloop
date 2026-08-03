@@ -83,6 +83,13 @@ const RT_FIELD_OPS_COLLECTION: &str = "lab_rfo_customers";
 const RT_FIELD_OPS_PIPELINE: &str = "lab-rfo-customers";
 const RT_FIELD_OPS_DEPLOYMENT: &str = "lab-rt-field-ops";
 
+const RT_EQUILOOKUP_ID: &str = "rt-equilookup";
+const RT_EQUILOOKUP_CUSTOMERS_TABLE: &str = "LAB_REL_CUSTOMERS";
+const RT_EQUILOOKUP_ORDERS_TABLE: &str = "LAB_REL_ORDERS";
+const RT_EQUILOOKUP_COLLECTION: &str = "lab_rel_customers";
+const RT_EQUILOOKUP_PIPELINE: &str = "lab-rel-customers";
+const RT_EQUILOOKUP_DEPLOYMENT: &str = "lab-rt-equilookup";
+
 const IDEMPOTENT_REDELIVERY_ID: &str = "idempotent-redelivery";
 const IDEMPOTENT_REDELIVERY_TABLE: &str = "LAB_IR_CUSTOMERS";
 const IDEMPOTENT_REDELIVERY_COLLECTION: &str = "lab_ir_customers";
@@ -267,6 +274,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         RT_PROJECT_ID,
         RT_FILTER_ID,
         RT_FIELD_OPS_ID,
+        RT_EQUILOOKUP_ID,
         CONCURRENT_SOURCE_WORKLOAD_ID,
         BULK_LOAD_ID,
         IDEMPOTENT_REDELIVERY_ID,
@@ -301,6 +309,7 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
             RT_FIELD_OPS_ID,
             "Rich Transform addFields/rename/remove",
         ),
+        (RT_EQUILOOKUP_ID, "Rich Transform equiLookup"),
         (
             CONCURRENT_SOURCE_WORKLOAD_ID,
             "intra-Scenario concurrent Source workload",
@@ -644,6 +653,7 @@ async fn scenario_run(
         RT_PROJECT_ID => run_rt_project(lab_dir).await,
         RT_FILTER_ID => run_rt_filter(lab_dir).await,
         RT_FIELD_OPS_ID => run_rt_field_ops(lab_dir).await,
+        RT_EQUILOOKUP_ID => run_rt_equilookup(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
         BULK_LOAD_ID => run_bulk_load(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => run_idempotent_redelivery(lab_dir).await,
@@ -743,6 +753,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         RT_PROJECT_ID => remove_rt_project_namespace(lab_dir).await,
         RT_FILTER_ID => remove_rt_filter_namespace(lab_dir).await,
         RT_FIELD_OPS_ID => remove_rt_field_ops_namespace(lab_dir).await,
+        RT_EQUILOOKUP_ID => remove_rt_equilookup_namespace(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
         BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => remove_idempotent_redelivery_namespace(lab_dir).await,
@@ -2450,6 +2461,272 @@ EXIT;\n"
         .map_err(|err| {
             CliError::Failed(format!(
                 "Failed to drive Source insert/update/delete for rt-field-ops Lab Scenario:\n{err}"
+            ))
+        })
+}
+
+async fn run_rt_equilookup(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {RT_EQUILOOKUP_ID}");
+    println!(
+        "Scenario Namespace: tables={RT_EQUILOOKUP_CUSTOMERS_TABLE},{RT_EQUILOOKUP_ORDERS_TABLE} \
+collection={RT_EQUILOOKUP_COLLECTION} deployment={RT_EQUILOOKUP_DEPLOYMENT}"
+    );
+
+    prepare_rt_equilookup_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, RT_EQUILOOKUP_ID)?;
+    let bin = lab_migraloop_bin();
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_path.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !(apply_out.contains(RT_EQUILOOKUP_CUSTOMERS_TABLE)
+        && apply_out.contains(RT_EQUILOOKUP_ORDERS_TABLE))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply must Initial Load both equiLookup Bases:\n{apply_out}"
+        )));
+    }
+    if !(apply_out.to_ascii_lowercase().contains("derived")
+        || apply_out.contains(RT_EQUILOOKUP_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+        )));
+    }
+
+    let derived_after_apply = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_EQUILOOKUP_PIPELINE,
+        ],
+    )
+    .await?;
+    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+        && derived_after_apply.contains("orders")
+        && (derived_after_apply.contains("42.50") || derived_after_apply.contains("42.5"))
+        && managed_field_present(&derived_after_apply, "NAME", "Bob"))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load equiLookup Derived check failed \
+(expected Alice/Bob with embedded orders):\n{derived_after_apply}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source primary + foreign mutations...");
+    mutate_rt_equilookup_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+
+    let derived_after = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_EQUILOOKUP_PIPELINE,
+        ],
+    )
+    .await?;
+    let target_after = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            RT_EQUILOOKUP_COLLECTION,
+        ],
+    )
+    .await?;
+
+    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+        && derived_after.contains("orders")
+        && (derived_after.contains("50.00") || derived_after.contains("50"))
+        && !derived_after.contains("42.50")
+        && managed_field_present(&derived_after, "NAME", "Bob");
+    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+        && target_after.contains("orders")
+        && (target_after.contains("50.00") || target_after.contains("50"))
+        && managed_field_present(&target_after, "NAME", "Bob");
+
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+
+    if !(derived_ok && target_ok) {
+        return Err(CliError::Failed(format!(
+            "correctness checks failed after equiLookup primary/foreign updates.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: correctness checks passed (equiLookup multi-Base Derived + Target Managed outcomes)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_rt_equilookup_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (tables={RT_EQUILOOKUP_CUSTOMERS_TABLE},{RT_EQUILOOKUP_ORDERS_TABLE}, \
+          collection={RT_EQUILOOKUP_COLLECTION}, deployment={RT_EQUILOOKUP_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {RT_EQUILOOKUP_ORDERS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {RT_EQUILOOKUP_CUSTOMERS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace tables for rt-equilookup:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{RT_EQUILOOKUP_COLLECTION}').drop()");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection {RT_EQUILOOKUP_COLLECTION}:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, RT_EQUILOOKUP_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{RT_EQUILOOKUP_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_rt_equilookup_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_rt_equilookup_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {RT_EQUILOOKUP_CUSTOMERS_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200)\n\
+);\n\
+ALTER TABLE {RT_EQUILOOKUP_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+CREATE TABLE {RT_EQUILOOKUP_ORDERS_TABLE} (\n\
+  ORDER_ID NUMBER(10) PRIMARY KEY,\n\
+  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
+  AMOUNT NUMBER(12,2) NOT NULL\n\
+);\n\
+ALTER TABLE {RT_EQUILOOKUP_ORDERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {RT_EQUILOOKUP_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
+INSERT INTO {RT_EQUILOOKUP_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
+INSERT INTO {RT_EQUILOOKUP_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (100, 1, 42.50);\n\
+INSERT INTO {RT_EQUILOOKUP_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (101, 1, 10.00);\n\
+INSERT INTO {RT_EQUILOOKUP_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (200, 2, 5.00);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare rt-equilookup Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_rt_equilookup_source(lab_dir: &Path) -> Result<(), CliError> {
+    // Primary NAME change + foreign AMOUNT change must both refresh the joined Derived.
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {RT_EQUILOOKUP_CUSTOMERS_TABLE} SET NAME = 'Alicia' WHERE ID = 1;\n\
+UPDATE {RT_EQUILOOKUP_ORDERS_TABLE} SET AMOUNT = 50.00 WHERE ORDER_ID = 100;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source mutations for rt-equilookup Lab Scenario:\n{err}"
             ))
         })
 }
@@ -7567,6 +7844,10 @@ mod tests {
             "catalog must include rt-field-ops for shipped Rich Transform addFields/rename/remove"
         );
         assert!(
+            ids.iter().any(|id| id == RT_EQUILOOKUP_ID),
+            "catalog must include rt-equilookup for shipped Rich Transform equiLookup"
+        );
+        assert!(
             ids.iter().any(|id| id == IDEMPOTENT_REDELIVERY_ID),
             "catalog must include idempotent-redelivery for duplicate-safe Delivery"
         );
@@ -7622,6 +7903,10 @@ mod tests {
         assert!(
             gaps.iter().any(|g| g.contains("addFields") || g.contains("rename") || g.contains("remove")),
             "missing rt-field-ops must be a visible gap; gaps={gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.contains("equiLookup") || g.contains("equilookup")),
+            "missing rt-equilookup must be a visible gap; gaps={gaps:?}"
         );
         assert!(
             gaps.iter()

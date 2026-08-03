@@ -261,12 +261,21 @@ pub fn value_to_bson(
         return Ok(Bson::String(json_to_plain_string(value)));
     }
 
+    // Nested documents/arrays from Rich Transform (e.g. equiLookup `as`) are not
+    // Oracle scalars — convert structurally regardless of column metadata.
+    if matches!(value, Value::Array(_) | Value::Object(_)) {
+        return nested_json_to_bson(field, value);
+    }
+
     let Some(column) = column else {
         // No schema: preserve non-float JSON numbers as integers when possible.
         return json_fallback_to_bson(field, value);
     };
 
     let oracle = normalize_oracle_type(&column.oracle_type);
+    if oracle == "JSON" {
+        return nested_json_to_bson(field, value);
+    }
     match oracle.as_str() {
         "NUMBER" => number_to_bson(field, value, column.precision, column.scale, mapping),
         "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" => float_to_bson(field, value),
@@ -390,7 +399,31 @@ fn json_fallback_to_bson(field: &str, value: &Value) -> Result<Bson, DeliveryErr
                 })
             }
         }
+        Value::Array(_) | Value::Object(_) => nested_json_to_bson(field, value),
         other => bson::to_bson(other).map_err(|err| DeliveryError::Identity(err.to_string())),
+    }
+}
+
+fn nested_json_to_bson(field: &str, value: &Value) -> Result<Bson, DeliveryError> {
+    match value {
+        Value::Null => Ok(Bson::Null),
+        Value::Bool(b) => Ok(Bson::Boolean(*b)),
+        Value::String(s) => Ok(Bson::String(s.clone())),
+        Value::Number(_) => json_fallback_to_bson(field, value),
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                out.push(nested_json_to_bson(&format!("{field}[{index}]"), item)?);
+            }
+            Ok(Bson::Array(out))
+        }
+        Value::Object(map) => {
+            let mut doc = Document::new();
+            for (key, val) in map {
+                doc.insert(key, nested_json_to_bson(&format!("{field}.{key}"), val)?);
+            }
+            Ok(Bson::Document(doc))
+        }
     }
 }
 

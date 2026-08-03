@@ -1,0 +1,26 @@
+# Lab Scenario recipe (ADR-0025 / issue #127).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: rt-equilookup
+summary: "Rich Transform equiLookup: multi-Base join → Derived → Delivery (real apply/sync)"
+namespace:
+  source_tables:
+    - LAB_REL_CUSTOMERS
+    - LAB_REL_ORDERS
+  target_collections:
+    - lab_rel_customers
+  deployment: lab-rt-equilookup
+  pipelines:
+    - lab-rel-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace tables + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load both Bases + equiLookup Derived)
+    - mutate primary + foreign Source rows (NAME change; order AMOUNT change)
+    - sync Incremental Capture + Delivery via real LogMiner path
+checks:
+  correctness:
+    - "Derived/Target embed matching ORDERS under orders for each customer Output Identity"
+    - "Primary NAME and foreign AMOUNT incremental updates both refresh Derived/Target"
+thresholds: {}
