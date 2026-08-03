@@ -52,11 +52,7 @@ impl ContractLogMiner {
         let mut contents = named_scenario_logminer_contents();
         if let Ok(extra) = load_injected_logminer_contents() {
             contents.extend(extra);
-            contents.sort_by(|a, b| {
-                a.scn
-                    .cmp(&b.scn)
-                    .then_with(|| a.table_name.cmp(&b.table_name))
-            });
+            contents.sort_by(super::contents::logminer_content_order);
         }
         Self { contents }
     }
@@ -138,6 +134,8 @@ fn customers_logminer_fixture() -> Vec<LogMinerContent> {
                 ("ACTIVE", json_num(1)),
                 ("BIO", json_str("blob-bytes-alicia")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         LogMinerContent {
             scn: 1060,
@@ -152,6 +150,8 @@ fn customers_logminer_fixture() -> Vec<LogMinerContent> {
                 ("ACTIVE", json_num(1)),
                 ("BIO", json_str("blob-bytes-carol")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         LogMinerContent {
             scn: 1070,
@@ -160,6 +160,8 @@ fn customers_logminer_fixture() -> Vec<LogMinerContent> {
             table_name: "CUSTOMERS".to_string(),
             identity: row(&[("ID", json_num(2))]),
             after_image: None,
+            rs_id: String::new(),
+            ssn: 0,
         },
     ]
 }
@@ -182,6 +184,8 @@ fn orders_logminer_fixture() -> Vec<LogMinerContent> {
                 ("AMOUNT", json_str("42.50")),
                 ("ADDRESS", json_str("1 Main Ave")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         LogMinerContent {
             scn: 520,
@@ -195,6 +199,8 @@ fn orders_logminer_fixture() -> Vec<LogMinerContent> {
                 ("AMOUNT", json_str("50.00")),
                 ("ADDRESS", json_str("1 Main Ave")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         LogMinerContent {
             scn: 530,
@@ -208,6 +214,8 @@ fn orders_logminer_fixture() -> Vec<LogMinerContent> {
                 ("AMOUNT", json_str("5.00")),
                 ("ADDRESS", json_str("2 Side Rd")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
     ]
 }

@@ -11,7 +11,7 @@ use std::path::Path;
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::contents::{LogMinerContent, LogMinerOperation};
+use super::contents::{logminer_content_order, LogMinerContent, LogMinerOperation};
 use crate::CaptureError;
 
 /// Env var: path to a JSON file of LogMiner contents for the contract harness
@@ -47,6 +47,12 @@ struct InjectContent {
     identity: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     after_image: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Optional LogMiner `RS_ID` for same-SCN multi-row identity (issue #143).
+    #[serde(default)]
+    rs_id: Option<String>,
+    /// Optional LogMiner `SSN` for same-SCN multi-row identity (issue #143).
+    #[serde(default)]
+    ssn: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,21 +99,18 @@ pub fn load_logminer_contents_file(
 
     let mut out = Vec::with_capacity(file.contents.len());
     for entry in file.contents {
-        out.push(LogMinerContent {
-            scn: entry.scn,
-            operation: entry.operation.as_logminer(),
-            seg_owner: entry
-                .seg_owner
-                .unwrap_or_else(|| "APP".to_string()),
-            table_name: entry.table_name,
-            identity: entry.identity,
-            after_image: entry.after_image,
-        });
+        out.push(
+            LogMinerContent::new(
+                entry.scn,
+                entry.operation.as_logminer(),
+                entry.seg_owner.unwrap_or_else(|| "APP".to_string()),
+                entry.table_name,
+                entry.identity,
+                entry.after_image,
+            )
+            .with_order(entry.rs_id.unwrap_or_default(), entry.ssn.unwrap_or(0)),
+        );
     }
-    out.sort_by(|a, b| {
-        a.scn
-            .cmp(&b.scn)
-            .then_with(|| a.table_name.cmp(&b.table_name))
-    });
+    out.sort_by(logminer_content_order);
     Ok(out)
 }

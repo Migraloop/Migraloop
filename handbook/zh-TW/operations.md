@@ -110,7 +110,7 @@ Lab Scenario `backward-compatible-upgrades` 可在可拋棄 Fixture 上演練升
 
 ## 重啟後 resume
 
-耐久的 capture 與 Delivery 進度存在 Platform Store。行程重啟後，`migraloop sync` 會從存放的 checkpoint（exclusive）繼續 Incremental Capture 並接續 Delivery—Operator 不應依賴僅存在本機的 recovery 檔。
+耐久的 capture 與 Delivery 進度存在 Platform Store。行程重啟後，`migraloop sync` 會從存放的 checkpoint（inclusive SCN，並以 change-id dedupe 避免跳過同一 SCN 的其餘變更）繼續 Incremental Capture 並接續 Delivery—Operator 不應依賴僅存在本機的 recovery 檔。
 
 ## 相關章節
 

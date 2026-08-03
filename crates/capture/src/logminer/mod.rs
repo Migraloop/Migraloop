@@ -14,7 +14,8 @@ mod oci;
 mod source;
 
 pub use contents::{
-    change_events_from_logminer_contents, logminer_change_id, LogMinerContent, LogMinerOperation,
+    change_events_from_logminer_contents, logminer_change_id, logminer_content_order,
+    LogMinerContent, LogMinerOperation,
 };
 pub use contract::{named_scenario_logminer_contents, ContractLogMiner};
 pub use inject::{

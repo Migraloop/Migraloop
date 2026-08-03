@@ -8,7 +8,7 @@
 - Docker / Docker Compose（Platform Store 與可選的整合測試相依）
 - Git
 - **可選（live Oracle Source）：** 在執行 `migraloop` 的機器上安裝 Oracle Instant Client Basic 或 Basic Light，並將 `LD_LIBRARY_PATH` 指向 Instant Client 目錄。真實 host 的 Initial Load 與 LogMiner (OCI) 需要它；`host: contract` / `stub` 的 CI 切片不需要。若要用 Source TLS（TCPS），另掛載 Instant Client wallet 並設定 `spec.source.tls`（`enabled` + `walletLocation`）—見 [Security](security.md)。
-- **可選（contract/stub CI 切片）：** 將 `MIGRALOOP_CONTRACT_SOURCE_CATALOG` 指向 harness catalog 資料表 JSON（schema discovery + Initial Load），需要時再將 `MIGRALOOP_INJECT_LOGMINER_CONTENTS` 指向 Incremental LogMiner contents（見 [Source System](source-system.md)／[CLI 與 Config](cli-and-config.md)）。命名 scenario fixtures 應放在這些 inject 檔供測試使用—不是 shipped product path。
+- **可選（contract/stub CI 切片）：** 將 `MIGRALOOP_CONTRACT_SOURCE_CATALOG` 指向 harness catalog 資料表 JSON（schema discovery + Initial Load），需要時再將 `MIGRALOOP_INJECT_LOGMINER_CONTENTS` 指向 Incremental LogMiner contents（可選 `rs_id` / `ssn` ordering keys 供 same-SCN 多列串流；見 [Source System](source-system.md)／[CLI 與 Config](cli-and-config.md)）。命名 scenario fixtures 應放在這些 inject 檔供測試使用—不是 shipped product path。
 
 ## Clone 與 build
 

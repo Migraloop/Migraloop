@@ -153,6 +153,8 @@ fn extra_logminer_backlog(count: usize) -> Vec<migraloop_capture::LogMinerConten
                     serde_json::json!(format!("blob-bytes-{id}")),
                 ),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         });
     }
     contents

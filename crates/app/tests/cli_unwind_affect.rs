@@ -339,7 +339,9 @@ async fn unwind_affect_analysis_updates_and_deletes_identities() {
             ("ACTIVE", json_num(1)),
             ("BIO", json_str("blob-bytes-alice")),
         ])),
-    }];
+            rs_id: String::new(),
+            ssn: 0,
+        }];
     let doubles = common::NamedScenarioDoubles::install_with_extra_logminer(dir.path(), &extra);
     let config = write_config(
         &dir,

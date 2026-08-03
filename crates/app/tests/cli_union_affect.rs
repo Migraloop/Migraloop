@@ -159,6 +159,8 @@ fn union_logminer_contents() -> Vec<LogMinerContent> {
                 ("ACTIVE", json_num(1)),
                 ("BIO", json_str("blob-bytes-alice")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
     );
     contents.extend([
@@ -175,6 +177,8 @@ fn union_logminer_contents() -> Vec<LogMinerContent> {
                 ("ACTIVE", json_num(1)),
                 ("BIO", json_str("blob-bytes-zoe")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         LogMinerContent {
             scn: 4020,
@@ -189,6 +193,8 @@ fn union_logminer_contents() -> Vec<LogMinerContent> {
                 ("ACTIVE", json_num(1)),
                 ("BIO", json_str("blob-bytes-zoe")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
     ]);
     contents

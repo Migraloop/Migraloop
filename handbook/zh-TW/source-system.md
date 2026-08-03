@@ -19,6 +19,8 @@
 
 真實 Oracle host 的 **Initial Load**（schema discovery + chunked snapshot）與 **LogMiner Incremental Capture** 都走 **OCI** 路徑。Initial Load 以 PK 排序的 `OFFSET`/`FETCH` window 讀取（由 `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` 限制），而不是一次 unbounded full-table slam；見 [Operations](operations.md) 與 [CLI & Config](cli-and-config.md)。若 runtime 沒有 Oracle Instant Client / OCI libraries，apply/sync 會以 LogMiner/OCI 名稱 fail fast—不會默默退回 stub catalog。當 `tls.enabled: true` 時，連線字串使用 TCPS，設定錯誤會明確失敗（不靜默回退 cleartext）。對 live Source 執行前請安裝 Instant Client（Basic 或 Basic Light），並將 `LD_LIBRARY_PATH` 指向其目錄。
 
+LogMiner Incremental Capture 會投影 `RS_ID` 與 `SSN`（連同 SCN），讓共享同一 SCN 的多列 contents 保持可區分、有序，且在行程重啟或 bounded capture window 後仍可 resume-safe—Platform Store 的 dedupe 與 checkpoint 不得跳過尚未套用的 same-SCN peers（prefer duplicates over gaps；見 [Operations](operations.md)）。
+
 在 live Source 上，Pipeline 的 `source.schema` 選擇 Oracle owner；省略時平台以 Source `username`（大寫）作為預設 schema。contract/stub harness 會忽略 schema，僅在 CI 切片使用**注入的 contract Source catalog**（`MIGRALOOP_CONTRACT_SOURCE_CATALOG` JSON 供 schema discovery + Initial Load；`MIGRALOOP_INJECT_LOGMINER_CONTENTS` 供 Incremental Capture）—不是 binary 內建的業務資料表 catalog、不是 Lab／真實路徑的定義真相，也不是受支援的 production Source 機制。
 
 ## Source Prerequisites（Oracle / LogMiner）

@@ -42,7 +42,8 @@ pub const DBMS_LOGMNR_START_LOGMNR: &str = "BEGIN DBMS_LOGMNR.START_LOGMNR(\
 /// [`super::LogMinerContent`]. Column values are mined per-column at runtime.
 ///
 /// Bound parameters: `:owner`, `:table_name`, `:start_scn`.
-pub const V_LOGMNR_CONTENTS_QUERY: &str = "SELECT SCN, OPERATION, SEG_OWNER, TABLE_NAME \
+pub const V_LOGMNR_CONTENTS_QUERY: &str = "SELECT SCN, OPERATION, SEG_OWNER, TABLE_NAME, \
+     RS_ID, SSN \
      FROM V$LOGMNR_CONTENTS \
      WHERE UPPER(SEG_OWNER) = :owner \
        AND UPPER(SEG_NAME) = :table_name \
@@ -245,6 +246,8 @@ fn read_mined_contents(
         "OPERATION".to_string(),
         "SEG_OWNER".to_string(),
         "TABLE_NAME".to_string(),
+        "RS_ID".to_string(),
+        "SSN".to_string(),
     ];
     for column in columns {
         let name = &column.name;
@@ -285,6 +288,12 @@ fn read_mined_contents(
         let operation: String = row.get(1).map_err(|err| map_oracle_error(host, err))?;
         let seg_owner: String = row.get(2).map_err(|err| map_oracle_error(host, err))?;
         let table_name: String = row.get(3).map_err(|err| map_oracle_error(host, err))?;
+        // RS_ID may be RAW/VARCHAR2 depending on Oracle version; normalize to string.
+        let rs_id = read_rs_id(&row, host)?;
+        let ssn: i64 = row
+            .get::<_, Option<i64>>(5)
+            .map_err(|err| map_oracle_error(host, err))?
+            .unwrap_or(0);
 
         let op = match operation.trim().to_ascii_uppercase().as_str() {
             "INSERT" => LogMinerOperation::Insert,
@@ -296,7 +305,7 @@ fn read_mined_contents(
         let mut redo = BTreeMap::new();
         let mut undo = BTreeMap::new();
         for (idx, column) in columns.iter().enumerate() {
-            let redo_idx = 4 + idx * 2;
+            let redo_idx = 6 + idx * 2;
             let undo_idx = redo_idx + 1;
             let redo_text: Option<String> = row
                 .get(redo_idx)
@@ -337,17 +346,37 @@ fn read_mined_contents(
             LogMinerOperation::Insert | LogMinerOperation::Update => Some(redo),
         };
 
-        contents.push(LogMinerContent {
-            scn: scn as u64,
-            operation: op,
-            seg_owner,
-            table_name,
-            identity,
-            after_image,
-        });
+        contents.push(
+            LogMinerContent::new(
+                scn as u64,
+                op,
+                seg_owner,
+                table_name,
+                identity,
+                after_image,
+            )
+            .with_order(rs_id, ssn.max(0) as u32),
+        );
     }
 
     Ok(contents)
+}
+
+fn read_rs_id(row: &oracle::Row, host: &str) -> Result<String, CaptureError> {
+    // Prefer textual RS_ID; fall back to hex for RAW bindings.
+    match row.get::<_, Option<String>>(4) {
+        Ok(value) => Ok(value.unwrap_or_default()),
+        Err(string_err) => match row.get::<_, Option<Vec<u8>>>(4) {
+            Ok(bytes) => Ok(bytes
+                .map(|b| {
+                    b.iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default()),
+            Err(_) => Err(map_oracle_error(host, string_err)),
+        },
+    }
 }
 
 fn identity_from_row(
@@ -476,6 +505,10 @@ mod tests {
         assert!(sql[0].contains("COMMITTED_DATA_ONLY"));
         assert!(!sql[0].contains("CONTINUOUS_MINE"));
         assert!(sql[1].contains("V$LOGMNR_CONTENTS"));
+        assert!(
+            sql[1].contains("RS_ID") && sql[1].contains("SSN"),
+            "OCI contents query must project LogMiner ordering keys for same-SCN identity"
+        );
         assert!(sql[2].contains("END_LOGMNR"));
     }
 
