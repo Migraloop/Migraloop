@@ -82,12 +82,23 @@ fn value_key(value: &Value) -> String {
 /// Map LogMiner contents at or after `from_position` into platform change events.
 ///
 /// Filters by table name (case-insensitive) and `scn >= from_position`.
+/// When `limit` is `Some(n)`, returns at most `n` events (bounded Incremental window).
 pub fn change_events_from_logminer_contents(
     contents: &[LogMinerContent],
     table: &str,
     from_position: CapturePosition,
 ) -> Vec<ChangeEvent> {
-    contents
+    change_events_from_logminer_contents_limited(contents, table, from_position, None)
+}
+
+/// Like [`change_events_from_logminer_contents`] with an optional max event count.
+pub fn change_events_from_logminer_contents_limited(
+    contents: &[LogMinerContent],
+    table: &str,
+    from_position: CapturePosition,
+    limit: Option<usize>,
+) -> Vec<ChangeEvent> {
+    let iter = contents
         .iter()
         .filter(|row| row.table_name.eq_ignore_ascii_case(table))
         .filter(|row| CapturePosition(row.scn) >= from_position)
@@ -98,8 +109,24 @@ pub fn change_events_from_logminer_contents(
             row: row.after_image.clone(),
             position: CapturePosition(row.scn),
             change_id: logminer_change_id(row),
-        })
-        .collect()
+        });
+    match limit {
+        Some(n) => iter.take(n).collect(),
+        None => iter.collect(),
+    }
+}
+
+/// Count matching LogMiner contents at or after `from_position` without materializing events.
+pub fn count_logminer_contents(
+    contents: &[LogMinerContent],
+    table: &str,
+    from_position: CapturePosition,
+) -> usize {
+    contents
+        .iter()
+        .filter(|row| row.table_name.eq_ignore_ascii_case(table))
+        .filter(|row| CapturePosition(row.scn) >= from_position)
+        .count()
 }
 
 #[cfg(test)]

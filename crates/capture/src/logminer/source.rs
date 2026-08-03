@@ -58,9 +58,38 @@ impl IncrementalCapture {
         table: &str,
         from_position: CapturePosition,
     ) -> Result<Vec<ChangeEvent>, CaptureError> {
+        self.fetch_changes_in_schema_limited(schema, table, from_position, None)
+    }
+
+    /// Bounded Incremental Capture fetch for backpressure windows (ADR-0020).
+    pub fn fetch_changes_in_schema_limited(
+        &self,
+        schema: &str,
+        table: &str,
+        from_position: CapturePosition,
+        limit: Option<usize>,
+    ) -> Result<Vec<ChangeEvent>, CaptureError> {
         match self {
-            Self::Contract(c) => c.fetch_changes(table, from_position),
-            Self::Oci(o) => o.fetch_changes_in_schema(schema, table, from_position),
+            Self::Contract(c) => c.fetch_changes_limited(table, from_position, limit),
+            Self::Oci(o) => {
+                o.fetch_changes_in_schema_limited(schema, table, from_position, limit)
+            }
+        }
+    }
+
+    /// Count pending Incremental changes for Sync/Delivery Health lag (ADR-0020).
+    ///
+    /// Does not materialize full row images — used so lag can reflect backlog under
+    /// bounded windows without defeating the queue capacity bound.
+    pub fn count_changes_in_schema(
+        &self,
+        schema: &str,
+        table: &str,
+        from_position: CapturePosition,
+    ) -> Result<usize, CaptureError> {
+        match self {
+            Self::Contract(c) => c.count_changes(table, from_position),
+            Self::Oci(o) => o.count_changes_in_schema(schema, table, from_position),
         }
     }
 

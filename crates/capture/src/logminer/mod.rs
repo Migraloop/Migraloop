@@ -9,6 +9,7 @@
 
 mod contents;
 mod contract;
+mod inject;
 mod oci;
 mod source;
 
@@ -16,6 +17,9 @@ pub use contents::{
     change_events_from_logminer_contents, logminer_change_id, LogMinerContent, LogMinerOperation,
 };
 pub use contract::ContractLogMiner;
+pub use inject::{
+    load_injected_logminer_contents, LogMinerInjectError, INJECT_LOGMINER_CONTENTS_ENV,
+};
 pub use oci::{
     oci_logminer_session_sql, OciLogMiner, DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR,
     V_LOGMNR_CONTENTS_QUERY,

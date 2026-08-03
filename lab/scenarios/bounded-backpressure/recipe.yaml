@@ -1,0 +1,29 @@
+# Lab Scenario recipe (ADR-0025 / issue #26 / ADR-0020).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: bounded-backpressure
+summary: Bounded queues under Downstream slowness; Sync/Delivery lag visible; Pipeline not paused
+namespace:
+  source_tables:
+    - LAB_BP_CUSTOMERS
+  target_collections:
+    - lab_bp_customers
+  deployment: lab-bounded-backpressure
+  pipelines:
+    - lab-bp-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery)
+    - insert Source backlog (many rows)
+    - sync with Downstream Delivery delay + small queue capacity; stop mid-window
+    - assert Backpressure signal, queue_depth within capacity, status lag > 0, not paused
+    - sync catch-up without delay; lag → 0; Target receives backlog
+checks:
+  correctness:
+    - "Artificial Downstream slowness prints Backpressure with queue_depth ≤ capacity"
+    - "Sync Health / Delivery Health lag reflect delay mid-sync (not paused)"
+    - "Catch-up completes with lag=0 and Target Managed outcomes for backlog rows"
+    - "Pipeline is not paused merely for Downstream slowness"
+thresholds: {}

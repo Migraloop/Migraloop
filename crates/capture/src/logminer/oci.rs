@@ -97,15 +97,44 @@ impl OciLogMiner {
         table: &str,
         from_position: CapturePosition,
     ) -> Result<Vec<ChangeEvent>, CaptureError> {
+        self.fetch_changes_in_schema_limited(schema, table, from_position, None)
+    }
+
+    /// Bounded Incremental Capture fetch for backpressure windows (ADR-0020).
+    pub fn fetch_changes_in_schema_limited(
+        &self,
+        schema: &str,
+        table: &str,
+        from_position: CapturePosition,
+        limit: Option<usize>,
+    ) -> Result<Vec<ChangeEvent>, CaptureError> {
         let conn = connect_oracle(&self.connect, &self.password)?;
         let owner = resolve_oracle_schema(&self.connect, schema);
-        let contents =
-            fetch_logminer_contents(&conn, &self.connect.host, &owner, table, from_position)?;
+        let contents = fetch_logminer_contents(
+            &conn,
+            &self.connect.host,
+            &owner,
+            table,
+            from_position,
+            limit,
+        )?;
         Ok(change_events_from_logminer_contents(
             &contents,
             table,
             from_position,
         ))
+    }
+
+    /// Count pending Incremental DML rows for Sync/Delivery Health lag (ADR-0020).
+    pub fn count_changes_in_schema(
+        &self,
+        schema: &str,
+        table: &str,
+        from_position: CapturePosition,
+    ) -> Result<usize, CaptureError> {
+        let conn = connect_oracle(&self.connect, &self.password)?;
+        let owner = resolve_oracle_schema(&self.connect, schema);
+        count_logminer_contents(&conn, &self.connect.host, &owner, table, from_position)
     }
 
     pub fn probe_prerequisites(&self) -> Result<OracleSourcePrerequisiteState, CaptureError> {
@@ -114,12 +143,49 @@ impl OciLogMiner {
     }
 }
 
+fn count_logminer_contents(
+    conn: &Connection,
+    host: &str,
+    owner: &str,
+    table: &str,
+    from_position: CapturePosition,
+) -> Result<usize, CaptureError> {
+    let table = table.trim().to_ascii_uppercase();
+    let owner = owner.trim().to_ascii_uppercase();
+    let end_scn = current_scn(conn, host)?;
+    let start_scn = from_position.as_i64();
+    let end_scn_i64 = end_scn.as_i64();
+    if end_scn_i64 < start_scn {
+        return Ok(0);
+    }
+
+    conn.execute(DBMS_LOGMNR_START_LOGMNR, &[&start_scn, &end_scn_i64])
+        .map_err(|err| map_oracle_error(host, err))?;
+
+    let result = (|| {
+        let sql = "SELECT COUNT(*) FROM V$LOGMNR_CONTENTS \
+             WHERE UPPER(SEG_OWNER) = :1 \
+               AND UPPER(SEG_NAME) = :2 \
+               AND SCN >= :3 \
+               AND OPERATION IN ('INSERT', 'UPDATE', 'DELETE')";
+        let row = conn
+            .query_row(sql, &[&owner, &table, &start_scn])
+            .map_err(|err| map_oracle_error(host, err))?;
+        let count: i64 = row.get(0).map_err(|err| map_oracle_error(host, err))?;
+        Ok(count.max(0) as usize)
+    })();
+
+    let _ = conn.execute(DBMS_LOGMNR_END_LOGMNR, &[]);
+    result
+}
+
 fn fetch_logminer_contents(
     conn: &Connection,
     host: &str,
     owner: &str,
     table: &str,
     from_position: CapturePosition,
+    limit: Option<usize>,
 ) -> Result<Vec<LogMinerContent>, CaptureError> {
     let table = table.trim().to_ascii_uppercase();
     let owner = owner.trim().to_ascii_uppercase();
@@ -147,7 +213,16 @@ fn fetch_logminer_contents(
     conn.execute(DBMS_LOGMNR_START_LOGMNR, &[&start_scn, &end_scn_i64])
         .map_err(|err| map_oracle_error(host, err))?;
 
-    let result = read_mined_contents(conn, host, &owner, &table, start_scn, &columns, &primary_key);
+    let result = read_mined_contents(
+        conn,
+        host,
+        &owner,
+        &table,
+        start_scn,
+        &columns,
+        &primary_key,
+        limit,
+    );
 
     // Always attempt to end the session — ignore end errors if start/query already failed.
     let _ = conn.execute(DBMS_LOGMNR_END_LOGMNR, &[]);
@@ -163,6 +238,7 @@ fn read_mined_contents(
     start_scn: i64,
     columns: &[SourceColumn],
     primary_key: &[String],
+    limit: Option<usize>,
 ) -> Result<Vec<LogMinerContent>, CaptureError> {
     let mut select_parts = vec![
         "SCN".to_string(),
@@ -182,13 +258,19 @@ fn read_mined_contents(
         ));
     }
 
+    // FETCH FIRST bounds the LogMiner contents materialization under backpressure
+    // (ADR-0020) so Downstream slowness does not pull an unbounded redo window.
+    let fetch_clause = match limit {
+        Some(n) if n > 0 => format!(" FETCH FIRST {n} ROWS ONLY"),
+        _ => String::new(),
+    };
     let sql = format!(
         "SELECT {} FROM V$LOGMNR_CONTENTS \
          WHERE UPPER(SEG_OWNER) = :1 \
            AND UPPER(SEG_NAME) = :2 \
            AND SCN >= :3 \
            AND OPERATION IN ('INSERT', 'UPDATE', 'DELETE') \
-         ORDER BY SCN, COMMIT_TIMESTAMP, RS_ID, SSN",
+         ORDER BY SCN, COMMIT_TIMESTAMP, RS_ID, SSN{fetch_clause}",
         select_parts.join(", ")
     );
 

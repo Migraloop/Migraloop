@@ -49,12 +49,12 @@ The check reads at most `--max-rows` expected Output Identities (default `1000` 
 
 When Platform Store apply, Derived maintenance, or Target Delivery cannot keep up (ADR-0020):
 
-- Stages use **bounded queues** and slow capture/apply
-- Lag remains visible on Sync Health / Delivery Health (and metrics when exposed)
+- Stages use **bounded queues** (default Incremental window `MIGRALOOP_SYNC_QUEUE_CAPACITY`, 256) and slow capture/apply
+- Sync Health and Delivery Health both expose `lag=` for remaining work in the current window; `sync` prints `Backpressure: queue_depth=… capacity=…` when the window is full or Downstream is delayed
 - Unbounded in-memory buffering / OOM-as-backpressure is rejected
 - Pausing an entire Pipeline solely because the Target is slow is **not** the default
 
-Operators act on visible lag (scale Target, reduce load, inspect Delivery errors)—pause remains for true blockers.
+Operators act on visible lag (scale Target, reduce load, inspect Delivery errors)—pause remains for true blockers. Lab Scenario `bounded-backpressure` exercises this path on the disposable Fixture.
 
 ## Platform Store Guardrails
 

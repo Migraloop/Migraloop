@@ -140,6 +140,17 @@ const DRIFT_CHECK_PIPELINE: &str = "lab-dc-customers";
 const DRIFT_CHECK_DEPLOYMENT: &str = "lab-drift-check";
 const DRIFT_CHECK_EXTRA_FIELD: &str = "keep-me-non-managed";
 
+const BOUNDED_BACKPRESSURE_ID: &str = "bounded-backpressure";
+const BOUNDED_BACKPRESSURE_TABLE: &str = "LAB_BP_CUSTOMERS";
+const BOUNDED_BACKPRESSURE_COLLECTION: &str = "lab_bp_customers";
+const BOUNDED_BACKPRESSURE_PIPELINE: &str = "lab-bp-customers";
+const BOUNDED_BACKPRESSURE_DEPLOYMENT: &str = "lab-bounded-backpressure";
+/// Lab orchestration: tiny Incremental window + Downstream Delivery delay.
+const BOUNDED_BACKPRESSURE_CAPACITY: &str = "2";
+const BOUNDED_BACKPRESSURE_DELAY_MS: &str = "80";
+const BOUNDED_BACKPRESSURE_FAIL_AFTER: &str = "1";
+const BOUNDED_BACKPRESSURE_BACKLOG: i64 = 20;
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -225,6 +236,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         SCHEMA_CHANGE_PAUSE_ID,
         SOURCE_ALIGNMENT_ID,
         DRIFT_CHECK_ID,
+        BOUNDED_BACKPRESSURE_ID,
     ]
 }
 
@@ -276,6 +288,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             DRIFT_CHECK_ID,
             "Drift Check with Managed-field auto-repair",
+        ),
+        (
+            BOUNDED_BACKPRESSURE_ID,
+            "Bounded backpressure with visible lag",
         ),
     ]
 }
@@ -572,6 +588,7 @@ async fn scenario_run(
         SCHEMA_CHANGE_PAUSE_ID => run_schema_change_pause(lab_dir).await,
         SOURCE_ALIGNMENT_ID => run_source_alignment(lab_dir).await,
         DRIFT_CHECK_ID => run_drift_check(lab_dir).await,
+        BOUNDED_BACKPRESSURE_ID => run_bounded_backpressure(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -665,6 +682,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         SCHEMA_CHANGE_PAUSE_ID => remove_schema_change_pause_namespace(lab_dir).await,
         SOURCE_ALIGNMENT_ID => remove_source_alignment_namespace(lab_dir).await,
         DRIFT_CHECK_ID => remove_drift_check_namespace(lab_dir).await,
+        BOUNDED_BACKPRESSURE_ID => remove_bounded_backpressure_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -3764,6 +3782,353 @@ EXIT;\n"
         })
 }
 
+
+async fn run_bounded_backpressure(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {BOUNDED_BACKPRESSURE_ID}");
+    println!(
+        "Scenario Namespace: table={BOUNDED_BACKPRESSURE_TABLE} \
+collection={BOUNDED_BACKPRESSURE_COLLECTION} deployment={BOUNDED_BACKPRESSURE_DEPLOYMENT}"
+    );
+
+    prepare_bounded_backpressure_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, BOUNDED_BACKPRESSURE_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !apply_out.to_ascii_lowercase().contains("delivery") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: inserting Source backlog ({BOUNDED_BACKPRESSURE_BACKLOG} rows)..."
+    );
+    insert_bounded_backpressure_backlog(lab_dir).await?;
+
+    println!(
+        "Lab Scenario: sync under Downstream delay with queue capacity={} \
+(fail after {} durable checkpoint)...",
+        BOUNDED_BACKPRESSURE_CAPACITY, BOUNDED_BACKPRESSURE_FAIL_AFTER
+    );
+    let (slow_ok, slow_out) = run_product_cli_allow_fail(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[
+            (
+                "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+                BOUNDED_BACKPRESSURE_CAPACITY,
+            ),
+            (
+                "MIGRALOOP_DELIVERY_DELAY_MS",
+                BOUNDED_BACKPRESSURE_DELAY_MS,
+            ),
+            (
+                "MIGRALOOP_SYNC_FAIL_AFTER_CHANGES",
+                BOUNDED_BACKPRESSURE_FAIL_AFTER,
+            ),
+        ],
+    )
+    .await?;
+    if slow_ok {
+        return Err(CliError::Failed(format!(
+            "expected mid-sync stop under Downstream slowness (FAIL_AFTER), got success:\n{slow_out}"
+        )));
+    }
+    if !slow_out.to_ascii_lowercase().contains("logminer") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{slow_out}"
+        )));
+    }
+    let slow_lower = slow_out.to_ascii_lowercase();
+    if !(slow_out.contains("Backpressure:") || slow_lower.contains("backpressure")) {
+        return Err(CliError::Failed(format!(
+            "expected Backpressure signal while Downstream is slow:\n{slow_out}"
+        )));
+    }
+    let mut peak_depth = 0i32;
+    for line in slow_out.lines() {
+        if let Some(rest) = line.split("queue_depth=").nth(1) {
+            if let Some(n) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                peak_depth = peak_depth.max(n);
+            }
+        }
+    }
+    if peak_depth <= 0 || peak_depth > 2 {
+        return Err(CliError::Failed(format!(
+            "queue_depth must stay within capacity=2 under backpressure, peak={peak_depth}:\n{slow_out}"
+        )));
+    }
+    if slow_lower
+        .lines()
+        .any(|line| line.contains("paused") && line.contains(BOUNDED_BACKPRESSURE_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "backpressure must not pause the Pipeline for Downstream slowness:\n{slow_out}"
+        )));
+    }
+
+    let status_mid = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let sync_lag = parse_sync_lag_for_table(&status_mid, BOUNDED_BACKPRESSURE_TABLE).ok_or_else(
+        || {
+            CliError::Failed(format!(
+                "could not parse Sync Health lag under backpressure:\n{status_mid}"
+            ))
+        },
+    )?;
+    if sync_lag < 10 {
+        return Err(CliError::Failed(format!(
+            "Sync Health lag must reflect Source backlog under backpressure (not only window remainder), got {sync_lag}:\n{status_mid}"
+        )));
+    }
+    let delivery_lag = parse_delivery_lag_for_pipeline(&status_mid, BOUNDED_BACKPRESSURE_PIPELINE)
+        .ok_or_else(|| {
+            CliError::Failed(format!(
+                "could not parse Delivery Health lag under backpressure:\n{status_mid}"
+            ))
+        })?;
+    if delivery_lag < 10 {
+        return Err(CliError::Failed(format!(
+            "Delivery Health lag must reflect Downstream backlog under delay, got {delivery_lag}:\n{status_mid}"
+        )));
+    }
+    if status_mid.contains("Delivery Health: paused") {
+        return Err(CliError::Failed(format!(
+            "default must not pause Pipeline for mere Downstream slowness:\n{status_mid}"
+        )));
+    }
+
+    println!("Lab Scenario: catch-up sync without Downstream delay...");
+    let catch_out = run_product_cli_with_env(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[(
+            "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+            BOUNDED_BACKPRESSURE_CAPACITY,
+        )],
+    )
+    .await?;
+    let capture_note = if catch_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario catch-up sync must use real LogMiner path:\n{catch_out}"
+        )));
+    };
+
+    let status_after = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let sync_lag_after =
+        parse_sync_lag_for_table(&status_after, BOUNDED_BACKPRESSURE_TABLE).unwrap_or(-1);
+    let delivery_lag_after =
+        parse_delivery_lag_for_pipeline(&status_after, BOUNDED_BACKPRESSURE_PIPELINE).unwrap_or(-1);
+    if sync_lag_after != 0 || delivery_lag_after != 0 {
+        return Err(CliError::Failed(format!(
+            "lag must return to 0 after catch-up (sync={sync_lag_after}, delivery={delivery_lag_after}):\n{status_after}"
+        )));
+    }
+    if status_after.contains("Delivery Health: paused") {
+        return Err(CliError::Failed(format!(
+            "Pipeline must remain unpaused after backpressure catch-up:\n{status_after}"
+        )));
+    }
+
+    let target_out = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            BOUNDED_BACKPRESSURE_COLLECTION,
+        ],
+    )
+    .await?;
+    if !(managed_name_present(&target_out, "User100")
+        && managed_name_present(&target_out, "User119"))
+    {
+        return Err(CliError::Failed(format!(
+            "Target must receive backlog rows User100..User119 after catch-up:\n{target_out}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out)
+        + count_delivery_ops(&slow_out)
+        + count_delivery_ops(&catch_out);
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (bounded backpressure; visible lag; catch-up; Pipeline not paused)"
+    );
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: Some(sync_lag_after),
+        max_lag: Some(0),
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_bounded_backpressure_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={BOUNDED_BACKPRESSURE_TABLE}, collection={BOUNDED_BACKPRESSURE_COLLECTION}, \
+          deployment={BOUNDED_BACKPRESSURE_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {BOUNDED_BACKPRESSURE_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for bounded-backpressure:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{BOUNDED_BACKPRESSURE_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for bounded-backpressure:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, BOUNDED_BACKPRESSURE_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{BOUNDED_BACKPRESSURE_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_bounded_backpressure_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_bounded_backpressure_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {BOUNDED_BACKPRESSURE_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {BOUNDED_BACKPRESSURE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {BOUNDED_BACKPRESSURE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {BOUNDED_BACKPRESSURE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare bounded-backpressure Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn insert_bounded_backpressure_backlog(lab_dir: &Path) -> Result<(), CliError> {
+    let mut inserts = String::new();
+    for i in 0..BOUNDED_BACKPRESSURE_BACKLOG {
+        let id = 100 + i;
+        inserts.push_str(&format!(
+            "INSERT INTO {BOUNDED_BACKPRESSURE_TABLE} (ID, NAME, EMAIL, ACTIVE) \
+VALUES ({id}, 'User{id}', 'user{id}@example.com', 1);\n"
+        ));
+    }
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+{inserts}\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to insert Source backlog for bounded-backpressure:\n{err}"
+            ))
+        })
+}
+
+fn parse_delivery_lag_for_pipeline(status_out: &str, pipeline: &str) -> Option<i32> {
+    status_out.lines().find_map(|line| {
+        if !(line.contains("Delivery Health") && line.contains(&format!("Pipeline={pipeline}"))) {
+            return None;
+        }
+        line.split("lag=")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split(|c: char| c.is_whitespace() || c == ',')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+            })
+    })
+}
+
 /// Parse `checkpoint=N` from `migraloop status` Cutover lines.
 fn parse_capture_checkpoint(status_out: &str) -> Option<i64> {
     for line in status_out.lines() {
@@ -5176,6 +5541,39 @@ Hint: Scenario apply/sync needs Oracle Instant Client on the host \
     print!("{text}");
     Ok(text)
 }
+
+/// Like [`run_product_cli_with_env`] but returns stdout/stderr even on non-zero exit
+/// (used for mid-sync FAIL_AFTER backpressure observation).
+async fn run_product_cli_allow_fail(
+    bin: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Result<(bool, String), CliError> {
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .env(LAB_ORACLE_PASSWORD_ENV, LAB_ORACLE_PASSWORD_DEFAULT)
+        .env(LAB_MONGO_PASSWORD_ENV, LAB_MONGO_PASSWORD_DEFAULT)
+        .env("MIGRALOOP_PLATFORM_STORE_URL", LAB_PLATFORM_STORE_URL);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command.output().await.map_err(|err| {
+        CliError::Failed(format!(
+            "failed to run `{} {}`: {err}",
+            bin.display(),
+            args.join(" ")
+        ))
+    })?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    print!("{text}");
+    Ok((output.status.success(), text))
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LockFile {

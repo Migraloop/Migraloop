@@ -50,12 +50,12 @@ migraloop drift [--pipeline customers] [--max-rows 1000]
 
 當 Platform Store apply、Derived maintenance 或 Target Delivery 跟不上時（ADR-0020）：
 
-- 各階段使用 **bounded queues** 並放慢 capture/apply
-- Lag 仍會顯示在 Sync Health / Delivery Health（以及暴露時的 metrics）
+- 各階段使用 **bounded queues**（預設 Incremental window `MIGRALOOP_SYNC_QUEUE_CAPACITY`，256）並放慢 capture/apply
+- Sync Health 與 Delivery Health 都暴露目前 window 剩餘工作的 `lag=`；當 window 已滿或 Downstream 延遲時，`sync` 會印出 `Backpressure: queue_depth=… capacity=…`
 - 拒絕無界記憶體緩衝 / 把 OOM 當 backpressure
 - 只因 Target 慢就 pause 整條 Pipeline **不是**預設行為
 
-Operator 依可見 lag 行動（擴充 Target、降低負載、檢查 Delivery 錯誤）—pause 留給真正的 blocker。
+Operator 依可見 lag 行動（擴充 Target、降低負載、檢查 Delivery 錯誤）—pause 留給真正的 blocker。Lab Scenario `bounded-backpressure` 可在可拋棄 Fixture 上演練此路徑。
 
 ## Platform Store Guardrails
 
