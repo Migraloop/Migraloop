@@ -22,7 +22,7 @@ use thiserror::Error;
 ///
 /// Held for one `sync` / continuous-run cycle so one-shot catch-up and the long-running
 /// app instance do not multi-write Base/Delivery state concurrently.
-pub const INCREMENTAL_SYNC_ADVISORY_LOCK_KEY: i64 = 0x4D47_5F53_594E_4301; // "MG_SYNC\x01"
+const INCREMENTAL_SYNC_ADVISORY_LOCK_KEY: i64 = 0x4D47_5F53_594E_4301; // "MG_SYNC\x01"
 
 /// Prior-release Platform Store schema cut for upgrade-smoke verification.
 ///

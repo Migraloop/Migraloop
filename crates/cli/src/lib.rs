@@ -2498,6 +2498,15 @@ enum SyncInvocation {
     ContinuousCycle,
 }
 
+/// Outcome of one Incremental Capture cycle (drives continuous idle-poll vs immediate catch-up).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncCycleOutcome {
+    /// No pending Source changes applied this cycle (caught up, or no Deployments yet).
+    Idle,
+    /// At least one bounded window of Incremental work was processed.
+    Progressed,
+}
+
 /// Test/Lab fault injection: artificial Downstream Delivery slowness (milliseconds).
 fn delivery_delay_ms() -> Option<u64> {
     std::env::var("MIGRALOOP_DELIVERY_DELAY_MS")
@@ -3499,14 +3508,17 @@ fn normalize_json_for_drift(value: &serde_json::Value) -> serde_json::Value {
 }
 
 async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
-    run_incremental_sync(platform_store_url, SyncInvocation::OneShot).await
+    run_incremental_sync(platform_store_url, SyncInvocation::OneShot)
+        .await
+        .map(|_| ())
 }
 
 /// Continuous Incremental Capture → Affect Analysis → Delivery inside `migraloop run`.
 ///
-/// Idle-polls when caught up or when no Deployments are applied yet so compose can
-/// start before `apply`. Errors are logged and retried — Observability metrics keep
-/// serving on the same single active instance (issue #145).
+/// Idle-polls only when caught up or when no Deployments are applied yet so compose
+/// can start before `apply`. While there is pending Source work, cycles continue
+/// immediately (bounded windows still apply). Errors are logged and retried —
+/// Observability metrics keep serving on the same single active instance (issue #145).
 async fn run_continuous_incremental_sync(platform_store_url: String) {
     let poll = sync_poll_interval();
     println!(
@@ -3522,23 +3534,56 @@ async fn run_continuous_incremental_sync(platform_store_url: String) {
     );
     loop {
         match run_incremental_sync(&platform_store_url, SyncInvocation::ContinuousCycle).await {
-            Ok(()) => {}
+            Ok(SyncCycleOutcome::Progressed) => {
+                // Catch up backlog without waiting for the idle poll interval.
+            }
+            Ok(SyncCycleOutcome::Idle) => {
+                tokio::time::sleep(poll).await;
+            }
             Err(err) => {
                 eprintln!("Continuous Incremental Capture cycle failed: {err}");
                 emit_event(
                     "continuous_sync_error",
                     &[("error", EventValue::from(err.to_string()))],
                 );
+                tokio::time::sleep(poll).await;
             }
         }
-        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Supervise continuous Sync so a panic does not leave `/metrics` up with Sync dead.
+async fn supervise_continuous_incremental_sync(platform_store_url: String) {
+    loop {
+        let url = platform_store_url.clone();
+        match tokio::spawn(async move { run_continuous_incremental_sync(url).await }).await {
+            Ok(()) => {
+                eprintln!(
+                    "Continuous Incremental Capture task ended unexpectedly; restarting"
+                );
+                emit_event(
+                    "continuous_sync_error",
+                    &[("error", EventValue::from("task ended unexpectedly"))],
+                );
+            }
+            Err(join_err) => {
+                eprintln!(
+                    "Continuous Incremental Capture task panicked: {join_err}; restarting"
+                );
+                emit_event(
+                    "continuous_sync_error",
+                    &[("error", EventValue::from(join_err.to_string()))],
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
 async fn run_incremental_sync(
     platform_store_url: &str,
     invocation: SyncInvocation,
-) -> Result<(), CliError> {
+) -> Result<SyncCycleOutcome, CliError> {
     ensure_store_healthy(platform_store_url).await?;
 
     // Serialize Incremental Capture writers: continuous `run` + one-shot `sync`
@@ -3556,7 +3601,7 @@ async fn run_incremental_sync(
                 "no Deployments applied; run `migraloop apply` first".to_string(),
             )),
             // Compose / Lab Fixture may start `run` before any Deployment is applied.
-            SyncInvocation::ContinuousCycle => Ok(()),
+            SyncInvocation::ContinuousCycle => Ok(SyncCycleOutcome::Idle),
         };
     }
 
@@ -3571,6 +3616,7 @@ async fn run_incremental_sync(
     let injected_schema_changes = load_injected_schema_changes()
         .map_err(|err| CliError::Failed(err.to_string()))?;
     let mut applied_this_run: u32 = 0;
+    let mut progressed = false;
     let quiet = matches!(invocation, SyncInvocation::ContinuousCycle);
 
     for deployment in &deployments {
@@ -3796,16 +3842,18 @@ async fn run_incremental_sync(
                         0,
                     )
                     .await?;
-                    if windows_processed == 0 {
-                        println!(
-                            "Incremental Capture: Base Dataset {table} resume from checkpoint — \
-                             0 new changes (already applied; lag=0)"
-                        );
-                    } else {
-                        println!(
-                            "Incremental Capture: Base Dataset {table} caught up (lag=0; \
-                             bounded queue capacity={queue_capacity})"
-                        );
+                    if !quiet {
+                        if windows_processed == 0 {
+                            println!(
+                                "Incremental Capture: Base Dataset {table} resume from checkpoint — \
+                                 0 new changes (already applied; lag=0)"
+                            );
+                        } else {
+                            println!(
+                                "Incremental Capture: Base Dataset {table} caught up (lag=0; \
+                                 bounded queue capacity={queue_capacity})"
+                            );
+                        }
                     }
                     break;
                 }
@@ -3835,19 +3883,21 @@ async fn run_incremental_sync(
                     );
                 }
 
-                if windows_processed == 0 {
-                    println!(
-                        "Incremental Capture: resuming Base Dataset {table} from \
-                         checkpoint={checkpoint_before} (inclusive resume={resume_from}, \
-                         queue_depth={queue_depth}, capacity={queue_capacity}, \
-                         low-watermark={low_watermark})"
-                    );
-                } else {
-                    println!(
-                        "Incremental Capture: Base Dataset {table} next bounded window \
-                         resume={resume_from} queue_depth={queue_depth} \
-                         capacity={queue_capacity}"
-                    );
+                if !quiet {
+                    if windows_processed == 0 {
+                        println!(
+                            "Incremental Capture: resuming Base Dataset {table} from \
+                             checkpoint={checkpoint_before} (inclusive resume={resume_from}, \
+                             queue_depth={queue_depth}, capacity={queue_capacity}, \
+                             low-watermark={low_watermark})"
+                        );
+                    } else {
+                        println!(
+                            "Incremental Capture: Base Dataset {table} next bounded window \
+                             resume={resume_from} queue_depth={queue_depth} \
+                             capacity={queue_capacity}"
+                        );
+                    }
                 }
                 emit_event(
                     "incremental_capture",
@@ -4229,6 +4279,7 @@ async fn run_incremental_sync(
                     ))
                 })?;
                 windows_processed += 1;
+                progressed = true;
             }
 
         }
@@ -4237,7 +4288,11 @@ async fn run_incremental_sync(
     if !quiet {
         println!("Incremental Capture and Delivery complete");
     }
-    Ok(())
+    Ok(if progressed {
+        SyncCycleOutcome::Progressed
+    } else {
+        SyncCycleOutcome::Idle
+    })
 }
 
 async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
@@ -4962,7 +5017,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             // instance that serves Observability /metrics (issue #145 / ADR-0008).
             let sync_url = platform_store_url.clone();
             tokio::spawn(async move {
-                run_continuous_incremental_sync(sync_url).await;
+                supervise_continuous_incremental_sync(sync_url).await;
             });
             observability::serve_prometheus_metrics(addr, platform_store_url).await
         }
