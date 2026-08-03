@@ -1454,7 +1454,6 @@ dependencies = [
 name = "migraloop-cli"
 version = "0.1.0"
 dependencies = [
- "chrono-tz",
  "clap",
  "migraloop-capture",
  "migraloop-delivery",

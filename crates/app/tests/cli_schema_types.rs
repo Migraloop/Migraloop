@@ -470,6 +470,83 @@ spec:
 }
 
 #[tokio::test]
+async fn naive_date_uses_configured_oracle_offset_timezone_mongo_utc_datetime() {
+    let url = ephemeral_database_url().await;
+    let mongo_database = unique_mongo_database();
+    let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
+    let config = write_config(
+        &dir,
+        "events-offset-tz.yaml",
+        &format!(
+            r#"
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: oracle-to-mongo
+spec:
+  source:
+    kind: oracle
+    host: stub
+    port: 1521
+    database: STUB
+    username: sync_user
+    timezone: "+09:00"
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: {host}
+    port: {port}
+    database: {mongo_database}
+    username: deliver_user
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: events
+      mode: direct
+      source:
+        table: EVENTS
+      target:
+        collection: events
+"#,
+            host = mongo_host(),
+            port = mongo_port(),
+        ),
+    );
+
+    migrate(&url);
+    let out = apply(&url, &config, &doubles);
+    assert!(
+        out.status.success(),
+        "apply with Oracle-style offset timezone must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let status = Command::new(bin())
+        .args(["status", "--platform-store-url", &url])
+        .output()
+        .expect("status");
+    let status_out = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_out.contains("timezone=+09:00"),
+        "status should surface Oracle-style source timezone, got:\n{status_out}"
+    );
+
+    let occurred = pymongo_field_type(&mongo_database, "events", 1, "OCCURRED_AT");
+    assert!(
+        occurred.contains("datetime"),
+        "OCCURRED_AT must be Mongo UTC datetime: {occurred}"
+    );
+    // 2024-01-15 10:30 +09:00 → 01:30 UTC
+    assert!(
+        occurred.contains("1, 30") || occurred.contains("01:30"),
+        "expected UTC 01:30 from +09:00 naive local, got: {occurred}"
+    );
+}
+
+#[tokio::test]
 async fn naive_date_uses_readable_db_timezone_over_configured() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();

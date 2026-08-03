@@ -144,7 +144,7 @@ spec:
     username: sync_user
     password:
       fromEnv: ORACLE_PASSWORD
-    timezone: Asia/Taipei          # 可選；naive DATE/TIMESTAMP 後備
+    timezone: Asia/Taipei          # 可選 IANA 或 ±HH:MM；naive DATE/TIMESTAMP 後備
     # tls:                         # 可選；省略即 cleartext Lab/開發
     #   enabled: true
     #   walletLocation: /etc/oracle/wallet

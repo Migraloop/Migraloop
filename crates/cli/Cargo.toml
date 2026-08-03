@@ -6,7 +6,6 @@ license.workspace = true
 description = "Operator CLI for the DB Sync Platform"
 
 [dependencies]
-chrono-tz = { workspace = true }
 clap = { workspace = true }
 migraloop-capture = { workspace = true }
 migraloop-delivery = { workspace = true }
