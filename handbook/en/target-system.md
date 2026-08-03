@@ -28,7 +28,7 @@ The binding (with the Pipeline) also implies **Output Identity** and **Managed C
 
 ## Managed Columns / fields
 
-**Managed Columns** (document fields in v1) are the output shape Delivery will write. Delivery ownership differs by Target kind (ADR-0002). **v1 ships MongoDB document Delivery only**; the relational rules below are design continuity for later SQL targets—not a v1 Delivery runtime.
+**Managed Columns** (document fields in v1) are the output shape Delivery will write. Delivery ownership differs by Target kind (ADR-0002). **v1 ships MongoDB document Delivery only**; the relational rules below are design continuity for later relational Target Systems—not a v1 Delivery runtime.
 
 ### Document targets (v1: MongoDB)
 

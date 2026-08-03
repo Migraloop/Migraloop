@@ -28,7 +28,7 @@ Binding（連同 Pipeline）也隱含 **Output Identity** 與 **Managed Columns*
 
 ## Managed Columns / fields
 
-**Managed Columns**（v1 為 document fields）是 Delivery 會寫入的輸出形狀。Delivery 所有權依 Target kind 而異（ADR-0002）。**v1 僅提供 MongoDB document Delivery**；下列 relational 規則是給後續 SQL targets 的 design continuity—不是 v1 Delivery runtime。
+**Managed Columns**（v1 為 document fields）是 Delivery 會寫入的輸出形狀。Delivery 所有權依 Target kind 而異（ADR-0002）。**v1 僅提供 MongoDB document Delivery**；下列 relational 規則是給後續 relational Target Systems 的 design continuity—不是 v1 Delivery runtime。
 
 ### Document targets（v1：MongoDB）
 
