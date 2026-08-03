@@ -10,7 +10,7 @@ migraloop status
 
 `status` is the primary Operator loop today. It reports:
 
-- **Platform Store** reachability / health and schema version
+- **Platform Store** reachability / health and schema version (Platform Store Guardrails: absurdly low Postgres settings are rejected; free disk below 1 GiB prints a warn-only `WARN` — never auto-pauses Pipelines)
 - Each **Deployment** (Source/Target identity, LogMiner mechanism: contract vs OCI)
 - Each **Pipeline** (mode, source table, target collection, Delivery status)
 - Each **Base Dataset** (status, row count, columns, omitted unsupported types, Initial Load / cutover watermarks, **Sync Health** with appliedChanges / lag / checkpoint, **Source Alignment** with checked/mismatched counts)
@@ -46,8 +46,8 @@ Add `--deployment <name>` when multiple Deployments share table/collection/pipel
 
 ## Logs and metrics
 
-- App/CLI emit **structured JSON** operator event lines (plus human-readable companions) on Initial Load, Incremental Capture, Delivery, Backpressure, Poison Change quarantine, and blocking Schema Change (stdout/stderr of the `migraloop` process / container logs). Look for `"event":"…"` fields such as `initial_load_complete`, `incremental_capture`, `delivery_complete`, `backpressure`, `poison_quarantine`, `schema_change_blocked`.
-- `migraloop run` serves a Prometheus scrape endpoint at `http://<metrics-addr>/metrics` (default `0.0.0.0:9090`, override with `--metrics-addr` / `MIGRALOOP_METRICS_ADDR`). Compose publishes host port `9090`. Metrics include Sync/Delivery lag (`migraloop_sync_lag`, `migraloop_delivery_lag`), Pipeline pause, and alertable failure gauges (`migraloop_quarantined_changes`, `migraloop_failures`) read from durable Platform Store state.
+- App/CLI emit **structured JSON** operator event lines (plus human-readable companions) on Initial Load, Incremental Capture, Delivery, Backpressure, Poison Change quarantine, blocking Schema Change, and Platform Store free-disk warn (stdout/stderr of the `migraloop` process / container logs). Look for `"event":"…"` fields such as `initial_load_complete`, `incremental_capture`, `delivery_complete`, `backpressure`, `poison_quarantine`, `schema_change_blocked`, `platform_store_disk_warn`.
+- `migraloop run` serves a Prometheus scrape endpoint at `http://<metrics-addr>/metrics` (default `0.0.0.0:9090`, override with `--metrics-addr` / `MIGRALOOP_METRICS_ADDR`). Compose publishes host port `9090`. Metrics include Sync/Delivery lag (`migraloop_sync_lag`, `migraloop_delivery_lag`), Pipeline pause, alertable failure gauges (`migraloop_quarantined_changes`, `migraloop_failures`) read from durable Platform Store state, and Platform Store disk gauges (`migraloop_platform_store_disk_free_bytes`, `migraloop_platform_store_disk_warn` — warn-only; never auto-pause).
 - `status` remains the primary Operator loop for lag/checkpoint/error lines; scrape `/metrics` for alerting and dashboards.
 
 ## Related chapters

@@ -10,7 +10,7 @@ migraloop status
 
 `status` 是当前主要的 Operator 循环。它会报告：
 
-- **Platform Store** 可达性 / 健康与 schema version
+- **Platform Store** 可达性 / 健康与 schema version（Platform Store Guardrails：过低的 Postgres 设置会被拒绝；可用磁盘低于 1 GiB 时打印 warn-only `WARN` — 绝不自动 pause Pipelines）
 - 每个 **Deployment**（Source/Target 标识、LogMiner 机制：contract 或 OCI）
 - 每条 **Pipeline**（mode、source 表、target collection、Delivery status）
 - 每个 **Base Dataset**（status、行数、列、省略的不支持类型、Initial Load / cutover watermarks、含 appliedChanges / lag / checkpoint 的 **Sync Health**、含 checked/mismatched 计数的 **Source Alignment**）
@@ -46,8 +46,8 @@ migraloop status
 
 ## Logs 与 metrics
 
-- App/CLI 在 Initial Load、Incremental Capture、Delivery、Backpressure、Poison Change quarantine，以及 blocking Schema Change 会发出 **structured JSON** operator event lines（并保留 human-readable 对应行）（`migraloop` 进程 / container logs 的 stdout/stderr）。请查找 `"event":"…"` 字段，例如 `initial_load_complete`、`incremental_capture`、`delivery_complete`、`backpressure`、`poison_quarantine`、`schema_change_blocked`。
-- `migraloop run` 在 `http://<metrics-addr>/metrics` 提供 Prometheus scrape endpoint（默认 `0.0.0.0:9090`，可用 `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` 覆盖）。Compose 会公布 host port `9090`。Metrics 包含 Sync/Delivery lag（`migraloop_sync_lag`、`migraloop_delivery_lag`）、Pipeline pause，以及可告警 failure gauges（`migraloop_quarantined_changes`、`migraloop_failures`），皆自耐久 Platform Store state 读取。
+- App/CLI 在 Initial Load、Incremental Capture、Delivery、Backpressure、Poison Change quarantine、blocking Schema Change，以及 Platform Store 可用磁盘警告会发出 **structured JSON** operator event lines（并保留 human-readable 对应行）（`migraloop` 进程 / container logs 的 stdout/stderr）。请查找 `"event":"…"` 字段，例如 `initial_load_complete`、`incremental_capture`、`delivery_complete`、`backpressure`、`poison_quarantine`、`schema_change_blocked`、`platform_store_disk_warn`。
+- `migraloop run` 在 `http://<metrics-addr>/metrics` 提供 Prometheus scrape endpoint（默认 `0.0.0.0:9090`，可用 `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` 覆盖）。Compose 会公布 host port `9090`。Metrics 包含 Sync/Delivery lag（`migraloop_sync_lag`、`migraloop_delivery_lag`）、Pipeline pause、可告警 failure gauges（`migraloop_quarantined_changes`、`migraloop_failures`，皆自耐久 Platform Store state 读取），以及 Platform Store disk gauges（`migraloop_platform_store_disk_free_bytes`、`migraloop_platform_store_disk_warn` — warn-only；绝不自动 pause）。
 - `status` 仍是 Operator 解读 lag/checkpoint/error 的主要循环；用 scrape `/metrics` 做 alerting 与 dashboards。
 
 ## 相关章节

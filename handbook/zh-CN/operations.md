@@ -59,7 +59,22 @@ Operator 依可见 lag 行动（扩容 Target、降低负载、检查 Delivery �
 
 ## Platform Store Guardrails
 
-随附的 PostgreSQL Platform Store 带有安全默认与产品强制的下限（ADR-0010）。跨越安全门槛（例如可用磁盘）时必须 **只警告**—平台不会只因资源压力就自动 pause。Postgres 备份仍是 Operator 的责任。
+随附的 PostgreSQL Platform Store 带有安全默认与产品强制的下限（ADR-0010 / issue #28）。Operator 可以提高设置；app 会 **拒绝** 过低值，使 migrate / status / sync / apply / run 以 Guardrails 消息失败，而不是在资源不足下继续跑。
+
+| 设置 | Compose 默认 | 产品下限（floor） |
+| --- | --- | --- |
+| `shared_buffers` | `128MB` | ≥ `64MB` |
+| `work_mem` | `8MB` | ≥ `4MB` |
+| `maintenance_work_mem` | `128MB` | ≥ `64MB` |
+| `max_connections` | `100` | ≥ `20` |
+
+根目录 `compose.yaml` 与 `lab/compose.yaml` 会在 `platform-store` service 带上这些默认。
+
+**可用磁盘警告（warn-only）：** 当 Platform Store data volume 可用空间低于 **1 GiB** 时，产品会在 `migraloop status`（以及 sync / apply / run 路径）打印 `WARN: …`、发出 structured event `platform_store_disk_warn`，并暴露 Prometheus gauges `migraloop_platform_store_disk_free_bytes` 与 `migraloop_platform_store_disk_warn`。跨越门槛 **不会** 自动 pause Pipelines—除非另有问题，Platform Store 仍保持 healthy；如何响应警告是 Operator 的责任。
+
+**如何观测可用磁盘：** compose 会把 store data volume 以 read-only 挂进 app 的 `/var/lib/migraloop/platform-store-data`，并设置 `MIGRALOOP_PLATFORM_STORE_DATA_DIR` 指向该路径。当无法做 filesystem probe 时，Operator／orchestrator 也可改供 `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES`。
+
+Lab Scenario `platform-store-guardrails` 可在可丢弃 Fixture 上演练「低于下限即拒绝」与 warn-only 可用磁盘行为。Postgres 备份仍是 Operator 的责任。
 
 ## Upgrades
 
