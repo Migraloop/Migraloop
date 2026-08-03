@@ -48,9 +48,62 @@ migraloop target --collection orders
 # 可选：名称冲突时加 --deployment <name>
 ```
 
-## Required Privileges（Target）
+## Required Privileges (Target)
 
-Delivery 账号需要能在 bound collections 上 insert/update/delete（若你的运维模型允许，也可包含创建 collection）。偏好刚好足够 Deliver 的最小授权—不是默认 cluster-admin（ADR-0016）。
+MongoDB Delivery 账号的具体授权（ADR-0016）。**不需要 `root` / `clusterAdmin`**—请使用限定在 Target database（若运维模型允许，可再限缩到 bound collections）的专用用户。
+
+### v1 Delivery + Target 检视必要
+
+Delivery 会对每个 Pipeline 的 bound collection 按 Output Identity 做 upsert（`update` 且 `upsert: true`）与 `delete`，并以 `find` 支持 `migraloop target` 检视。在 `spec.target.database` 所指的 Target database 上，最小 role 为：
+
+```javascript
+use admin
+db.createUser({
+  user: "deliver_user",
+  pwd: passwordPrompt(),  // 或由你的 secret-manager 注入
+  roles: [
+    { role: "readWrite", db: "<target_database>" }
+  ]
+})
+```
+
+该 database 上的 `readWrite` 包含其 collections 的 `find`、`insert`、`update`、`remove` 与 `createCollection`—足以支持 Delivery 与 CLI Target 检视（collection 可在首次写入时创建）。
+
+### 更窄的自定义 role（选用）
+
+若你已预先创建每个 bound collection，并希望用 collection 范围授权取代 database 级 `readWrite`：
+
+```javascript
+use <target_database>
+db.createRole({
+  role: "migraloopDeliver",
+  privileges: [
+    {
+      resource: { db: "<target_database>", collection: "<bound_collection>" },
+      actions: ["find", "insert", "update", "remove"]
+    }
+    // 每个 Pipeline Target Binding 重复 resource+actions
+  ],
+  roles: []
+})
+use admin
+db.createUser({
+  user: "deliver_user",
+  pwd: passwordPrompt(),
+  roles: [{ role: "migraloopDeliver", db: "<target_database>" }]
+})
+```
+
+若首次 Delivery 必须创建尚不存在的 collection，请在 database 上加入 `createCollection`（或事先创建 collections）。
+
+### 选用／不需要
+
+| Privilege | 状态 |
+| --- | --- |
+| `root`、`clusterAdmin`、`dbAdminAnyDatabase` | Delivery **不需要**。Local Sync Lab 的可抛弃 Mongo 用户为 root 仅为 Fixture 方便—不是生产默认。 |
+| `dropCollection` / `dropDatabase` | 产品 Delivery **不需要**（Lab Scenario 清理可能使用更宽的 Fixture 凭证）。 |
+
+v1 连接字符串以 `authSource=admin` 验证（见 Delivery URI 构建）。请在部署预期的 auth database 创建用户，并把密码放在 secret reference（[Security](security.md)）。Source sync 账号 grants：[Source System](source-system.md)。
 
 ## Mapping 注意事项
 
@@ -61,4 +114,5 @@ Source allow-list 与 NUMBER/时间规则会影响 Managed 输出能出现什么
 - Deployment 配对：[Deployment](deployment.md)
 - Pipeline modes 与 `fields`：[Pipeline](pipeline.md)
 - Delivery Health：[Observability](observability.md)
-- Secrets / TLS：[Security](security.md)
+- Secrets、TLS 与 privilege 指引：[Security](security.md#required-privileges-pointer)
+- Oracle sync grants：[Source System](source-system.md#required-privileges)

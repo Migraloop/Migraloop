@@ -74,15 +74,64 @@ Live OCI probe 要求 **ARCHIVELOG** 模式。可讀時會回報可用 archived-
 
 ## Required Privileges
 
-Sync 帳號需要足以執行 **Initial Load**、**Incremental Capture**（LogMiner session 與相關 dictionary/redo 讀取）、Pipeline 參照資料表的 schema discovery，以及 alignment 類讀取的權限—不是只能用 superuser（ADR-0016）。
+Oracle sync 帳號的具體 grants（ADR-0016）。Sync、Prerequisites probe 或 Delivery 配對 **不需要 DBA / SYSDBA**—請使用下方最小授權的專用 sync 使用者。Source Prerequisites DDL（`ALTER DATABASE` / `ALTER TABLE` supplemental logging、ARCHIVELOG）由 DBA 另行套用；**不屬於** sync 帳號的 Required Privileges。
 
-實務上帳號必須能：
+### v1 必要（Initial Load + LogMiner Incremental Capture + Prerequisites）
 
-- 對 Pipeline 參照的資料表（與 schema）做 Initial Load 所需的 `SELECT`
-- 開啟 LogMiner / 讀取 Incremental Capture 所需的 redo contents views
-- 讀取 supplemental-logging 與 schema probe 所需的 data-dictionary metadata
+授予 Deployment `spec.source.username`（替換 `SYNC_USER` 與資料表名稱）：
 
-在你的 Oracle edition 上授予能滿足上述職責的最小集合。Admin/DBA 可用於 lab，但不得當成正式環境文件預設。
+```sql
+-- Session
+GRANT CREATE SESSION TO SYNC_USER;
+GRANT ALTER SESSION TO SYNC_USER;
+
+-- Initial Load + alignment 類讀取（每個 Pipeline 參照資料表各一次）
+GRANT SELECT ON <schema>.<table> TO SYNC_USER;
+
+-- LogMiner Incremental Capture
+GRANT LOGMINING TO SYNC_USER;              -- 若該 edition 有此 privilege
+GRANT SELECT ANY TRANSACTION TO SYNC_USER;
+GRANT EXECUTE_CATALOG_ROLE TO SYNC_USER;   -- DBMS_LOGMNR / DBMS_LOGMNR_D
+GRANT SELECT_CATALOG_ROLE TO SYNC_USER;    -- capture 與 probe 使用的 dictionary + V$
+```
+
+`SELECT_CATALOG_ROLE` 涵蓋 schema discovery、supplemental-logging probe、redo-retention probe 與 LogMiner contents 所需的 dictionary / fixed views，包括：
+
+| 物件 | 用途 |
+| --- | --- |
+| `ALL_TAB_COLUMNS`、`ALL_CONSTRAINTS` / `ALL_CONS_COLUMNS` | Schema discovery + primary-key identity |
+| `ALL_LOG_GROUPS` | 資料表層級 supplemental-logging Prerequisites |
+| `V$DATABASE` | ARCHIVELOG / DB supplemental logging / current SCN |
+| `V$ARCHIVED_LOG`、`V$PARAMETER` | Redo retention / archive-destination Prerequisites |
+| `V$LOGMNR_CONTENTS`（及相關 LogMiner fixed views） | Incremental Capture |
+
+若安全政策禁止 `SELECT_CATALOG_ROLE` / `EXECUTE_CATALOG_ROLE`，改授同等能力的較窄集合：
+
+```sql
+GRANT EXECUTE ON SYS.DBMS_LOGMNR TO SYNC_USER;
+GRANT EXECUTE ON SYS.DBMS_LOGMNR_D TO SYNC_USER;
+GRANT SELECT ON V_$DATABASE TO SYNC_USER;
+GRANT SELECT ON V_$ARCHIVED_LOG TO SYNC_USER;
+GRANT SELECT ON V_$LOG TO SYNC_USER;
+GRANT SELECT ON V_$LOGFILE TO SYNC_USER;
+GRANT SELECT ON V_$LOGMNR_CONTENTS TO SYNC_USER;
+GRANT SELECT ON V_$PARAMETER TO SYNC_USER;
+-- 外加上方的 Pipeline 資料表 SELECT 與 CREATE/ALTER SESSION
+```
+
+Edition 備註：部分舊版可能沒有 `LOGMINING`—改用 `DBMS_LOGMNR` / `DBMS_LOGMNR_D` 的 `EXECUTE` 加上 `V_$…` SELECT。角色名稱可能隨 Oracle 版本而異；以上能力清單才是契約。
+
+### 選用／正式 Sync 不需要
+
+| Grant | 狀態 |
+| --- | --- |
+| `CREATE TABLE`、`UNLIMITED TABLESPACE` | **僅 Lab**—Local Sync Lab Scenario 以 `SYNC_USER` 建立 Namespace 資料表。正式 sync 帳號 **不需要** DDL。 |
+| `DBA`、`SYSDBA`、`SELECT ANY TABLE` | **不需要。** Lab 或緊急破窗可用；不得當成正式環境文件預設。 |
+| Source Prerequisites DDL（ARCHIVELOG、supplemental logging） | 由 **DBA** 帳號套用—見上方 Source Prerequisites—不是 sync 使用者。 |
+
+**Local Sync Lab：** `lab/oracle/init/01-lab-source-prerequisites.sh` 授予必要集合，外加 Lab DDL（`CREATE TABLE` / `UNLIMITED TABLESPACE`）讓 Scenario 擁有 Namespace 物件。將 Lab grants 視為正式 Required Privileges 的超集，而非正式預設。
+
+此帳號的密鑰與 TLS：[Security](security.md)。Target Delivery 帳號：[Target System](target-system.md)。
 
 ## Supported Source Types（v1）
 
@@ -127,5 +176,6 @@ cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocaptu
 
 - 與 Target 配對：[Deployment](deployment.md)
 - 參照資料表的 Pipelines：[Pipeline](pipeline.md)
-- Secrets 與 TLS：[Security](security.md)
+- Secrets、TLS 與 privilege 指引：[Security](security.md#required-privileges-pointer)
+- MongoDB Delivery grants：[Target System](target-system.md#required-privileges-target)
 - Developer 機器上的 Instant Client：[Developer 本機設定](developer-local-setup.md)

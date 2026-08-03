@@ -74,15 +74,64 @@ When Source `host` is `contract` or `stub`, Incremental Capture uses the in-proc
 
 ## Required Privileges
 
-The sync account needs rights sufficient for **Initial Load**, **Incremental Capture** (LogMiner session and related dictionary/redo reads), schema discovery for Pipeline-referenced tables, and alignment-style reads—not superuser as the only supported mode (ADR-0016).
+Concrete grants for the Oracle sync account (ADR-0016). **DBA / SYSDBA is not required** for Sync, Prerequisites probes, or Delivery pairing—use a dedicated sync user with the minimum below. Source Prerequisites DDL (`ALTER DATABASE` / `ALTER TABLE` supplemental logging, ARCHIVELOG) is applied by a DBA separately; it is **not** part of the sync account’s Required Privileges.
 
-In practice the account must be able to:
+### Required for v1 (Initial Load + LogMiner Incremental Capture + Prerequisites)
 
-- `SELECT` the tables (and schemas) referenced by Pipelines for Initial Load
-- Open LogMiner / read redo contents views required for Incremental Capture
-- Read data-dictionary metadata needed for supplemental-logging and schema probes
+Grant these to the Deployment `spec.source.username` (replace `SYNC_USER` and table names):
 
-Grant the narrowest set that satisfies those duties on your Oracle edition. Admin/DBA may work for labs but must not be the documented production default.
+```sql
+-- Session
+GRANT CREATE SESSION TO SYNC_USER;
+GRANT ALTER SESSION TO SYNC_USER;
+
+-- Initial Load + alignment-style reads (repeat per Pipeline-referenced table)
+GRANT SELECT ON <schema>.<table> TO SYNC_USER;
+
+-- LogMiner Incremental Capture
+GRANT LOGMINING TO SYNC_USER;              -- when the privilege exists on your edition
+GRANT SELECT ANY TRANSACTION TO SYNC_USER;
+GRANT EXECUTE_CATALOG_ROLE TO SYNC_USER;   -- DBMS_LOGMNR / DBMS_LOGMNR_D
+GRANT SELECT_CATALOG_ROLE TO SYNC_USER;    -- dictionary + V$ used by capture and probes
+```
+
+`SELECT_CATALOG_ROLE` covers the dictionary / fixed views the product reads for schema discovery, supplemental-logging probes, redo-retention probes, and LogMiner contents, including:
+
+| Object | Used for |
+| --- | --- |
+| `ALL_TAB_COLUMNS`, `ALL_CONSTRAINTS` / `ALL_CONS_COLUMNS` | Schema discovery + primary-key identity |
+| `ALL_LOG_GROUPS` | Table-level supplemental-logging Prerequisites |
+| `V$DATABASE` | ARCHIVELOG / DB supplemental logging / current SCN |
+| `V$ARCHIVED_LOG`, `V$PARAMETER` | Redo retention / archive-destination Prerequisites |
+| `V$LOGMNR_CONTENTS` (and related LogMiner fixed views) | Incremental Capture |
+
+If your security policy forbids `SELECT_CATALOG_ROLE` / `EXECUTE_CATALOG_ROLE`, grant the equivalent narrower set instead (same capabilities):
+
+```sql
+GRANT EXECUTE ON SYS.DBMS_LOGMNR TO SYNC_USER;
+GRANT EXECUTE ON SYS.DBMS_LOGMNR_D TO SYNC_USER;
+GRANT SELECT ON V_$DATABASE TO SYNC_USER;
+GRANT SELECT ON V_$ARCHIVED_LOG TO SYNC_USER;
+GRANT SELECT ON V_$LOG TO SYNC_USER;
+GRANT SELECT ON V_$LOGFILE TO SYNC_USER;
+GRANT SELECT ON V_$LOGMNR_CONTENTS TO SYNC_USER;
+GRANT SELECT ON V_$PARAMETER TO SYNC_USER;
+-- plus SELECT on Pipeline tables and CREATE/ALTER SESSION as above
+```
+
+Edition notes: `LOGMINING` may be absent on some older editions—use the `EXECUTE` grants on `DBMS_LOGMNR` / `DBMS_LOGMNR_D` plus the `V_$…` selects. Exact role names can vary by Oracle version; the capability list above is the contract.
+
+### Optional / not required for production Sync
+
+| Grant | Status |
+| --- | --- |
+| `CREATE TABLE`, `UNLIMITED TABLESPACE` | **Lab-only** — Local Sync Lab Scenarios create Namespace tables as `SYNC_USER`. Production sync accounts do **not** need DDL. |
+| `DBA`, `SYSDBA`, `SELECT ANY TABLE` | **Not required.** Labs or break-glass may use them; they must not be the documented production default. |
+| Source Prerequisites DDL (ARCHIVELOG, supplemental logging) | Applied by a **DBA** account — see Source Prerequisites above — not by the sync user. |
+
+**Local Sync Lab:** `lab/oracle/init/01-lab-source-prerequisites.sh` grants the required set plus Lab DDL (`CREATE TABLE` / `UNLIMITED TABLESPACE`) so Scenarios can own Namespace objects. Treat Lab grants as a superset of production Required Privileges, not as the production default.
+
+Secrets and TLS for this account: [Security](security.md). Target Delivery account: [Target System](target-system.md).
 
 ## Supported Source Types (v1)
 
@@ -127,5 +176,6 @@ cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocaptu
 
 - Pairing with Target: [Deployment](deployment.md)
 - Pipelines that reference tables: [Pipeline](pipeline.md)
-- Secrets and TLS: [Security](security.md)
+- Secrets, TLS, and privilege pointers: [Security](security.md#required-privileges-pointer)
+- MongoDB Delivery grants: [Target System](target-system.md#required-privileges-target)
 - Instant Client on a Developer machine: [Developer local setup](developer-local-setup.md)

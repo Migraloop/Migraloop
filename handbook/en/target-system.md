@@ -50,7 +50,60 @@ migraloop target --collection orders
 
 ## Required Privileges (Target)
 
-The Delivery account needs rights to insert/update/delete documents in the bound collections (and to create the collection if your ops model allows). Prefer minimum grants sufficient to Deliver—not cluster-admin by default (ADR-0016).
+Concrete MongoDB privileges for the Delivery account (ADR-0016). **`root` / `clusterAdmin` is not required**—use a dedicated user scoped to the Target database (and, when your ops model allows, only the bound collections).
+
+### Required for v1 Delivery + Target inspection
+
+Delivery performs upsert (`update` with `upsert: true`) and `delete` by Output Identity on each Pipeline’s bound collection, and `find` for `migraloop target` inspection. Minimum role on the Target database named in `spec.target.database`:
+
+```javascript
+use admin
+db.createUser({
+  user: "deliver_user",
+  pwd: passwordPrompt(),  // or your secret-manager injection
+  roles: [
+    { role: "readWrite", db: "<target_database>" }
+  ]
+})
+```
+
+`readWrite` on that database includes `find`, `insert`, `update`, `remove`, and `createCollection` on its collections—enough for Delivery and CLI Target inspection when collections may be created on first write.
+
+### Narrower custom role (optional)
+
+If you pre-create every bound collection and want collection-scoped grants instead of database `readWrite`:
+
+```javascript
+use <target_database>
+db.createRole({
+  role: "migraloopDeliver",
+  privileges: [
+    {
+      resource: { db: "<target_database>", collection: "<bound_collection>" },
+      actions: ["find", "insert", "update", "remove"]
+    }
+    // repeat resource+actions per Pipeline Target Binding
+  ],
+  roles: []
+})
+use admin
+db.createUser({
+  user: "deliver_user",
+  pwd: passwordPrompt(),
+  roles: [{ role: "migraloopDeliver", db: "<target_database>" }]
+})
+```
+
+Add `createCollection` on the database (or create collections ahead of time) if first Delivery must create a missing collection.
+
+### Optional / not required
+
+| Privilege | Status |
+| --- | --- |
+| `root`, `clusterAdmin`, `dbAdminAnyDatabase` | **Not required** for Delivery. Local Sync Lab’s disposable Mongo user is root for Fixture convenience only—not the production default. |
+| `dropCollection` / `dropDatabase` | **Not required** for product Delivery (Lab Scenario cleanup may use broader Fixture credentials). |
+
+Connection strings in v1 authenticate with `authSource=admin` (see Delivery URI construction). Create the user in the auth database your deployment expects, and keep the password in a secret reference ([Security](security.md)). Source sync account grants: [Source System](source-system.md).
 
 ## Supported mapping notes
 
@@ -61,4 +114,5 @@ Source allow-list and NUMBER/temporal rules affect what can appear in Managed ou
 - Deployment pairing: [Deployment](deployment.md)
 - Pipeline modes and `fields`: [Pipeline](pipeline.md)
 - Delivery Health: [Observability](observability.md)
-- Secrets / TLS: [Security](security.md)
+- Secrets, TLS, and privilege pointers: [Security](security.md#required-privileges-pointer)
+- Oracle sync grants: [Source System](source-system.md#required-privileges)
