@@ -17,12 +17,12 @@ use migraloop_capture::{
     is_allow_listed_oracle_type, load_injected_schema_changes, normalize_change_temporals,
     open_oracle_incremental_capture, AlignmentCheckSample, CapturePosition, ChangeEvent,
     ChangeOp, IncrementalCapture, InitialLoadChunkOptions, NumberMongoMapping,
-    OracleSourceConnect, OracleTlsSettings, PipelineSchemaDeps, SchemaChangeEvent,
-    SchemaImpact, SourceColumn, TypeError,
+    OracleSourceConnect, PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn,
+    TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
-    DeliveryDocument, ManagedFieldAs, MongoTargetConnection, MongoTlsSettings,
+    DeliveryDocument, ManagedFieldAs, MongoTargetConnection,
 };
 use migraloop_platform_store::{
     acquire_incremental_sync_lock, append_base_dataset_chunk, base_dataset_exists,
@@ -37,9 +37,10 @@ use migraloop_platform_store::{
     update_pipeline_delivery_progress, update_pipeline_delivery_progress_with_lag,
     update_pipeline_drift_status, upsert_deployment, upsert_quarantined_change,
     upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment, DerivedDataset,
-    FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, QuarantinedChange,
-    SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
+    OmittedColumn, Pipeline, PlatformStoreHealth, QuarantinedChange, SchemaChangeImpact,
+    SecretRef, SecretRefKind, SystemConnection,
 };
+use migraloop_types::resolve_secret_ref;
 use migraloop_transform::{
     analyze_affect_on_base_with_bases, analyze_affect_with_maintenance, build_maintenance_state,
     derived_output_field_names, evaluate_transform_with_bases,
@@ -325,8 +326,8 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
         .iter()
         .map(|(name, spec)| {
             let mapping = match spec.map_as {
-                crate::config::FieldMappingAsSpec::String => FieldMappingAs::String,
-                crate::config::FieldMappingAsSpec::Omit => FieldMappingAs::Omit,
+                crate::config::FieldMappingAsSpec::String => ManagedFieldAs::String,
+                crate::config::FieldMappingAsSpec::Omit => ManagedFieldAs::Omit,
             };
             (name.clone(), mapping)
         })
@@ -366,30 +367,7 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
 }
 
 fn resolve_secret_value(reference: &SecretRef, field: &str) -> Result<String, CliError> {
-    match reference.kind {
-        SecretRefKind::Env => std::env::var(&reference.value).map_err(|_| {
-            CliError::Failed(format!(
-                "unresolvable secret reference: {field} fromEnv {} is missing",
-                reference.value
-            ))
-        }),
-        SecretRefKind::File => {
-            let contents = std::fs::read_to_string(&reference.value).map_err(|err| {
-                CliError::Failed(format!(
-                    "unresolvable secret reference: {field} {}: {err}",
-                    reference.value
-                ))
-            })?;
-            let trimmed = contents.trim_end_matches(['\n', '\r']).to_string();
-            if trimmed.is_empty() {
-                return Err(CliError::Failed(format!(
-                    "unresolvable secret reference: {field} {} is empty",
-                    reference.value
-                )));
-            }
-            Ok(trimmed)
-        }
-    }
+    resolve_secret_ref(reference, field).map_err(|err| CliError::Failed(err.to_string()))
 }
 
 fn output_identity_from_row(
@@ -520,24 +498,8 @@ fn mongo_target_from_deployment(deployment: &Deployment) -> Result<MongoTargetCo
         database: deployment.target.database.clone(),
         username: deployment.target.username.clone(),
         password,
-        tls: mongo_tls_from_settings(&deployment.target.tls),
+        tls: deployment.target.tls.clone(),
     })
-}
-
-fn mongo_tls_from_settings(tls: &TlsSettings) -> MongoTlsSettings {
-    MongoTlsSettings {
-        enabled: tls.enabled,
-        ca_file: tls.ca_file.clone(),
-        insecure_skip_verify: tls.insecure_skip_verify,
-    }
-}
-
-fn oracle_tls_from_settings(tls: &TlsSettings) -> OracleTlsSettings {
-    OracleTlsSettings {
-        enabled: tls.enabled,
-        wallet_location: tls.wallet_location.clone(),
-        insecure_skip_verify: tls.insecure_skip_verify,
-    }
 }
 
 fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
@@ -605,22 +567,6 @@ fn delivery_columns_from_base(columns: &[BaseColumn]) -> Vec<DeliveryColumn> {
         .collect()
 }
 
-fn managed_field_as_map(
-    pipeline: &Pipeline,
-) -> std::collections::BTreeMap<String, ManagedFieldAs> {
-    pipeline
-        .field_mappings
-        .iter()
-        .map(|(k, v)| {
-            let mapped = match v {
-                FieldMappingAs::String => ManagedFieldAs::String,
-                FieldMappingAs::Omit => ManagedFieldAs::Omit,
-            };
-            (k.clone(), mapped)
-        })
-        .collect()
-}
-
 fn apply_field_mappings_to_row(
     row: &serde_json::Map<String, serde_json::Value>,
     pipeline: &Pipeline,
@@ -628,8 +574,8 @@ fn apply_field_mappings_to_row(
     let mut out = serde_json::Map::new();
     for (key, value) in row {
         match pipeline.field_mappings.get(key) {
-            Some(FieldMappingAs::Omit) => continue,
-            Some(FieldMappingAs::String) => {
+            Some(ManagedFieldAs::Omit) => continue,
+            Some(ManagedFieldAs::String) => {
                 let as_string = match value {
                     serde_json::Value::String(s) => s.clone(),
                     serde_json::Value::Number(n) => n.to_string(),
@@ -637,7 +583,7 @@ fn apply_field_mappings_to_row(
                 };
                 out.insert(key.clone(), serde_json::Value::String(as_string));
             }
-            None => {
+            None | Some(ManagedFieldAs::Default) => {
                 out.insert(key.clone(), value.clone());
             }
         }
@@ -665,7 +611,7 @@ fn validate_pipeline_managed_fields(
                 )));
             }
             Some(col) if !col.supported || !is_allow_listed_oracle_type(&col.oracle_type, col.size) => {
-                if *mapping != FieldMappingAs::Omit {
+                if *mapping != ManagedFieldAs::Omit {
                     return Err(CliError::Failed(format!(
                         "Pipeline {}: {} (column {field})",
                         pipeline.name,
@@ -690,8 +636,8 @@ fn validate_pipeline_managed_fields(
             continue;
         }
         match pipeline.field_mappings.get(name) {
-            Some(FieldMappingAs::String) | Some(FieldMappingAs::Omit) => {}
-            None => {
+            Some(ManagedFieldAs::String) | Some(ManagedFieldAs::Omit) => {}
+            None | Some(ManagedFieldAs::Default) => {
                 return Err(CliError::Failed(format!(
                     "NUMBER column {name} has unsafe declared precision/scale \
                      (precision={:?}, scale={:?}); Pipeline {} cannot apply until \
@@ -719,7 +665,7 @@ fn delivery_document_for_row(
         identity,
         managed_fields: managed,
         columns: delivery_columns_from_base(columns),
-        field_as: managed_field_as_map(pipeline),
+        field_as: pipeline.field_mappings.clone(),
     })
 }
 
@@ -1242,7 +1188,7 @@ fn oracle_source_connect(source: &SystemConnection) -> Result<OracleSourceConnec
         port: source.port as u16,
         database: source.database.clone(),
         username: source.username.clone(),
-        tls: oracle_tls_from_settings(&source.tls),
+        tls: source.tls.clone(),
     })
 }
 
@@ -1485,7 +1431,7 @@ async fn deliver_direct_pipeline_with_options(
         .filter(|name| {
             !matches!(
                 pipeline.field_mappings.get(name),
-                Some(FieldMappingAs::Omit)
+                Some(ManagedFieldAs::Omit)
             )
         })
         .collect();
@@ -1650,7 +1596,7 @@ async fn deliver_transform_pipeline_with_options(
         .filter(|name| {
             !matches!(
                 pipeline.field_mappings.get(name),
-                Some(FieldMappingAs::Omit)
+                Some(ManagedFieldAs::Omit)
             )
         })
         .collect();
@@ -2237,7 +2183,7 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
             .filter(|name| {
                 !matches!(
                     pipeline.field_mappings.get(name),
-                    Some(FieldMappingAs::Omit)
+                    Some(ManagedFieldAs::Omit)
                 )
             })
             .collect();
@@ -2712,7 +2658,7 @@ fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineS
     match pipeline.mode.as_str() {
         "direct" => {
             for col in &dataset.columns {
-                if pipeline.field_mappings.get(&col.name) == Some(&FieldMappingAs::Omit) {
+                if pipeline.field_mappings.get(&col.name) == Some(&ManagedFieldAs::Omit) {
                     continue;
                 }
                 dependency_columns.insert(col.name.clone());

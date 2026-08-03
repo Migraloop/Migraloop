@@ -11,6 +11,7 @@ migraloop-capture = { workspace = true }
 migraloop-delivery = { workspace = true }
 migraloop-platform-store = { workspace = true }
 migraloop-transform = { workspace = true }
+migraloop-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

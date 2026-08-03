@@ -49,82 +49,19 @@ pub enum PlatformStoreError {
     InvalidJson(#[source] serde_json::Error),
 }
 
-/// How a secret is referenced (never stored as plaintext).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SecretRefKind {
-    Env,
-    File,
-}
+// Shared apply-path types live in `migraloop-types`. Re-export so store callers keep
+// a single import surface while enums stop drifting across crates.
+pub use migraloop_types::{ManagedFieldAs, SecretRef, SecretRefKind, TlsSettings};
 
-impl SecretRefKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Env => "env",
-            Self::File => "file",
-        }
-    }
+/// Expand-contract leftover alias — prefer [`ManagedFieldAs`] on the apply path.
+#[deprecated(note = "use ManagedFieldAs — temporary expand-contract leftover")]
+pub type FieldMappingAs = ManagedFieldAs;
 
-    pub fn parse(value: &str) -> Result<Self, PlatformStoreError> {
-        match value {
-            "env" => Ok(Self::Env),
-            "file" => Ok(Self::File),
-            other => Err(PlatformStoreError::Load(sqlx::Error::Protocol(format!(
-                "unknown secret ref kind: {other}"
-            )))),
-        }
-    }
-}
-
-/// A named reference to a secret supplied outside config/store rows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecretRef {
-    pub kind: SecretRefKind,
-    pub value: String,
-}
-
-impl SecretRef {
-    pub fn display(&self) -> String {
-        format!("{}:{}", self.kind.as_str(), self.value)
-    }
-}
-
-/// Non-secret TLS settings for a Source or Target System connection (ADR-0017).
-///
-/// Paths point at mounted cert/wallet material; PEM bodies and passwords are never
-/// stored here (ADR-0006).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct TlsSettings {
-    pub enabled: bool,
-    /// Filesystem path to a CA certificate (Mongo `tlsCAFile`; optional for Oracle).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub ca_file: String,
-    /// Oracle Instant Client wallet directory (`MY_WALLET_DIRECTORY`). Empty for Mongo.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub wallet_location: String,
-    /// When true, skip certificate verification (dev/lab only; never for production).
-    #[serde(default)]
-    pub insecure_skip_verify: bool,
-}
-
-impl TlsSettings {
-    pub fn display_summary(&self) -> String {
-        if !self.enabled {
-            return "tls=disabled".to_string();
-        }
-        let mut parts = vec!["tls=enabled".to_string()];
-        if !self.ca_file.is_empty() {
-            parts.push(format!("caFile={}", self.ca_file));
-        }
-        if !self.wallet_location.is_empty() {
-            parts.push(format!("walletLocation={}", self.wallet_location));
-        }
-        if self.insecure_skip_verify {
-            parts.push("insecureSkipVerify=true".to_string());
-        }
-        parts.join(" ")
-    }
+/// Parse a persisted secret-ref kind, mapping unknown values into store Load errors.
+pub fn parse_secret_ref_kind(value: &str) -> Result<SecretRefKind, PlatformStoreError> {
+    SecretRefKind::parse(value).map_err(|err| {
+        PlatformStoreError::Load(sqlx::Error::Protocol(err.to_string()))
+    })
 }
 
 /// Non-secret connection configuration for a Source or Target System.
@@ -154,23 +91,6 @@ pub struct Deployment {
     pub target: SystemConnection,
 }
 
-/// Explicit Managed-field mapping override for Pipeline apply (ADR-0023).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FieldMappingAs {
-    String,
-    Omit,
-}
-
-impl FieldMappingAs {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::String => "string",
-            Self::Omit => "omit",
-        }
-    }
-}
-
 /// A Pipeline declared inside a Deployment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pipeline {
@@ -195,8 +115,9 @@ pub struct Pipeline {
     #[serde(default)]
     pub description: String,
     /// Per-field Managed mapping overrides (`string` / `omit`) keyed by column name.
+    /// Uses shared [`ManagedFieldAs`]; only explicit overrides are persisted.
     #[serde(default)]
-    pub field_mappings: std::collections::BTreeMap<String, FieldMappingAs>,
+    pub field_mappings: std::collections::BTreeMap<String, ManagedFieldAs>,
     /// Transform Pipeline Output Identity field names (empty for Direct).
     #[serde(default)]
     pub output_identity: Vec<String>,
@@ -1277,7 +1198,7 @@ impl DeploymentRow {
                 database: self.source_database,
                 username: self.source_username,
                 password_ref: SecretRef {
-                    kind: SecretRefKind::parse(&self.source_password_ref_kind)?,
+                    kind: parse_secret_ref_kind(&self.source_password_ref_kind)?,
                     value: self.source_password_ref_value,
                 },
                 timezone: self.source_timezone,
@@ -1290,7 +1211,7 @@ impl DeploymentRow {
                 database: self.target_database,
                 username: self.target_username,
                 password_ref: SecretRef {
-                    kind: SecretRefKind::parse(&self.target_password_ref_kind)?,
+                    kind: parse_secret_ref_kind(&self.target_password_ref_kind)?,
                     value: self.target_password_ref_value,
                 },
                 timezone: String::new(),
