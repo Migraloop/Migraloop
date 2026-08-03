@@ -2,7 +2,7 @@
 //!
 //! Agreed seam (issues #60–#66, #63, #84, #85, #86 / PRD #55): CLI Lab Scenario commands.
 //! Always-on tests cover catalog listing from on-disk `recipe.yaml` packages
-//! (including bulk-load, rt-project, rt-filter, idempotent-redelivery),
+//! (including bulk-load, rt-project, rt-filter, rt-field-ops, idempotent-redelivery),
 //! shipped-capability coverage visibility, help surface, one-at-a-time rejection,
 //! refusal of non-Lab / production engine bindings, Namespace cleanup control
 //! surface, and CLI-seam bulk-load correctness-fail / metrics-fail probes
@@ -256,6 +256,29 @@ async fn lab_scenario_list_includes_rt_filter() {
     assert!(
         out.to_ascii_lowercase().contains("filter"),
         "rt-filter summary should mention filter, got:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn lab_scenario_list_includes_rt_field_ops() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("rt-field-ops"),
+        "catalog must list Rich Transform addFields/rename/remove Scenario, got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("addfields") || lower.contains("rename") || lower.contains("remove"),
+        "rt-field-ops summary should mention field ops, got:\n{out}"
     );
 }
 
@@ -2094,6 +2117,108 @@ async fn lab_scenario_rt_project_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove rt-project failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Full Rich Transform `addFields` / `rename` / `remove` Lab Scenario against Docker Lab
+/// Fixture + Instant Client (issue #125).
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_rt_field_ops_run_and_inspect() {
+    let lab = lab_dir();
+    let store_url = "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop";
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args(["lab", "scenario", "run", "rt-field-ops", "--lab-dir", &lab])
+        .output()
+        .expect("lab scenario run rt-field-ops");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run rt-field-ops failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+
+    let derived = Command::new(bin())
+        .args([
+            "derived",
+            "--platform-store-url",
+            store_url,
+            "--pipeline",
+            "lab-rfo-customers",
+        ])
+        .output()
+        .expect("derived inspect");
+    let derived_out = String::from_utf8_lossy(&derived.stdout);
+    assert!(
+        derived.status.success(),
+        "derived inspect failed: {}",
+        String::from_utf8_lossy(&derived.stderr)
+    );
+    assert!(
+        derived_out.contains("Alicia")
+            && derived_out.contains("Carol")
+            && derived_out.contains("customerName")
+            && derived_out.contains("displayName")
+            && !derived_out.contains("Bob"),
+        "field-ops Derived Managed outcomes, got:\n{derived_out}"
+    );
+    assert!(
+        !derived_out.contains("\"EMAIL\"") && !derived_out.contains("\"email\""),
+        "remove must omit EMAIL from Derived Managed shape, got:\n{derived_out}"
+    );
+
+    let remove = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "remove",
+            "rt-field-ops",
+            "--lab-dir",
+            &lab,
+        ])
+        .output()
+        .expect("lab scenario remove rt-field-ops");
+    assert!(
+        remove.status.success(),
+        "lab scenario remove rt-field-ops failed: {}",
         String::from_utf8_lossy(&remove.stderr)
     );
 

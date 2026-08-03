@@ -24,6 +24,39 @@ Keep only listed fields:
     fields: [ID, CUSTOMER_ID, AMOUNT]
 ```
 
+### `addFields`
+
+Add Managed fields as a literal JSON value or a copy of an existing field (exactly one of `value` or `field`):
+
+```yaml
+- addFields:
+    fields:
+      - as: currency
+        value: USD
+      - as: displayName
+        field: customerName
+```
+
+### `rename`
+
+Rename fields (`from` → `to`):
+
+```yaml
+- rename:
+    fields:
+      - from: NAME
+        to: customerName
+```
+
+### `remove`
+
+Drop fields from the row (unused for Affect Analysis after removal):
+
+```yaml
+- remove:
+    fields: [EMAIL, NOTES]
+```
+
 ### `filter`
 
 Equality filter on one field:
@@ -47,7 +80,7 @@ Group keys plus aggregates. v1 aggregate op: `sum`.
         as: TOTAL_AMOUNT
 ```
 
-Domain roadmap also names operators such as rename/remove, equiLookup, unwind, count/min/max/avg, distinct/addToSet, and union. Until those land in the CLI config parser, declare only `project` / `filter` / `groupBy` above—unsupported operator names fail apply.
+Domain roadmap also names operators such as equiLookup, unwind, count/min/max/avg, distinct/addToSet, and union. Until those land in the CLI config parser, declare only the operators above—unsupported operator names fail apply.
 
 ## Output Identity
 

@@ -24,6 +24,39 @@ Transform Pipelines 必須宣告：
     fields: [ID, CUSTOMER_ID, AMOUNT]
 ```
 
+### `addFields`
+
+新增 Managed 欄位：literal JSON `value`，或從既有欄位 `field` 複製（兩者擇一）：
+
+```yaml
+- addFields:
+    fields:
+      - as: currency
+        value: USD
+      - as: displayName
+        field: customerName
+```
+
+### `rename`
+
+重新命名欄位（`from` → `to`）：
+
+```yaml
+- rename:
+    fields:
+      - from: NAME
+        to: customerName
+```
+
+### `remove`
+
+從列中移除欄位（移除後對 Affect Analysis 視為未使用）：
+
+```yaml
+- remove:
+    fields: [EMAIL, NOTES]
+```
+
 ### `filter`
 
 單一欄位的等值過濾：
@@ -47,7 +80,7 @@ Group keys 加上 aggregates。v1 aggregate op：`sum`。
         as: TOTAL_AMOUNT
 ```
 
-領域 roadmap 也提到 rename/remove、equiLookup、unwind、count/min/max/avg、distinct/addToSet、union 等 operators。在它們進入 CLI config parser 之前，請只宣告上面的 `project` / `filter` / `groupBy`—不支援的 operator 名稱會讓 apply 失敗。
+領域 roadmap 也提到 equiLookup、unwind、count/min/max/avg、distinct/addToSet、union 等 operators。在它們進入 CLI config parser 之前，請只宣告上面的 operators—不支援的 operator 名稱會讓 apply 失敗。
 
 ## Output Identity
 

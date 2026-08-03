@@ -50,7 +50,7 @@ Validation rules enforced on `apply`:
 - Transform Pipelines require `outputIdentity` and a non-empty declarative `transform`
 - `fields` keys map source/Managed field names to `{ as: string }` or `{ as: omit }` (ADR-0023)
 
-See [Rich Transform](rich-transform.md) for operator shapes.
+See [Rich Transform](rich-transform.md) for operator shapes (`project`, `addFields`, `rename`, `remove`, `filter`, `groupBy`).
 
 ## Lifecycle (control plane)
 

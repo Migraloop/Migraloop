@@ -16,6 +16,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Multi-table Transform Pipeline (`groupBy` / `sum`) | `transform-pipeline` |
 | Rich Transform `project` | `rt-project` |
 | Rich Transform `filter` | `rt-filter` |
+| Rich Transform `addFields` / `rename` / `remove` | `rt-field-ops` |
 | Rich Transform `groupBy` / `sum` (also under contention) | `transform-pipeline`, `concurrent-source-workload` |
 | Intra-Scenario concurrent Source workload | `concurrent-source-workload` |
 | Bulk load (~100k) with fail-able metric thresholds | `bulk-load` |
@@ -39,6 +40,6 @@ These are **not** covered and must stay listed until the capability ships with a
 
 | Capability | Why gated |
 | --- | --- |
-| Rich Transform rename/remove, equiLookup, unwind, count/min/max/avg, distinct/addToSet, union | Domain roadmap; not accepted by the CLI transform parser yet |
+| Rich Transform equiLookup, unwind, count/min/max/avg, distinct/addToSet, union | Domain roadmap; not accepted by the CLI transform parser yet |
 
 When shipping any gap above: add `lab/scenarios/<id>/`, register the runner, update this table, and only then restate catalog-complete for the expanded shipped surface.

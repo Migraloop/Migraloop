@@ -1,0 +1,25 @@
+# Lab Scenario recipe (ADR-0025 / issue #125).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: rt-field-ops
+summary: "Rich Transform addFields/rename/remove: shape Managed fields → Derived → Delivery (real apply/sync)"
+namespace:
+  source_tables:
+    - LAB_RFO_CUSTOMERS
+  target_collections:
+    - lab_rfo_customers
+  deployment: lab-rt-field-ops
+  pipelines:
+    - lab-rfo-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + field-ops Derived)
+    - mutate Source insert/update/delete (including EMAIL-only unused change)
+    - sync Incremental Capture + Delivery via real LogMiner path
+checks:
+  correctness:
+    - "Derived/Target Managed customerName/displayName/source present; EMAIL absent"
+    - "ACTIVE filter: Alicia and Carol present; Bob absent after delete"
+thresholds: {}

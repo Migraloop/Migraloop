@@ -1,8 +1,9 @@
 //! Rich Transform operators and Affect Analysis.
 //!
-//! Declarative project, filter (eq), and groupBy (sum) over Base Dataset rows.
-//! Free-form scripts and unanalyzable operators are rejected at parse time.
-//! Affect Analysis skips Derived recompute when only unused Base fields change.
+//! Declarative project, addFields, rename, remove, filter (eq), and groupBy (sum)
+//! over Base Dataset rows. Free-form scripts and unanalyzable operators are rejected
+//! at parse time. Affect Analysis skips Derived recompute when only unused Base
+//! fields change.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -14,9 +15,9 @@ pub const SEAM: &str = "transform";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransformError {
-    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/filter/groupBy)")]
+    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/groupBy)")]
     FreeFormScript,
-    #[error("unsupported Rich Transform operator: {0}; v1 allows project, filter, and groupBy")]
+    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, and groupBy")]
     UnsupportedOperator(String),
     #[error("invalid Rich Transform: {0}")]
     Invalid(String),
@@ -38,11 +39,39 @@ pub enum AggregateOp {
     Sum,
 }
 
+/// Source for one `addFields` entry: literal JSON or copy from an existing field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AddFieldSource {
+    Literal(Value),
+    Field(String),
+}
+
+/// One field added by `addFields`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddFieldSpec {
+    #[serde(rename = "as")]
+    pub as_name: String,
+    pub source: AddFieldSource,
+}
+
+/// One rename mapping (`from` → `to`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSpec {
+    pub from: String,
+    pub to: String,
+}
+
 /// One analyzable Rich Transform operator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TransformOp {
     Project { fields: Vec<String> },
+    AddFields { fields: Vec<AddFieldSpec> },
+    Rename { fields: Vec<RenameSpec> },
+    Remove { fields: Vec<String> },
     FilterEq { field: String, value: Value },
     GroupBy {
         keys: Vec<String>,
@@ -73,12 +102,15 @@ pub enum AffectOutcome {
 ///
 /// Accepted shapes:
 /// - `{ "project": { "fields": [...] } }`
+/// - `{ "addFields": { "fields": [{ "as": "...", "value": ... } | { "as": "...", "field": "..." }] } }`
+/// - `{ "rename": { "fields": [{ "from": "...", "to": "..." }] } }`
+/// - `{ "remove": { "fields": [...] } }`
 /// - `{ "filter": { "field": "...", "eq": ... } }`
 /// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum", "field": "...", "as": "..." }] } }`
 /// Rejected shapes (clear errors):
 /// - `{ "script": "..." }` / `{ "function": "..." }`
 /// - any other operator object
-/// - malformed project/filter/groupBy (reported as invalid, not unsupported)
+/// - malformed operators (reported as invalid, not unsupported)
 pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, TransformError> {
     let obj = step.as_object().ok_or_else(|| {
         TransformError::Invalid("each transform step must be an object".to_string())
@@ -96,6 +128,33 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
             ));
         }
         return parse_project(obj.get("project").expect("project key"));
+    }
+
+    if obj.contains_key("addFields") {
+        if obj.len() != 1 {
+            return Err(TransformError::Invalid(
+                "addFields step must not mix other operators in the same step".to_string(),
+            ));
+        }
+        return parse_add_fields(obj.get("addFields").expect("addFields key"));
+    }
+
+    if obj.contains_key("rename") {
+        if obj.len() != 1 {
+            return Err(TransformError::Invalid(
+                "rename step must not mix other operators in the same step".to_string(),
+            ));
+        }
+        return parse_rename(obj.get("rename").expect("rename key"));
+    }
+
+    if obj.contains_key("remove") {
+        if obj.len() != 1 {
+            return Err(TransformError::Invalid(
+                "remove step must not mix other operators in the same step".to_string(),
+            ));
+        }
+        return parse_remove(obj.get("remove").expect("remove key"));
     }
 
     if obj.contains_key("filter") {
@@ -157,6 +216,188 @@ fn parse_project(value: &Value) -> Result<TransformOp, TransformError> {
         ));
     }
     Ok(TransformOp::Project { fields })
+}
+
+fn parse_add_fields(value: &Value) -> Result<TransformOp, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid("addFields must be an object with fields".to_string())
+    })?;
+    let fields_value = obj.get("fields").ok_or_else(|| {
+        TransformError::Invalid("addFields.fields is required".to_string())
+    })?;
+    let fields_arr = fields_value.as_array().ok_or_else(|| {
+        TransformError::Invalid("addFields.fields must be an array".to_string())
+    })?;
+    if fields_arr.is_empty() {
+        return Err(TransformError::Invalid(
+            "addFields.fields must not be empty".to_string(),
+        ));
+    }
+    let mut fields = Vec::with_capacity(fields_arr.len());
+    for (index, entry) in fields_arr.iter().enumerate() {
+        fields.push(parse_add_field_spec(entry, index)?);
+    }
+    if obj.keys().any(|k| k != "fields") {
+        return Err(TransformError::Invalid(
+            "addFields only supports fields".to_string(),
+        ));
+    }
+    Ok(TransformOp::AddFields { fields })
+}
+
+fn parse_add_field_spec(value: &Value, index: usize) -> Result<AddFieldSpec, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid(format!("addFields.fields[{index}] must be an object"))
+    })?;
+    let as_name = obj
+        .get("as")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            TransformError::Invalid(format!("addFields.fields[{index}].as is required"))
+        })?;
+    if as_name.trim().is_empty() {
+        return Err(TransformError::Invalid(format!(
+            "addFields.fields[{index}].as must not be empty"
+        )));
+    }
+    let has_value = obj.contains_key("value");
+    let has_field = obj.contains_key("field");
+    let source = match (has_value, has_field) {
+        (true, false) => AddFieldSource::Literal(obj.get("value").expect("value").clone()),
+        (false, true) => {
+            let field = obj
+                .get("field")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    TransformError::Invalid(format!(
+                        "addFields.fields[{index}].field must be a string"
+                    ))
+                })?;
+            if field.trim().is_empty() {
+                return Err(TransformError::Invalid(format!(
+                    "addFields.fields[{index}].field must not be empty"
+                )));
+            }
+            AddFieldSource::Field(field.to_string())
+        }
+        (true, true) => {
+            return Err(TransformError::Invalid(format!(
+                "addFields.fields[{index}] must set exactly one of value or field"
+            )));
+        }
+        (false, false) => {
+            return Err(TransformError::Invalid(format!(
+                "addFields.fields[{index}] requires value or field"
+            )));
+        }
+    };
+    if obj
+        .keys()
+        .any(|k| k != "as" && k != "value" && k != "field")
+    {
+        return Err(TransformError::Invalid(format!(
+            "addFields.fields[{index}] only supports as, value, and field"
+        )));
+    }
+    Ok(AddFieldSpec {
+        as_name: as_name.to_string(),
+        source,
+    })
+}
+
+fn parse_rename(value: &Value) -> Result<TransformOp, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid("rename must be an object with fields".to_string())
+    })?;
+    let fields_value = obj.get("fields").ok_or_else(|| {
+        TransformError::Invalid("rename.fields is required".to_string())
+    })?;
+    let fields_arr = fields_value.as_array().ok_or_else(|| {
+        TransformError::Invalid("rename.fields must be an array".to_string())
+    })?;
+    if fields_arr.is_empty() {
+        return Err(TransformError::Invalid(
+            "rename.fields must not be empty".to_string(),
+        ));
+    }
+    let mut fields = Vec::with_capacity(fields_arr.len());
+    for (index, entry) in fields_arr.iter().enumerate() {
+        let entry_obj = entry.as_object().ok_or_else(|| {
+            TransformError::Invalid(format!("rename.fields[{index}] must be an object"))
+        })?;
+        let from = entry_obj
+            .get("from")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                TransformError::Invalid(format!("rename.fields[{index}].from is required"))
+            })?;
+        if from.trim().is_empty() {
+            return Err(TransformError::Invalid(format!(
+                "rename.fields[{index}].from must not be empty"
+            )));
+        }
+        let to = entry_obj
+            .get("to")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                TransformError::Invalid(format!("rename.fields[{index}].to is required"))
+            })?;
+        if to.trim().is_empty() {
+            return Err(TransformError::Invalid(format!(
+                "rename.fields[{index}].to must not be empty"
+            )));
+        }
+        if entry_obj.keys().any(|k| k != "from" && k != "to") {
+            return Err(TransformError::Invalid(format!(
+                "rename.fields[{index}] only supports from and to"
+            )));
+        }
+        fields.push(RenameSpec {
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
+    if obj.keys().any(|k| k != "fields") {
+        return Err(TransformError::Invalid(
+            "rename only supports fields".to_string(),
+        ));
+    }
+    Ok(TransformOp::Rename { fields })
+}
+
+fn parse_remove(value: &Value) -> Result<TransformOp, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid("remove must be an object with fields".to_string())
+    })?;
+    let fields_value = obj.get("fields").ok_or_else(|| {
+        TransformError::Invalid("remove.fields is required".to_string())
+    })?;
+    let fields_arr = fields_value.as_array().ok_or_else(|| {
+        TransformError::Invalid("remove.fields must be an array of field names".to_string())
+    })?;
+    if fields_arr.is_empty() {
+        return Err(TransformError::Invalid(
+            "remove.fields must not be empty".to_string(),
+        ));
+    }
+    let mut fields = Vec::with_capacity(fields_arr.len());
+    for entry in fields_arr {
+        let name = entry.as_str().ok_or_else(|| {
+            TransformError::Invalid("remove.fields entries must be strings".to_string())
+        })?;
+        if name.trim().is_empty() {
+            return Err(TransformError::Invalid(
+                "remove.fields entries must not be empty".to_string(),
+            ));
+        }
+        fields.push(name.to_string());
+    }
+    if obj.keys().any(|k| k != "fields") {
+        return Err(TransformError::Invalid(
+            "remove only supports fields".to_string(),
+        ));
+    }
+    Ok(TransformOp::Remove { fields })
 }
 
 fn parse_filter(value: &Value) -> Result<TransformOp, TransformError> {
@@ -322,11 +563,9 @@ pub fn parse_transform_steps(steps: &[Value]) -> Result<Vec<TransformOp>, Transf
     Ok(ops)
 }
 
-/// Field names present in Derived output after applying ops.
-///
-/// When no project/groupBy is present, returns `None` (Derived keeps Base field shape).
-pub fn derived_projected_fields(ops: &[TransformOp]) -> Option<Vec<String>> {
-    let mut fields = None;
+/// Derived Managed field names given Base column names (handles open remove/rename/addFields).
+pub fn derived_output_field_names(ops: &[TransformOp], base_field_names: &[String]) -> Vec<String> {
+    let mut fields: Option<Vec<String>> = None;
     for op in ops {
         match op {
             TransformOp::Project { fields: projected } => {
@@ -339,32 +578,162 @@ pub fn derived_projected_fields(ops: &[TransformOp]) -> Option<Vec<String>> {
                 }
                 fields = Some(names);
             }
+            TransformOp::AddFields { fields: adds } => {
+                let mut cur = fields.unwrap_or_else(|| base_field_names.to_vec());
+                for spec in adds {
+                    if !cur.iter().any(|n| n == &spec.as_name) {
+                        cur.push(spec.as_name.clone());
+                    }
+                }
+                fields = Some(cur);
+            }
+            TransformOp::Rename { fields: renames } => {
+                let mut cur = fields.unwrap_or_else(|| base_field_names.to_vec());
+                for spec in renames {
+                    if let Some(pos) = cur.iter().position(|n| n == &spec.from) {
+                        cur[pos] = spec.to.clone();
+                    }
+                }
+                fields = Some(cur);
+            }
+            TransformOp::Remove { fields: remove } => {
+                let mut cur = fields.unwrap_or_else(|| base_field_names.to_vec());
+                cur.retain(|n| !remove.iter().any(|r| r == n));
+                fields = Some(cur);
+            }
             TransformOp::FilterEq { .. } => {}
         }
     }
-    fields
+    fields.unwrap_or_else(|| base_field_names.to_vec())
 }
 
-/// Base fields this Rich Transform depends on for Affect Analysis.
-pub fn used_base_fields(ops: &[TransformOp]) -> BTreeSet<String> {
-    let mut used = BTreeSet::new();
+/// Base-field dependency mode for Affect Analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AffectDeps {
+    /// Output depends only on these Base fields (closed by project/groupBy).
+    Closed(BTreeSet<String>),
+    /// Passthrough Base fields except `unused`; `extra` are always-used deps (filter/copies).
+    Open {
+        unused: BTreeSet<String>,
+        extra: BTreeSet<String>,
+    },
+}
+
+fn resolve_field_deps(
+    lineage: &BTreeMap<String, BTreeSet<String>>,
+    closed: bool,
+    removed: &BTreeSet<String>,
+    field: &str,
+) -> BTreeSet<String> {
+    if let Some(deps) = lineage.get(field) {
+        return deps.clone();
+    }
+    if closed || removed.contains(field) {
+        return BTreeSet::new();
+    }
+    BTreeSet::from([field.to_string()])
+}
+
+fn affect_deps(ops: &[TransformOp]) -> AffectDeps {
+    let mut lineage: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut closed = false;
+    let mut removed: BTreeSet<String> = BTreeSet::new();
+    let mut filter_used: BTreeSet<String> = BTreeSet::new();
+
     for op in ops {
         match op {
             TransformOp::Project { fields } => {
-                used.extend(fields.iter().cloned());
+                let mut next = BTreeMap::new();
+                for field in fields {
+                    next.insert(
+                        field.clone(),
+                        resolve_field_deps(&lineage, closed, &removed, field),
+                    );
+                }
+                lineage = next;
+                closed = true;
+                removed.clear();
             }
             TransformOp::FilterEq { field, .. } => {
-                used.insert(field.clone());
+                filter_used.extend(resolve_field_deps(&lineage, closed, &removed, field));
+            }
+            TransformOp::AddFields { fields } => {
+                for spec in fields {
+                    let deps = match &spec.source {
+                        AddFieldSource::Literal(_) => BTreeSet::new(),
+                        AddFieldSource::Field(src) => {
+                            resolve_field_deps(&lineage, closed, &removed, src)
+                        }
+                    };
+                    lineage.insert(spec.as_name.clone(), deps);
+                    removed.remove(&spec.as_name);
+                }
+            }
+            TransformOp::Rename { fields } => {
+                for spec in fields {
+                    let deps = resolve_field_deps(&lineage, closed, &removed, &spec.from);
+                    lineage.remove(&spec.from);
+                    if !closed {
+                        removed.insert(spec.from.clone());
+                    }
+                    lineage.insert(spec.to.clone(), deps);
+                    removed.remove(&spec.to);
+                }
+            }
+            TransformOp::Remove { fields } => {
+                for field in fields {
+                    lineage.remove(field);
+                    removed.insert(field.clone());
+                }
             }
             TransformOp::GroupBy { keys, aggregates } => {
-                used.extend(keys.iter().cloned());
-                for agg in aggregates {
-                    used.insert(agg.field.clone());
+                let mut next = BTreeMap::new();
+                for key in keys {
+                    next.insert(
+                        key.clone(),
+                        resolve_field_deps(&lineage, closed, &removed, key),
+                    );
                 }
+                for agg in aggregates {
+                    next.insert(
+                        agg.as_name.clone(),
+                        resolve_field_deps(&lineage, closed, &removed, &agg.field),
+                    );
+                }
+                lineage = next;
+                closed = true;
+                removed.clear();
             }
         }
     }
-    used
+
+    let mut explicit_used: BTreeSet<String> = lineage.values().flatten().cloned().collect();
+    explicit_used.extend(filter_used);
+
+    if closed {
+        AffectDeps::Closed(explicit_used)
+    } else {
+        let unused = removed
+            .into_iter()
+            .filter(|name| !explicit_used.contains(name))
+            .collect();
+        AffectDeps::Open {
+            unused,
+            extra: explicit_used,
+        }
+    }
+}
+
+/// Base fields this Rich Transform depends on for Affect Analysis.
+///
+/// For open (passthrough) transforms this is only the *explicit* dependency set
+/// (filter / addFields copies / rename sources). Removed fields are unused; other
+/// passthrough Base fields still affect output and are handled in [`analyze_affect`].
+pub fn used_base_fields(ops: &[TransformOp]) -> BTreeSet<String> {
+    match affect_deps(ops) {
+        AffectDeps::Closed(used) => used,
+        AffectDeps::Open { extra, .. } => extra,
+    }
 }
 
 /// Evaluate a Rich Transform over Base rows, producing Derived rows.
@@ -437,11 +806,7 @@ pub fn analyze_affect(
     pre_apply: Option<&Map<String, Value>>,
     after: Option<&Map<String, Value>>,
 ) -> Result<AffectOutcome, TransformError> {
-    let used = used_base_fields(ops);
-    if used.is_empty() {
-        return Ok(AffectOutcome::SkipUnusedFields);
-    }
-
+    let deps = affect_deps(ops);
     let group_keys = group_by_keys(ops);
 
     match kind {
@@ -449,7 +814,7 @@ pub fn analyze_affect(
             let after = after.ok_or_else(|| {
                 TransformError::Invalid("Insert Affect Analysis requires after-image".into())
             })?;
-            let identity = identity_from_row(after, group_keys.as_deref(), &used)?;
+            let identity = identity_from_row(ops, after, group_keys.as_deref())?;
             Ok(AffectOutcome::Recompute {
                 identities: vec![identity],
             })
@@ -460,7 +825,7 @@ pub fn analyze_affect(
                     "Delete Affect Analysis requires pre-apply Base row".into(),
                 )
             })?;
-            let identity = identity_from_row(pre, group_keys.as_deref(), &used)?;
+            let identity = identity_from_row(ops, pre, group_keys.as_deref())?;
             Ok(AffectOutcome::Recompute {
                 identities: vec![identity],
             })
@@ -475,30 +840,42 @@ pub fn analyze_affect(
                 TransformError::Invalid("Update Affect Analysis requires after-image".into())
             })?;
             let changed = changed_fields(pre, after);
-            if changed.is_empty() || changed.is_disjoint(&used) {
+            let skip = match &deps {
+                AffectDeps::Closed(used) => used.is_empty() || changed.is_disjoint(used),
+                AffectDeps::Open { unused, .. } => {
+                    changed.is_empty() || changed.is_subset(unused)
+                }
+            };
+            if skip {
                 return Ok(AffectOutcome::SkipUnusedFields);
             }
-            // Always derive after-image identity, and always derive pre-apply identity
-            // (required for group-key moves: old + new Output Identities). Do not depend
-            // on reading the prior key after Base has already been overwritten.
-            let after_id = identity_from_row(after, group_keys.as_deref(), &used)?;
-            let pre_id = identity_from_row(pre, group_keys.as_deref(), &used)?;
-            let mut identities = vec![after_id];
-            if !identities
-                .iter()
-                .any(|existing| identity_maps_eq(existing, &pre_id))
-            {
-                identities.push(pre_id);
+            let after_id = identity_from_row(ops, after, group_keys.as_deref())?;
+            // groupBy key moves need pre-apply + after identities. Row-grain transforms
+            // (project/addFields/rename/remove/filter) keep a single after-image identity —
+            // shaped field renames must not invent a second delete identity.
+            if group_keys.is_some() {
+                let pre_id = identity_from_row(ops, pre, group_keys.as_deref())?;
+                let mut identities = vec![after_id];
+                if !identities
+                    .iter()
+                    .any(|existing| identity_maps_eq(existing, &pre_id))
+                {
+                    identities.push(pre_id);
+                }
+                Ok(AffectOutcome::Recompute { identities })
+            } else {
+                Ok(AffectOutcome::Recompute {
+                    identities: vec![after_id],
+                })
             }
-            Ok(AffectOutcome::Recompute { identities })
         }
     }
 }
 
 fn identity_from_row(
+    ops: &[TransformOp],
     row: &Map<String, Value>,
     group_keys: Option<&[String]>,
-    used: &BTreeSet<String>,
 ) -> Result<Map<String, Value>, TransformError> {
     if let Some(keys) = group_keys {
         let mut identity = Map::new();
@@ -512,21 +889,32 @@ fn identity_from_row(
         }
         return Ok(identity);
     }
-    // Non-groupBy: Output Identity is typically source PK fields still present after project.
-    // Affect Analysis still keys off used fields for skip decisions; identity map uses
-    // all used fields present on the row as a best-effort locator for recompute filter.
-    let mut identity = Map::new();
-    for key in used {
-        if let Some(value) = row.get(key) {
-            identity.insert(key.clone(), value.clone());
-        }
-    }
+    // Non-groupBy: shape the Base row through project/addFields/rename/remove so
+    // recompute identity keys match Derived field names (rename-safe).
+    let identity = shape_row_for_identity(ops, row)?;
     if identity.is_empty() {
         return Err(TransformError::Invalid(
             "cannot derive Affect Analysis identity from Base row".into(),
         ));
     }
     Ok(identity)
+}
+
+/// Apply field-shaping operators (not filter/groupBy) so identity keys match Derived.
+fn shape_row_for_identity(
+    ops: &[TransformOp],
+    row: &Map<String, Value>,
+) -> Result<Map<String, Value>, TransformError> {
+    let mut current = vec![row.clone()];
+    for op in ops {
+        match op {
+            TransformOp::FilterEq { .. } | TransformOp::GroupBy { .. } => {}
+            other => {
+                current = apply_op(other, current)?;
+            }
+        }
+    }
+    Ok(current.into_iter().next().unwrap_or_default())
 }
 
 fn changed_fields(pre: &Map<String, Value>, after: &Map<String, Value>) -> BTreeSet<String> {
@@ -566,6 +954,41 @@ fn apply_op(
                     }
                 }
                 projected
+            })
+            .collect()),
+        TransformOp::AddFields { fields } => Ok(rows
+            .into_iter()
+            .map(|mut row| {
+                for spec in fields {
+                    let value = match &spec.source {
+                        AddFieldSource::Literal(v) => v.clone(),
+                        AddFieldSource::Field(src) => {
+                            row.get(src).cloned().unwrap_or(Value::Null)
+                        }
+                    };
+                    row.insert(spec.as_name.clone(), value);
+                }
+                row
+            })
+            .collect()),
+        TransformOp::Rename { fields } => Ok(rows
+            .into_iter()
+            .map(|mut row| {
+                for spec in fields {
+                    if let Some(value) = row.remove(&spec.from) {
+                        row.insert(spec.to.clone(), value);
+                    }
+                }
+                row
+            })
+            .collect()),
+        TransformOp::Remove { fields } => Ok(rows
+            .into_iter()
+            .map(|mut row| {
+                for field in fields {
+                    row.remove(field);
+                }
+                row
             })
             .collect()),
         TransformOp::FilterEq { field, value } => Ok(rows
@@ -1095,5 +1518,147 @@ mod tests {
             .find(|r| r.get("CUSTOMER_ID") == Some(&json!(3)))
             .expect("new identity customer 3");
         assert_eq!(c3.get("TOTAL_AMOUNT"), Some(&json!("50.00")));
+    }
+
+    #[test]
+    fn add_fields_rename_remove_evaluate_and_skip_unused() {
+        let ops = parse_transform_steps(&[
+            json!({"project": {"fields": ["ID", "NAME", "EMAIL", "ACTIVE"]}}),
+            json!({"remove": {"fields": ["EMAIL"]}}),
+            json!({"rename": {"fields": [{"from": "NAME", "to": "customerName"}]}}),
+            json!({
+                "addFields": {
+                    "fields": [
+                        {"as": "source", "value": "oracle"},
+                        {"as": "displayName", "field": "customerName"}
+                    ]
+                }
+            }),
+            json!({"filter": {"field": "ACTIVE", "eq": 1}}),
+        ])
+        .unwrap();
+
+        let rows = vec![
+            row(&[
+                ("ID", json!(1)),
+                ("NAME", json!("Alice")),
+                ("EMAIL", json!("a@x")),
+                ("ACTIVE", json!(1)),
+                ("NOTES", json!("unused")),
+            ]),
+            row(&[
+                ("ID", json!(2)),
+                ("NAME", json!("Bob")),
+                ("EMAIL", json!("b@x")),
+                ("ACTIVE", json!(0)),
+                ("NOTES", json!("unused")),
+            ]),
+        ];
+        let out = evaluate_transform(&ops, &rows).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("customerName"), Some(&json!("Alice")));
+        assert_eq!(out[0].get("displayName"), Some(&json!("Alice")));
+        assert_eq!(out[0].get("source"), Some(&json!("oracle")));
+        assert!(!out[0].contains_key("EMAIL"));
+        assert!(!out[0].contains_key("NAME"));
+        assert!(!out[0].contains_key("NOTES"));
+
+        let base_names = vec![
+            "ID".into(),
+            "NAME".into(),
+            "EMAIL".into(),
+            "ACTIVE".into(),
+            "NOTES".into(),
+        ];
+        let managed = derived_output_field_names(&ops, &base_names);
+        assert!(managed.contains(&"customerName".to_string()));
+        assert!(managed.contains(&"displayName".to_string()));
+        assert!(managed.contains(&"source".to_string()));
+        assert!(!managed.iter().any(|n| n == "EMAIL" || n == "NAME" || n == "NOTES"));
+
+        // EMAIL was removed (and NOTES never projected): unused-field update must skip.
+        let pre = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alice")),
+            ("EMAIL", json!("a@x")),
+            ("ACTIVE", json!(1)),
+            ("NOTES", json!("unused")),
+        ]);
+        let after_email = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alice")),
+            ("EMAIL", json!("new@x")),
+            ("ACTIVE", json!(1)),
+            ("NOTES", json!("unused")),
+        ]);
+        assert_eq!(
+            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_email)).unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
+
+        // NAME is used (via rename + addFields copy): must recompute; identity uses output names.
+        let after_name = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alicia")),
+            ("EMAIL", json!("a@x")),
+            ("ACTIVE", json!(1)),
+            ("NOTES", json!("unused")),
+        ]);
+        match analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_name)).unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("ID"), Some(&json!(1)));
+                assert_eq!(identities[0].get("customerName"), Some(&json!("Alicia")));
+                assert_eq!(identities[0].get("displayName"), Some(&json!("Alicia")));
+                assert!(!identities[0].contains_key("NAME"));
+                assert!(!identities[0].contains_key("EMAIL"));
+            }
+            other => panic!("expected Recompute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_only_skips_removed_field_updates_in_open_passthrough() {
+        let ops = parse_transform_steps(&[json!({"remove": {"fields": ["ADDRESS"]}})]).unwrap();
+        let pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("AMOUNT", json!("42.50")),
+            ("ADDRESS", json!("1 Main St")),
+        ]);
+        let after_addr = row(&[
+            ("ORDER_ID", json!(100)),
+            ("AMOUNT", json!("42.50")),
+            ("ADDRESS", json!("1 Main Ave")),
+        ]);
+        assert_eq!(
+            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_addr)).unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
+        let after_amount = row(&[
+            ("ORDER_ID", json!(100)),
+            ("AMOUNT", json!("50.00")),
+            ("ADDRESS", json!("1 Main St")),
+        ]);
+        assert!(matches!(
+            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_amount)).unwrap(),
+            AffectOutcome::Recompute { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_add_fields_rename_remove_are_invalid_not_unsupported() {
+        for step in [
+            json!({"addFields": {"fields": []}}),
+            json!({"rename": {"fields": [{"from": "A"}]}}),
+            json!({"remove": {"fields": []}}),
+        ] {
+            let err = parse_transform_steps(&[step]).unwrap_err();
+            assert!(
+                matches!(err, TransformError::Invalid(_)),
+                "expected Invalid, got {err:?}"
+            );
+            assert!(!err.to_string().to_ascii_lowercase().contains("unsupported"));
+        }
     }
 }
