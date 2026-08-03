@@ -104,13 +104,13 @@ Lab Scenario `platform-store-guardrails` 可在可丢弃 Fixture 上演练随附
 2. 滚动新的 app image / binary
 3. 确认 migrations（`status` 中的 `Schema version`）
 4. 若需要，重新套用已接受的较旧 config（不得 Initial Load／从头 rebuild Base）
-5. `migraloop sync` / 监视 Sync Health 与 Delivery Health
+5. 确认 continuous `migraloop run`（或 one-shot `migraloop sync` catch-up）／监视 Sync Health 与 Delivery Health
 
 Lab Scenario `backward-compatible-upgrades` 可在可丢弃 Fixture 上演练升级时 migrate、较旧 SemVer-compatible config apply，以及不做 wipe-rebuild。
 
 ## 重启后 resume
 
-持久的 capture 与 Delivery 进度存在 Platform Store。进程重启后，`migraloop sync` 会从存放的 checkpoint（inclusive SCN，并以 change-id dedupe 避免跳过同一 SCN 的其余变更）继续 Incremental Capture 并接续 Delivery—Operator 不应依赖仅存在本地的 recovery 文件。
+持久的 capture 与 Delivery 进度存在 Platform Store。进程重启后，长驻的 `migraloop run` 实例（或 one-shot `migraloop sync` catch-up）会从存放的 checkpoint（inclusive SCN，并以 change-id dedupe 避免跳过同一 SCN 的其余变更）继续 Incremental Capture 并接续 Delivery—Operator 不应依赖仅存在本地的 recovery 文件。Continuous Sync、pause/resume/remove、bounded backpressure 与 lag visibility 都继续使用该持久 Platform Store 状态。
 
 ## 相关章节
 

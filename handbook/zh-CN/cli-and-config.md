@@ -87,7 +87,7 @@ migraloop derived --pipeline orders_by_customer [--deployment oracle-to-mongo]
 
 ### `sync`
 
-运行 Incremental Capture 写入 Base Datasets、维护 Derived Datasets，然后 Delivery。
+One-shot Incremental Capture 写入 Base Datasets、维护 Derived Datasets，然后 Delivery。用于 Lab scenarios 与 Operator catch-up；steady-state continuous Sync 请用 `migraloop run`（compose 默认）。
 
 Oracle Incremental Capture 一律走 LogMiner：真实 host 使用 **LogMiner (OCI)**；`host: contract` / `stub` 使用进程内 contract harness。真实 host **不会** silent fallback 到 stub catalog。缺少 Instant Client 或 OCI 失败时会以 LogMiner/OCI 名称 fail fast。
 
@@ -96,6 +96,8 @@ Oracle Incremental Capture 一律走 LogMiner：真实 host 使用 **LogMiner (O
 当单个 Output Identity 的 Delivery 反复失败时，`sync` 会重试最多 `MIGRALOOP_POISON_MAX_ATTEMPTS` 次（默认 `3`），然后 quarantine 该 identity、发出 Operator 可见的 **ALERT**、继续其他 changes，并在 `status` 上显示 quarantine（ADR-0015 / issue #22）。
 
 当 Incremental Capture 看到会 **blocking** 某条 Pipeline 依赖的 Source DDL 时，`sync` 会发出 Operator 可见的 **WARN**、pause 受影响的 Pipeline(s)，并在 `status` 记录 Schema Change impact—不会 quarantine（ADR-0009 / issue #23）。Unaffecting 或 non-blocking 的 schema changes 会继续。
+
+Platform Store 会序列化 Incremental Capture cycles，避免 one-shot `sync` 与 continuous `run` 同时 multi-write 同一个 Deployment。
 
 ```bash
 migraloop sync --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
@@ -148,7 +150,7 @@ migraloop pause --pipeline customers [--deployment oracle-to-mongo]
 
 ### `resume`
 
-恢复已 pause 的 Pipeline。清除耐久 pause 标志，并按当前 Platform Store 的 Base/Derived 状态做 catch-up Delivery（含 pause 期间消失的 identities 的 deletes），之后的 `sync` 再继续 Incremental Delivery。
+恢复已 pause 的 Pipeline。清除耐久 pause 标志，并按当前 Platform Store 的 Base/Derived 状态做 catch-up Delivery（含 pause 期间消失的 identities 的 deletes），之后由 continuous `run`（或后续 one-shot `sync`）继续 Incremental Delivery。
 
 ```bash
 migraloop resume --pipeline customers [--deployment oracle-to-mongo]
@@ -174,7 +176,7 @@ migraloop remove --pipeline customers [--deployment oracle-to-mongo]
 
 ### `run`
 
-启动时 migrate，提供 Observability Surface Prometheus scrape endpoint，然后保持 app 进程运行（compose 默认 command）。
+启动时 migrate，对已应用（未 pause）的 Pipelines 持续执行 Incremental Capture → Affect Analysis → Delivery，并在同一个 single active instance 上提供 Observability Surface Prometheus scrape endpoint，然后保持进程运行（compose 默认 command）。Steady-state Sync 不需要外部 sync scheduler。Caught up 或尚未应用 Deployment 时会 idle-poll（`MIGRALOOP_SYNC_POLL_INTERVAL_MS`）。Source/Target secret refs 必须存在于此进程环境。
 
 ```bash
 migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" \
@@ -222,13 +224,14 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | `MIGRALOOP_PLATFORM_STORE_DATA_DIR` | app filesystem 上用来观测 Platform Store 可用磁盘的路径（compose 会把 store data volume 以 read-only 挂在 `/var/lib/migraloop/platform-store-data`） |
 | `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES` | 选用：当无法做 filesystem probe 时，由 Operator／orchestrator 提供的可用磁盘字节数（覆盖目录探测以供 warn threshold） |
 | `MIGRALOOP_METRICS_ADDR` | `migraloop run` 的 Prometheus scrape listen address（默认 `0.0.0.0:9090`） |
-| 配置中 `fromEnv` 引用的密钥环境变量名 | 你在 `password.fromEnv` 写的任何名称（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply/sync 时必须存在于进程环境 |
-| `LD_LIBRARY_PATH` | 真实 Oracle host：Oracle Instant Client libraries 目录（apply/sync runtime 需要；`contract`/`stub` 不使用） |
+| `MIGRALOOP_SYNC_POLL_INTERVAL_MS` | `migraloop run` 内 continuous Incremental Capture cycles 之间的 idle poll 间隔（默认 `1000`；必须 > 0） |
+| 配置中 `fromEnv` 引用的密钥环境变量名 | 你在 `password.fromEnv` 写的任何名称（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply / one-shot `sync` / continuous `run` 时必须存在于进程环境 |
+| `LD_LIBRARY_PATH` | 真实 Oracle host：Oracle Instant Client libraries 目录（apply/sync/`run` runtime 需要；`contract`/`stub` 不使用） |
 | `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | 仅 contract/stub host：harness catalog 表的 JSON 文件路径，供 schema discovery + Initial Load（CI／本地切片；未设置为空；不是 production Source 机制） |
 | `MIGRALOOP_POISON_MAX_ATTEMPTS` | Poison Change quarantine 前的有界 Delivery 重试次数（默认 `3`；必须 > 0） |
 | `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | 仅 Test/Lab fault injection：以逗号分隔、一律让 Delivery 失败的 Output Identity keys，用来演练 quarantine（不是 production Operator 控制） |
 | `MIGRALOOP_INJECT_SCHEMA_CHANGES` | 仅 Test/Lab injection：Schema Change events 的 JSON 文件路径（`scn`、`table`、`kind`、`columns` …），以便在没有 LogMiner DDL capture 时演练 blocking DDL warn+pause（不是 production Operator 控制） |
-| `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window 大小（默认 `256`；必须 > 0）。各阶段一次 materialize 的 pending changes 不超过此容量（ADR-0020） |
+| `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window 大小（默认 `256`；必须 > 0）。one-shot `sync` 或 continuous `run` 下各阶段一次 materialize 的 pending changes 都不超过此容量（ADR-0020） |
 | `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` | Bounded Initial Load Source read window（默认 `1000`；必须 > 0）。apply 的正常路径不会把 unbounded full-table slam 整表灌进内存 |
 | `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` | 可选的 Initial Load throttle（rows/second；`0`／未设置 = 除 chunking 外不再人工限速）。在 progress 行／`initial_load_progress` 以 `rate_limit` 可见 |
 | `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` | 仅供 Test/Lab inject：成功 N 个 chunks 后 pause Initial Load，以便演练 durable pause/resume（不是 production Operator 控制；Operators 请在 chunks 之间使用 `migraloop pause`） |

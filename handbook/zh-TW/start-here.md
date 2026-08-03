@@ -17,7 +17,7 @@ v1 第一組引擎是 **Oracle → MongoDB**。一個 Deployment 恰好配對一
 docker compose up -d --build
 ```
 
-Compose 會為 app 設定 `MIGRALOOP_PLATFORM_STORE_URL`。entrypoint 執行 `migraloop run`（啟動時 migrate，在 port `9090` 提供 Prometheus `/metrics`，然後維持行程）。
+Compose 會為 app 設定 `MIGRALOOP_PLATFORM_STORE_URL`。entrypoint 執行 `migraloop run`（啟動時 migrate，對已套用的 Deployments/Pipelines 持續執行 Incremental Capture → Affect Analysis → Delivery，在 port `9090` 提供 Prometheus `/metrics`，然後維持行程）。Pipeline 使用的 Source/Target secret refs（例如 `ORACLE_PASSWORD` / `MONGO_PASSWORD`）必須存在於 app 行程環境中，continuous Sync 才能開啟 Source 並 Deliver。
 
 若要可拋棄的 **Local Sync Lab** Fixture（Oracle + MongoDB + Platform Store + app，無預設 Deployment/Pipelines）：`migraloop lab up` / `status` / `down`。`lab status` 會回報 Fixture 就緒狀態，以及哪個 Scenario Namespace 為 active 或 leftover（或 `(none)`）。可選的 **Lab Scenarios**（catalog 來自 `lab/scenarios/<id>/recipe.yaml`；例如 `migraloop lab scenario list` / `run direct-pipeline` / `run rt-project` / `run rt-filter` / `run rt-field-ops` / `run rt-equilookup` / `run rt-union` / `run rt-unwind` / `run rt-distinct-addtoset` / `run transform-pipeline`（groupBy sum/count/min/max/avg） / `run concurrent-source-workload` / `run bulk-load` / `run idempotent-redelivery` / `run pause-resume` / `run remove-pipeline` / `run change-pipeline` / `run poison-quarantine` / `run schema-change-pause` / `run source-alignment` / `run drift-check` / `run bounded-backpressure` / `run observability-surface` / `run platform-store-guardrails` / `run backward-compatible-upgrades` / `run initial-load-throttled`）會在 Scenario Namespace 內走真實 apply/sync；Scenario `run` 會在 apply/sync 前拒絕非 Lab／正式環境的 Source/Target engine 綁定。重跑會先 wipe Namespace，另可用 `scenario remove` / `--auto-remove` 清理。若要在 Scenario recipes 之外做 DB-level restore/load，請用 `lab/escape-hatch/` 搭配 Lab 連線細節，再接一般 `apply`／`status`／inspect—同樣不是 Release Quality Gate。手動驗證（ADR-0025）。巢狀 Docker／**Cursor Cloud** storage-driver 說明（`fuse-overlayfs` 或 `vfs`）：見 [Developer local setup](developer-local-setup.md) 與 [Deployment](deployment.md)。另見 [CLI 與 Config 參考](cli-and-config.md)。
 
@@ -48,13 +48,17 @@ migraloop apply -f deployment.yaml
 - Direct Pipeline（一張 source 表 → Target Binding）：[Pipeline](pipeline.md)
 - Transform Pipeline（宣告式 Rich Transform + Output Identity）：[Rich Transform](rich-transform.md)
 
-## 4. 執行 Incremental Capture 與 Delivery
+## 4. Continuous Sync（以及可選的 one-shot catch-up）
+
+Steady-state Sync 由長駐 app 負責：`apply` 之後，compose / `migraloop run` 實體會持續從耐久 checkpoint 繼續 **Incremental Capture**（Oracle LogMiner）寫入 Base Datasets、維護 Transform Pipeline 的 Derived Datasets，並把 Managed 欄位 **Deliver** 到 MongoDB—不需要外部 sync scheduler。
+
+One-shot catch-up（Lab scenarios、Operator 手動 drain，或 `run` 不是 active path 時）：
 
 ```bash
 migraloop sync
 ```
 
-`sync` 會從耐久 checkpoint 繼續 **Incremental Capture**（Oracle LogMiner）寫入 Base Datasets、維護 Transform Pipeline 的 Derived Datasets，並把 Managed 欄位 **Deliver** 到 MongoDB。
+`sync` 會跑同一條 Incremental Capture → Affect Analysis → Delivery 路徑一次後結束。Continuous Sync 請優先用執行中的 app；`sync` 留給 Lab 與 catch-up。
 
 ## 5. 檢查 Sync Health 與 Delivery Health
 

@@ -87,7 +87,7 @@ migraloop derived --pipeline orders_by_customer [--deployment oracle-to-mongo]
 
 ### `sync`
 
-Run Incremental Capture into Base Datasets, maintain Derived Datasets, then Delivery.
+One-shot Incremental Capture into Base Datasets, maintain Derived Datasets, then Delivery. Use for Lab scenarios and operator catch-up; steady-state continuous Sync is `migraloop run` (compose default).
 
 Oracle Incremental Capture is always LogMiner-backed: real hosts use **LogMiner (OCI)**; `host: contract` / `stub` use the in-process contract harness. There is no silent fallback from a real host to the stub catalog. Missing Instant Client or OCI failures fail fast naming LogMiner/OCI.
 
@@ -96,6 +96,8 @@ Paused Pipelines skip Delivery/processing during `sync`; shared Base Dataset Inc
 When a single Output Identity repeatedly fails Delivery, `sync` retries up to `MIGRALOOP_POISON_MAX_ATTEMPTS` (default `3`), then quarantines that identity with an Operator-visible **ALERT**, continues other changes, and leaves quarantine visible on `status` (ADR-0015 / issue #22).
 
 When Incremental Capture sees **blocking** Source DDL for a Pipeline’s dependencies, `sync` emits an Operator-visible **WARN**, pauses the affected Pipeline(s), and records a Schema Change impact on `status`—without quarantine (ADR-0009 / issue #23). Unaffecting or non-blocking schema changes continue.
+
+Platform Store serializes Incremental Capture cycles so one-shot `sync` and continuous `run` do not multi-write the same Deployment concurrently.
 
 ```bash
 migraloop sync --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
@@ -148,7 +150,7 @@ migraloop pause --pipeline customers [--deployment oracle-to-mongo]
 
 ### `resume`
 
-Resume a paused Pipeline. Clears the durable pause flag and catch-up Delivers from current Platform Store Base/Derived state (including deletes for identities that disappeared while paused), then later `sync` continues Incremental Delivery.
+Resume a paused Pipeline. Clears the durable pause flag and catch-up Delivers from current Platform Store Base/Derived state (including deletes for identities that disappeared while paused), then continuous `run` (or a later one-shot `sync`) continues Incremental Delivery.
 
 ```bash
 migraloop resume --pipeline customers [--deployment oracle-to-mongo]
@@ -174,7 +176,7 @@ migraloop remove --pipeline customers [--deployment oracle-to-mongo]
 
 ### `run`
 
-Migrate on startup, serve the Observability Surface Prometheus scrape endpoint, then keep the app process alive (compose default command).
+Migrate on startup, continuously run Incremental Capture → Affect Analysis → Delivery for applied (non-paused) Pipelines, serve the Observability Surface Prometheus scrape endpoint on the same single active instance, then keep the process alive (compose default command). No external sync scheduler is required for steady-state Sync. Idle-polls when caught up or when no Deployment is applied yet (`MIGRALOOP_SYNC_POLL_INTERVAL_MS`). Source/Target secret refs must be present in this process environment.
 
 ```bash
 migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" \
@@ -222,13 +224,14 @@ Lab is manual verification—not the Release Quality Gate and not the contract/s
 | `MIGRALOOP_PLATFORM_STORE_DATA_DIR` | Path on the app filesystem to observe Platform Store free disk (compose mounts the store data volume read-only at `/var/lib/migraloop/platform-store-data`) |
 | `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES` | Optional Operator/orchestrator-supplied free-disk bytes when a filesystem probe is unavailable (overrides directory probe for the warn threshold) |
 | `MIGRALOOP_METRICS_ADDR` | Prometheus scrape listen address for `migraloop run` (default `0.0.0.0:9090`) |
-| Secret env names referenced from config | Any names you put in `password.fromEnv` (for example `ORACLE_PASSWORD`, `MONGO_PASSWORD`) must be present in the process environment at apply/sync time |
-| `LD_LIBRARY_PATH` | For real Oracle hosts: directory of Oracle Instant Client libraries (required at apply/sync runtime; not used by `contract`/`stub`) |
+| `MIGRALOOP_SYNC_POLL_INTERVAL_MS` | Idle poll interval between continuous Incremental Capture cycles inside `migraloop run` (default `1000`; must be > 0) |
+| Secret env names referenced from config | Any names you put in `password.fromEnv` (for example `ORACLE_PASSWORD`, `MONGO_PASSWORD`) must be present in the process environment at apply / one-shot `sync` / continuous `run` time |
+| `LD_LIBRARY_PATH` | For real Oracle hosts: directory of Oracle Instant Client libraries (required at apply/sync/`run` runtime; not used by `contract`/`stub`) |
 | `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Contract/stub hosts only: path to a JSON file of harness catalog tables for schema discovery + Initial Load (CI / local slices; empty when unset; not a production Source mechanism) |
 | `MIGRALOOP_POISON_MAX_ATTEMPTS` | Bounded Delivery retries before Poison Change quarantine (default `3`; must be > 0) |
 | `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | Test/Lab fault injection only: comma-separated Output Identity keys that always fail Delivery so quarantine can be exercised (not a production Operator control) |
 | `MIGRALOOP_INJECT_SCHEMA_CHANGES` | Test/Lab injection only: path to a JSON file of Schema Change events (`scn`, `table`, `kind`, `columns`, …) so blocking DDL warn+pause can be exercised without LogMiner DDL capture (not a production Operator control) |
-| `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window size (default `256`; must be > 0). Stages never materialize more pending changes than this capacity (ADR-0020) |
+| `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window size (default `256`; must be > 0). Stages never materialize more pending changes than this capacity under one-shot `sync` or continuous `run` (ADR-0020) |
 | `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` | Bounded Initial Load Source read window (default `1000`; must be > 0). Apply never slams an unbounded full-table read into memory as the normal path |
 | `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` | Optional Initial Load throttle in rows/second (`0` / unset = no artificial cap beyond chunking). Visible on progress lines / `initial_load_progress` as `rate_limit` |
 | `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` | Test/Lab inject only: pause Initial Load after N successful chunks so durable pause/resume can be exercised (not a production Operator control; Operators use `migraloop pause` between chunks) |

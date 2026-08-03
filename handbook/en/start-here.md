@@ -17,7 +17,7 @@ Default install is **one compose stack, two containers**: the `migraloop` app an
 docker compose up -d --build
 ```
 
-Compose sets `MIGRALOOP_PLATFORM_STORE_URL` for the app. The app entrypoint runs `migraloop run` (migrate on startup, serve Prometheus `/metrics` on port `9090`, then stay alive).
+Compose sets `MIGRALOOP_PLATFORM_STORE_URL` for the app. The app entrypoint runs `migraloop run` (migrate on startup, continuously run Incremental Capture → Affect Analysis → Delivery for applied Deployments/Pipelines, serve Prometheus `/metrics` on port `9090`, then stay alive). Source/Target secret refs used by Pipelines (for example `ORACLE_PASSWORD` / `MONGO_PASSWORD`) must be present in the app process environment so continuous Sync can open Source and Deliver.
 
 For a disposable **Local Sync Lab** Fixture (Oracle + MongoDB + Platform Store + app, no default Deployment/Pipelines): `migraloop lab up` / `status` / `down`. `lab status` reports Fixture readiness and which Scenario Namespace is active or leftover (or `(none)`). Selectable **Lab Scenarios** (catalogued via `lab/scenarios/<id>/recipe.yaml`; for example `migraloop lab scenario list` / `run direct-pipeline` / `run rt-project` / `run rt-filter` / `run rt-field-ops` / `run rt-equilookup` / `run rt-union` / `run rt-unwind` / `run rt-distinct-addtoset` / `run transform-pipeline` (groupBy sum/count/min/max/avg) / `run concurrent-source-workload` / `run bulk-load` / `run idempotent-redelivery` / `run pause-resume` / `run remove-pipeline` / `run change-pipeline` / `run poison-quarantine` / `run schema-change-pause` / `run source-alignment` / `run drift-check` / `run bounded-backpressure` / `run observability-surface` / `run platform-store-guardrails` / `run backward-compatible-upgrades` / `run initial-load-throttled`) exercise real apply/sync inside a Scenario Namespace; Scenario `run` refuses non-Lab / production Source/Target engine bindings before apply/sync. Re-run wipes that Namespace first, and `scenario remove` / `--auto-remove` cover cleanup. For DB-level restore/load outside Scenario recipes, use `lab/escape-hatch/` with Lab connection details, then ordinary `apply` / `status` / inspect—still not the Release Quality Gate. Manual verification (ADR-0025). Nested Docker / **Cursor Cloud** storage-driver notes (`fuse-overlayfs` or `vfs`): [Developer local setup](developer-local-setup.md) and [Deployment](deployment.md). See also [CLI & Config reference](cli-and-config.md).
 
@@ -48,13 +48,17 @@ migraloop apply -f deployment.yaml
 - Direct Pipeline (one source table → Target Binding): [Pipeline](pipeline.md)
 - Transform Pipeline (declarative Rich Transform + Output Identity): [Rich Transform](rich-transform.md)
 
-## 4. Run Incremental Capture and Delivery
+## 4. Continuous Sync (and optional one-shot catch-up)
+
+Steady-state Sync is the long-running app: after `apply`, the compose/`migraloop run` instance continuously resumes **Incremental Capture** (Oracle LogMiner) into Base Datasets from durable checkpoints, maintains Derived Datasets for Transform Pipelines, and **Delivers** Managed fields to MongoDB—no external sync scheduler required.
+
+One-shot catch-up (Lab scenarios, operator-driven drain, or when `run` is not the active path):
 
 ```bash
 migraloop sync
 ```
 
-`sync` resumes **Incremental Capture** (Oracle LogMiner) into Base Datasets from durable checkpoints, maintains Derived Datasets for Transform Pipelines, and **Delivers** Managed fields to MongoDB.
+`sync` runs the same Incremental Capture → Affect Analysis → Delivery path once and exits. Prefer the running app for continuous Sync; keep `sync` for Lab and catch-up.
 
 ## 5. Check Sync Health and Delivery Health
 

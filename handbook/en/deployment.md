@@ -17,7 +17,7 @@ Bring the stack up from the repo root:
 docker compose up -d --build
 ```
 
-Compose wires `MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@platform-store:5432/migraloop` into the app and runs `migraloop run` (Prometheus `/metrics` on host port `9090` via `MIGRALOOP_METRICS_ADDR`). Bundled Postgres ships Platform Store Guardrails safe defaults (`shared_buffers=128MB`, `work_mem=8MB`, `maintenance_work_mem=128MB`, `max_connections=100`); the store data volume is also mounted read-only into the app (`MIGRALOOP_PLATFORM_STORE_DATA_DIR`) for the free-disk warn probe. Tune Postgres volumes/resources upward as needed; do not replace the store engine or drop settings below product minimums (see [Operations](operations.md)).
+Compose wires `MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@platform-store:5432/migraloop` into the app and runs `migraloop run` (continuous Incremental Capture + Delivery for applied Pipelines, plus Prometheus `/metrics` on host port `9090` via `MIGRALOOP_METRICS_ADDR`). Supply Source/Target secret refs into the app environment so continuous Sync can run. Bundled Postgres ships Platform Store Guardrails safe defaults (`shared_buffers=128MB`, `work_mem=8MB`, `maintenance_work_mem=128MB`, `max_connections=100`); the store data volume is also mounted read-only into the app (`MIGRALOOP_PLATFORM_STORE_DATA_DIR`) for the free-disk warn probe. Tune Postgres volumes/resources upward as needed; do not replace the store engine or drop settings below product minimums (see [Operations](operations.md)).
 
 For Operator CLI on the host (against published store port `5432`):
 
@@ -98,7 +98,8 @@ migraloop apply -f lab/escape-hatch/deployment.yaml
 migraloop status
 migraloop base --table LAB_ESCAPE_CUSTOMERS
 migraloop target --collection lab_escape_customers   # after Delivery has run
-migraloop sync                                       # optional Incremental Capture follow-up
+# Steady-state Sync is continuous inside Lab `migraloop run`; optional one-shot:
+migraloop sync                                       # Lab / operator Incremental Capture catch-up
 ```
 
 **Optional dump-tool restore** (same Lab connection details; still not a Scenario / not CI). Host tools talk to Lab ports on `127.0.0.1` because Lab Compose uses `network_mode: host`:

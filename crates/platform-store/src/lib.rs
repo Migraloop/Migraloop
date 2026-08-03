@@ -13,9 +13,16 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres};
 use thiserror::Error;
+
+/// Session advisory-lock key serializing Incremental Capture cycles (ADR-0005 single writer).
+///
+/// Held for one `sync` / continuous-run cycle so one-shot catch-up and the long-running
+/// app instance do not multi-write Base/Delivery state concurrently.
+pub const INCREMENTAL_SYNC_ADVISORY_LOCK_KEY: i64 = 0x4D47_5F53_594E_4301; // "MG_SYNC\x01"
 
 /// Prior-release Platform Store schema cut for upgrade-smoke verification.
 ///
@@ -305,6 +312,28 @@ pub(crate) async fn connect(database_url: &str) -> Result<PgPool, PlatformStoreE
         .connect(database_url)
         .await
         .map_err(|err| map_store_connect_error(database_url, err))
+}
+
+/// Holds a Platform Store session advisory lock for one Incremental Capture cycle.
+///
+/// Dropping the guard returns the connection to the pool; PostgreSQL releases the
+/// session advisory lock automatically when that backend session ends.
+pub struct IncrementalSyncLock {
+    _conn: PoolConnection<Postgres>,
+}
+
+/// Acquire the Incremental Capture single-writer lock (blocks until available).
+pub async fn acquire_incremental_sync_lock(
+    database_url: &str,
+) -> Result<IncrementalSyncLock, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let mut conn = pool.acquire().await.map_err(PlatformStoreError::Connect)?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(INCREMENTAL_SYNC_ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    Ok(IncrementalSyncLock { _conn: conn })
 }
 
 /// True when the Platform Store URL explicitly requests TLS (no cleartext fallback).

@@ -25,13 +25,13 @@ use migraloop_delivery::{
     DeliveryDocument, ManagedFieldAs, MongoTargetConnection, MongoTlsSettings,
 };
 use migraloop_platform_store::{
-    append_base_dataset_chunk, base_dataset_exists, check_store_settings,
-    clear_schema_change_impacts, delete_base_datasets_not_in, delete_maintenance_state,
-    delete_pipeline, disk_warn_message, filter_unapplied_change_ids, get_base_rows,
-    get_derived_rows, get_maintenance_state_json, health, list_applied_change_ids_from_position,
-    list_base_datasets, list_deployments, list_derived_datasets, list_pipelines,
-    list_quarantined_changes, list_schema_change_impacts, migrate, probe_store_resources,
-    probe_store_settings, record_applied_source_changes,
+    acquire_incremental_sync_lock, append_base_dataset_chunk, base_dataset_exists,
+    check_store_settings, clear_schema_change_impacts, delete_base_datasets_not_in,
+    delete_maintenance_state, delete_pipeline, disk_warn_message, filter_unapplied_change_ids,
+    get_base_rows, get_derived_rows, get_maintenance_state_json, health,
+    list_applied_change_ids_from_position, list_base_datasets, list_deployments,
+    list_derived_datasets, list_pipelines, list_quarantined_changes, list_schema_change_impacts,
+    migrate, probe_store_resources, probe_store_settings, record_applied_source_changes,
     replace_base_dataset, replace_derived_dataset, replace_maintenance_state, replace_pipelines,
     set_pipeline_paused, update_base_primary_key, update_pipeline_delivery_lag,
     update_pipeline_delivery_progress, update_pipeline_delivery_progress_with_lag,
@@ -127,7 +127,7 @@ pub enum Command {
         #[arg(long)]
         deployment: Option<String>,
     },
-    /// Run Incremental Capture into Base Datasets, then Delivery for Direct Pipelines
+    /// One-shot Incremental Capture into Base Datasets, then Delivery (Lab / operator catch-up)
     Sync {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
@@ -199,7 +199,7 @@ pub enum Command {
         #[arg(long)]
         deployment: Option<String>,
     },
-    /// Run the app: migrate on startup, expose Observability metrics, keep alive
+    /// Run the app: migrate, continuous Incremental Capture + Delivery, Observability metrics
     Run {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
@@ -2477,6 +2477,27 @@ fn sync_queue_capacity() -> usize {
         .unwrap_or(256)
 }
 
+/// Idle poll interval between continuous Incremental Capture cycles (`migraloop run`).
+///
+/// Override via `MIGRALOOP_SYNC_POLL_INTERVAL_MS` (must be > 0). Default 1000ms.
+fn sync_poll_interval() -> std::time::Duration {
+    let ms = std::env::var("MIGRALOOP_SYNC_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(1000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// How Incremental Capture is invoked: one-shot CLI vs continuous `run` cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncInvocation {
+    /// `migraloop sync` — Lab / operator catch-up; errors when no Deployments exist.
+    OneShot,
+    /// Continuous cycle inside `migraloop run` — idle when no Deployments; quieter logs.
+    ContinuousCycle,
+}
+
 /// Test/Lab fault injection: artificial Downstream Delivery slowness (milliseconds).
 fn delivery_delay_ms() -> Option<u64> {
     std::env::var("MIGRALOOP_DELIVERY_DELAY_MS")
@@ -3478,15 +3499,65 @@ fn normalize_json_for_drift(value: &serde_json::Value) -> serde_json::Value {
 }
 
 async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
+    run_incremental_sync(platform_store_url, SyncInvocation::OneShot).await
+}
+
+/// Continuous Incremental Capture → Affect Analysis → Delivery inside `migraloop run`.
+///
+/// Idle-polls when caught up or when no Deployments are applied yet so compose can
+/// start before `apply`. Errors are logged and retried — Observability metrics keep
+/// serving on the same single active instance (issue #145).
+async fn run_continuous_incremental_sync(platform_store_url: String) {
+    let poll = sync_poll_interval();
+    println!(
+        "Continuous Incremental Capture: poll_interval_ms={}",
+        poll.as_millis()
+    );
+    emit_event(
+        "continuous_sync_start",
+        &[(
+            "poll_interval_ms",
+            EventValue::from(poll.as_millis() as i64),
+        )],
+    );
+    loop {
+        match run_incremental_sync(&platform_store_url, SyncInvocation::ContinuousCycle).await {
+            Ok(()) => {}
+            Err(err) => {
+                eprintln!("Continuous Incremental Capture cycle failed: {err}");
+                emit_event(
+                    "continuous_sync_error",
+                    &[("error", EventValue::from(err.to_string()))],
+                );
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+async fn run_incremental_sync(
+    platform_store_url: &str,
+    invocation: SyncInvocation,
+) -> Result<(), CliError> {
     ensure_store_healthy(platform_store_url).await?;
+
+    // Serialize Incremental Capture writers: continuous `run` + one-shot `sync`
+    // (Lab / catch-up) must not multi-write the same Deployment (ADR-0005).
+    let _sync_lock = acquire_incremental_sync_lock(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
 
     let deployments = list_deployments(platform_store_url)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     if deployments.is_empty() {
-        return Err(CliError::Failed(
-            "no Deployments applied; run `migraloop apply` first".to_string(),
-        ));
+        return match invocation {
+            SyncInvocation::OneShot => Err(CliError::Failed(
+                "no Deployments applied; run `migraloop apply` first".to_string(),
+            )),
+            // Compose / Lab Fixture may start `run` before any Deployment is applied.
+            SyncInvocation::ContinuousCycle => Ok(()),
+        };
     }
 
     let pipelines = list_pipelines(platform_store_url)
@@ -3500,6 +3571,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
     let injected_schema_changes = load_injected_schema_changes()
         .map_err(|err| CliError::Failed(err.to_string()))?;
     let mut applied_this_run: u32 = 0;
+    let quiet = matches!(invocation, SyncInvocation::ContinuousCycle);
 
     for deployment in &deployments {
         let mut deployment_pipelines: Vec<_> = pipelines
@@ -3528,10 +3600,12 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             None
         };
         if let Some(ref capture) = capture {
-            println!(
-                "Incremental Capture: mechanism={}",
-                capture.mechanism_label()
-            );
+            if !quiet {
+                println!(
+                    "Incremental Capture: mechanism={}",
+                    capture.mechanism_label()
+                );
+            }
         }
 
         // Resume from durable Platform Store checkpoint (inclusive SCN). Initial Load sets
@@ -4160,7 +4234,9 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
-    println!("Incremental Capture and Delivery complete");
+    if !quiet {
+        println!("Incremental Capture and Delivery complete");
+    }
     Ok(())
 }
 
@@ -4882,7 +4958,12 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
                     "invalid --metrics-addr / MIGRALOOP_METRICS_ADDR `{metrics_addr}`: {err}"
                 ))
             })?;
-            // Keep the single app instance alive and serve Prometheus /metrics (ADR-0008).
+            // Continuous Incremental Capture + Delivery on the same single active
+            // instance that serves Observability /metrics (issue #145 / ADR-0008).
+            let sync_url = platform_store_url.clone();
+            tokio::spawn(async move {
+                run_continuous_incremental_sync(sync_url).await;
+            });
             observability::serve_prometheus_metrics(addr, platform_store_url).await
         }
         Command::Lab { command } => run_lab(command).await,

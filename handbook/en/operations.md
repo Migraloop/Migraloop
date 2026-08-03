@@ -103,13 +103,13 @@ Recommended upgrade loop:
 2. Roll the new app image / binary
 3. Confirm migrations (`Schema version` in `status`)
 4. Re-apply accepted older config if needed (must not Initial Load / rebuild Base from scratch)
-5. `migraloop sync` / watch Sync Health and Delivery Health
+5. Confirm continuous `migraloop run` (or one-shot `migraloop sync` catch-up) / watch Sync Health and Delivery Health
 
 Lab Scenario `backward-compatible-upgrades` exercises migrate-on-upgrade, older SemVer-compatible config apply, and no wipe-rebuild on the disposable Fixture.
 
 ## Restart resume
 
-Durable capture and Delivery progress live in the Platform Store. After process restart, `migraloop sync` resumes Incremental Capture from the stored checkpoint (inclusive SCN, with change-id dedupe so same-SCN peers are not skipped) and continues Delivery—Operators should not need local-only recovery files.
+Durable capture and Delivery progress live in the Platform Store. After process restart, the long-running `migraloop run` instance (or one-shot `migraloop sync` catch-up) resumes Incremental Capture from the stored checkpoint (inclusive SCN, with change-id dedupe so same-SCN peers are not skipped) and continues Delivery—Operators should not need local-only recovery files. Continuous Sync, pause/resume/remove, bounded backpressure, and lag visibility all keep using that durable Platform Store state.
 
 ## Related chapters
 
