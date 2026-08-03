@@ -265,7 +265,7 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | `database` | 是 | 是 | |
 | `username` | 是 | 是 | 省略 Pipeline `source.schema` 时，也作为默认 Oracle schema/owner |
 | `password` | 是 | 是 | 恰好一个 `fromEnv`、`fromFile`、`fromDockerSecret` |
-| `timezone` | 可选 | n/a | IANA 或 `±HH:MM`，供 naive 时间 |
+| `timezone` | 可选 | n/a | IANA 或 Oracle 风格 `±HH:MM`，供 naive 时间；两种形式均可在 `apply` 通过 |
 | `tls` | 可选 | 可选 | 见下；省略／`enabled: false` 仍允许 cleartext |
 
 #### `tls`（可选）

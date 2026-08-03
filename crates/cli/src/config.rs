@@ -105,7 +105,8 @@ pub struct SystemSpec {
     pub database: String,
     pub username: String,
     pub password: PasswordField,
-    /// IANA timezone for naive DATE/TIMESTAMP when Source DB timezone is unreadable.
+    /// IANA name or Oracle-style offset (`±HH:MM`) for naive DATE/TIMESTAMP when
+    /// Source DB timezone is unreadable.
     #[serde(default)]
     pub timezone: Option<String>,
     /// Optional TLS settings (ADR-0017). Omitted / disabled keeps cleartext allowed.
@@ -559,14 +560,15 @@ fn validate_transform_steps(
     Ok(())
 }
 
-/// Validate source.timezone when present (IANA name).
+/// Validate source.timezone when present (IANA name or Oracle-style `±HH:MM`).
 pub fn validate_source_timezone(timezone: Option<&str>) -> Result<(), CliError> {
     let Some(tz) = timezone.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    if tz.parse::<chrono_tz::Tz>().is_err() {
+    // Same acceptance rules as Capture temporal resolution (ADR-0022 / handbook).
+    if migraloop_capture::resolve_temporal_timezone(None, Some(tz)).is_err() {
         return Err(CliError::Failed(format!(
-            "source.timezone {tz:?} is not a valid IANA timezone"
+            "source.timezone {tz:?} is not a valid IANA timezone or Oracle-style offset (±HH:MM)"
         )));
     }
     Ok(())
@@ -659,4 +661,42 @@ pub fn resolve_tls_settings(
         wallet_location,
         insecure_skip_verify: tls.insecure_skip_verify,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_timezone_accepts_iana_name() {
+        validate_source_timezone(Some("Asia/Taipei")).expect("IANA name");
+    }
+
+    #[test]
+    fn source_timezone_accepts_oracle_style_offset() {
+        validate_source_timezone(Some("+09:00")).expect("Oracle-style offset");
+        validate_source_timezone(Some("-05:00")).expect("negative offset");
+    }
+
+    #[test]
+    fn source_timezone_rejects_neither_iana_nor_offset() {
+        let err = validate_source_timezone(Some("Not/AZone"))
+            .expect_err("invalid timezone must fail apply");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source.timezone \"Not/AZone\""),
+            "error should name the field and value, got: {msg}"
+        );
+        assert!(
+            msg.contains("IANA") && msg.contains("offset"),
+            "error should explain accepted forms, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn source_timezone_empty_or_absent_ok() {
+        validate_source_timezone(None).expect("absent");
+        validate_source_timezone(Some("")).expect("empty");
+        validate_source_timezone(Some("   ")).expect("whitespace");
+    }
 }

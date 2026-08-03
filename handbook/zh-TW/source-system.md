@@ -14,7 +14,7 @@
 | `database` | Service / database 名稱 |
 | `username` | Sync 帳號（最小 Required Privileges；不是預設就要 admin） |
 | `password` | Secret reference：`fromEnv`、`fromFile` 或 `fromDockerSecret` |
-| `timezone` | 可選 IANA 名稱或 Oracle 風格 offset（`+09:00`）。在 naive DATE/TIMESTAMP 需要解讀且 Source DB timezone 不可讀時使用 |
+| `timezone` | 可選 IANA 名稱或 Oracle 風格 offset（`+09:00` / `±HH:MM`）。`apply` 時接受。在 naive DATE/TIMESTAMP 需要解讀且 Source DB timezone 不可讀時使用 |
 | `tls` | 可選。設 `enabled: true` 以使用 TCPS；用 `walletLocation` 指向 Instant Client wallet 目錄（`caFile` 會被拒絕—Oracle 此處不使用 PEM CA 檔）。僅路徑—禁止 inline PEM。見 [Security](security.md) |
 
 真實 Oracle host 的 **Initial Load**（schema discovery + chunked snapshot）與 **LogMiner Incremental Capture** 都走 **OCI** 路徑。Initial Load 以 PK 排序的 `OFFSET`/`FETCH` window 讀取（由 `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` 限制），而不是一次 unbounded full-table slam；見 [Operations](operations.md) 與 [CLI & Config](cli-and-config.md)。若 runtime 沒有 Oracle Instant Client / OCI libraries，apply/sync 會以 LogMiner/OCI 名稱 fail fast—不會默默退回 stub catalog。當 `tls.enabled: true` 時，連線字串使用 TCPS，設定錯誤會明確失敗（不靜默回退 cleartext）。對 live Source 執行前請安裝 Instant Client（Basic 或 Basic Light），並將 `LD_LIBRARY_PATH` 指向其目錄。
@@ -152,7 +152,7 @@ Schema discovery 之後，Sync 只把 allow-list 內的 Oracle 型別轉入 Plat
 
 **NUMBER：** 在安全時對應到保精度的 Mongo 型別（`NumberLong` / `Decimal128`）。Schema 不安全的 NUMBER 欄位必須在設定時以 Pipeline `fields`（`as: string` 或 `as: omit`）解決—不是在 runtime 逐列 quarantine。
 
-**時間型別：** 平台內部使用 UTC。具時區值會變成絕對瞬間。Naive DATE/TIMESTAMP 在可讀時使用 Source DB timezone，否則使用設定的 Source `timezone`。
+**時間型別：** 平台內部使用 UTC。具時區值會變成絕對瞬間。Naive DATE/TIMESTAMP 在可讀時使用 Source DB timezone，否則使用設定的 Source `timezone`（IANA 名稱或 Oracle 風格 `±HH:MM`）。
 
 ## 哪些資料表會被 capture
 

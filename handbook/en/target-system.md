@@ -14,7 +14,7 @@ Under `spec.target` in the Deployment config:
 | `password` | Secret reference (`fromEnv`, `fromFile`, or `fromDockerSecret`) |
 | `tls` | Optional. Set `enabled: true` for Mongo TLS; `caFile` is a filesystem CA path (not PEM inline). See [Security](security.md) |
 
-Target timezone is not configured in v1—Delivery writes UTC datetime for temporal Managed fields.
+Target timezone is not configured in v1—Delivery writes UTC datetime for temporal Managed fields (values already normalized from the Source DB timezone or Deployment Source `timezone`, which may be an IANA name or Oracle-style `±HH:MM`).
 
 ## Target Binding
 

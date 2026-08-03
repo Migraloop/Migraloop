@@ -271,6 +271,13 @@ mod tests {
     }
 
     #[test]
+    fn configured_timezone_accepts_oracle_offset_when_db_unreadable() {
+        let tz = resolve_temporal_timezone(None, Some("+09:00")).unwrap();
+        let utc = naive_temporal_to_utc("2024-01-15T10:30:00", tz).unwrap();
+        assert_eq!(utc.to_rfc3339(), "2024-01-15T01:30:00+00:00");
+    }
+
+    #[test]
     fn fractional_timestamp_supported() {
         let tz = resolve_temporal_timezone(None, Some("UTC")).unwrap();
         let utc = naive_temporal_to_utc("2024-01-15T10:30:00.123456", tz).unwrap();

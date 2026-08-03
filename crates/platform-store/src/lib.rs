@@ -136,7 +136,8 @@ pub struct SystemConnection {
     pub database: String,
     pub username: String,
     pub password_ref: SecretRef,
-    /// IANA timezone for naive DATE/TIMESTAMP when Source DB timezone is unreadable.
+    /// IANA name or Oracle-style offset (`±HH:MM`) for naive DATE/TIMESTAMP when
+    /// Source DB timezone is unreadable.
     /// Empty means unset (ADR-0022).
     #[serde(default)]
     pub timezone: String,
