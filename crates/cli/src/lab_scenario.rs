@@ -77,6 +77,12 @@ const RT_FILTER_COLLECTION: &str = "lab_rf_customers";
 const RT_FILTER_PIPELINE: &str = "lab-rf-customers";
 const RT_FILTER_DEPLOYMENT: &str = "lab-rt-filter";
 
+const RT_FIELD_OPS_ID: &str = "rt-field-ops";
+const RT_FIELD_OPS_TABLE: &str = "LAB_RFO_CUSTOMERS";
+const RT_FIELD_OPS_COLLECTION: &str = "lab_rfo_customers";
+const RT_FIELD_OPS_PIPELINE: &str = "lab-rfo-customers";
+const RT_FIELD_OPS_DEPLOYMENT: &str = "lab-rt-field-ops";
+
 const IDEMPOTENT_REDELIVERY_ID: &str = "idempotent-redelivery";
 const IDEMPOTENT_REDELIVERY_TABLE: &str = "LAB_IR_CUSTOMERS";
 const IDEMPOTENT_REDELIVERY_COLLECTION: &str = "lab_ir_customers";
@@ -260,6 +266,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         TRANSFORM_PIPELINE_ID,
         RT_PROJECT_ID,
         RT_FILTER_ID,
+        RT_FIELD_OPS_ID,
         CONCURRENT_SOURCE_WORKLOAD_ID,
         BULK_LOAD_ID,
         IDEMPOTENT_REDELIVERY_ID,
@@ -290,6 +297,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         ),
         (RT_PROJECT_ID, "Rich Transform project"),
         (RT_FILTER_ID, "Rich Transform filter"),
+        (
+            RT_FIELD_OPS_ID,
+            "Rich Transform addFields/rename/remove",
+        ),
         (
             CONCURRENT_SOURCE_WORKLOAD_ID,
             "intra-Scenario concurrent Source workload",
@@ -632,6 +643,7 @@ async fn scenario_run(
         TRANSFORM_PIPELINE_ID => run_transform_pipeline(lab_dir).await,
         RT_PROJECT_ID => run_rt_project(lab_dir).await,
         RT_FILTER_ID => run_rt_filter(lab_dir).await,
+        RT_FIELD_OPS_ID => run_rt_field_ops(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
         BULK_LOAD_ID => run_bulk_load(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => run_idempotent_redelivery(lab_dir).await,
@@ -730,6 +742,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         TRANSFORM_PIPELINE_ID => remove_transform_pipeline_namespace(lab_dir).await,
         RT_PROJECT_ID => remove_rt_project_namespace(lab_dir).await,
         RT_FILTER_ID => remove_rt_filter_namespace(lab_dir).await,
+        RT_FIELD_OPS_ID => remove_rt_field_ops_namespace(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
         BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => remove_idempotent_redelivery_namespace(lab_dir).await,
@@ -2168,6 +2181,258 @@ EXIT;\n"
         .map_err(|err| {
             CliError::Failed(format!(
                 "Failed to drive Source insert/update/delete for rt-filter Lab Scenario:\n{err}"
+            ))
+        })
+}
+
+
+async fn run_rt_field_ops(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {RT_FIELD_OPS_ID}");
+    println!(
+        "Scenario Namespace: table={RT_FIELD_OPS_TABLE} \
+collection={RT_FIELD_OPS_COLLECTION} deployment={RT_FIELD_OPS_DEPLOYMENT}"
+    );
+
+    prepare_rt_field_ops_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, RT_FIELD_OPS_ID)?;
+    let bin = lab_migraloop_bin();
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_path.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !(apply_out.to_ascii_lowercase().contains("derived")
+        || apply_out.contains(RT_FIELD_OPS_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+        )));
+    }
+
+    let derived_after_apply = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_FIELD_OPS_PIPELINE,
+        ],
+    )
+    .await?;
+    // project+remove+rename+addFields+filter: Alice only; EMAIL gone; customerName/displayName/source present.
+    if !(managed_field_present(&derived_after_apply, "customerName", "Alice")
+        && managed_field_present(&derived_after_apply, "displayName", "Alice")
+        && managed_field_present(&derived_after_apply, "source", "oracle")
+        && !managed_field_present(&derived_after_apply, "customerName", "Bob")
+        && !inspect_mentions_email_field(&derived_after_apply))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load field-ops Derived check failed \
+(expected Alice customerName/displayName/source, no EMAIL, no Bob):\n{derived_after_apply}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source insert/update/delete...");
+    mutate_rt_field_ops_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+
+    let derived_after = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_FIELD_OPS_PIPELINE,
+        ],
+    )
+    .await?;
+    let target_after = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            RT_FIELD_OPS_COLLECTION,
+        ],
+    )
+    .await?;
+
+    let derived_ok = managed_field_present(&derived_after, "customerName", "Alicia")
+        && managed_field_present(&derived_after, "displayName", "Alicia")
+        && managed_field_present(&derived_after, "customerName", "Carol")
+        && managed_field_present(&derived_after, "source", "oracle")
+        && !managed_field_present(&derived_after, "customerName", "Bob")
+        && !inspect_mentions_email_field(&derived_after);
+    let target_ok = managed_field_present(&target_after, "customerName", "Alicia")
+        && managed_field_present(&target_after, "displayName", "Alicia")
+        && managed_field_present(&target_after, "customerName", "Carol")
+        && managed_field_present(&target_after, "source", "oracle")
+        && !managed_field_present(&target_after, "customerName", "Bob")
+        && !inspect_mentions_email_field(&target_after);
+
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+
+    if !(derived_ok && target_ok) {
+        return Err(CliError::Failed(format!(
+            "correctness checks failed after field-ops insert/update/delete.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: correctness checks passed (addFields/rename/remove Derived + Target Managed outcomes)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_rt_field_ops_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={RT_FIELD_OPS_TABLE}, collection={RT_FIELD_OPS_COLLECTION}, \
+          deployment={RT_FIELD_OPS_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {RT_FIELD_OPS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table {RT_FIELD_OPS_TABLE}:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{RT_FIELD_OPS_COLLECTION}').drop()");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection {RT_FIELD_OPS_COLLECTION}:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, RT_FIELD_OPS_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{RT_FIELD_OPS_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_rt_field_ops_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_rt_field_ops_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {RT_FIELD_OPS_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1) NOT NULL\n\
+);\n\
+ALTER TABLE {RT_FIELD_OPS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {RT_FIELD_OPS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {RT_FIELD_OPS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare rt-field-ops Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_rt_field_ops_source(lab_dir: &Path) -> Result<(), CliError> {
+    // EMAIL-only update is unused after remove; NAME rename path must still update;
+    // Carol ACTIVE=1 enters; Bob deleted.
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {RT_FIELD_OPS_TABLE} SET EMAIL = 'alice-only@example.com' WHERE ID = 1;\n\
+UPDATE {RT_FIELD_OPS_TABLE} SET NAME = 'Alicia' WHERE ID = 1;\n\
+INSERT INTO {RT_FIELD_OPS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
+DELETE FROM {RT_FIELD_OPS_TABLE} WHERE ID = 2;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source insert/update/delete for rt-field-ops Lab Scenario:\n{err}"
             ))
         })
 }
@@ -7281,6 +7546,10 @@ mod tests {
             "catalog must include rt-filter for shipped Rich Transform filter"
         );
         assert!(
+            ids.iter().any(|id| id == RT_FIELD_OPS_ID),
+            "catalog must include rt-field-ops for shipped Rich Transform addFields/rename/remove"
+        );
+        assert!(
             ids.iter().any(|id| id == IDEMPOTENT_REDELIVERY_ID),
             "catalog must include idempotent-redelivery for duplicate-safe Delivery"
         );
@@ -7332,6 +7601,10 @@ mod tests {
         assert!(
             gaps.iter().any(|g| g.contains("Rich Transform filter")),
             "missing rt-filter must be a visible gap; gaps={gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.contains("addFields") || g.contains("rename") || g.contains("remove")),
+            "missing rt-field-ops must be a visible gap; gaps={gaps:?}"
         );
         assert!(
             gaps.iter()

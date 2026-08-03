@@ -39,7 +39,7 @@ use migraloop_platform_store::{
     SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
 };
 use migraloop_transform::{
-    analyze_affect, derived_projected_fields, evaluate_transform,
+    analyze_affect, derived_output_field_names, evaluate_transform,
     evaluate_transform_for_identities, identity_matches_row, parse_transform_steps, used_base_fields,
     AffectOutcome, BaseChangeKind, TransformOp,
 };
@@ -1662,20 +1662,18 @@ async fn deliver_transform_pipeline_with_options(
     Ok(())
 }
 
-/// Columns for a Derived Dataset: project/groupBy fields when present, else Base columns,
+/// Columns for a Derived Dataset after project/addFields/rename/remove/groupBy,
 /// unioned with keys observed in Derived rows. Works for empty Derived results.
-/// Aggregate `as` names inherit the source field's Oracle type metadata.
+/// Aggregate/`addFields`/`rename` aliases inherit the source field's Oracle type metadata.
 fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
     ops: &[TransformOp],
     derived_rows: &[serde_json::Map<String, serde_json::Value>],
 ) -> Vec<BaseColumn> {
-    let mut names = BTreeSet::new();
-    if let Some(projected) = derived_projected_fields(ops) {
-        names.extend(projected);
-    } else {
-        names.extend(base_columns.iter().map(|c| c.name.clone()));
-    }
+    let base_names: Vec<String> = base_columns.iter().map(|c| c.name.clone()).collect();
+    let mut names: BTreeSet<String> = derived_output_field_names(ops, &base_names)
+        .into_iter()
+        .collect();
     for row in derived_rows {
         names.extend(row.keys().cloned());
     }
@@ -1685,10 +1683,35 @@ fn derived_columns_for_ops(
         .collect();
     let mut alias_source: BTreeMap<String, String> = BTreeMap::new();
     for op in ops {
-        if let TransformOp::GroupBy { aggregates, .. } = op {
-            for agg in aggregates {
-                alias_source.insert(agg.as_name.clone(), agg.field.clone());
+        match op {
+            TransformOp::GroupBy { aggregates, .. } => {
+                for agg in aggregates {
+                    alias_source.insert(agg.as_name.clone(), agg.field.clone());
+                }
             }
+            TransformOp::AddFields { fields } => {
+                for spec in fields {
+                    if let migraloop_transform::AddFieldSource::Field(src) = &spec.source {
+                        // Chase prior rename/addFields aliases so type metadata
+                        // resolves to a Base column (e.g. displayName→customerName→NAME).
+                        let resolved = alias_source
+                            .get(src)
+                            .cloned()
+                            .unwrap_or_else(|| src.clone());
+                        alias_source.insert(spec.as_name.clone(), resolved);
+                    }
+                }
+            }
+            TransformOp::Rename { fields } => {
+                for spec in fields {
+                    let src = alias_source
+                        .get(&spec.from)
+                        .cloned()
+                        .unwrap_or_else(|| spec.from.clone());
+                    alias_source.insert(spec.to.clone(), src);
+                }
+            }
+            _ => {}
         }
     }
     names

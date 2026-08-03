@@ -1,0 +1,50 @@
+# Lab Scenario: rt-field-ops
+# Rich Transform addFields / rename / remove coverage (ADR-0025 / issue #125).
+# Applied via the real product `migraloop apply` path — not contract/stub.
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-rt-field-ops
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-rfo-customers
+      mode: transform
+      source:
+        table: LAB_RFO_CUSTOMERS
+      target:
+        collection: lab_rfo_customers
+      outputIdentity: [ID]
+      transform:
+        - project:
+            fields: [ID, NAME, EMAIL, ACTIVE]
+        - remove:
+            fields: [EMAIL]
+        - rename:
+            fields:
+              - from: NAME
+                to: customerName
+        - addFields:
+            fields:
+              - as: source
+                value: oracle
+              - as: displayName
+                field: customerName
+        - filter:
+            field: ACTIVE
+            eq: 1
