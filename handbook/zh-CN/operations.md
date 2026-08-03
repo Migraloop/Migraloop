@@ -46,6 +46,18 @@ migraloop drift [--pipeline customers] [--max-rows 1000]
 
 检查最多读取 `--max-rows` 个 expected Output Identities（默认 `1000`—不是全表 slam），比对 Target 的 Managed fields，并默认以 Managed-only upsert **auto-repair** Managed drift。**non-Managed Target fields 会被忽略**且保持不动。不会在 Alignment baseline 之外再增加 Source load。`status` 显示 `Drift: ok|partial|unknown` 与 checked/mismatched 计数（`partial` = budget 被截断）。见 [CLI 与 Config](cli-and-config.md) 与 [Observability](observability.md)。
 
+## Initial Load（chunked、rate-limited、pausable）
+
+新需要的 Base Dataset 做 Initial Load 时，不得以 unbounded full-table slam 压垮 Oracle：
+
+- Source reads 使用有界 chunk window（`MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE`，默认 `1000`）；`apply` 会打印 `Initial Load progress` 与 structured `initial_load_progress` events
+- 可选 throttle：`MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC`（以 `rate_limit=`／`rate_limit_rows_per_sec` 可见）
+- Load 中途 pause 且不拆除 Deployment：chunks 之间会遵守 `migraloop pause --pipeline <name>`，或 Lab inject `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS`。耐久 Base status 变为 `initial_load_paused`，并保留 rows + cutover low-watermark；再跑 `migraloop apply` 即可 resume
+- 在 Downstream／Platform Store 压力下，Initial Load 会打印 `Initial Load backoff`／`initial_load_backoff`，内存只保留一个 chunk，而不是无界增长
+- No-gap cutover（ADR-0004）仍在第一个 chunk 之前建立 low-watermark；Incremental Capture overlap／dedupe 不变
+
+Lab Scenario `initial-load-throttled` 会在可丢弃 Fixture 上演练 chunked progress、pause/resume、rate limit 与 backoff。
+
 ## Backpressure
 
 当 Platform Store apply、Derived maintenance 或 Target Delivery 跟不上时（ADR-0020）：

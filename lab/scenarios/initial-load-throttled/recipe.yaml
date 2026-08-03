@@ -1,0 +1,27 @@
+# Lab Scenario recipe (ADR-0025 / issue #124).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: initial-load-throttled
+summary: Chunked / rate-limited / pausable Initial Load with backoff under store pressure
+namespace:
+  source_tables:
+    - LAB_IL_ITEMS
+  target_collections:
+    - lab_il_items
+  deployment: lab-initial-load-throttled
+  pipelines:
+    - lab-il-items
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + non-trivial Source seed + table-level supplemental logging
+    - apply with small chunk size + pause-after-chunks; assert durable paused progress + watermark
+    - resume apply to completion; assert chunk progress + rate_limit + backoff signals
+    - status shows Initial Load complete and cutover watermark retained
+checks:
+  correctness:
+    - "Initial Load progress emits multiple bounded chunks (not one unbounded slam)"
+    - "Pause mid-load persists rows + low-watermark; resume completes without Deployment teardown"
+    - "Operator-visible rate_limit and backoff under store pressure"
+    - "Cutover low-watermark remains set after chunked load"
+thresholds: {}

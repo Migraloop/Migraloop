@@ -1,0 +1,31 @@
+# Lab Scenario: initial-load-throttled
+# Chunked / rate-limited / pausable Initial Load (issue #124).
+# Applied via the real product `migraloop apply` path.
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-initial-load-throttled
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-il-items
+      mode: direct
+      source:
+        table: LAB_IL_ITEMS
+      target:
+        collection: lab_il_items

@@ -174,6 +174,18 @@ const BACKWARD_COMPATIBLE_UPGRADES_COLLECTION: &str = "lab_upg_customers";
 const BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT: &str = "lab-backward-compatible-upgrades";
 const BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG: &str = "deployment-v1.0.0.yaml";
 
+const INITIAL_LOAD_THROTTLED_ID: &str = "initial-load-throttled";
+const INITIAL_LOAD_THROTTLED_TABLE: &str = "LAB_IL_ITEMS";
+const INITIAL_LOAD_THROTTLED_COLLECTION: &str = "lab_il_items";
+const INITIAL_LOAD_THROTTLED_PIPELINE: &str = "lab-il-items";
+const INITIAL_LOAD_THROTTLED_DEPLOYMENT: &str = "lab-initial-load-throttled";
+/// Non-trivial Source volume for chunked Initial Load (issue #124).
+const INITIAL_LOAD_THROTTLED_ROW_COUNT: i64 = 500;
+const INITIAL_LOAD_THROTTLED_CHUNK_SIZE: &str = "50";
+const INITIAL_LOAD_THROTTLED_RATE: &str = "200";
+const INITIAL_LOAD_THROTTLED_PAUSE_AFTER: &str = "2";
+const INITIAL_LOAD_THROTTLED_STORE_DELAY_MS: &str = "20";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -263,6 +275,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         OBSERVABILITY_SURFACE_ID,
         PLATFORM_STORE_GUARDRAILS_ID,
         BACKWARD_COMPATIBLE_UPGRADES_ID,
+        INITIAL_LOAD_THROTTLED_ID,
     ]
 }
 
@@ -330,6 +343,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             BACKWARD_COMPATIBLE_UPGRADES_ID,
             "Backward-compatible upgrades / Platform Store migrations",
+        ),
+        (
+            INITIAL_LOAD_THROTTLED_ID,
+            "Chunked / rate-limited / pausable Initial Load with backoff",
         ),
     ]
 }
@@ -630,6 +647,7 @@ async fn scenario_run(
         OBSERVABILITY_SURFACE_ID => run_observability_surface(lab_dir).await,
         PLATFORM_STORE_GUARDRAILS_ID => run_platform_store_guardrails(lab_dir).await,
         BACKWARD_COMPATIBLE_UPGRADES_ID => run_backward_compatible_upgrades(lab_dir).await,
+        INITIAL_LOAD_THROTTLED_ID => run_initial_load_throttled(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -729,6 +747,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         BACKWARD_COMPATIBLE_UPGRADES_ID => {
             remove_backward_compatible_upgrades_namespace(lab_dir).await
         }
+        INITIAL_LOAD_THROTTLED_ID => remove_initial_load_throttled_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -4055,6 +4074,246 @@ collection={BOUNDED_BACKPRESSURE_COLLECTION} deployment={BOUNDED_BACKPRESSURE_DE
         measured_duration_ms: None,
         thresholds_ok: true,
     })
+}
+
+async fn run_initial_load_throttled(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {INITIAL_LOAD_THROTTLED_ID}");
+    println!(
+        "Scenario Namespace: table={INITIAL_LOAD_THROTTLED_TABLE} \
+collection={INITIAL_LOAD_THROTTLED_COLLECTION} deployment={INITIAL_LOAD_THROTTLED_DEPLOYMENT}"
+    );
+    prepare_initial_load_throttled_namespace(lab_dir).await?;
+
+    let config_path = deployment_config_path(lab_dir, INITIAL_LOAD_THROTTLED_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!(
+        "Lab Scenario: apply with chunk_size={INITIAL_LOAD_THROTTLED_CHUNK_SIZE} \
+pause_after={INITIAL_LOAD_THROTTLED_PAUSE_AFTER}..."
+    );
+    let paused_out = run_product_cli_with_env(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+        &[
+            (
+                "MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE",
+                INITIAL_LOAD_THROTTLED_CHUNK_SIZE,
+            ),
+            (
+                "MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS",
+                INITIAL_LOAD_THROTTLED_PAUSE_AFTER,
+            ),
+        ],
+    )
+    .await?;
+    if !(paused_out.contains("Initial Load paused")
+        || paused_out.contains("initial_load_paused")
+        || paused_out.contains("\"event\":\"initial_load_paused\""))
+    {
+        return Err(CliError::Failed(format!(
+            "expected Initial Load pause after bounded chunks:\n{paused_out}"
+        )));
+    }
+    let progress_paused = paused_out
+        .lines()
+        .filter(|l| l.contains("initial_load_progress") || l.contains("Initial Load progress"))
+        .count();
+    if progress_paused < 2 {
+        return Err(CliError::Failed(format!(
+            "expected >=2 Initial Load progress signals before pause, got {progress_paused}:\n{paused_out}"
+        )));
+    }
+
+    let status_paused = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !(status_paused.contains("status=initial_load_paused")
+        || status_paused.contains("Initial Load paused"))
+    {
+        return Err(CliError::Failed(format!(
+            "expected durable Initial Load paused status:\n{status_paused}"
+        )));
+    }
+    if !status_paused.contains("low-watermark=") {
+        return Err(CliError::Failed(format!(
+            "expected cutover low-watermark after paused chunked load:\n{status_paused}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: resume apply with rate_limit={INITIAL_LOAD_THROTTLED_RATE}/s \
+and store delay for backoff..."
+    );
+    let resume_out = run_product_cli_with_env(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+        &[
+            (
+                "MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE",
+                INITIAL_LOAD_THROTTLED_CHUNK_SIZE,
+            ),
+            (
+                "MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC",
+                INITIAL_LOAD_THROTTLED_RATE,
+            ),
+            (
+                "MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS",
+                INITIAL_LOAD_THROTTLED_STORE_DELAY_MS,
+            ),
+        ],
+    )
+    .await?;
+    if !(resume_out.contains("Initial Load complete")
+        || resume_out.contains("\"event\":\"initial_load_complete\""))
+    {
+        return Err(CliError::Failed(format!(
+            "expected Initial Load complete after resume:\n{resume_out}"
+        )));
+    }
+    if !(resume_out.contains("rate_limit=")
+        || resume_out.contains("rate_limit_rows_per_sec"))
+    {
+        return Err(CliError::Failed(format!(
+            "expected Operator-visible rate_limit on resume apply:\n{resume_out}"
+        )));
+    }
+    if !(resume_out.contains("Initial Load backoff")
+        || resume_out.contains("initial_load_backoff"))
+    {
+        return Err(CliError::Failed(format!(
+            "expected Initial Load backoff under store pressure:\n{resume_out}"
+        )));
+    }
+
+    let status_after = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !(status_after.contains("status=initial_load_complete")
+        && status_after.contains(&format!("rows={INITIAL_LOAD_THROTTLED_ROW_COUNT}")))
+    {
+        return Err(CliError::Failed(format!(
+            "expected complete Base with {INITIAL_LOAD_THROTTLED_ROW_COUNT} rows:\n{status_after}"
+        )));
+    }
+
+    let capture_note = if resume_out.to_ascii_lowercase().contains("oci") {
+        "Initial Load (chunked OCI)".to_string()
+    } else {
+        "Initial Load (chunked)".to_string()
+    };
+    println!(
+        "Lab Scenario: {INITIAL_LOAD_THROTTLED_ID} checks passed \
+         (chunked progress; pause/resume; rate_limit; backoff; watermark retained)"
+    );
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied: INITIAL_LOAD_THROTTLED_ROW_COUNT as u64,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: Some(0),
+        max_lag: Some(0),
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_initial_load_throttled_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={INITIAL_LOAD_THROTTLED_TABLE}, collection={INITIAL_LOAD_THROTTLED_COLLECTION}, \
+          deployment={INITIAL_LOAD_THROTTLED_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {INITIAL_LOAD_THROTTLED_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for initial-load-throttled:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{INITIAL_LOAD_THROTTLED_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for initial-load-throttled:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, INITIAL_LOAD_THROTTLED_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{INITIAL_LOAD_THROTTLED_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_initial_load_throttled_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_initial_load_throttled_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {INITIAL_LOAD_THROTTLED_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  LABEL VARCHAR2(100) NOT NULL\n\
+);\n\
+ALTER TABLE {INITIAL_LOAD_THROTTLED_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {INITIAL_LOAD_THROTTLED_TABLE} (ID, LABEL)\n\
+SELECT LEVEL, 'item' || LEVEL FROM DUAL CONNECT BY LEVEL <= {INITIAL_LOAD_THROTTLED_ROW_COUNT};\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare initial-load-throttled Scenario Namespace:\n{err}"
+            ))
+        })
 }
 
 async fn remove_bounded_backpressure_namespace(lab_dir: &Path) -> Result<(), CliError> {

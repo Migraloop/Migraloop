@@ -14,7 +14,8 @@ use crate::oracle_connect::{connect_oracle, map_oracle_error, resolve_oracle_sch
 use crate::oracle_types::{is_allow_listed_oracle_type, normalize_oracle_type};
 use crate::{
     load_contract_source_catalog, normalize_snapshot_temporals, CaptureError, CapturePosition,
-    InitialLoadSnapshot, OracleSourceConnect, SourceColumn,
+    InitialLoadChunk, InitialLoadChunkOptions, InitialLoadSnapshot, OracleSourceConnect,
+    SourceColumn,
 };
 
 /// Discover Source columns for a Pipeline-referenced table.
@@ -36,6 +37,10 @@ pub fn discover_source_schema(
 }
 
 /// Table-level Initial Load: low-watermark SCN first, then snapshot rows (ADR-0004).
+///
+/// Assembles the full snapshot via the chunked path so the normal Source read is
+/// never one unbounded slam (issue #124). Prefer [`initial_load_chunk_for_source`]
+/// at the CLI/Deployment seam for streaming persist.
 pub fn initial_load_for_source(
     source: &OracleSourceConnect,
     password: &str,
@@ -43,17 +48,94 @@ pub fn initial_load_for_source(
     table: &str,
     configured_timezone: Option<&str>,
 ) -> Result<InitialLoadSnapshot, CaptureError> {
+    const ASSEMBLE_CHUNK: usize = 1000;
+    let mut rows = Vec::new();
+    let mut offset = 0usize;
+    let mut established = None;
+    let mut meta: Option<InitialLoadChunk> = None;
+    loop {
+        let chunk = initial_load_chunk_for_source(
+            source,
+            password,
+            schema,
+            table,
+            configured_timezone,
+            &InitialLoadChunkOptions {
+                chunk_size: ASSEMBLE_CHUNK,
+                offset,
+                established_watermark: established,
+            },
+        )?;
+        established = Some(chunk.low_watermark);
+        offset = offset.saturating_add(chunk.rows.len());
+        let exhausted = chunk.exhausted;
+        rows.extend(chunk.rows.iter().cloned());
+        if meta.is_none() {
+            meta = Some(chunk);
+        }
+        if exhausted {
+            break;
+        }
+    }
+    let meta = meta.ok_or_else(|| CaptureError::ContractCatalog {
+        detail: format!("Initial Load produced no chunks for table {table}"),
+    })?;
+    Ok(InitialLoadSnapshot {
+        table: meta.table,
+        low_watermark: meta.low_watermark,
+        primary_key: meta.primary_key,
+        columns: meta.columns,
+        rows,
+    })
+}
+
+/// Bounded Initial Load chunk: watermark first (or reuse durable), then at most
+/// `chunk_size` rows ordered by primary key (issue #124 / ADR-0004).
+pub fn initial_load_chunk_for_source(
+    source: &OracleSourceConnect,
+    password: &str,
+    schema: &str,
+    table: &str,
+    configured_timezone: Option<&str>,
+    options: &InitialLoadChunkOptions,
+) -> Result<InitialLoadChunk, CaptureError> {
+    if options.chunk_size == 0 {
+        return Err(CaptureError::ContractCatalog {
+            detail: "Initial Load chunk_size must be >= 1".to_string(),
+        });
+    }
     if source.is_contract_harness() {
-        return load_contract_source_catalog()?.initial_load(table, configured_timezone);
+        return load_contract_source_catalog()?.initial_load_chunk(
+            table,
+            configured_timezone,
+            options,
+        );
     }
     let conn = connect_oracle(source, password)?;
     let owner = resolve_oracle_schema(source, schema);
-    let mut snapshot = initial_load_oci(&conn, &source.host, &owner, table)?;
-    // Prefer configured Source timezone; otherwise readable DBTIMEZONE.
+    let mut chunk = initial_load_chunk_oci(&conn, &source.host, &owner, table, options)?;
     let db_tz = read_db_timezone(&conn, &source.host).ok().flatten();
     let tz = configured_timezone.or(db_tz.as_deref());
+    let mut snapshot = InitialLoadSnapshot {
+        table: chunk.table.clone(),
+        low_watermark: chunk.low_watermark,
+        primary_key: chunk.primary_key.clone(),
+        columns: chunk.columns.clone(),
+        rows: chunk.rows,
+    };
     normalize_snapshot_temporals(&mut snapshot, tz)?;
-    Ok(snapshot)
+    chunk.rows = snapshot.rows;
+    chunk.cursor_pk = chunk.rows.last().map(|last| {
+        chunk
+            .primary_key
+            .iter()
+            .map(|pk| last.get(pk).cloned().unwrap_or(Value::Null))
+            .collect()
+    });
+    if chunk.rows.is_empty() {
+        chunk.exhausted = true;
+    }
+    Ok(chunk)
 }
 
 /// Resource-gated Source read for Source Alignment Check (issue #24).
@@ -179,19 +261,24 @@ fn alignment_check_read_oci(
     })
 }
 
-fn initial_load_oci(
+fn initial_load_chunk_oci(
     conn: &Connection,
     host: &str,
     owner: &str,
     table: &str,
-) -> Result<InitialLoadSnapshot, CaptureError> {
+    options: &InitialLoadChunkOptions,
+) -> Result<InitialLoadChunk, CaptureError> {
     let table = table.trim().to_ascii_uppercase();
     if table.is_empty() {
         return Err(CaptureError::UnknownTable(table));
     }
 
-    // ADR-0004: establish low-watermark BEFORE reading snapshot rows.
-    let low_watermark = current_scn(conn, host)?;
+    // ADR-0004: establish low-watermark BEFORE reading the first chunk; resume reuses it.
+    let low_watermark = if let Some(wm) = options.established_watermark {
+        wm
+    } else {
+        current_scn(conn, host)?
+    };
     let columns = discover_columns(conn, host, owner, &table)?;
     if columns.is_empty() {
         return Err(CaptureError::UnknownTable(format!("{owner}.{table}")));
@@ -210,14 +297,29 @@ fn initial_load_oci(
         .iter()
         .map(|c| format!("TO_CHAR(\"{}\") AS \"{}\"", c.name, c.name))
         .collect();
+    let order_cols: Vec<String> = primary_key
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect();
+
+    // PK-ordered OFFSET/FETCH window: bounded read, correct resume via durable row_count.
+    // Fetch one extra row to detect exhaustion without COUNT(*).
+    let fetch_limit = (options.chunk_size as u64).saturating_add(1);
+    let offset = options.offset as u64;
     let sql = format!(
-        "SELECT {} FROM \"{}\".\"{}\"",
+        "SELECT {} FROM \"{}\".\"{}\" ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
         select_cols.join(", "),
         owner,
-        table
+        table,
+        order_cols.join(", "),
+        offset,
+        fetch_limit
     );
 
-    let rows = conn.query(&sql, &[]).map_err(|err| map_oracle_error(host, err))?;
+    let rows = conn
+        .query(&sql, &[])
+        .map_err(|err| map_oracle_error(host, err))?;
+
     let mut out_rows = Vec::new();
     for row_result in rows {
         let row = row_result.map_err(|err| map_oracle_error(host, err))?;
@@ -229,12 +331,25 @@ fn initial_load_oci(
         out_rows.push(values_to_json(values, &columns)?);
     }
 
-    Ok(InitialLoadSnapshot {
+    let exhausted = out_rows.len() <= options.chunk_size;
+    if !exhausted {
+        out_rows.truncate(options.chunk_size);
+    }
+    let cursor_pk = out_rows.last().map(|last| {
+        primary_key
+            .iter()
+            .map(|pk| last.get(pk).cloned().unwrap_or(Value::Null))
+            .collect()
+    });
+
+    Ok(InitialLoadChunk {
         table,
         low_watermark,
         primary_key,
         columns,
         rows: out_rows,
+        cursor_pk,
+        exhausted,
     })
 }
 

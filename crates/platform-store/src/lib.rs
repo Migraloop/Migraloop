@@ -278,6 +278,9 @@ pub struct BaseDataset {
     pub source_alignment_checked_rows: i32,
     /// Mismatches detected in the last Source Alignment Check (before repair).
     pub source_alignment_mismatched_rows: i32,
+    /// Keyset cursor for resumable chunked Initial Load (issue #124).
+    /// JSON array of last-persisted primary-key values; `None` when complete/idle.
+    pub initial_load_cursor: Option<Vec<serde_json::Value>>,
 }
 
 /// One row stored in a Base Dataset (supported columns only).
@@ -616,6 +619,10 @@ pub async fn replace_base_dataset(
         serde_json::to_string(&dataset.omitted_columns).map_err(PlatformStoreError::InvalidJson)?;
     let primary_key_json =
         serde_json::to_string(&dataset.primary_key).map_err(PlatformStoreError::InvalidJson)?;
+    let cursor_json = match &dataset.initial_load_cursor {
+        Some(cursor) => Some(serde_json::to_string(cursor).map_err(PlatformStoreError::InvalidJson)?),
+        None => None,
+    };
 
     sqlx::query(
         r#"
@@ -625,9 +632,9 @@ pub async fn replace_base_dataset(
             sync_applied_changes, sync_health,
             capture_low_watermark, capture_checkpoint, sync_lag,
             source_alignment, source_alignment_checked_rows,
-            source_alignment_mismatched_rows, loaded_at
+            source_alignment_mismatched_rows, initial_load_cursor_json, loaded_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now()
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now()
         )
         ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
             status = EXCLUDED.status,
@@ -643,6 +650,7 @@ pub async fn replace_base_dataset(
             source_alignment = EXCLUDED.source_alignment,
             source_alignment_checked_rows = EXCLUDED.source_alignment_checked_rows,
             source_alignment_mismatched_rows = EXCLUDED.source_alignment_mismatched_rows,
+            initial_load_cursor_json = EXCLUDED.initial_load_cursor_json,
             loaded_at = now()
         "#,
     )
@@ -662,6 +670,7 @@ pub async fn replace_base_dataset(
     .bind(&dataset.source_alignment)
     .bind(dataset.source_alignment_checked_rows)
     .bind(dataset.source_alignment_mismatched_rows)
+    .bind(&cursor_json)
     .execute(&mut *tx)
     .await
     .map_err(PlatformStoreError::Persist)?;
@@ -679,6 +688,105 @@ pub async fn replace_base_dataset(
         .bind(&dataset.source_schema)
         .bind(&dataset.source_table)
         .bind(ordinal as i32)
+        .bind(&row_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    }
+
+    tx.commit().await.map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+/// Append one Initial Load chunk into an existing (or new) Base Dataset.
+///
+/// Does **not** delete prior rows — used for chunked / pausable Initial Load
+/// (issue #124). `dataset.row_count` must be the new total after this chunk.
+/// `start_ordinal` is the first `row_ordinal` for the appended rows.
+pub async fn append_base_dataset_chunk(
+    database_url: &str,
+    dataset: &BaseDataset,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    start_ordinal: i32,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
+
+    let columns_json =
+        serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+    let omitted_json =
+        serde_json::to_string(&dataset.omitted_columns).map_err(PlatformStoreError::InvalidJson)?;
+    let primary_key_json =
+        serde_json::to_string(&dataset.primary_key).map_err(PlatformStoreError::InvalidJson)?;
+    let cursor_json = match &dataset.initial_load_cursor {
+        Some(cursor) => Some(serde_json::to_string(cursor).map_err(PlatformStoreError::InvalidJson)?),
+        None => None,
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO base_datasets (
+            deployment_name, source_table, source_schema, status,
+            primary_key_json, columns_json, omitted_columns_json, row_count,
+            sync_applied_changes, sync_health,
+            capture_low_watermark, capture_checkpoint, sync_lag,
+            source_alignment, source_alignment_checked_rows,
+            source_alignment_mismatched_rows, initial_load_cursor_json, loaded_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now()
+        )
+        ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
+            status = EXCLUDED.status,
+            primary_key_json = EXCLUDED.primary_key_json,
+            columns_json = EXCLUDED.columns_json,
+            omitted_columns_json = EXCLUDED.omitted_columns_json,
+            row_count = EXCLUDED.row_count,
+            sync_applied_changes = EXCLUDED.sync_applied_changes,
+            sync_health = EXCLUDED.sync_health,
+            capture_low_watermark = EXCLUDED.capture_low_watermark,
+            capture_checkpoint = EXCLUDED.capture_checkpoint,
+            sync_lag = EXCLUDED.sync_lag,
+            source_alignment = EXCLUDED.source_alignment,
+            source_alignment_checked_rows = EXCLUDED.source_alignment_checked_rows,
+            source_alignment_mismatched_rows = EXCLUDED.source_alignment_mismatched_rows,
+            initial_load_cursor_json = EXCLUDED.initial_load_cursor_json,
+            loaded_at = now()
+        "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.source_table)
+    .bind(&dataset.source_schema)
+    .bind(&dataset.status)
+    .bind(&primary_key_json)
+    .bind(&columns_json)
+    .bind(&omitted_json)
+    .bind(dataset.row_count)
+    .bind(dataset.sync_applied_changes)
+    .bind(&dataset.sync_health)
+    .bind(dataset.capture_low_watermark)
+    .bind(dataset.capture_checkpoint)
+    .bind(dataset.sync_lag)
+    .bind(&dataset.source_alignment)
+    .bind(dataset.source_alignment_checked_rows)
+    .bind(dataset.source_alignment_mismatched_rows)
+    .bind(&cursor_json)
+    .execute(&mut *tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    for (offset, row) in rows.iter().enumerate() {
+        let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
+        sqlx::query(
+            r#"
+            INSERT INTO base_rows (
+                deployment_name, source_schema, source_table, row_ordinal, row_json
+            ) VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.source_schema)
+        .bind(&dataset.source_table)
+        .bind(start_ordinal + offset as i32)
         .bind(&row_json)
         .execute(&mut *tx)
         .await
@@ -997,7 +1105,8 @@ pub async fn list_base_datasets(
             sync_applied_changes, sync_health,
             capture_low_watermark, capture_checkpoint, sync_lag,
             source_alignment, source_alignment_checked_rows,
-            source_alignment_mismatched_rows
+            source_alignment_mismatched_rows,
+            initial_load_cursor_json
         FROM base_datasets
         ORDER BY deployment_name, source_schema, source_table
         "#,
@@ -1029,7 +1138,8 @@ pub async fn get_base_rows(
                 sync_applied_changes, sync_health,
                 capture_low_watermark, capture_checkpoint, sync_lag,
                 source_alignment, source_alignment_checked_rows,
-                source_alignment_mismatched_rows
+                source_alignment_mismatched_rows,
+                initial_load_cursor_json
             FROM base_datasets
             WHERE source_table = $1 AND deployment_name = $2
             ORDER BY source_schema
@@ -1049,7 +1159,8 @@ pub async fn get_base_rows(
                 sync_applied_changes, sync_health,
                 capture_low_watermark, capture_checkpoint, sync_lag,
                 source_alignment, source_alignment_checked_rows,
-                source_alignment_mismatched_rows
+                source_alignment_mismatched_rows,
+                initial_load_cursor_json
             FROM base_datasets
             WHERE source_table = $1
             ORDER BY deployment_name, source_schema
@@ -1233,6 +1344,7 @@ struct BaseDatasetRow {
     source_alignment: String,
     source_alignment_checked_rows: i32,
     source_alignment_mismatched_rows: i32,
+    initial_load_cursor_json: Option<String>,
 }
 
 /// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
@@ -1370,6 +1482,12 @@ impl BaseDatasetRow {
             source_alignment: self.source_alignment,
             source_alignment_checked_rows: self.source_alignment_checked_rows,
             source_alignment_mismatched_rows: self.source_alignment_mismatched_rows,
+            initial_load_cursor: match self.initial_load_cursor_json.as_deref() {
+                None | Some("") => None,
+                Some(raw) => Some(
+                    serde_json::from_str(raw).map_err(PlatformStoreError::InvalidJson)?,
+                ),
+            },
         })
     }
 }

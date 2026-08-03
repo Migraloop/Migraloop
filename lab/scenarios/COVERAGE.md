@@ -31,6 +31,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Observability Surface (logs, health, Prometheus) | `observability-surface` |
 | Platform Store Guardrails and warn-only disk thresholds | `platform-store-guardrails` |
 | Backward-compatible upgrades / Platform Store migrations | `backward-compatible-upgrades` |
+| Chunked / rate-limited / pausable Initial Load with backoff | `initial-load-throttled` |
 
 ## Visible gaps (not yet shipped)
 

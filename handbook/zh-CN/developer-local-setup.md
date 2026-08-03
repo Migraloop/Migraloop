@@ -177,7 +177,7 @@ Lab Fixture lifecycle seam（默认 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine、schema-change-pause 、source-alignment、drift-check、bounded-backpressure、observability-surface 、platform-store-guardrails 和 backward-compatible-upgrades seams（默认 ignored；需要 Docker Lab Fixture + Instant Client）。这些是**手动 Lab** seams—不是 Release Quality Gate 证据，也不应接到 CI：
+Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine、schema-change-pause 、source-alignment、drift-check、bounded-backpressure、observability-surface 、platform-store-guardrails 、backward-compatible-upgrades 和 initial-load-throttled seams（默认 ignored；需要 Docker Lab Fixture + Instant Client）。这些是**手动 Lab** seams—不是 Release Quality Gate 证据，也不应接到 CI：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient

@@ -65,7 +65,8 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run bounded-backpressure
 ./target/debug/migraloop lab scenario run observability-surface
 ./target/debug/migraloop lab scenario run platform-store-guardrails
-./target/debug/migraloop lab scenario run backward-compatible-upgrades
+./target/debug/migraloop lab scenario run initial-load-throttled
+target/debug/migraloop lab scenario run backward-compatible-upgrades
 # lab status names leftover Namespace after keep-on-finish; also inspect with base / derived / target.
 # Re-run wipes Namespace first; or: lab scenario remove <id> / run --auto-remove
 ./target/debug/migraloop lab down
