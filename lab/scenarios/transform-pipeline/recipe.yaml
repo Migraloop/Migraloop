@@ -1,7 +1,7 @@
 # Lab Scenario recipe (ADR-0025 / issue #65).
 # Catalog listing (`migraloop lab scenario list`) reads this file.
 id: transform-pipeline
-summary: "Multi-table Transform Pipeline: customers + orders groupBy/sum → Derived → Delivery (real apply/sync)"
+summary: "Multi-table Transform Pipeline: customers + orders groupBy sum/count/min/max/avg → Derived → Delivery (real apply/sync)"
 namespace:
   source_tables:
     - LAB_TP_CUSTOMERS
@@ -24,5 +24,5 @@ workload:
 checks:
   correctness:
     - "Customers Base/Target Managed NAME: Alicia and Carol present; Bob absent"
-    - "Derived and order-totals Target: totals 35 and 50 (not stale 30)"
+    - "Derived and order-totals Target: sum 35/50, count 2/1, min/max/avg for cust1 (15/20/17.5); not stale 30"
 thresholds: {}

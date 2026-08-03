@@ -15,11 +15,12 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Capability (Lab COVERAGE row) | Lab Scenario id(s) | Non-ignored CI twin evidence (`crates/app/tests/…`) | Notes |
 | --- | --- | --- | --- |
 | Direct Pipeline Initial Load + insert/update/delete | `direct-pipeline` | `cli_direct_pipeline_initial_load.rs`, `cli_direct_pipeline_delivery.rs`, `cli_stub_incremental.rs`, `cli_logminer_incremental.rs`, `cli_contract_catalog_initial_load.rs` | Contract/stub + delivery outcomes |
-| Multi-table Transform Pipeline (`groupBy` / `sum`) | `transform-pipeline` | `cli_groupby_sum_affect.rs`, `cli_multi_table_incremental.rs` | Affect Analysis + multi-table Direct/Transform settle |
+| Multi-table Transform Pipeline (`groupBy` sum/count/min/max/avg) | `transform-pipeline` | `cli_groupby_sum_affect.rs`, `cli_groupby_rich_aggs_affect.rs`, `cli_multi_table_incremental.rs` | Affect Analysis + multi-table Direct/Transform settle |
 | Rich Transform `project` | `rt-project` | `cli_transform_pipeline.rs` (`project` paths) | |
 | Rich Transform `filter` | `rt-filter` | `cli_transform_pipeline.rs` (`filter` paths) | |
 | Rich Transform `addFields` / `rename` / `remove` | `rt-field-ops` | `cli_transform_field_ops.rs` | Affect Analysis unused-field skip after `remove` |
 | Rich Transform `groupBy` / `sum` (also under contention) | `transform-pipeline`, `concurrent-source-workload` | `cli_groupby_sum_affect.rs`, `cli_multi_table_incremental.rs` | CI: multi-table settle after both Bases change. OS-parallel Source sessions stay Lab-manual |
+| Rich Transform `groupBy` `count` / `min` / `max` / `avg` | `transform-pipeline` | `cli_groupby_rich_aggs_affect.rs` | Affect Analysis unused-field skip + incremental Derived for new aggregations |
 | Intra-Scenario concurrent Source workload | `concurrent-source-workload` | `cli_multi_table_incremental.rs` | CI twin = same multi-table Pipeline shape settling after Incremental on both tables (correctness where sensible). Parallel sqlplus / contention timing stay Lab-manual |
 | Bulk load (~100k) with fail-able metric thresholds | `bulk-load` | `cli_direct_pipeline_initial_load.rs`, `cli_contract_catalog_initial_load.rs`, `cli_direct_pipeline_delivery.rs` | CI twin = Initial Load + Delivery correctness on contract/stub. ~100k volume and lag/throughput/duration **thresholds stay Lab-manual** (ADR-0025 / ADR-0028)—never RQG evidence |
 | Idempotent re-delivery / duplicate-safe Delivery | `idempotent-redelivery` | `cli_idempotent_redelivery.rs` (also overlap absorb: `cli_cutover_no_gap.rs`; Managed-only upsert: `cli_direct_pipeline_delivery.rs`, `cli_stub_incremental.rs`) | Force re-Delivery via Platform Store Delivery status + product `apply` |
