@@ -128,7 +128,7 @@ fn two_pipelines_same_customers_table() -> &'static str {
 "#
 }
 
-fn migrate_and_apply(url: &str, config: &Path) -> String {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> String {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -139,13 +139,16 @@ fn migrate_and_apply(url: &str, config: &Path) -> String {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    apply(url, config)
+    apply(url, config, doubles)
 }
 
-fn apply(url: &str, config: &Path) -> String {
-    let apply = Command::new(bin())
+fn apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> String {
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -284,13 +287,14 @@ async fn two_pipelines_same_table_share_one_base_and_both_deliver() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment-shared-base.yaml",
         &deployment_with_pipelines(two_pipelines_same_customers_table(), &mongo_database),
     );
 
-    let apply_out = migrate_and_apply(&url, &config);
+    let apply_out = migrate_and_apply(&url, &config, &doubles);
 
     let initial_load_count = apply_out
         .matches("Initial Load complete: Base Dataset CUSTOMERS")
@@ -343,13 +347,14 @@ async fn runtime_add_second_pipeline_reuses_existing_base_for_same_table() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
 
     let first = write_config(
         &dir,
         "deployment-one.yaml",
         &deployment_with_pipelines(one_customers_pipeline(), &mongo_database),
     );
-    let first_apply = migrate_and_apply(&url, &first);
+    let first_apply = migrate_and_apply(&url, &first, &doubles);
     assert!(
         first_apply.contains("Initial Load complete: Base Dataset CUSTOMERS"),
         "first apply must Initial Load CUSTOMERS, got:\n{first_apply}"
@@ -377,7 +382,7 @@ async fn runtime_add_second_pipeline_reuses_existing_base_for_same_table() {
         "deployment-two.yaml",
         &deployment_with_pipelines(two_pipelines_same_customers_table(), &mongo_database),
     );
-    let second_apply = apply(&url, &second);
+    let second_apply = apply(&url, &second, &doubles);
 
     assert!(
         second_apply.contains("Runtime Pipeline add: customers_reporting (source=CUSTOMERS)"),

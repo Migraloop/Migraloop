@@ -146,10 +146,13 @@ fn migrate(url: &str) {
     );
 }
 
-fn apply(url: &str, config: &Path) -> String {
-    let apply = Command::new(bin())
+fn apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> String {
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -159,6 +162,7 @@ fn apply(url: &str, config: &Path) -> String {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -168,13 +172,17 @@ fn apply(url: &str, config: &Path) -> String {
     String::from_utf8_lossy(&apply.stdout).into_owned()
 }
 
-fn run_sync(url: &str) -> String {
-    let sync = Command::new(bin())
+fn run_sync(url: &str, doubles: &common::NamedScenarioDoubles) -> String {
+    let mut sync = Command::new(bin());
+    sync
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut sync);
+    let sync = sync
         .args(["sync", "--platform-store-url", url])
         .output()
         .expect("run sync");
+
     assert!(
         sync.status.success(),
         "sync failed: stdout={} stderr={}",
@@ -257,6 +265,7 @@ async fn semantic_transform_change_rebuilds_derived_re_delivers_without_base_rel
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
 
     let v1 = write_config(
         &dir,
@@ -267,7 +276,7 @@ async fn semantic_transform_change_rebuilds_derived_re_delivers_without_base_rel
         ),
     );
     migrate(&url);
-    let first = apply(&url, &v1);
+    let first = apply(&url, &v1, &doubles);
     assert!(
         first.contains("Derived Dataset materialized: Pipeline active_customers")
             || first.contains("Delivery complete: Pipeline active_customers"),
@@ -296,7 +305,7 @@ async fn semantic_transform_change_rebuilds_derived_re_delivers_without_base_rel
             &active_customers_and_reporting(0, "active", "customers_reporting"),
         ),
     );
-    let revision = apply(&url, &v2);
+    let revision = apply(&url, &v2, &doubles);
     let revision_lower = revision.to_ascii_lowercase();
     assert!(
         revision_lower.contains("revision") && revision.contains("active_customers"),
@@ -357,7 +366,7 @@ async fn semantic_transform_change_rebuilds_derived_re_delivers_without_base_rel
     // Incremental continues under the new revision. Stub CDC deletes Bob and updates
     // Alice→Alicia (ACTIVE==1); the ACTIVE==0 transform must not Deliver Alicia, and
     // Bob's Source delete must clear the previous revision's Target identity.
-    let sync_out = run_sync(&url);
+    let sync_out = run_sync(&url, &doubles);
     assert!(
         !sync_out.to_ascii_lowercase().contains("error"),
         "incremental sync after revision must succeed, got:\n{sync_out}"
@@ -378,6 +387,7 @@ async fn metadata_only_description_change_skips_derived_rebuild() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
 
     let v1 = write_config(
         &dir,
@@ -388,7 +398,7 @@ async fn metadata_only_description_change_skips_derived_rebuild() {
         ),
     );
     migrate(&url);
-    apply(&url, &v1);
+    apply(&url, &v1, &doubles);
 
     let target_before = target_stdout(&url, "active_customers");
     assert!(
@@ -404,7 +414,7 @@ async fn metadata_only_description_change_skips_derived_rebuild() {
             &active_customers_and_reporting(1, "renamed comment", "customers_reporting"),
         ),
     );
-    let revision = apply(&url, &v2);
+    let revision = apply(&url, &v2, &doubles);
     let revision_lower = revision.to_ascii_lowercase();
     assert!(
         revision_lower.contains("metadata")
@@ -437,6 +447,7 @@ async fn semantic_binding_change_re_delivers_to_new_collection_without_base_relo
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
 
     let v1 = write_config(
         &dir,
@@ -447,7 +458,7 @@ async fn semantic_binding_change_re_delivers_to_new_collection_without_base_relo
         ),
     );
     migrate(&url);
-    apply(&url, &v1);
+    apply(&url, &v1, &doubles);
 
     let reporting_v1 = target_stdout(&url, "customers_reporting");
     assert!(
@@ -463,7 +474,7 @@ async fn semantic_binding_change_re_delivers_to_new_collection_without_base_relo
             &active_customers_and_reporting(1, "active", "customers_reporting_v2"),
         ),
     );
-    let revision = apply(&url, &v2);
+    let revision = apply(&url, &v2, &doubles);
     let revision_lower = revision.to_ascii_lowercase();
     assert!(
         revision_lower.contains("revision") && revision.contains("customers_reporting"),

@@ -105,7 +105,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -116,9 +116,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -128,6 +131,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -136,13 +140,17 @@ fn migrate_and_apply(url: &str, config: &Path) {
     );
 }
 
-fn run_sync(url: &str) -> std::process::Output {
-    Command::new(bin())
+fn run_sync(url: &str, doubles: &common::NamedScenarioDoubles) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut cmd);
+    cmd
         .args(["sync", "--platform-store-url", url])
         .output()
         .expect("run sync")
+
 }
 
 fn seed_mongo_document(database: &str, collection: &str, document_json: &str) {
@@ -178,13 +186,14 @@ async fn stub_incremental_insert_update_delete_update_base_then_mongo() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     // Baseline after Initial Load: Alice (1), Bob (2), and overlap Carol (3).
     let base_before = Command::new(bin())
@@ -198,7 +207,7 @@ async fn stub_incremental_insert_update_delete_update_base_then_mongo() {
         "expected Initial Load rows before incremental, got:\n{before}"
     );
 
-    let sync = run_sync(&url);
+    let sync = run_sync(&url, &doubles);
     assert!(
         sync.status.success(),
         "sync failed: stdout={} stderr={}",
@@ -281,6 +290,7 @@ async fn incremental_delivery_preserves_non_managed_fields_and_status_shows_prog
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
@@ -294,8 +304,8 @@ async fn incremental_delivery_preserves_non_managed_fields_and_status_shows_prog
         r#"{"_id": 1, "NAME": "Stale", "EMAIL": "stale@example.com", "ACTIVE": 0, "EXTRA": "keep-me"}"#,
     );
 
-    migrate_and_apply(&url, &config);
-    let sync = run_sync(&url);
+    migrate_and_apply(&url, &config, &doubles);
+    let sync = run_sync(&url, &doubles);
     assert!(
         sync.status.success(),
         "sync failed: stdout={} stderr={}",

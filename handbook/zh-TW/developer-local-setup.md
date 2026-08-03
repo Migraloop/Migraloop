@@ -8,7 +8,7 @@
 - Docker / Docker Compose（Platform Store 與可選的整合測試相依）
 - Git
 - **可選（live Oracle Source）：** 在執行 `migraloop` 的機器上安裝 Oracle Instant Client Basic 或 Basic Light，並將 `LD_LIBRARY_PATH` 指向 Instant Client 目錄。真實 host 的 Initial Load 與 LogMiner (OCI) 需要它；`host: contract` / `stub` 的 CI 切片不需要。
-- **可選（contract/stub CI 切片）：** `MIGRALOOP_CONTRACT_SOURCE_CATALOG` 可指向 JSON 檔，merge/override 行程內 contract Source catalog 以供 schema discovery + Initial Load（見 [Source System](source-system.md)／[CLI 與 Config](cli-and-config.md)）。預設命名 fixtures 仍供情境可讀性；這不是 production Source 機制。
+- **可選（contract/stub CI 切片）：** 將 `MIGRALOOP_CONTRACT_SOURCE_CATALOG` 指向 harness catalog 資料表 JSON（schema discovery + Initial Load），需要時再將 `MIGRALOOP_INJECT_LOGMINER_CONTENTS` 指向 Incremental LogMiner contents（見 [Source System](source-system.md)／[CLI 與 Config](cli-and-config.md)）。命名 scenario fixtures 應放在這些 inject 檔供測試使用—不是 shipped product path。
 
 ## Clone 與 build
 

@@ -16,7 +16,7 @@ mod source;
 pub use contents::{
     change_events_from_logminer_contents, logminer_change_id, LogMinerContent, LogMinerOperation,
 };
-pub use contract::ContractLogMiner;
+pub use contract::{named_scenario_logminer_contents, ContractLogMiner};
 pub use inject::{
     load_injected_logminer_contents, LogMinerInjectError, INJECT_LOGMINER_CONTENTS_ENV,
 };

@@ -1,7 +1,9 @@
-//! Test/Lab injection of extra LogMiner contents for contract Incremental Capture.
+//! Test/Lab injection of LogMiner contents for contract Incremental Capture.
 //!
-//! Used to exercise bounded backpressure (ADR-0020 / issue #26) with a backlog
-//! larger than the default contract fixture. Not a production Operator control.
+//! On `contract`/`stub` hosts the product path loads **only** this inject file
+//! (empty when unset)—named scenario Incremental rows are not baked in
+//! (issue #120). Tests may include backlog rows here for bounded backpressure
+//! (ADR-0020 / issue #26). Not a production Operator control.
 
 use std::fs;
 use std::path::Path;
@@ -12,8 +14,8 @@ use thiserror::Error;
 use super::contents::{LogMinerContent, LogMinerOperation};
 use crate::CaptureError;
 
-/// Env var: path to a JSON file of extra LogMiner contents to merge into the
-/// contract harness Incremental stream.
+/// Env var: path to a JSON file of LogMiner contents for the contract harness
+/// Incremental stream (sole contents source on the product path).
 pub const INJECT_LOGMINER_CONTENTS_ENV: &str = "MIGRALOOP_INJECT_LOGMINER_CONTENTS";
 
 #[derive(Debug, Error)]

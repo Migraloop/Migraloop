@@ -116,7 +116,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -127,9 +127,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -147,34 +150,31 @@ fn migrate_and_apply(url: &str, config: &Path) {
     );
 }
 
-/// Extra CUSTOMERS inserts beyond the default contract fixture (positions ≥ 1080).
-fn write_injected_logminer_contents(dir: &TempDir, count: usize) -> PathBuf {
+/// Extra CUSTOMERS inserts beyond the named-scenario fixture (positions ≥ 1080).
+fn extra_logminer_backlog(count: usize) -> Vec<migraloop_capture::LogMinerContent> {
+    use migraloop_capture::{LogMinerContent, LogMinerOperation};
+    use std::collections::BTreeMap;
+
     let mut contents = Vec::with_capacity(count);
     for i in 0..count {
         let id = 100 + i as i64;
         let scn = 1080 + i as u64;
-        contents.push(json!({
-            "scn": scn,
-            "operation": "INSERT",
-            "seg_owner": "APP",
-            "table_name": "CUSTOMERS",
-            "identity": { "ID": id },
-            "after_image": {
-                "ID": id,
-                "NAME": format!("User{id}"),
-                "EMAIL": format!("user{id}@example.com"),
-                "ACTIVE": 1,
-                "BIO": format!("blob-bytes-{id}")
-            }
-        }));
+        contents.push(LogMinerContent {
+            scn,
+            operation: LogMinerOperation::Insert,
+            seg_owner: "APP".to_string(),
+            table_name: "CUSTOMERS".to_string(),
+            identity: BTreeMap::from([("ID".to_string(), json!(id))]),
+            after_image: Some(BTreeMap::from([
+                ("ID".to_string(), json!(id)),
+                ("NAME".to_string(), json!(format!("User{id}"))),
+                ("EMAIL".to_string(), json!(format!("user{id}@example.com"))),
+                ("ACTIVE".to_string(), json!(1)),
+                ("BIO".to_string(), json!(format!("blob-bytes-{id}"))),
+            ])),
+        });
     }
-    let path = dir.path().join("inject_logminer.json");
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(&json!({ "contents": contents })).unwrap(),
-    )
-    .expect("write inject file");
-    path
+    contents
 }
 
 fn extract_sync_lag(status: &str) -> Option<i32> {
@@ -219,28 +219,28 @@ async fn downstream_slowness_applies_bounded_backpressure_with_visible_lag() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    // Named-scenario fixture + 20 extra inserts so backlog exceeds tiny queue.
+    let extra = extra_logminer_backlog(20);
+    let doubles =
+        common::NamedScenarioDoubles::install_with_extra_logminer(dir.path(), &extra);
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery(&mongo_database),
     );
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
-    // Default contract fixture has 3 CUSTOMERS changes; inject 20 more so the
-    // backlog clearly exceeds the tiny queue capacity under Downstream delay.
-    let inject = write_injected_logminer_contents(&dir, 20);
     const CAPACITY: &str = "2";
 
-    let slow = Command::new(bin())
+    let mut slow = Command::new(bin());
+    slow
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env(
-            "MIGRALOOP_INJECT_LOGMINER_CONTENTS",
-            inject.to_str().unwrap(),
-        )
         .env("MIGRALOOP_SYNC_QUEUE_CAPACITY", CAPACITY)
         .env("MIGRALOOP_DELIVERY_DELAY_MS", "80")
-        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "1")
+        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "1");
+    doubles.apply_env(&mut slow);
+    let slow = slow
         .args(["sync", "--platform-store-url", &url])
         .output()
         .expect("run sync under Downstream slowness");
@@ -301,14 +301,13 @@ async fn downstream_slowness_applies_bounded_backpressure_with_visible_lag() {
     );
 
     // Catch-up without Downstream delay: apply remaining changes, lag → 0.
-    let catch_up = Command::new(bin())
+    let mut catch_up = Command::new(bin());
+    catch_up
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env(
-            "MIGRALOOP_INJECT_LOGMINER_CONTENTS",
-            inject.to_str().unwrap(),
-        )
-        .env("MIGRALOOP_SYNC_QUEUE_CAPACITY", CAPACITY)
+        .env("MIGRALOOP_SYNC_QUEUE_CAPACITY", CAPACITY);
+    doubles.apply_env(&mut catch_up);
+    let catch_up = catch_up
         .args(["sync", "--platform-store-url", &url])
         .output()
         .expect("run catch-up sync");

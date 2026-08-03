@@ -78,11 +78,14 @@ fn migrate(url: &str) {
     );
 }
 
-fn apply(url: &str, config: &Path) -> std::process::Output {
-    Command::new(bin())
+fn apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env_remove("MIGRALOOP_STUB_DB_TIMEZONE")
+        .env_remove("MIGRALOOP_STUB_DB_TIMEZONE");
+    doubles.apply_env(&mut cmd);
+    cmd
         .args([
             "apply",
             "--platform-store-url",
@@ -92,6 +95,7 @@ fn apply(url: &str, config: &Path) -> std::process::Output {
         ])
         .output()
         .expect("run apply")
+
 }
 
 fn pymongo_field_type(database: &str, collection: &str, id: i64, field: &str) -> String {
@@ -152,6 +156,7 @@ async fn safe_number_delivers_long_and_decimal128_not_ieee_double() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "orders.yaml",
@@ -192,7 +197,7 @@ spec:
     );
 
     migrate(&url);
-    let apply_out = apply(&url, &config);
+    let apply_out = apply(&url, &config, &doubles);
     assert!(
         apply_out.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -226,6 +231,7 @@ async fn unsafe_number_blocks_apply_until_string_or_omit() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
 
     let blocked = write_config(
         &dir,
@@ -267,7 +273,7 @@ spec:
     );
 
     migrate(&url);
-    let fail = apply(&url, &blocked);
+    let fail = apply(&url, &blocked, &doubles);
     assert!(
         !fail.status.success(),
         "unsafe NUMBER must block apply, got success: {}",
@@ -327,7 +333,7 @@ spec:
         ),
     );
 
-    let ok = apply(&url, &resolved);
+    let ok = apply(&url, &resolved, &doubles);
     assert!(
         ok.status.success(),
         "string/omit must allow apply: stdout={} stderr={}",
@@ -381,6 +387,7 @@ async fn naive_date_uses_configured_timezone_mongo_utc_datetime() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "events.yaml",
@@ -422,7 +429,7 @@ spec:
     );
 
     migrate(&url);
-    let out = apply(&url, &config);
+    let out = apply(&url, &config, &doubles);
     assert!(
         out.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -467,6 +474,7 @@ async fn naive_date_uses_readable_db_timezone_over_configured() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "events-db-tz.yaml",
@@ -508,10 +516,13 @@ spec:
     );
 
     migrate(&url);
-    let out = Command::new(bin())
+    let mut out = Command::new(bin());
+    out
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_STUB_DB_TIMEZONE", "Asia/Tokyo")
+        .env("MIGRALOOP_STUB_DB_TIMEZONE", "Asia/Tokyo");
+    doubles.apply_env(&mut out);
+    let out = out
         .args([
             "apply",
             "--platform-store-url",
@@ -521,6 +532,7 @@ spec:
         ])
         .output()
         .expect("apply with db tz");
+
     assert!(
         out.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -541,6 +553,7 @@ async fn unsupported_type_cannot_be_used_as_managed_input() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "blob-managed.yaml",
@@ -584,7 +597,7 @@ spec:
     );
 
     migrate(&url);
-    let out = apply(&url, &config);
+    let out = apply(&url, &config, &doubles);
     assert!(
         !out.status.success(),
         "BLOB as Managed input must fail apply"

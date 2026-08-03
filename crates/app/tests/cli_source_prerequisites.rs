@@ -117,35 +117,46 @@ fn migrate(url: &str) {
     );
 }
 
-fn apply_with_env(url: &str, config: &Path, extra_env: &[(&str, &str)]) -> std::process::Output {
+fn apply_with_env(
+    url: &str,
+    config: &Path,
+    doubles: &common::NamedScenarioDoubles,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = Command::new(bin());
     cmd.env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
         // Default stub prereqs are satisfied unless a test overrides them.
         .env_remove("MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING")
         .env_remove("MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING")
-        .env_remove("MIGRALOOP_STUB_REDO_RETENTION_HOURS")
-        .args([
-            "apply",
-            "--platform-store-url",
-            url,
-            "--file",
-            config.to_str().unwrap(),
-        ]);
+        .env_remove("MIGRALOOP_STUB_REDO_RETENTION_HOURS");
+    doubles.apply_env(&mut cmd);
+    cmd.args([
+        "apply",
+        "--platform-store-url",
+        url,
+        "--file",
+        config.to_str().unwrap(),
+    ]);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
     cmd.output().expect("run apply")
 }
 
-fn sync_with_env(url: &str, extra_env: &[(&str, &str)]) -> std::process::Output {
+fn sync_with_env(
+    url: &str,
+    doubles: &common::NamedScenarioDoubles,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = Command::new(bin());
     cmd.env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
         .env_remove("MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING")
         .env_remove("MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING")
-        .env_remove("MIGRALOOP_STUB_REDO_RETENTION_HOURS")
-        .args(["sync", "--platform-store-url", url]);
+        .env_remove("MIGRALOOP_STUB_REDO_RETENTION_HOURS");
+    doubles.apply_env(&mut cmd);
+    cmd.args(["sync", "--platform-store-url", url]);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -164,6 +175,7 @@ fn combined_output(output: &std::process::Output) -> String {
 async fn apply_fails_fast_when_database_supplemental_logging_missing() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_db = unique_mongo_database();
     let config = write_config(&dir, "deployment.yaml", &deployment_config(&mongo_db));
     migrate(&url);
@@ -171,6 +183,7 @@ async fn apply_fails_fast_when_database_supplemental_logging_missing() {
     let apply = apply_with_env(
         &url,
         &config,
+        &doubles,
         &[("MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING", "off")],
     );
     let text = combined_output(&apply);
@@ -201,6 +214,7 @@ async fn apply_fails_fast_when_database_supplemental_logging_missing() {
 async fn apply_fails_fast_when_table_supplemental_logging_missing() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_db = unique_mongo_database();
     let config = write_config(&dir, "deployment.yaml", &deployment_config(&mongo_db));
     migrate(&url);
@@ -209,6 +223,7 @@ async fn apply_fails_fast_when_table_supplemental_logging_missing() {
     let apply = apply_with_env(
         &url,
         &config,
+        &doubles,
         &[("MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING", "ORDERS")],
     );
     let text = combined_output(&apply);
@@ -234,6 +249,7 @@ async fn apply_fails_fast_when_table_supplemental_logging_missing() {
 async fn apply_fails_fast_when_redo_retention_insufficient() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_db = unique_mongo_database();
     let config = write_config(&dir, "deployment.yaml", &deployment_config(&mongo_db));
     migrate(&url);
@@ -241,6 +257,7 @@ async fn apply_fails_fast_when_redo_retention_insufficient() {
     let apply = apply_with_env(
         &url,
         &config,
+        &doubles,
         &[("MIGRALOOP_STUB_REDO_RETENTION_HOURS", "1")],
     );
     let text = combined_output(&apply);
@@ -262,6 +279,7 @@ async fn apply_fails_fast_when_redo_retention_insufficient() {
 async fn apply_proceeds_when_source_prerequisites_satisfied() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_db = unique_mongo_database();
     let config = write_config(&dir, "deployment.yaml", &deployment_config(&mongo_db));
     migrate(&url);
@@ -269,6 +287,7 @@ async fn apply_proceeds_when_source_prerequisites_satisfied() {
     let apply = apply_with_env(
         &url,
         &config,
+        &doubles,
         &[
             ("MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING", "on"),
             ("MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING", "all"),
@@ -294,11 +313,12 @@ async fn apply_proceeds_when_source_prerequisites_satisfied() {
 async fn sync_fails_fast_when_prerequisites_become_unmet() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_db = unique_mongo_database();
     let config = write_config(&dir, "deployment.yaml", &deployment_config(&mongo_db));
     migrate(&url);
 
-    let apply = apply_with_env(&url, &config, &[]);
+    let apply = apply_with_env(&url, &config, &doubles, &[]);
     assert!(
         apply.status.success(),
         "baseline apply with default satisfied prereqs failed: {}",
@@ -307,6 +327,7 @@ async fn sync_fails_fast_when_prerequisites_become_unmet() {
 
     let sync = sync_with_env(
         &url,
+        &doubles,
         &[("MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING", "off")],
     );
     let text = combined_output(&sync);
@@ -329,6 +350,7 @@ async fn sync_fails_fast_when_prerequisites_become_unmet() {
 async fn unmet_prerequisites_are_not_auto_fixed_by_platform() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_db = unique_mongo_database();
     let config = write_config(&dir, "deployment.yaml", &deployment_config(&mongo_db));
     migrate(&url);
@@ -336,6 +358,7 @@ async fn unmet_prerequisites_are_not_auto_fixed_by_platform() {
     let first = apply_with_env(
         &url,
         &config,
+        &doubles,
         &[("MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING", "off")],
     );
     let first_text = combined_output(&first);
@@ -352,6 +375,7 @@ async fn unmet_prerequisites_are_not_auto_fixed_by_platform() {
     let second = apply_with_env(
         &url,
         &config,
+        &doubles,
         &[("MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING", "off")],
     );
     let second_text = combined_output(&second);

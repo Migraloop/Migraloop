@@ -98,7 +98,7 @@ spec:
     )
 }
 
-fn apply_expect_failure(url: &str, config: &Path) -> String {
+fn apply_expect_failure(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> String {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -109,9 +109,12 @@ fn apply_expect_failure(url: &str, config: &Path) -> String {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -121,6 +124,7 @@ fn apply_expect_failure(url: &str, config: &Path) -> String {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         !apply.status.success(),
         "apply should fail, but succeeded: stdout={}",
@@ -131,7 +135,7 @@ fn apply_expect_failure(url: &str, config: &Path) -> String {
     combined
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -142,9 +146,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -154,6 +161,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -167,6 +175,7 @@ async fn transform_pipeline_missing_output_identity_fails_apply() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let pipeline = r#"
     - name: active-customers
       mode: transform
@@ -187,7 +196,7 @@ async fn transform_pipeline_missing_output_identity_fails_apply() {
         &deployment_shell(&mongo_database, pipeline),
     );
 
-    let err = apply_expect_failure(&url, &config);
+    let err = apply_expect_failure(&url, &config, &doubles);
     assert!(
         err.to_ascii_lowercase().contains("output identity")
             || err.contains("outputIdentity"),
@@ -200,6 +209,7 @@ async fn transform_pipeline_script_transform_fails_apply_clearly() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let pipeline = r#"
     - name: scripted
       mode: transform
@@ -217,7 +227,7 @@ async fn transform_pipeline_script_transform_fails_apply_clearly() {
         &deployment_shell(&mongo_database, pipeline),
     );
 
-    let err = apply_expect_failure(&url, &config);
+    let err = apply_expect_failure(&url, &config, &doubles);
     let lower = err.to_ascii_lowercase();
     assert!(
         lower.contains("script")
@@ -232,6 +242,7 @@ async fn transform_pipeline_malformed_project_fails_as_invalid_not_unsupported()
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let pipeline = r#"
     - name: bad-project
       mode: transform
@@ -250,7 +261,7 @@ async fn transform_pipeline_malformed_project_fails_as_invalid_not_unsupported()
         &deployment_shell(&mongo_database, pipeline),
     );
 
-    let err = apply_expect_failure(&url, &config);
+    let err = apply_expect_failure(&url, &config, &doubles);
     let lower = err.to_ascii_lowercase();
     assert!(
         lower.contains("invalid") || lower.contains("project.fields"),
@@ -267,6 +278,7 @@ async fn transform_pipeline_filter_matching_no_rows_still_materializes_empty_der
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     // ACTIVE==99 matches nothing in stub CUSTOMERS.
     let pipeline = r#"
     - name: nobody
@@ -289,7 +301,7 @@ async fn transform_pipeline_filter_matching_no_rows_still_materializes_empty_der
         &deployment_shell(&mongo_database, pipeline),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let derived = Command::new(bin())
         .args([
@@ -319,6 +331,7 @@ async fn transform_pipeline_unsupported_operator_fails_apply_clearly() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let pipeline = r#"
     - name: faceted
       mode: transform
@@ -337,7 +350,7 @@ async fn transform_pipeline_unsupported_operator_fails_apply_clearly() {
         &deployment_shell(&mongo_database, pipeline),
     );
 
-    let err = apply_expect_failure(&url, &config);
+    let err = apply_expect_failure(&url, &config, &doubles);
     let lower = err.to_ascii_lowercase();
     assert!(
         lower.contains("unsupported") && lower.contains("facet"),
@@ -350,6 +363,7 @@ async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     // project keeps ID/NAME/ACTIVE; filter keeps ACTIVE==1 → Alice + Carol (not Bob).
     let pipeline = r#"
     - name: active-customers
@@ -372,7 +386,7 @@ async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_
         &deployment_shell(&mongo_database, pipeline),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let status = Command::new(bin())
         .args(["status", "--platform-store-url", &url])

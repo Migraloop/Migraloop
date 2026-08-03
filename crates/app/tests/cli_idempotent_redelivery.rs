@@ -109,7 +109,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) -> String {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> String {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -120,9 +120,12 @@ fn migrate_and_apply(url: &str, config: &Path) -> String {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -132,6 +135,7 @@ fn migrate_and_apply(url: &str, config: &Path) -> String {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -141,13 +145,17 @@ fn migrate_and_apply(url: &str, config: &Path) -> String {
     String::from_utf8_lossy(&apply.stdout).into_owned()
 }
 
-fn run_sync(url: &str) -> String {
-    let sync = Command::new(bin())
+fn run_sync(url: &str, doubles: &common::NamedScenarioDoubles) -> String {
+    let mut sync = Command::new(bin());
+    sync
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut sync);
+    let sync = sync
         .args(["sync", "--platform-store-url", url])
         .output()
         .expect("run sync");
+
     assert!(
         sync.status.success(),
         "sync failed: stdout={} stderr={}",
@@ -157,10 +165,13 @@ fn run_sync(url: &str) -> String {
     String::from_utf8_lossy(&sync.stdout).into_owned()
 }
 
-fn apply_again(url: &str, config: &Path) -> String {
-    let apply = Command::new(bin())
+fn apply_again(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> String {
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -170,6 +181,7 @@ fn apply_again(url: &str, config: &Path) -> String {
         ])
         .output()
         .expect("run re-apply");
+
     assert!(
         apply.status.success(),
         "re-apply failed: stdout={} stderr={}",
@@ -263,13 +275,14 @@ async fn duplicate_safe_redelivery_keeps_managed_outcomes_and_non_managed_fields
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
     );
 
-    let apply_out = migrate_and_apply(&url, &config);
+    let apply_out = migrate_and_apply(&url, &config, &doubles);
     assert!(
         apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial"),
         "first apply must Initial Load, got:\n{apply_out}"
@@ -279,7 +292,7 @@ async fn duplicate_safe_redelivery_keeps_managed_outcomes_and_non_managed_fields
         "first apply must Deliver, got:\n{apply_out}"
     );
 
-    let sync_out = run_sync(&url);
+    let sync_out = run_sync(&url, &doubles);
     assert!(
         sync_out.to_ascii_lowercase().contains("incremental")
             || sync_out.to_ascii_lowercase().contains("sync"),
@@ -316,7 +329,7 @@ async fn duplicate_safe_redelivery_keeps_managed_outcomes_and_non_managed_fields
     .await
     .expect("reset Pipeline Delivery status for re-Delivery exercise");
 
-    let reapply_out = apply_again(&url, &config);
+    let reapply_out = apply_again(&url, &config, &doubles);
     assert!(
         reapply_out.to_ascii_lowercase().contains("delivery"),
         "re-apply must perform duplicate-safe re-Delivery, got:\n{reapply_out}"

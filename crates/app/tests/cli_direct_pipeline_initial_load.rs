@@ -83,7 +83,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -94,9 +94,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -106,6 +109,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -118,13 +122,14 @@ fn migrate_and_apply(url: &str, config: &Path) {
 async fn apply_direct_pipeline_initial_loads_referenced_table_into_base() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_pipeline("CUSTOMERS"),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let status = Command::new(bin())
         .args(["status", "--platform-store-url", &url])
@@ -153,13 +158,14 @@ async fn apply_direct_pipeline_initial_loads_referenced_table_into_base() {
 async fn base_contains_full_supported_type_rows_not_projected_subset() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_pipeline("CUSTOMERS"),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let base = Command::new(bin())
         .args([
@@ -222,17 +228,21 @@ async fn base_contains_full_supported_type_rows_not_projected_subset() {
 async fn reapply_does_not_reload_existing_base_dataset() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_pipeline("CUSTOMERS"),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
-    let reapply = Command::new(bin())
+    let mut reapply = Command::new(bin());
+    reapply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut reapply);
+    let reapply = reapply
         .args([
             "apply",
             "--platform-store-url",
@@ -242,6 +252,7 @@ async fn reapply_does_not_reload_existing_base_dataset() {
         ])
         .output()
         .expect("re-apply");
+
     assert!(
         reapply.status.success(),
         "re-apply failed: {}",
@@ -269,13 +280,14 @@ async fn reapply_does_not_reload_existing_base_dataset() {
 async fn unsupported_columns_are_omitted_and_visible_in_status() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_pipeline("CUSTOMERS"),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let status = Command::new(bin())
         .args(["status", "--platform-store-url", &url])
@@ -297,13 +309,14 @@ async fn unsupported_columns_are_omitted_and_visible_in_status() {
 async fn unreferenced_stub_tables_are_not_captured() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_pipeline("CUSTOMERS"),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let status = Command::new(bin())
         .args(["status", "--platform-store-url", &url])

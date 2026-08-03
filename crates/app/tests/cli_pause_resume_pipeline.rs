@@ -164,7 +164,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -175,9 +175,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -187,6 +190,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -195,13 +199,17 @@ fn migrate_and_apply(url: &str, config: &Path) {
     );
 }
 
-fn run_sync(url: &str) -> String {
-    let sync = Command::new(bin())
+fn run_sync(url: &str, doubles: &common::NamedScenarioDoubles) -> String {
+    let mut sync = Command::new(bin());
+    sync
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut sync);
+    let sync = sync
         .args(["sync", "--platform-store-url", url])
         .output()
         .expect("run sync");
+
     assert!(
         sync.status.success(),
         "sync failed: stdout={} stderr={}",
@@ -233,10 +241,17 @@ fn pause_pipeline(url: &str, pipeline: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn resume_pipeline(url: &str, pipeline: &str) -> String {
-    let out = Command::new(bin())
-        .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+fn resume_pipeline(
+    url: &str,
+    pipeline: &str,
+    doubles: &common::NamedScenarioDoubles,
+) -> String {
+    // Resume catch-up Delivery rediscovers Source columns for Managed validation.
+    let mut out = Command::new(bin());
+    out.env("ORACLE_PASSWORD", "oracle-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut out);
+    let out = out
         .args([
             "resume",
             "--platform-store-url",
@@ -308,13 +323,14 @@ async fn pause_stops_pipeline_delivery_resume_catch_up_other_pipelines_unaffecte
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &two_direct_pipelines(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let pause_out = pause_pipeline(&url, "customers");
     assert!(
@@ -334,7 +350,7 @@ async fn pause_stops_pipeline_delivery_resume_catch_up_other_pipelines_unaffecte
         "status must still list unaffected Pipeline orders, got:\n{status_paused}"
     );
 
-    let sync_out = run_sync(&url);
+    let sync_out = run_sync(&url, &doubles);
     assert!(
         !sync_out.contains("Delivery complete: Pipeline customers"),
         "paused Pipeline must not Deliver during sync, got:\n{sync_out}"
@@ -373,7 +389,7 @@ async fn pause_stops_pipeline_delivery_resume_catch_up_other_pipelines_unaffecte
         "unaffected Pipeline orders must Deliver Incremental updates, got:\n{orders_target}"
     );
 
-    let resume_out = resume_pipeline(&url, "customers");
+    let resume_out = resume_pipeline(&url, "customers", &doubles);
     assert!(
         resume_out.to_ascii_lowercase().contains("resum")
             && resume_out.contains("customers"),
@@ -416,16 +432,17 @@ async fn pause_stops_transform_processing_resume_rebuilds_from_durable_base() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &transform_and_direct_pipelines(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
     pause_pipeline(&url, "active_customers");
 
-    let sync_out = run_sync(&url);
+    let sync_out = run_sync(&url, &doubles);
     assert!(
         !sync_out.contains("Delivery complete: Pipeline active_customers")
             && !sync_out.contains("Affect Analysis: Pipeline active_customers"),
@@ -443,7 +460,7 @@ async fn pause_stops_transform_processing_resume_rebuilds_from_durable_base() {
         "paused Transform Target must retain pre-pause Derived Delivery, got:\n{target_paused}"
     );
 
-    let resume_out = resume_pipeline(&url, "active_customers");
+    let resume_out = resume_pipeline(&url, "active_customers", &doubles);
     assert!(
         resume_out.to_ascii_lowercase().contains("delivery")
             || resume_out.to_ascii_lowercase().contains("derived"),

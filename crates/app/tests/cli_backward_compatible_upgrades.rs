@@ -217,10 +217,13 @@ fn migrate_cli(url: &str) -> String {
     combined
 }
 
-fn apply_cli(url: &str, config: &Path) -> String {
-    let apply = Command::new(bin())
+fn apply_cli(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> String {
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -230,6 +233,7 @@ fn apply_cli(url: &str, config: &Path) -> String {
         ])
         .output()
         .expect("run apply");
+
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&apply.stdout),
@@ -329,6 +333,7 @@ async fn newer_app_migrates_prior_schema_without_wiping_deployment_data() {
 async fn older_semver_compatible_config_still_applies_after_upgrade() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_database = unique_mongo_database();
 
     migraloop_platform_store::migrate_through(
@@ -345,7 +350,7 @@ async fn older_semver_compatible_config_still_applies_after_upgrade() {
         "older-v1.0.0.yaml",
         &older_compatible_deployment(&mongo_database),
     );
-    let apply_out = apply_cli(&url, &older);
+    let apply_out = apply_cli(&url, &older, &doubles);
     assert!(
         !apply_out.contains("Initial Load complete"),
         "older compatible config must not rebuild Base from scratch, got:\n{apply_out}"
@@ -365,6 +370,7 @@ async fn older_semver_compatible_config_still_applies_after_upgrade() {
 async fn assert_apply_rejects_api_version(api_version: &str, must_mention: &str) {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     migrate_cli(&url);
 
     let bad = write_config(
@@ -373,9 +379,12 @@ async fn assert_apply_rejects_api_version(api_version: &str, must_mention: &str)
         &deployment_with_api_version(api_version, "unused"),
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -385,6 +394,7 @@ async fn assert_apply_rejects_api_version(api_version: &str, must_mention: &str)
         ])
         .output()
         .expect("run apply");
+
     assert!(
         !apply.status.success(),
         "apiVersion {api_version} must fail apply"
@@ -415,6 +425,7 @@ async fn newer_same_major_config_is_rejected() {
 async fn upgrade_smoke_does_not_require_rebuild_from_scratch() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_database = unique_mongo_database();
 
     // Establish a full current Deployment first (operator path), then re-apply
@@ -425,7 +436,7 @@ async fn upgrade_smoke_does_not_require_rebuild_from_scratch() {
         &current_deployment(&mongo_database),
     );
     migrate_cli(&url);
-    let first_apply = apply_cli(&url, &current);
+    let first_apply = apply_cli(&url, &current, &doubles);
     assert!(
         first_apply.contains("Initial Load complete"),
         "fresh apply should Initial Load, got:\n{first_apply}"
@@ -444,7 +455,7 @@ async fn upgrade_smoke_does_not_require_rebuild_from_scratch() {
         "older.yaml",
         &older_compatible_deployment(&mongo_database),
     );
-    let reapply = apply_cli(&url, &older);
+    let reapply = apply_cli(&url, &older, &doubles);
     assert!(
         !reapply.contains("Initial Load complete"),
         "upgrade smoke must not rebuild Base from scratch, got:\n{reapply}"

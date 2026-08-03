@@ -26,7 +26,7 @@ migraloop migrate --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 套用宣告式 Deployment 設定（YAML 或 JSON）。驗證 secrets-by-reference、Source/Target kinds、Pipeline specs、（當 Pipelines 參照資料表時）Source Prerequisites，視需要執行 schema discovery + Initial Load，並 upsert Deployment/Pipeline 狀態。以語意 Pipeline 變更重新 apply（transform/binding 等）是 Operator 的 **Pipeline revision** 路徑：暫停該 Pipeline 的舊 Delivery，依需要重建 Derived 並重新 Delivery，然後繼續 incremental；Shared Bases 不重建。僅變更選用的 `description` 屬 metadata-only，可跳過 rebuild。
 
-在真實 Oracle Source host（非 `contract`/`stub`）上，apply 會透過 OCI 從 live Source 做 schema discovery 與 Initial Load（需要 Instant Client；見 [Source System](source-system.md)）。contract/stub host 使用行程內 **contract Source catalog**（CI 切片；預設命名 fixtures 供情境可讀性；可用 `MIGRALOOP_CONTRACT_SOURCE_CATALOG` 注入額外資料表—不是受支援的 production Source 機制）。
+在真實 Oracle Source host（非 `contract`/`stub`）上，apply 會透過 OCI 從 live Source 做 schema discovery 與 Initial Load（需要 Instant Client；見 [Source System](source-system.md)）。contract/stub host 僅使用**注入的**行程內 **contract Source catalog**（CI 切片；`MIGRALOOP_CONTRACT_SOURCE_CATALOG` 供 discovery/Initial Load；`MIGRALOOP_INJECT_LOGMINER_CONTENTS` 供 Incremental Capture）—不是隨產品附帶的業務資料表 catalog，也不是受支援的 production Source 機制。
 
 ```bash
 migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployment.yaml
@@ -222,13 +222,13 @@ Lab 是手動驗證—不是 Release Quality Gate，也不是 contract/stub LogM
 | `MIGRALOOP_METRICS_ADDR` | `migraloop run` 的 Prometheus scrape listen address（預設 `0.0.0.0:9090`） |
 | 設定中 `fromEnv` 參照的密鑰環境變數名 | 你在 `password.fromEnv` 寫的任何名稱（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply/sync 時必須存在於行程環境 |
 | `LD_LIBRARY_PATH` | 真實 Oracle host：Oracle Instant Client libraries 目錄（apply/sync runtime 需要；`contract`/`stub` 不使用） |
-| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | 僅 contract/stub host：JSON 檔路徑，merge/override harness catalog 資料表以供 schema discovery + Initial Load（CI／本機切片；不是 production Source 機制） |
+| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | 僅 contract/stub host：harness catalog 資料表 JSON 檔路徑，供 schema discovery + Initial Load（CI／本機切片；未設定為空；不是 production Source 機制） |
 | `MIGRALOOP_POISON_MAX_ATTEMPTS` | Poison Change quarantine 前的有界 Delivery 重試次數（預設 `3`；必須 > 0） |
 | `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | 僅 Test/Lab fault injection：以逗號分隔、一律讓 Delivery 失敗的 Output Identity keys，用來演練 quarantine（不是 production Operator 控制） |
 | `MIGRALOOP_INJECT_SCHEMA_CHANGES` | 僅 Test/Lab injection：Schema Change events 的 JSON 檔路徑（`scn`、`table`、`kind`、`columns` …），以便在沒有 LogMiner DDL capture 時演練 blocking DDL warn+pause（不是 production Operator 控制） |
 | `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window 大小（預設 `256`；必須 > 0）。各階段一次 materialize 的 pending changes 不超過此容量（ADR-0020） |
 | `MIGRALOOP_DELIVERY_DELAY_MS` | 僅 Test/Lab fault injection：人工 Downstream Delivery 延遲（毫秒），用來演練 bounded backpressure 與可見 lag（不是 production Operator 控制） |
-| `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | 僅 Test/Lab injection：額外 contract LogMiner contents 的 JSON 檔路徑（`contents: [{scn, operation, table_name, identity, after_image}, …]`），以便在 `contract`/`stub` hosts 上演練大型 Incremental backlog（不是 production Operator 控制） |
+| `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | 僅 Test/Lab injection：contract LogMiner contents 的 JSON 檔路徑（`contents: [{scn, operation, table_name, identity, after_image}, …]`），供 `contract`/`stub` hosts 的 Incremental Capture（未設定時 harness Incremental 串流為空；不是 production Operator 控制） |
 | Lab disposable defaults | `migraloop lab up` 之後：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`（僅本機 Lab） |
 
 ### Contract-harness Source Prerequisite probes（僅 host `stub` / `contract`）

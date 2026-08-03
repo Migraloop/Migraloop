@@ -142,12 +142,15 @@ fn migrate(url: &str) {
     );
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     migrate(url);
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -157,6 +160,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -273,9 +277,10 @@ async fn status_warns_on_low_disk_without_failing_health() {
 async fn disk_threshold_does_not_auto_pause_pipeline() {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let mongo_db = unique_mongo_database();
     let config = write_config(&dir, "deployment.yaml", &deployment_with_direct_delivery(&mongo_db));
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let status = Command::new(bin())
         .env(
@@ -310,13 +315,16 @@ async fn disk_threshold_does_not_auto_pause_pipeline() {
     );
 
     // sync must also refuse to pause solely for disk pressure
-    let sync = Command::new(bin())
+    let mut sync = Command::new(bin());
+    sync
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
         .env(
             "MIGRALOOP_INJECT_PLATFORM_STORE_FREE_DISK_BYTES",
             "536870912",
-        )
+        );
+    doubles.apply_env(&mut sync);
+    let sync = sync
         .args(["sync", "--platform-store-url", &url])
         .output()
         .expect("run sync");

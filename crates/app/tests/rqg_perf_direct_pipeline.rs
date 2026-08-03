@@ -353,13 +353,38 @@ fn migrate(url: &str) {
     );
 }
 
-fn apply_with_catalog(url: &str, config: &Path, catalog_path: &Path) -> std::process::Output {
+fn write_customers_logminer_inject(dir: &TempDir) -> PathBuf {
+    // Named-scenario CUSTOMERS Incremental doubles (Alice→Alicia / Carol insert / Bob delete).
+    // Product path no longer bakes these in (issue #120); rqg-perf must inject them.
+    let contents = migraloop_capture::named_scenario_logminer_contents();
+    let customers_only: Vec<_> = contents
+        .into_iter()
+        .filter(|c| c.table_name.eq_ignore_ascii_case("CUSTOMERS"))
+        .collect();
+    write_config(
+        dir,
+        "customers-logminer.json",
+        &serde_json::to_string_pretty(&json!({ "contents": customers_only }))
+            .expect("serialize logminer inject"),
+    )
+}
+
+fn apply_with_catalog(
+    url: &str,
+    config: &Path,
+    catalog_path: &Path,
+    logminer_path: &Path,
+) -> std::process::Output {
     Command::new(bin())
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
         .env(
             "MIGRALOOP_CONTRACT_SOURCE_CATALOG",
             catalog_path.to_str().unwrap(),
+        )
+        .env(
+            "MIGRALOOP_INJECT_LOGMINER_CONTENTS",
+            logminer_path.to_str().unwrap(),
         )
         .env("MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING", "all")
         .args([
@@ -373,13 +398,21 @@ fn apply_with_catalog(url: &str, config: &Path, catalog_path: &Path) -> std::pro
         .expect("run apply")
 }
 
-fn run_sync_with_catalog(url: &str, catalog_path: &Path) -> std::process::Output {
+fn run_sync_with_catalog(
+    url: &str,
+    catalog_path: &Path,
+    logminer_path: &Path,
+) -> std::process::Output {
     Command::new(bin())
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
         .env(
             "MIGRALOOP_CONTRACT_SOURCE_CATALOG",
             catalog_path.to_str().unwrap(),
+        )
+        .env(
+            "MIGRALOOP_INJECT_LOGMINER_CONTENTS",
+            logminer_path.to_str().unwrap(),
         )
         .env("MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING", "all")
         .args(["sync", "--platform-store-url", url])
@@ -392,6 +425,7 @@ async fn run_timed_microbench(seed_rows: u64) -> PerfMeasurement {
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
     let catalog_path = write_config(&dir, "catalog.json", &customers_catalog_json(seed_rows));
+    let logminer_path = write_customers_logminer_inject(&dir);
     let config = write_config(
         &dir,
         "deployment.yaml",
@@ -402,7 +436,7 @@ async fn run_timed_microbench(seed_rows: u64) -> PerfMeasurement {
 
     // Timed path: seed N → Initial Load → Incremental → Delivery.
     let started = Instant::now();
-    let apply = apply_with_catalog(&url, &config, &catalog_path);
+    let apply = apply_with_catalog(&url, &config, &catalog_path, &logminer_path);
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -419,7 +453,7 @@ async fn run_timed_microbench(seed_rows: u64) -> PerfMeasurement {
         "expected Delivery after Initial Load, got:\n{apply_out}"
     );
 
-    let sync = run_sync_with_catalog(&url, &catalog_path);
+    let sync = run_sync_with_catalog(&url, &catalog_path, &logminer_path);
     assert!(
         sync.status.success(),
         "sync failed: stdout={} stderr={}",

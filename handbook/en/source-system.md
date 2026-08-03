@@ -18,7 +18,7 @@ Under `spec.source` in the Deployment config:
 
 Real Oracle hosts use the **OCI** path for both **Initial Load** (schema discovery + snapshot) and **LogMiner Incremental Capture**. Without Oracle Instant Client / OCI libraries in the runtime, apply/sync fail fast naming LogMiner/OCI—there is no silent fallback to the stub catalog. Install Instant Client (Basic or Basic Light) and set `LD_LIBRARY_PATH` to its directory before running the app against a live Source.
 
-On a live Source, Pipeline `source.schema` selects the Oracle owner; when omitted, the platform uses the Source `username` (uppercased) as the default schema. The contract/stub harness ignores schema and uses its **contract Source catalog** for CI slices only (default named fixtures for scenario tests; optional `MIGRALOOP_CONTRACT_SOURCE_CATALOG` JSON merge for arbitrary tables)—not as the Lab/real-path definition of truth, and not a supported production Source mechanism.
+On a live Source, Pipeline `source.schema` selects the Oracle owner; when omitted, the platform uses the Source `username` (uppercased) as the default schema. The contract/stub harness ignores schema and uses an **injected contract Source catalog** for CI slices only (`MIGRALOOP_CONTRACT_SOURCE_CATALOG` JSON for schema discovery + Initial Load; `MIGRALOOP_INJECT_LOGMINER_CONTENTS` for Incremental Capture)—not an in-binary business-table catalog, not the Lab/real-path definition of truth, and not a supported production Source mechanism.
 
 ## Source Prerequisites (Oracle / LogMiner)
 
@@ -70,7 +70,7 @@ When Source `host` is `contract` or `stub`, Incremental Capture uses the in-proc
 | `MIGRALOOP_STUB_SUPPLEMENTAL_LOGGING` | `on` / `off` for database supplemental logging | `on` |
 | `MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING` | `all` (every table currently in the contract Source catalog), empty, or comma-separated tables with PK/ALL logging | `all` |
 | `MIGRALOOP_STUB_REDO_RETENTION_HOURS` | Reported redo retention in hours | `72` |
-| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Path to a JSON file that merges/overrides contract catalog tables for schema discovery + Initial Load (CI / local slices only) | unset (named default fixtures only) |
+| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Path to a JSON file of contract catalog tables for schema discovery + Initial Load (CI / local slices only). Required for harness hosts that need tables; unset means an empty catalog | unset (empty catalog) |
 
 ## Required Privileges
 

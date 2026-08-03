@@ -1,7 +1,7 @@
 //! Live Oracle schema discovery and Initial Load (OCI).
 //!
-//! Contract/stub hosts use the process [`crate::ContractSourceCatalog`] (default
-//! named fixtures for scenario tests; injectable tables for arbitrary schemas).
+//! Contract/stub hosts use the process [`crate::ContractSourceCatalog`] loaded
+//! only from inject/override (no in-binary business fixtures; issue #120).
 //! Real hosts always read the Source System over OCI — never a hard-coded
 //! business-table catalog.
 
@@ -399,7 +399,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn contract_host_initial_load_uses_default_named_fixtures() {
+    fn contract_host_initial_load_without_inject_rejects_former_fixture_table() {
         clear_contract_source_catalog_override();
         let source = OracleSourceConnect {
             host: "contract".into(),
@@ -407,15 +407,18 @@ mod tests {
             database: "ORCL".into(),
             username: "sync_user".into(),
         };
-        let snapshot = initial_load_for_source(&source, "unused", "APP", "CUSTOMERS", None)
-            .expect("contract initial load");
-        assert_eq!(snapshot.table, "CUSTOMERS");
-        assert!(!snapshot.rows.is_empty());
+        let err = initial_load_for_source(&source, "unused", "APP", "CUSTOMERS", None)
+            .expect_err("no in-binary fixture catalog");
+        assert!(
+            err.to_string().contains("unknown Source table"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn contract_alignment_check_read_respects_max_rows_budget() {
         clear_contract_source_catalog_override();
+        set_contract_source_catalog_override(ContractSourceCatalog::with_default_fixtures());
         let source = OracleSourceConnect {
             host: "stub".into(),
             port: 1521,
@@ -424,6 +427,7 @@ mod tests {
         };
         let sample = alignment_check_read_for_source(&source, "unused", "APP", "CUSTOMERS", 1, None)
             .expect("gated alignment read");
+        clear_contract_source_catalog_override();
         assert_eq!(sample.rows.len(), 1);
         assert!(sample.truncated);
         assert_eq!(sample.source_row_count, Some(3));
@@ -433,7 +437,7 @@ mod tests {
     #[test]
     fn contract_host_discovers_and_loads_injected_non_fixture_table() {
         clear_contract_source_catalog_override();
-        let mut catalog = ContractSourceCatalog::with_default_fixtures();
+        let mut catalog = ContractSourceCatalog::empty();
         let mut row = BTreeMap::new();
         row.insert("WID".into(), json!(7));
         row.insert("LABEL".into(), json!("gamma"));

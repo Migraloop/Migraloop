@@ -26,7 +26,7 @@ migraloop migrate --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 Apply a declarative Deployment config (YAML or JSON). Validates secrets-by-reference, Source/Target kinds, Pipeline specs, Source Prerequisites (when Pipelines reference tables), runs schema discovery + Initial Load as needed, and upserts Deployment/Pipeline state. Re-applying with a semantic Pipeline change (transform/binding and related fields) is the Operator path for a **Pipeline revision**: pause old Delivery for that Pipeline, rebuild its Derived Dataset and re-Deliver as required, then continue incremental work; Shared Bases are not rebuilt. Changing only optional `description` is metadata-only and skips rebuild.
 
-On a real Oracle Source host (not `contract`/`stub`), apply discovers columns and Initial Loads from the live Source over OCI (requires Instant Client; see [Source System](source-system.md)). Contract/stub hosts use the in-process **contract Source catalog** for CI slices (default named fixtures for scenario readability; injectable tables via `MIGRALOOP_CONTRACT_SOURCE_CATALOG`—not a supported production Source mechanism).
+On a real Oracle Source host (not `contract`/`stub`), apply discovers columns and Initial Loads from the live Source over OCI (requires Instant Client; see [Source System](source-system.md)). Contract/stub hosts use an **injected** in-process **contract Source catalog** for CI slices only (`MIGRALOOP_CONTRACT_SOURCE_CATALOG` for discovery/Initial Load; `MIGRALOOP_INJECT_LOGMINER_CONTENTS` for Incremental Capture)—not a shipped business-table catalog and not a supported production Source mechanism.
 
 ```bash
 migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployment.yaml
@@ -222,13 +222,13 @@ Lab is manual verification—not the Release Quality Gate and not the contract/s
 | `MIGRALOOP_METRICS_ADDR` | Prometheus scrape listen address for `migraloop run` (default `0.0.0.0:9090`) |
 | Secret env names referenced from config | Any names you put in `password.fromEnv` (for example `ORACLE_PASSWORD`, `MONGO_PASSWORD`) must be present in the process environment at apply/sync time |
 | `LD_LIBRARY_PATH` | For real Oracle hosts: directory of Oracle Instant Client libraries (required at apply/sync runtime; not used by `contract`/`stub`) |
-| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Contract/stub hosts only: path to a JSON file that merges/overrides harness catalog tables for schema discovery + Initial Load (CI / local slices; not a production Source mechanism) |
+| `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Contract/stub hosts only: path to a JSON file of harness catalog tables for schema discovery + Initial Load (CI / local slices; empty when unset; not a production Source mechanism) |
 | `MIGRALOOP_POISON_MAX_ATTEMPTS` | Bounded Delivery retries before Poison Change quarantine (default `3`; must be > 0) |
 | `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | Test/Lab fault injection only: comma-separated Output Identity keys that always fail Delivery so quarantine can be exercised (not a production Operator control) |
 | `MIGRALOOP_INJECT_SCHEMA_CHANGES` | Test/Lab injection only: path to a JSON file of Schema Change events (`scn`, `table`, `kind`, `columns`, …) so blocking DDL warn+pause can be exercised without LogMiner DDL capture (not a production Operator control) |
 | `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window size (default `256`; must be > 0). Stages never materialize more pending changes than this capacity (ADR-0020) |
 | `MIGRALOOP_DELIVERY_DELAY_MS` | Test/Lab fault injection only: artificial Downstream Delivery delay in milliseconds so bounded backpressure and visible lag can be exercised (not a production Operator control) |
-| `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | Test/Lab injection only: path to a JSON file of extra contract LogMiner contents (`contents: [{scn, operation, table_name, identity, after_image}, …]`) so a large Incremental backlog can be exercised on `contract`/`stub` hosts (not a production Operator control) |
+| `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | Test/Lab injection only: path to a JSON file of contract LogMiner contents (`contents: [{scn, operation, table_name, identity, after_image}, …]`) for Incremental Capture on `contract`/`stub` hosts (the full harness Incremental stream when unset is empty; not a production Operator control) |
 | Lab disposable defaults | After `migraloop lab up`: `ORACLE_PASSWORD=lab_oracle`, `MONGO_PASSWORD=lab_mongo`, Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin` (local Lab only) |
 
 ### Contract-harness Source Prerequisite probes (host `stub` / `contract` only)
