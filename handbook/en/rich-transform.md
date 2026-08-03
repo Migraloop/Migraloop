@@ -100,6 +100,35 @@ These aggregations do **not** invent Maintenance State: incremental updates reco
 only affected Output Identities from Base. Unused-field changes (for example ADDRESS
 when aggregates read ORDER_ID/AMOUNT) skip Derived recompute.
 
+### `distinct`
+
+One Derived row per unique combination of `fields` (SQL `DISTINCT` semantics). Output
+Identity typically matches those fields.
+
+```yaml
+- distinct:
+    fields: [CUSTOMER_ID]
+```
+
+### `addToSet`
+
+Group by `keys` and collect unique non-null values of `field` into a JSON array `as`
+(Mongo-style `$addToSet`). Values in the array are ordered deterministically.
+
+```yaml
+- addToSet:
+    keys: [CUSTOMER_ID]
+    field: AMOUNT
+    as: AMOUNTS
+```
+
+`distinct` and `addToSet` **do** create **Maintenance State** (per-identity / per-member
+refcounts in the Platform Store) so value-level Affect Analysis can skip useless
+Derived updates—for example inserting a duplicate `CUSTOMER_ID` that is already
+counted, or an `AMOUNT` already present in the set. v1 allows at most one `distinct`
+or `addToSet` operator per transform. Simple `groupBy` sum/count/min/max/avg still
+must not invent Maintenance State.
+
 ### `equiLookup`
 
 Left-outer equijoin against another **Base Dataset** in the same Deployment. Matching
@@ -122,9 +151,9 @@ updates only the affected primary Output Identities; unused primary fields (for 
 EMAIL after `project`) still skip recompute. Embedded foreign rows include full Base
 fields, so foreign-side field changes recompute matching identities.
 
-Domain roadmap also names operators such as unwind, distinct/addToSet, and union. Until
-those land in the CLI config parser, declare only the operators above—unsupported
-operator names fail apply.
+Domain roadmap also names operators such as unwind and union. Until those land in the
+CLI config parser, declare only the operators above—unsupported operator names fail
+apply.
 
 ## Output Identity
 
@@ -132,7 +161,7 @@ operator names fail apply.
 
 ## Affect Analysis
 
-**Affect Analysis** decides, from the transform definition and an incoming Base change, which Output Identities (if any) need Derived recomputation. Unused fields must not trigger recompute (for example an address-only update must not recompute a sum-of-amount-by-customer). Operator semantics decide value-level cases (e.g. distinct/count style updates).
+**Affect Analysis** decides, from the transform definition and an incoming Base change, which Output Identities (if any) need Derived recomputation. Unused fields must not trigger recompute (for example an address-only update must not recompute a sum-of-amount-by-customer). For `distinct` / `addToSet`, Maintenance State enables value-level skips when a duplicate key or set member is already counted (and when a delete is not the last contributor).
 
 When a `groupBy` key changes on a Base row, Affect Analysis reads the Base row **before** applying the change so both the old and new Output Identities are updated (adjust or remove the old identity; upsert the new one). It must not rely on overwriting Base first and then trying to recover the prior key.
 

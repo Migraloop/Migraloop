@@ -1,0 +1,27 @@
+# Lab Scenario recipe (ADR-0025 / issue #128).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: rt-distinct-addtoset
+summary: "Rich Transform distinct/addToSet with Maintenance State → Derived → Delivery (real apply/sync)"
+namespace:
+  source_tables:
+    - LAB_RDA_ORDERS
+  target_collections:
+    - lab_rda_distinct_customers
+    - lab_rda_amounts_by_customer
+  deployment: lab-rt-distinct-addtoset
+  pipelines:
+    - lab-rda-distinct-customers
+    - lab-rda-amounts-by-customer
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace ORDERS-like table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + distinct/addToSet Derived)
+    - mutate Source (unused ADDRESS; duplicate CUSTOMER_ID; new AMOUNT; CUSTOMER_ID key move)
+    - sync Incremental Capture + Delivery via real LogMiner path
+checks:
+  correctness:
+    - "distinct Derived/Target lists customers 1 and 3 (not 2) after key move"
+    - "addToSet Derived/Target includes AMOUNT 7.00 for customer 1 and 5.00 for customer 3"
+thresholds: {}

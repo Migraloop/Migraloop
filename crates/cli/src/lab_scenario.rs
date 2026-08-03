@@ -90,6 +90,14 @@ const RT_EQUILOOKUP_COLLECTION: &str = "lab_rel_customers";
 const RT_EQUILOOKUP_PIPELINE: &str = "lab-rel-customers";
 const RT_EQUILOOKUP_DEPLOYMENT: &str = "lab-rt-equilookup";
 
+const RT_DISTINCT_ADDTOSET_ID: &str = "rt-distinct-addtoset";
+const RT_DISTINCT_ADDTOSET_TABLE: &str = "LAB_RDA_ORDERS";
+const RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION: &str = "lab_rda_distinct_customers";
+const RT_DISTINCT_ADDTOSET_ADD_COLLECTION: &str = "lab_rda_amounts_by_customer";
+const RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE: &str = "lab-rda-distinct-customers";
+const RT_DISTINCT_ADDTOSET_ADD_PIPELINE: &str = "lab-rda-amounts-by-customer";
+const RT_DISTINCT_ADDTOSET_DEPLOYMENT: &str = "lab-rt-distinct-addtoset";
+
 const IDEMPOTENT_REDELIVERY_ID: &str = "idempotent-redelivery";
 const IDEMPOTENT_REDELIVERY_TABLE: &str = "LAB_IR_CUSTOMERS";
 const IDEMPOTENT_REDELIVERY_COLLECTION: &str = "lab_ir_customers";
@@ -275,6 +283,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         RT_FILTER_ID,
         RT_FIELD_OPS_ID,
         RT_EQUILOOKUP_ID,
+        RT_DISTINCT_ADDTOSET_ID,
         CONCURRENT_SOURCE_WORKLOAD_ID,
         BULK_LOAD_ID,
         IDEMPOTENT_REDELIVERY_ID,
@@ -310,6 +319,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
             "Rich Transform addFields/rename/remove",
         ),
         (RT_EQUILOOKUP_ID, "Rich Transform equiLookup"),
+        (
+            RT_DISTINCT_ADDTOSET_ID,
+            "Rich Transform distinct/addToSet with Maintenance State",
+        ),
         (
             CONCURRENT_SOURCE_WORKLOAD_ID,
             "intra-Scenario concurrent Source workload",
@@ -654,6 +667,7 @@ async fn scenario_run(
         RT_FILTER_ID => run_rt_filter(lab_dir).await,
         RT_FIELD_OPS_ID => run_rt_field_ops(lab_dir).await,
         RT_EQUILOOKUP_ID => run_rt_equilookup(lab_dir).await,
+        RT_DISTINCT_ADDTOSET_ID => run_rt_distinct_addtoset(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
         BULK_LOAD_ID => run_bulk_load(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => run_idempotent_redelivery(lab_dir).await,
@@ -754,6 +768,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         RT_FILTER_ID => remove_rt_filter_namespace(lab_dir).await,
         RT_FIELD_OPS_ID => remove_rt_field_ops_namespace(lab_dir).await,
         RT_EQUILOOKUP_ID => remove_rt_equilookup_namespace(lab_dir).await,
+        RT_DISTINCT_ADDTOSET_ID => remove_rt_distinct_addtoset_namespace(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
         BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
         IDEMPOTENT_REDELIVERY_ID => remove_idempotent_redelivery_namespace(lab_dir).await,
@@ -2727,6 +2742,304 @@ EXIT;\n"
         .map_err(|err| {
             CliError::Failed(format!(
                 "Failed to drive Source mutations for rt-equilookup Lab Scenario:\n{err}"
+            ))
+        })
+}
+
+async fn run_rt_distinct_addtoset(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {RT_DISTINCT_ADDTOSET_ID}");
+    println!(
+        "Scenario Namespace: table={RT_DISTINCT_ADDTOSET_TABLE} \
+collections={RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION},{RT_DISTINCT_ADDTOSET_ADD_COLLECTION} \
+deployment={RT_DISTINCT_ADDTOSET_DEPLOYMENT}"
+    );
+
+    prepare_rt_distinct_addtoset_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, RT_DISTINCT_ADDTOSET_ID)?;
+    let bin = lab_migraloop_bin();
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_path.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !(apply_out.contains(RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE)
+        && apply_out.contains(RT_DISTINCT_ADDTOSET_ADD_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply must materialize both distinct and addToSet Pipelines:\n{apply_out}"
+        )));
+    }
+
+    let distinct_after_apply = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE,
+        ],
+    )
+    .await?;
+    let add_after_apply = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_DISTINCT_ADDTOSET_ADD_PIPELINE,
+        ],
+    )
+    .await?;
+    if !(distinct_after_apply.contains("\"CUSTOMER_ID\": 1")
+        && distinct_after_apply.contains("\"CUSTOMER_ID\": 2")
+        && add_after_apply.contains("42.50")
+        && add_after_apply.contains("10.00")
+        && add_after_apply.contains("5.00"))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load distinct/addToSet Derived check failed.\n\
+distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source mutations (unused/duplicate/new/key-move)...");
+    mutate_rt_distinct_addtoset_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+
+    let distinct_after = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE,
+        ],
+    )
+    .await?;
+    let add_after = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_DISTINCT_ADDTOSET_ADD_PIPELINE,
+        ],
+    )
+    .await?;
+    let distinct_target = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION,
+        ],
+    )
+    .await?;
+    let add_target = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            RT_DISTINCT_ADDTOSET_ADD_COLLECTION,
+        ],
+    )
+    .await?;
+
+    let distinct_ok = distinct_after.contains("\"CUSTOMER_ID\": 1")
+        && distinct_after.contains("\"CUSTOMER_ID\": 3")
+        && !distinct_after.contains("\"CUSTOMER_ID\": 2")
+        && distinct_target.contains("\"CUSTOMER_ID\": 1")
+        && distinct_target.contains("\"CUSTOMER_ID\": 3")
+        && !distinct_target.contains("\"CUSTOMER_ID\": 2");
+    let add_ok = add_after.contains("7.00")
+        && add_after.contains("42.50")
+        && add_after.contains("10.00")
+        && add_after.contains("\"CUSTOMER_ID\": 3")
+        && add_after.contains("5.00")
+        && !add_after.contains("\"CUSTOMER_ID\": 2")
+        && add_target.contains("7.00")
+        && add_target.contains("\"CUSTOMER_ID\": 3");
+
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+
+    if !(distinct_ok && add_ok) {
+        return Err(CliError::Failed(format!(
+            "correctness checks failed after distinct/addToSet Source mutations.\n\
+distinct Derived:\n{distinct_after}\ndistinct Target:\n{distinct_target}\n\
+addToSet Derived:\n{add_after}\naddToSet Target:\n{add_target}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: correctness checks passed (distinct + addToSet Derived/Target outcomes)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_rt_distinct_addtoset_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={RT_DISTINCT_ADDTOSET_TABLE}, \
+          collections={RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION},{RT_DISTINCT_ADDTOSET_ADD_COLLECTION}, \
+          deployment={RT_DISTINCT_ADDTOSET_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {RT_DISTINCT_ADDTOSET_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for rt-distinct-addtoset:\n{err}"
+            ))
+        })?;
+
+    for collection in [
+        RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION,
+        RT_DISTINCT_ADDTOSET_ADD_COLLECTION,
+    ] {
+        let js = format!("db.getCollection('{collection}').drop()");
+        mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Mongo Scenario Namespace collection {collection}:\n{err}"
+            ))
+        })?;
+    }
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, RT_DISTINCT_ADDTOSET_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{RT_DISTINCT_ADDTOSET_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_rt_distinct_addtoset_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_rt_distinct_addtoset_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {RT_DISTINCT_ADDTOSET_TABLE} (\n\
+  ORDER_ID NUMBER(10) PRIMARY KEY,\n\
+  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
+  AMOUNT NUMBER(12,2) NOT NULL,\n\
+  ADDRESS VARCHAR2(200)\n\
+);\n\
+ALTER TABLE {RT_DISTINCT_ADDTOSET_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
+VALUES (100, 1, 42.50, '1 Main St');\n\
+INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
+VALUES (101, 1, 10.00, '1 Main St');\n\
+INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
+VALUES (200, 2, 5.00, '2 Side Rd');\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare rt-distinct-addtoset Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_rt_distinct_addtoset_source(lab_dir: &Path) -> Result<(), CliError> {
+    // Unused ADDRESS; duplicate CUSTOMER_ID+AMOUNT; new AMOUNT; last-row key move 2→3.
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {RT_DISTINCT_ADDTOSET_TABLE} SET ADDRESS = '1 Main Ave' WHERE ORDER_ID = 100;\n\
+INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
+VALUES (102, 1, 42.50, '1 Main Ave');\n\
+INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
+VALUES (103, 1, 7.00, '1 Main Ave');\n\
+UPDATE {RT_DISTINCT_ADDTOSET_TABLE} SET CUSTOMER_ID = 3 WHERE ORDER_ID = 200;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source mutations for rt-distinct-addtoset Lab Scenario:\n{err}"
             ))
         })
 }
@@ -7848,6 +8161,10 @@ mod tests {
             "catalog must include rt-equilookup for shipped Rich Transform equiLookup"
         );
         assert!(
+            ids.iter().any(|id| id == RT_DISTINCT_ADDTOSET_ID),
+            "catalog must include rt-distinct-addtoset for shipped Rich Transform distinct/addToSet"
+        );
+        assert!(
             ids.iter().any(|id| id == IDEMPOTENT_REDELIVERY_ID),
             "catalog must include idempotent-redelivery for duplicate-safe Delivery"
         );
@@ -7907,6 +8224,11 @@ mod tests {
         assert!(
             gaps.iter().any(|g| g.contains("equiLookup") || g.contains("equilookup")),
             "missing rt-equilookup must be a visible gap; gaps={gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|g| g.contains("distinct") || g.contains("addToSet") || g.contains("Maintenance State")),
+            "missing rt-distinct-addtoset must be a visible gap; gaps={gaps:?}"
         );
         assert!(
             gaps.iter()

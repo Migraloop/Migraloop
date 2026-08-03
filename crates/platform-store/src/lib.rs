@@ -1757,6 +1757,79 @@ pub async fn get_derived_rows(
     Ok((dataset, rows))
 }
 
+/// Persist Maintenance State JSON for a Transform Pipeline (distinct/addToSet).
+///
+/// Callers serialize the transform-crate `MaintenanceState`. Pipelines that do not
+/// require Maintenance State should call [`delete_maintenance_state`] instead.
+pub async fn replace_maintenance_state(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+    state_json: &str,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO maintenance_states (
+            deployment_name, pipeline_name, state_json, updated_at
+        ) VALUES ($1, $2, $3, now())
+        ON CONFLICT (deployment_name, pipeline_name) DO UPDATE SET
+            state_json = EXCLUDED.state_json,
+            updated_at = now()
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .bind(state_json)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+/// Load Maintenance State JSON for a Pipeline, if present.
+pub async fn get_maintenance_state_json(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+) -> Result<Option<String>, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT state_json
+        FROM maintenance_states
+        WHERE deployment_name = $1 AND pipeline_name = $2
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .fetch_optional(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)?;
+    Ok(row.map(|(json,)| json))
+}
+
+/// Remove Maintenance State for a Pipeline (no-op when absent).
+pub async fn delete_maintenance_state(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    sqlx::query(
+        r#"
+        DELETE FROM maintenance_states
+        WHERE deployment_name = $1 AND pipeline_name = $2
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct DerivedDatasetRow {
     deployment_name: String,
