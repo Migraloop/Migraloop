@@ -163,8 +163,25 @@ Output Identities；未使用的 primary 字段（例如 `project` 之后的 EMA
 `$unwind` 以及 `preserveNullAndEmptyArrays` / `includeArrayIndex` 等选项会被拒绝，以便
 **Affect Analysis** 只展开受影响的 Output Identities—包括数组成员消失时的 deletes。
 
-领域 roadmap 也提到 **union**。在它进入 CLI config parser 之前，请只声明上面的
-operators—不支持的 operator 名称会让 apply 失败。
+### `union`
+
+把另一个 **Base Dataset** 串联到流（SQL `UNION ALL` / Mongo `$unionWith` 且无 nested
+pipeline）。Pipeline 的 `source.table` 是 primary Base；`from` 命名 secondary Base
+（Initial Load + Incremental Capture 覆盖两者）。先前步骤已塑造的行在前；secondary Base
+行原样接在后面；之后的步骤（例如 `project`）对两边都生效。可选的 `fromSchema` 覆盖
+secondary schema（默认为 Pipeline source schema）。
+
+```yaml
+- union:
+    from: WEST_CUSTOMERS
+- project:
+    fields: [ID, NAME]
+```
+
+自由形式的 Mongo `$unionWith`（含 `pipeline` / `coll` 扩展）会被拒绝—请用此声明式形状，
+以便 **Affect Analysis** 保持正确。任一贡献 Base 的变更只更新受影响的 Output Identities；
+后续 `project` 未使用的字段（例如 EMAIL）仍会 skip 重算。v1 不允许 `union` 与
+`distinct` / `addToSet` 并用。
 
 ## Output Identity
 

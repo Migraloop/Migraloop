@@ -306,6 +306,29 @@ async fn lab_scenario_list_includes_rt_equilookup() {
 }
 
 #[tokio::test]
+async fn lab_scenario_list_includes_rt_union() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("rt-union"),
+        "catalog must list Rich Transform union Scenario, got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("union") || lower.contains("concatenat") || lower.contains("multi-base"),
+        "rt-union summary should mention union/multi-Base, got:\n{out}"
+    );
+}
+
+#[tokio::test]
 async fn lab_scenario_list_includes_rt_unwind() {
     let list = Command::new(bin())
         .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])

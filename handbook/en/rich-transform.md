@@ -169,8 +169,27 @@ options such as `preserveNullAndEmptyArrays` / `includeArrayIndex` are rejected 
 **Affect Analysis** can expand only the affected Output Identities—including deletes when
 array members disappear.
 
-Domain roadmap also names **union**. Until that lands in the CLI config parser, declare
-only the operators above—unsupported operator names fail apply.
+### `union`
+
+Concatenate another **Base Dataset** into the stream (SQL `UNION ALL` / Mongo `$unionWith`
+without a nested pipeline). The Pipeline's `source.table` is the primary Base; `from`
+names the secondary Base (Initial Load + Incremental Capture include both). Rows already
+shaped by prior steps come first; secondary Base rows are appended as-is; later steps
+(for example `project`) apply to both sides. Optional `fromSchema` overrides the secondary
+schema (defaults to the Pipeline source schema).
+
+```yaml
+- union:
+    from: WEST_CUSTOMERS
+- project:
+    fields: [ID, NAME]
+```
+
+Free-form Mongo `$unionWith` (including `pipeline` / `coll` extensions) is rejected—use
+this declarative form so **Affect Analysis** stays correct. A change on either contributing
+Base updates only the affected Output Identities; unused fields after a following `project`
+(for example EMAIL) still skip recompute. v1 does not combine `union` with `distinct` /
+`addToSet`.
 
 ## Output Identity
 

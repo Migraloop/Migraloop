@@ -1,0 +1,26 @@
+# Lab Scenario recipe (ADR-0025 / issue #130).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: rt-union
+summary: "Rich Transform union: multi-Base concatenate → Derived → Delivery (real apply/sync)"
+namespace:
+  source_tables:
+    - LAB_RNU_EAST
+    - LAB_RNU_WEST
+  target_collections:
+    - lab_rnu_customers
+  deployment: lab-rt-union
+  pipelines:
+    - lab-rnu-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace tables + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load both Bases + union Derived)
+    - mutate east + west Source rows (NAME changes on each contributing Base)
+    - sync Incremental Capture + Delivery via real LogMiner path
+checks:
+  correctness:
+    - "Derived/Target concatenate both EAST and WEST rows by Output Identity"
+    - "Primary EAST and secondary WEST NAME incremental updates both refresh Derived/Target"
+thresholds: {}

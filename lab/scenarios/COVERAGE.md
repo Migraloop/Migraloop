@@ -18,6 +18,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Rich Transform `filter` | `rt-filter` |
 | Rich Transform `addFields` / `rename` / `remove` | `rt-field-ops` |
 | Rich Transform `equiLookup` (multi-Base Transform Pipeline) | `rt-equilookup` |
+| Rich Transform `union` (multi-Base Transform Pipeline) | `rt-union` |
 | Rich Transform `unwind` | `rt-unwind` |
 | Rich Transform `distinct` / `addToSet` (Maintenance State) | `rt-distinct-addtoset` |
 | Rich Transform `groupBy` / `sum` (also under contention) | `transform-pipeline`, `concurrent-source-workload` |
@@ -44,6 +45,6 @@ These are **not** covered and must stay listed until the capability ships with a
 
 | Capability | Why gated |
 | --- | --- |
-| Rich Transform union | Domain roadmap; not accepted by the CLI transform parser yet |
+| _(none — shipped Rich Transform surface including `union` is catalogued)_ | |
 
 When shipping any gap above: add `lab/scenarios/<id>/`, register the runner, update this table, and only then restate catalog-complete for the expanded shipped surface.

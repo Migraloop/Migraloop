@@ -90,6 +90,13 @@ const RT_EQUILOOKUP_COLLECTION: &str = "lab_rel_customers";
 const RT_EQUILOOKUP_PIPELINE: &str = "lab-rel-customers";
 const RT_EQUILOOKUP_DEPLOYMENT: &str = "lab-rt-equilookup";
 
+const RT_UNION_ID: &str = "rt-union";
+const RT_UNION_EAST_TABLE: &str = "LAB_RNU_EAST";
+const RT_UNION_WEST_TABLE: &str = "LAB_RNU_WEST";
+const RT_UNION_COLLECTION: &str = "lab_rnu_customers";
+const RT_UNION_PIPELINE: &str = "lab-rnu-customers";
+const RT_UNION_DEPLOYMENT: &str = "lab-rt-union";
+
 const RT_UNWIND_ID: &str = "rt-unwind";
 const RT_UNWIND_CUSTOMERS_TABLE: &str = "LAB_RU_CUSTOMERS";
 const RT_UNWIND_ORDERS_TABLE: &str = "LAB_RU_ORDERS";
@@ -290,6 +297,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         RT_FILTER_ID,
         RT_FIELD_OPS_ID,
         RT_EQUILOOKUP_ID,
+        RT_UNION_ID,
         RT_UNWIND_ID,
         RT_DISTINCT_ADDTOSET_ID,
         CONCURRENT_SOURCE_WORKLOAD_ID,
@@ -327,6 +335,7 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
             "Rich Transform addFields/rename/remove",
         ),
         (RT_EQUILOOKUP_ID, "Rich Transform equiLookup"),
+        (RT_UNION_ID, "Rich Transform union"),
         (RT_UNWIND_ID, "Rich Transform unwind"),
         (
             RT_DISTINCT_ADDTOSET_ID,
@@ -676,6 +685,7 @@ async fn scenario_run(
         RT_FILTER_ID => run_rt_filter(lab_dir).await,
         RT_FIELD_OPS_ID => run_rt_field_ops(lab_dir).await,
         RT_EQUILOOKUP_ID => run_rt_equilookup(lab_dir).await,
+        RT_UNION_ID => run_rt_union(lab_dir).await,
         RT_UNWIND_ID => run_rt_unwind(lab_dir).await,
         RT_DISTINCT_ADDTOSET_ID => run_rt_distinct_addtoset(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
@@ -778,6 +788,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         RT_FILTER_ID => remove_rt_filter_namespace(lab_dir).await,
         RT_FIELD_OPS_ID => remove_rt_field_ops_namespace(lab_dir).await,
         RT_EQUILOOKUP_ID => remove_rt_equilookup_namespace(lab_dir).await,
+        RT_UNION_ID => remove_rt_union_namespace(lab_dir).await,
         RT_UNWIND_ID => remove_rt_unwind_namespace(lab_dir).await,
         RT_DISTINCT_ADDTOSET_ID => remove_rt_distinct_addtoset_namespace(lab_dir).await,
         CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
@@ -2753,6 +2764,268 @@ EXIT;\n"
         .map_err(|err| {
             CliError::Failed(format!(
                 "Failed to drive Source mutations for rt-equilookup Lab Scenario:\n{err}"
+            ))
+        })
+}
+
+async fn run_rt_union(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {RT_UNION_ID}");
+    println!(
+        "Scenario Namespace: tables={RT_UNION_EAST_TABLE},{RT_UNION_WEST_TABLE} \
+collection={RT_UNION_COLLECTION} deployment={RT_UNION_DEPLOYMENT}"
+    );
+
+    prepare_rt_union_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, RT_UNION_ID)?;
+    let bin = lab_migraloop_bin();
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_path.to_str().ok_or_else(|| {
+                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+            })?,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+    if !(apply_out.contains(RT_UNION_EAST_TABLE) && apply_out.contains(RT_UNION_WEST_TABLE)) {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply must Initial Load both union Bases:\n{apply_out}"
+        )));
+    }
+    if !(apply_out.to_ascii_lowercase().contains("derived")
+        || apply_out.contains(RT_UNION_PIPELINE))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+        )));
+    }
+
+    let derived_after_apply = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_UNION_PIPELINE,
+        ],
+    )
+    .await?;
+    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+        && managed_field_present(&derived_after_apply, "NAME", "Zoe")
+        && managed_field_present(&derived_after_apply, "NAME", "Wade")
+        && !derived_after_apply.contains("alice@example.com"))
+    {
+        return Err(CliError::Failed(format!(
+            "Initial Load union Derived check failed \
+(expected Alice/Zoe/Wade without EMAIL):\n{derived_after_apply}"
+        )));
+    }
+
+    println!("Lab Scenario: driving Source east + west mutations...");
+    mutate_rt_union_source(lab_dir).await?;
+
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
+        "LogMiner".to_string()
+    } else {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )));
+    };
+
+    let derived_after = run_product_cli(
+        &bin,
+        &[
+            "derived",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--pipeline",
+            RT_UNION_PIPELINE,
+        ],
+    )
+    .await?;
+    let target_after = run_product_cli(
+        &bin,
+        &[
+            "target",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--collection",
+            RT_UNION_COLLECTION,
+        ],
+    )
+    .await?;
+
+    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+        && managed_field_present(&derived_after, "NAME", "Zora")
+        && managed_field_present(&derived_after, "NAME", "Wade")
+        && !derived_after.contains("Alice")
+        && !derived_after.contains("Zoe");
+    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+        && managed_field_present(&target_after, "NAME", "Zora")
+        && managed_field_present(&target_after, "NAME", "Wade");
+
+    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
+
+    if !(derived_ok && target_ok) {
+        return Err(CliError::Failed(format!(
+            "correctness checks failed after union east/west updates.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: correctness checks passed (union multi-Base Derived + Target Managed outcomes)"
+    );
+    if !sync_out.trim().is_empty() {
+        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
+    }
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: capture_note,
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_rt_union_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (tables={RT_UNION_EAST_TABLE},{RT_UNION_WEST_TABLE}, \
+          collection={RT_UNION_COLLECTION}, deployment={RT_UNION_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {RT_UNION_WEST_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {RT_UNION_EAST_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace tables for rt-union:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{RT_UNION_COLLECTION}').drop()");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection {RT_UNION_COLLECTION}:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, RT_UNION_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{RT_UNION_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_rt_union_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_rt_union_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {RT_UNION_EAST_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200)\n\
+);\n\
+ALTER TABLE {RT_UNION_EAST_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+CREATE TABLE {RT_UNION_WEST_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200)\n\
+);\n\
+ALTER TABLE {RT_UNION_WEST_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {RT_UNION_EAST_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
+INSERT INTO {RT_UNION_EAST_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
+INSERT INTO {RT_UNION_WEST_TABLE} (ID, NAME, EMAIL) VALUES (10, 'Zoe', 'zoe@example.com');\n\
+INSERT INTO {RT_UNION_WEST_TABLE} (ID, NAME, EMAIL) VALUES (11, 'Wade', 'wade@example.com');\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare rt-union Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
+async fn mutate_rt_union_source(lab_dir: &Path) -> Result<(), CliError> {
+    // East + west NAME changes must both refresh the concatenated Derived.
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+UPDATE {RT_UNION_EAST_TABLE} SET NAME = 'Alicia' WHERE ID = 1;\n\
+UPDATE {RT_UNION_WEST_TABLE} SET NAME = 'Zora' WHERE ID = 10;\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drive Source mutations for rt-union Lab Scenario:\n{err}"
             ))
         })
 }
@@ -8441,6 +8714,10 @@ mod tests {
             "catalog must include rt-equilookup for shipped Rich Transform equiLookup"
         );
         assert!(
+            ids.iter().any(|id| id == RT_UNION_ID),
+            "catalog must include rt-union for shipped Rich Transform union"
+        );
+        assert!(
             ids.iter().any(|id| id == RT_UNWIND_ID),
             "catalog must include rt-unwind for shipped Rich Transform unwind"
         );
@@ -8508,6 +8785,10 @@ mod tests {
         assert!(
             gaps.iter().any(|g| g.contains("equiLookup") || g.contains("equilookup")),
             "missing rt-equilookup must be a visible gap; gaps={gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.contains("union")),
+            "missing rt-union must be a visible gap; gaps={gaps:?}"
         );
         assert!(
             gaps.iter().any(|g| g.contains("unwind")),
