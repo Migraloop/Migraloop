@@ -192,17 +192,24 @@ impl PasswordField {
     /// Uses the shared [`resolve_secret_ref`] path so config parse and runtime apply
     /// do not fork PasswordField / SecretRef logic.
     pub fn resolve(&self, field: &str) -> Result<String, CliError> {
-        let reference = match self.resolved_ref(field)? {
-            ResolvedSecretRef::Env(name) => SecretRef {
-                kind: SecretRefKind::Env,
-                value: name,
-            },
-            ResolvedSecretRef::File(path) => SecretRef {
-                kind: SecretRefKind::File,
-                value: path.display().to_string(),
-            },
-        };
+        let reference = secret_ref_from_resolved(self.resolved_ref(field)?);
         resolve_secret_ref(&reference, field).map_err(|err| CliError::Failed(err.to_string()))
+    }
+}
+
+/// Collapse config wire resolution (`ResolvedSecretRef`) into the shared [`SecretRef`].
+///
+/// Docker secrets are already file paths here; store persistence never sees a third kind.
+pub fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
+    match resolved {
+        ResolvedSecretRef::Env(name) => SecretRef {
+            kind: SecretRefKind::Env,
+            value: name,
+        },
+        ResolvedSecretRef::File(path) => SecretRef {
+            kind: SecretRefKind::File,
+            value: path.display().to_string(),
+        },
     }
 }
 

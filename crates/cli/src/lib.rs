@@ -38,7 +38,7 @@ use migraloop_platform_store::{
     update_pipeline_drift_status, upsert_deployment, upsert_quarantined_change,
     upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment, DerivedDataset,
     OmittedColumn, Pipeline, PlatformStoreHealth, QuarantinedChange, SchemaChangeImpact,
-    SecretRef, SecretRefKind, SystemConnection,
+    SecretRef, SystemConnection,
 };
 use migraloop_types::resolve_secret_ref;
 use migraloop_transform::{
@@ -51,8 +51,8 @@ use migraloop_transform::{
 use thiserror::Error;
 
 use crate::config::{
-    load_deployment_config, resolve_tls_settings, DeploymentDocument, PipelineSpec,
-    ResolvedSecretRef,
+    load_deployment_config, resolve_tls_settings, secret_ref_from_resolved, DeploymentDocument,
+    PipelineSpec,
 };
 use crate::observability::{emit_event, EventValue};
 
@@ -500,19 +500,6 @@ fn mongo_target_from_deployment(deployment: &Deployment) -> Result<MongoTargetCo
         password,
         tls: deployment.target.tls.clone(),
     })
-}
-
-fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
-    match resolved {
-        ResolvedSecretRef::Env(name) => SecretRef {
-            kind: SecretRefKind::Env,
-            value: name,
-        },
-        ResolvedSecretRef::File(path) => SecretRef {
-            kind: SecretRefKind::File,
-            value: path.display().to_string(),
-        },
-    }
 }
 
 fn format_system_line(label: &str, system: &SystemConnection) -> String {
