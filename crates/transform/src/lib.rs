@@ -1,11 +1,12 @@
 //! Rich Transform operators and Affect Analysis.
 //!
 //! Declarative project, addFields, rename, remove, filter (eq), equiLookup,
-//! groupBy (sum/count/min/max/avg), distinct, and addToSet over Base Dataset
-//! rows. Free-form scripts and unanalyzable operators (including `$lookup`
-//! pipelines) are rejected at parse time. Affect Analysis skips Derived
-//! recompute when only unused Base fields change, and (with Maintenance State)
-//! when distinct/addToSet value-level semantics prove no Derived change.
+//! unwind, groupBy (sum/count/min/max/avg), distinct, and addToSet over Base
+//! Dataset rows. Free-form scripts and unanalyzable operators (including
+//! `$lookup` / `$unwind` shorthands) are rejected at parse time. Affect
+//! Analysis skips Derived recompute when only unused Base fields change, and
+//! (with Maintenance State) when distinct/addToSet value-level semantics prove
+//! no Derived change.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -17,9 +18,9 @@ pub const SEAM: &str = "transform";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransformError {
-    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/equiLookup/groupBy/distinct/addToSet)")]
+    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/equiLookup/unwind/groupBy/distinct/addToSet)")]
     FreeFormScript,
-    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, equiLookup, groupBy, distinct, and addToSet")]
+    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, equiLookup, unwind, groupBy, distinct, and addToSet")]
     UnsupportedOperator(String),
     #[error("invalid Rich Transform: {0}")]
     Invalid(String),
@@ -95,6 +96,12 @@ pub enum TransformOp {
         foreign_field: String,
         as_name: String,
     },
+    /// Expand an array field into one Derived row per element (1→N grain).
+    ///
+    /// Object elements are merged into the parent (path removed) so Output
+    /// Identity can key Delivery on unwound fields. Scalar elements replace
+    /// the path value (Mongo-style). Missing / null / empty arrays emit no rows.
+    Unwind { path: String },
     GroupBy {
         keys: Vec<String>,
         aggregates: Vec<AggregateSpec>,
@@ -161,12 +168,14 @@ pub struct MaintenanceState {
 /// - `{ "remove": { "fields": [...] } }`
 /// - `{ "filter": { "field": "...", "eq": ... } }`
 /// - `{ "equiLookup": { "from": "...", "localField": "...", "foreignField": "...", "as": "...", "fromSchema?": "..." } }`
+/// - `{ "unwind": { "path": "..." } }`
 /// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum"|"count"|"min"|"max"|"avg", "field": "...", "as": "..." }] } }`
 /// - `{ "distinct": { "fields": [...] } }`
 /// - `{ "addToSet": { "keys": [...], "field": "...", "as": "..." } }`
 /// Rejected shapes (clear errors):
 /// - `{ "script": "..." }` / `{ "function": "..." }`
 /// - `{ "$lookup": ... }` (use declarative `equiLookup`)
+/// - `{ "$unwind": ... }` (use declarative `unwind`)
 /// - any other operator object
 /// - malformed operators (reported as invalid, not unsupported)
 pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, TransformError> {
@@ -182,6 +191,12 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
     if obj.contains_key("$lookup") {
         return Err(TransformError::Invalid(
             "$lookup is not supported; use declarative equiLookup (from/localField/foreignField/as) so Affect Analysis stays correct".to_string(),
+        ));
+    }
+
+    if obj.contains_key("$unwind") {
+        return Err(TransformError::Invalid(
+            "$unwind is not supported; use declarative unwind ({ path }) so Affect Analysis stays correct".to_string(),
         ));
     }
 
@@ -239,6 +254,15 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
         return parse_equi_lookup(obj.get("equiLookup").expect("equiLookup key"));
     }
 
+    if obj.contains_key("unwind") {
+        if obj.len() != 1 {
+            return Err(TransformError::Invalid(
+                "unwind step must not mix other operators in the same step".to_string(),
+            ));
+        }
+        return parse_unwind(obj.get("unwind").expect("unwind key"));
+    }
+
     if obj.contains_key("groupBy") {
         if obj.len() != 1 {
             return Err(TransformError::Invalid(
@@ -272,6 +296,56 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
         .cloned()
         .unwrap_or_else(|| "(empty)".to_string());
     Err(TransformError::UnsupportedOperator(name))
+}
+
+fn parse_unwind(value: &Value) -> Result<TransformOp, TransformError> {
+    let obj = value.as_object().ok_or_else(|| {
+        TransformError::Invalid("unwind must be an object with path".to_string())
+    })?;
+
+    for banned in [
+        "preserveNullAndEmptyArrays",
+        "includeArrayIndex",
+        "pipeline",
+        "let",
+    ] {
+        if obj.contains_key(banned) {
+            return Err(TransformError::Invalid(format!(
+                "unwind does not support `{banned}`; only declarative path (missing/null/empty arrays emit no rows)"
+            )));
+        }
+    }
+
+    let path_raw = obj
+        .get("path")
+        .ok_or_else(|| TransformError::Invalid("unwind.path is required".to_string()))?
+        .as_str()
+        .ok_or_else(|| TransformError::Invalid("unwind.path must be a string".to_string()))?
+        .trim();
+    if path_raw.is_empty() {
+        return Err(TransformError::Invalid(
+            "unwind.path must not be empty".to_string(),
+        ));
+    }
+    let path = path_raw
+        .strip_prefix('$')
+        .unwrap_or(path_raw)
+        .to_string();
+    if path.is_empty() {
+        return Err(TransformError::Invalid(
+            "unwind.path must not be empty".to_string(),
+        ));
+    }
+
+    for key in obj.keys() {
+        if key != "path" {
+            return Err(TransformError::Invalid(format!(
+                "unwind only supports path (unknown `{key}`)"
+            )));
+        }
+    }
+
+    Ok(TransformOp::Unwind { path })
 }
 
 fn parse_equi_lookup(value: &Value) -> Result<TransformOp, TransformError> {
@@ -857,6 +931,14 @@ pub fn parse_transform_steps(steps: &[Value]) -> Result<Vec<TransformOp>, Transf
             "v1 allows at most one distinct or addToSet operator per transform".to_string(),
         ));
     }
+    let has_unwind = ops
+        .iter()
+        .any(|op| matches!(op, TransformOp::Unwind { .. }));
+    if has_unwind && ms_ops > 0 {
+        return Err(TransformError::Invalid(
+            "v1 does not allow unwind together with distinct or addToSet".to_string(),
+        ));
+    }
     Ok(ops)
 }
 
@@ -911,6 +993,13 @@ pub fn derived_output_field_names(ops: &[TransformOp], base_field_names: &[Strin
                 if !cur.iter().any(|n| n == as_name) {
                     cur.push(as_name.clone());
                 }
+                fields = Some(cur);
+            }
+            TransformOp::Unwind { path } => {
+                // Object-element flatten removes `path`; element field names appear
+                // at evaluation time and are unioned from Derived rows by callers.
+                let mut cur = fields.unwrap_or_else(|| base_field_names.to_vec());
+                cur.retain(|n| n != path);
                 fields = Some(cur);
             }
             TransformOp::FilterEq { .. } => {}
@@ -1034,6 +1123,17 @@ fn affect_deps(ops: &[TransformOp]) -> AffectDeps {
                 let deps = resolve_field_deps(&lineage, closed, &removed, local_field);
                 lineage.insert(as_name.clone(), deps);
                 removed.remove(as_name);
+            }
+            TransformOp::Unwind { path } => {
+                // Expanding `path` keeps its Base deps used; object flatten drops
+                // the path field from output while element fields inherit those deps.
+                let deps = resolve_field_deps(&lineage, closed, &removed, path);
+                lineage.remove(path);
+                removed.insert(path.clone());
+                filter_used.extend(deps.iter().cloned());
+                for entry_deps in lineage.values_mut() {
+                    entry_deps.extend(deps.iter().cloned());
+                }
             }
             TransformOp::GroupBy { keys, aggregates } => {
                 let mut next = BTreeMap::new();
@@ -1219,20 +1319,25 @@ fn row_matches_group_keys(
 /// `after` is the change after-image (required for Insert/Update).
 ///
 /// For multi-Base `equiLookup` Pipelines, prefer [`analyze_affect_on_base`] so foreign
-/// Base changes resolve the correct primary Output Identities.
+/// Base changes resolve the correct primary Output Identities. Pipelines with `unwind`
+/// after `equiLookup` should use [`analyze_affect_on_base_with_bases`] so expansion
+/// can read secondary Bases.
 pub fn analyze_affect(
     ops: &[TransformOp],
     kind: BaseChangeKind,
     pre_apply: Option<&Map<String, Value>>,
     after: Option<&Map<String, Value>>,
 ) -> Result<AffectOutcome, TransformError> {
-    analyze_primary_affect(ops, kind, pre_apply, after)
+    analyze_primary_affect(ops, kind, pre_apply, after, &BTreeMap::new())
 }
 
 /// Affect Analysis when the changed Base table is known (primary or equiLookup `from`).
 ///
 /// `primary_table` is the Pipeline `source.table`. `primary_rows` are current primary
 /// Base rows (needed to resolve Output Identities when a foreign Base changes).
+///
+/// For `unwind` (optionally after `equiLookup`), prefer [`analyze_affect_on_base_with_bases`]
+/// so 1→N Output Identities expand from secondary Bases.
 pub fn analyze_affect_on_base(
     ops: &[TransformOp],
     changed_table: &str,
@@ -1242,12 +1347,43 @@ pub fn analyze_affect_on_base(
     after: Option<&Map<String, Value>>,
     primary_rows: &[Map<String, Value>],
 ) -> Result<AffectOutcome, TransformError> {
+    analyze_affect_on_base_with_bases(
+        ops,
+        changed_table,
+        primary_table,
+        kind,
+        pre_apply,
+        after,
+        primary_rows,
+        &BTreeMap::new(),
+    )
+}
+
+/// Like [`analyze_affect_on_base`] with secondary Bases for `equiLookup` + `unwind`.
+pub fn analyze_affect_on_base_with_bases(
+    ops: &[TransformOp],
+    changed_table: &str,
+    primary_table: &str,
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+    primary_rows: &[Map<String, Value>],
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<AffectOutcome, TransformError> {
     if table_names_eq(changed_table, primary_table)
         || !is_equi_lookup_from_table(ops, changed_table)
     {
-        return analyze_primary_affect(ops, kind, pre_apply, after);
+        return analyze_primary_affect(ops, kind, pre_apply, after, secondary_bases);
     }
-    analyze_foreign_equi_lookup_affect(ops, changed_table, kind, pre_apply, after, primary_rows)
+    analyze_foreign_equi_lookup_affect(
+        ops,
+        changed_table,
+        kind,
+        pre_apply,
+        after,
+        primary_rows,
+        secondary_bases,
+    )
 }
 
 fn analyze_primary_affect(
@@ -1255,8 +1391,9 @@ fn analyze_primary_affect(
     kind: BaseChangeKind,
     pre_apply: Option<&Map<String, Value>>,
     after: Option<&Map<String, Value>>,
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
 ) -> Result<AffectOutcome, TransformError> {
-    analyze_primary_affect_inner(ops, kind, pre_apply, after, None)
+    analyze_primary_affect_inner(ops, kind, pre_apply, after, None, secondary_bases)
 }
 
 /// Affect Analysis with Maintenance State for value-level distinct/addToSet skips.
@@ -1270,7 +1407,7 @@ pub fn analyze_affect_with_maintenance(
     after: Option<&Map<String, Value>>,
     state: &MaintenanceState,
 ) -> Result<AffectOutcome, TransformError> {
-    analyze_primary_affect_inner(ops, kind, pre_apply, after, Some(state))
+    analyze_primary_affect_inner(ops, kind, pre_apply, after, Some(state), &BTreeMap::new())
 }
 
 fn analyze_primary_affect_inner(
@@ -1279,6 +1416,7 @@ fn analyze_primary_affect_inner(
     pre_apply: Option<&Map<String, Value>>,
     after: Option<&Map<String, Value>>,
     state: Option<&MaintenanceState>,
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
 ) -> Result<AffectOutcome, TransformError> {
     let deps = affect_deps(ops);
     let group_keys = output_grouping_keys(ops);
@@ -1288,6 +1426,11 @@ fn analyze_primary_affect_inner(
             let after = after.ok_or_else(|| {
                 TransformError::Invalid("Insert Affect Analysis requires after-image".into())
             })?;
+            if expands_output_grain(ops) {
+                return Ok(AffectOutcome::Recompute {
+                    identities: expand_primary_to_output_rows(ops, after, secondary_bases)?,
+                });
+            }
             // Shape through prefix ops so distinct/addToSet keys match Maintenance State.
             let Some(shaped_after) = shape_row_before_ms_operator(ops, after)? else {
                 // Filtered out before distinct/addToSet — no Derived change.
@@ -1315,6 +1458,11 @@ fn analyze_primary_affect_inner(
                     "Delete Affect Analysis requires pre-apply Base row".into(),
                 )
             })?;
+            if expands_output_grain(ops) {
+                return Ok(AffectOutcome::Recompute {
+                    identities: expand_primary_to_output_rows(ops, pre, secondary_bases)?,
+                });
+            }
             let Some(shaped_pre) = shape_row_before_ms_operator(ops, pre)? else {
                 return Ok(AffectOutcome::SkipValueUnchanged);
             };
@@ -1352,6 +1500,13 @@ fn analyze_primary_affect_inner(
             };
             if skip {
                 return Ok(AffectOutcome::SkipUnusedFields);
+            }
+            if expands_output_grain(ops) {
+                let mut identities = expand_primary_to_output_rows(ops, pre, secondary_bases)?;
+                for id in expand_primary_to_output_rows(ops, after, secondary_bases)? {
+                    push_unique_identity(&mut identities, id);
+                }
+                return Ok(AffectOutcome::Recompute { identities });
             }
             // For Maintenance State ops, shape both images so keys/values match refcounts.
             let (pre_for_id, after_for_id) = if requires_maintenance_state(ops) {
@@ -1429,6 +1584,29 @@ fn analyze_primary_affect_inner(
                 })
             }
         }
+    }
+}
+
+/// Final Derived grain expands 1→N via `unwind` (and is not collapsed by groupBy/…).
+fn expands_output_grain(ops: &[TransformOp]) -> bool {
+    output_grouping_keys(ops).is_none()
+        && ops.iter().any(|op| matches!(op, TransformOp::Unwind { .. }))
+}
+
+fn expand_primary_to_output_rows(
+    ops: &[TransformOp],
+    primary: &Map<String, Value>,
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<Vec<Map<String, Value>>, TransformError> {
+    evaluate_transform_with_bases(ops, std::slice::from_ref(primary), secondary_bases)
+}
+
+fn push_unique_identity(identities: &mut Vec<Map<String, Value>>, identity: Map<String, Value>) {
+    if !identities
+        .iter()
+        .any(|existing| identity_maps_eq(existing, &identity))
+    {
+        identities.push(identity);
     }
 }
 
@@ -1892,6 +2070,7 @@ fn analyze_foreign_equi_lookup_affect(
     pre_apply: Option<&Map<String, Value>>,
     after: Option<&Map<String, Value>>,
     primary_rows: &[Map<String, Value>],
+    secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
 ) -> Result<AffectOutcome, TransformError> {
     let lookups: Vec<&TransformOp> = ops
         .iter()
@@ -1967,8 +2146,7 @@ fn analyze_foreign_equi_lookup_affect(
         });
     }
 
-    let group_keys = output_grouping_keys(ops);
-    let mut identities = Vec::new();
+    let mut matching_primaries = Vec::new();
     for op in &lookups {
         let TransformOp::EquiLookup { local_field, from, .. } = op else {
             continue;
@@ -1983,16 +2161,118 @@ fn analyze_foreign_equi_lookup_affect(
             if !join_values.iter().any(|jv| json_values_eq(jv, local_val)) {
                 continue;
             }
-            let identity = identity_from_row(ops, primary, group_keys.as_deref())?;
-            if !identities
+            if !matching_primaries
                 .iter()
-                .any(|existing| identity_maps_eq(existing, &identity))
+                .any(|existing: &Map<String, Value>| identity_maps_eq(existing, primary))
             {
-                identities.push(identity);
+                matching_primaries.push(primary.clone());
             }
         }
     }
+
+    if expands_output_grain(ops) {
+        return expand_foreign_unwind_identities(
+            ops,
+            changed_table,
+            kind,
+            pre_apply,
+            after,
+            &matching_primaries,
+            secondary_bases,
+        );
+    }
+
+    let group_keys = output_grouping_keys(ops);
+    let mut identities = Vec::new();
+    for primary in &matching_primaries {
+        let identity = identity_from_row(ops, primary, group_keys.as_deref())?;
+        push_unique_identity(&mut identities, identity);
+    }
     Ok(AffectOutcome::Recompute { identities })
+}
+
+/// Expand matching primaries through equiLookup+unwind with pre/after foreign Bases
+/// so disappeared Output Identities are included for Delivery delete.
+fn expand_foreign_unwind_identities(
+    ops: &[TransformOp],
+    changed_table: &str,
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+    matching_primaries: &[Map<String, Value>],
+    secondary_after: &BTreeMap<String, Vec<Map<String, Value>>>,
+) -> Result<AffectOutcome, TransformError> {
+    let mut identities = Vec::new();
+    let secondary_pre = foreign_secondary_pre_image(
+        secondary_after,
+        changed_table,
+        kind,
+        pre_apply,
+        after,
+    )?;
+    for primary in matching_primaries {
+        if let Some(pre_bases) = &secondary_pre {
+            for id in expand_primary_to_output_rows(ops, primary, pre_bases)? {
+                push_unique_identity(&mut identities, id);
+            }
+        }
+        for id in expand_primary_to_output_rows(ops, primary, secondary_after)? {
+            push_unique_identity(&mut identities, id);
+        }
+    }
+    Ok(AffectOutcome::Recompute { identities })
+}
+
+fn foreign_secondary_pre_image(
+    secondary_after: &BTreeMap<String, Vec<Map<String, Value>>>,
+    changed_table: &str,
+    kind: BaseChangeKind,
+    pre_apply: Option<&Map<String, Value>>,
+    after: Option<&Map<String, Value>>,
+) -> Result<Option<BTreeMap<String, Vec<Map<String, Value>>>>, TransformError> {
+    match kind {
+        BaseChangeKind::Insert => Ok(None),
+        BaseChangeKind::Delete => {
+            let pre = pre_apply.ok_or_else(|| {
+                TransformError::Invalid(
+                    "Delete Affect Analysis requires pre-apply Base row".into(),
+                )
+            })?;
+            let mut pre_bases = secondary_after.clone();
+            let rows = secondary_table_rows_mut(&mut pre_bases, changed_table);
+            rows.push(pre.clone());
+            Ok(Some(pre_bases))
+        }
+        BaseChangeKind::Update => {
+            let pre = pre_apply.ok_or_else(|| {
+                TransformError::Invalid(
+                    "Update Affect Analysis requires pre-apply Base row".into(),
+                )
+            })?;
+            let after = after.ok_or_else(|| {
+                TransformError::Invalid("Update Affect Analysis requires after-image".into())
+            })?;
+            let mut pre_bases = secondary_after.clone();
+            let rows = secondary_table_rows_mut(&mut pre_bases, changed_table);
+            rows.retain(|row| !identity_maps_eq(row, after));
+            rows.push(pre.clone());
+            Ok(Some(pre_bases))
+        }
+    }
+}
+
+fn secondary_table_rows_mut<'a>(
+    secondary: &'a mut BTreeMap<String, Vec<Map<String, Value>>>,
+    table: &str,
+) -> &'a mut Vec<Map<String, Value>> {
+    if let Some(key) = secondary
+        .keys()
+        .find(|name| table_names_eq(name, table))
+        .cloned()
+    {
+        return secondary.get_mut(&key).expect("secondary key");
+    }
+    secondary.entry(table.to_string()).or_default()
 }
 
 /// Shape a primary Base row through operators before the target `equiLookup.from` step.
@@ -2008,7 +2288,9 @@ fn shape_row_until_equi_lookup(
             TransformOp::EquiLookup { from, .. } if table_names_eq(from, from_table) => {
                 break;
             }
-            TransformOp::FilterEq { .. } | TransformOp::GroupBy { .. } => {}
+            TransformOp::FilterEq { .. }
+            | TransformOp::GroupBy { .. }
+            | TransformOp::Unwind { .. } => {}
             TransformOp::EquiLookup { .. } => {
                 // Prior equiLookup against another table still needs secondary Bases;
                 // for join-key matching we only need field shaping, so skip.
@@ -2075,6 +2357,10 @@ fn equi_lookup_as_survives(ops: &[TransformOp], as_name: &str) -> bool {
             TransformOp::AddToSet { keys, as_name, .. } => {
                 names.retain(|n| keys.iter().any(|k| k == n) || n == as_name);
             }
+            TransformOp::Unwind { path: _ } => {
+                // Object flatten removes `path` from the row shape, but Derived still
+                // depends on the lookup array — keep names so foreign Affect runs.
+            }
             _ => {}
         }
     }
@@ -2109,11 +2395,12 @@ fn identity_from_row(
     Ok(identity)
 }
 
-/// Apply field-shaping operators (not filter/groupBy/distinct/addToSet/equiLookup)
+/// Apply field-shaping operators (not filter/groupBy/distinct/addToSet/equiLookup/unwind)
 /// so identity keys match Derived.
 ///
-/// `equiLookup` is skipped: Output Identity is on primary-side fields; joining would
-/// require secondary Bases and is unnecessary for identity key shaping.
+/// `equiLookup` / `unwind` are skipped: Output Identity for non-expanding row-grain is
+/// on primary-side fields; joining/expanding would require secondary Bases and is
+/// handled by [`expands_output_grain`] Affect paths instead.
 fn shape_row_for_identity(
     ops: &[TransformOp],
     row: &Map<String, Value>,
@@ -2126,7 +2413,8 @@ fn shape_row_for_identity(
             | TransformOp::GroupBy { .. }
             | TransformOp::Distinct { .. }
             | TransformOp::AddToSet { .. }
-            | TransformOp::EquiLookup { .. } => {}
+            | TransformOp::EquiLookup { .. }
+            | TransformOp::Unwind { .. } => {}
             other => {
                 current = apply_op(other, current, &empty)?;
             }
@@ -2221,6 +2509,7 @@ fn apply_op(
             as_name,
             ..
         } => apply_equi_lookup(rows, secondary_bases, from, local_field, foreign_field, as_name),
+        TransformOp::Unwind { path } => apply_unwind(path, rows),
         TransformOp::GroupBy { keys, aggregates } => apply_group_by(keys, aggregates, rows),
         TransformOp::Distinct { fields } => Ok(apply_distinct(fields, rows)),
         TransformOp::AddToSet {
@@ -2229,6 +2518,47 @@ fn apply_op(
             as_name,
         } => apply_add_to_set(keys, field, as_name, rows),
     }
+}
+
+fn apply_unwind(
+    path: &str,
+    rows: Vec<Map<String, Value>>,
+) -> Result<Vec<Map<String, Value>>, TransformError> {
+    let mut out = Vec::new();
+    for mut row in rows {
+        match row.remove(path) {
+            None | Some(Value::Null) => {
+                // Missing / null → no Derived rows (preserveNullAndEmptyArrays unsupported).
+            }
+            Some(Value::Array(items)) => {
+                if items.is_empty() {
+                    continue;
+                }
+                for item in items {
+                    let mut expanded = row.clone();
+                    match item {
+                        Value::Object(obj) => {
+                            // Flatten object elements so Output Identity can key
+                            // Delivery on unwound fields (e.g. ORDER_ID).
+                            for (key, value) in obj {
+                                expanded.insert(key, value);
+                            }
+                        }
+                        other => {
+                            expanded.insert(path.to_string(), other);
+                        }
+                    }
+                    out.push(expanded);
+                }
+            }
+            Some(other) => {
+                return Err(TransformError::Invalid(format!(
+                    "unwind.path `{path}` must be an array; got {other}"
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn apply_distinct(fields: &[String], rows: Vec<Map<String, Value>>) -> Vec<Map<String, Value>> {
@@ -4119,5 +4449,205 @@ mod tests {
             }
             other => panic!("expected Recompute after rename+addToSet, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unwind_parse_evaluate_flatten_and_affect() {
+        let ops = parse_transform_steps(&[
+            json!({"project": {"fields": ["ID", "NAME"]}}),
+            json!({
+                "equiLookup": {
+                    "from": "ORDERS",
+                    "localField": "ID",
+                    "foreignField": "CUSTOMER_ID",
+                    "as": "orders"
+                }
+            }),
+            json!({"unwind": {"path": "orders"}}),
+        ])
+        .unwrap();
+        match &ops[2] {
+            TransformOp::Unwind { path } => assert_eq!(path, "orders"),
+            other => panic!("expected Unwind, got {other:?}"),
+        }
+
+        let customers = vec![
+            row(&[("ID", json!(1)), ("NAME", json!("Alice")), ("EMAIL", json!("a@x"))]),
+            row(&[("ID", json!(2)), ("NAME", json!("Bob")), ("EMAIL", json!("b@x"))]),
+        ];
+        let orders = vec![
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("42.50")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(200)),
+                ("CUSTOMER_ID", json!(2)),
+                ("AMOUNT", json!("5.00")),
+            ]),
+        ];
+        let mut secondary = BTreeMap::new();
+        secondary.insert("ORDERS".to_string(), orders.clone());
+
+        let out = evaluate_transform_with_bases(&ops, &customers, &secondary).unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|r| !r.contains_key("orders")));
+        let alice_100 = out
+            .iter()
+            .find(|r| r.get("ORDER_ID") == Some(&json!(100)))
+            .expect("order 100");
+        assert_eq!(alice_100.get("NAME"), Some(&json!("Alice")));
+        assert_eq!(alice_100.get("AMOUNT"), Some(&json!("42.50")));
+        assert_eq!(alice_100.get("ID"), Some(&json!(1)));
+
+        let managed = derived_output_field_names(
+            &ops,
+            &["ID".into(), "NAME".into(), "EMAIL".into()],
+        );
+        assert!(!managed.contains(&"orders".to_string()));
+        assert!(managed.contains(&"ID".to_string()));
+
+        // Primary unused EMAIL skips.
+        let pre = row(&[("ID", json!(1)), ("NAME", json!("Alice")), ("EMAIL", json!("a@x"))]);
+        let after_email = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alice")),
+            ("EMAIL", json!("new@x")),
+        ]);
+        assert_eq!(
+            analyze_affect_on_base_with_bases(
+                &ops,
+                "CUSTOMERS",
+                "CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&pre),
+                Some(&after_email),
+                &customers,
+                &secondary,
+            )
+            .unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
+
+        // Primary NAME change expands to both unwound order identities.
+        let after_name = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("Alicia")),
+            ("EMAIL", json!("a@x")),
+        ]);
+        match analyze_affect_on_base_with_bases(
+            &ops,
+            "CUSTOMERS",
+            "CUSTOMERS",
+            BaseChangeKind::Update,
+            Some(&pre),
+            Some(&after_name),
+            &customers,
+            &secondary,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                // pre + after images (NAME Alice→Alicia) both expand; ORDER_IDs overlap.
+                assert!(identities.len() >= 2);
+                assert!(identities.iter().any(|id| id.get("ORDER_ID") == Some(&json!(100))));
+                assert!(identities.iter().any(|id| id.get("ORDER_ID") == Some(&json!(101))));
+                assert!(identities.iter().any(|id| id.get("NAME") == Some(&json!("Alicia"))));
+            }
+            other => panic!("expected Recompute for NAME, got {other:?}"),
+        }
+
+        // Foreign order delete must include disappeared ORDER_ID for Delivery delete.
+        let order_pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("42.50")),
+        ]);
+        let mut orders_after_delete = orders.clone();
+        orders_after_delete.retain(|r| r.get("ORDER_ID") != Some(&json!(100)));
+        secondary.insert("ORDERS".to_string(), orders_after_delete);
+        match analyze_affect_on_base_with_bases(
+            &ops,
+            "ORDERS",
+            "CUSTOMERS",
+            BaseChangeKind::Delete,
+            Some(&order_pre),
+            None,
+            &customers,
+            &secondary,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert!(
+                    identities.iter().any(|id| id.get("ORDER_ID") == Some(&json!(100))),
+                    "deleted order identity must be present, got {identities:?}"
+                );
+                assert!(identities.iter().any(|id| id.get("ORDER_ID") == Some(&json!(101))));
+            }
+            other => panic!("expected foreign delete Recompute, got {other:?}"),
+        }
+
+        // Scalar unwind (literal array via addFields).
+        let scalar_ops = parse_transform_steps(&[
+            json!({"project": {"fields": ["ID"]}}),
+            json!({
+                "addFields": {
+                    "fields": [{"as": "tags", "value": ["a", "b"]}]
+                }
+            }),
+            json!({"unwind": {"path": "$tags"}}),
+        ])
+        .unwrap();
+        let scalar_out = evaluate_transform(&scalar_ops, &[row(&[("ID", json!(1))])]).unwrap();
+        assert_eq!(scalar_out.len(), 2);
+        assert_eq!(scalar_out[0].get("tags"), Some(&json!("a")));
+        assert_eq!(scalar_out[1].get("tags"), Some(&json!("b")));
+    }
+
+    #[test]
+    fn dollar_unwind_and_unsupported_forms_fail_clearly() {
+        let err = parse_transform_steps(&[json!({
+            "$unwind": "$orders"
+        })])
+        .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("$unwind") && msg.contains("unwind"),
+            "expected clear $unwind → unwind guidance, got: {err}"
+        );
+
+        let err = parse_transform_steps(&[json!({
+            "unwind": {
+                "path": "orders",
+                "preserveNullAndEmptyArrays": true
+            }
+        })])
+        .unwrap_err();
+        assert!(
+            matches!(err, TransformError::Invalid(_)),
+            "preserveNullAndEmptyArrays must be Invalid, got {err:?}"
+        );
+        assert!(err
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("preservenullandemptyarrays"));
+
+        let err = parse_transform_steps(&[
+            json!({"unwind": {"path": "orders"}}),
+            json!({"distinct": {"fields": ["ORDER_ID"]}}),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("distinct")
+                || err.to_string().to_ascii_lowercase().contains("addtoset"),
+            "unwind+distinct must fail clearly, got: {err}"
+        );
     }
 }

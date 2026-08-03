@@ -458,7 +458,21 @@ pub async fn upsert_managed_documents(
     let mut delivered = 0usize;
 
     for doc_row in documents {
-        let primary_hint = doc_row.columns.first();
+        // Scalar Output Identity must use the matching Managed column's Oracle type
+        // (e.g. unwind ORDER_ID as NUMBER), not columns.first() alphabetical luck.
+        let primary_hint = match &doc_row.identity {
+            Value::Object(_) => doc_row.columns.first(),
+            identity_value => doc_row
+                .columns
+                .iter()
+                .find(|col| {
+                    doc_row
+                        .managed_fields
+                        .get(&col.name)
+                        .is_some_and(|v| v == identity_value)
+                })
+                .or_else(|| doc_row.columns.first()),
+        };
         let identity = json_identity_to_bson(&doc_row.identity, &doc_row.columns, primary_hint)?;
         let set_doc = managed_fields_to_set_doc(doc_row)?;
 

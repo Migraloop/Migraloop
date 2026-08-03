@@ -40,7 +40,7 @@ use migraloop_platform_store::{
     SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
 };
 use migraloop_transform::{
-    analyze_affect_on_base, analyze_affect_with_maintenance, build_maintenance_state,
+    analyze_affect_on_base_with_bases, analyze_affect_with_maintenance, build_maintenance_state,
     derived_output_field_names, evaluate_transform_with_bases,
     evaluate_transform_for_identities_with_bases, identity_matches_row, maintain_state_for_change,
     parse_transform_steps, requires_maintenance_state, secondary_base_refs, used_base_fields,
@@ -465,14 +465,23 @@ fn pipeline_references_table(pipeline: &Pipeline, table: &str) -> bool {
 }
 
 /// Load secondary Base rows for all `equiLookup.from` tables on this Pipeline.
-async fn load_secondary_bases_for_pipeline(
+/// Secondary Base rows plus column metadata (for unwind-flattened foreign fields).
+async fn load_secondary_bases_and_columns_for_pipeline(
     platform_store_url: &str,
     pipeline: &Pipeline,
     ops: &[TransformOp],
-) -> Result<BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>>, CliError> {
+) -> Result<
+    (
+        BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+        Vec<BaseColumn>,
+    ),
+    CliError,
+> {
     let mut secondary = BTreeMap::new();
+    let mut columns = Vec::new();
+    let mut seen_cols = BTreeSet::new();
     for sec in secondary_base_refs(ops) {
-        let (_base, rows) = get_base_rows(
+        let (base, rows) = get_base_rows(
             platform_store_url,
             &sec.table,
             Some(&pipeline.deployment_name),
@@ -484,12 +493,17 @@ async fn load_secondary_bases_for_pipeline(
                 pipeline.name, sec.table
             ))
         })?;
+        for col in base.columns {
+            if seen_cols.insert(col.name.clone()) {
+                columns.push(col);
+            }
+        }
         secondary.insert(
             sec.table,
             rows.into_iter().map(|r| r.data).collect(),
         );
     }
-    Ok(secondary)
+    Ok((secondary, columns))
 }
 
 fn mongo_target_from_deployment(deployment: &Deployment) -> Result<MongoTargetConnection, CliError> {
@@ -1616,12 +1630,14 @@ async fn deliver_transform_pipeline_with_options(
     .map_err(|err| CliError::Failed(err.to_string()))?;
 
     let ops = transform_ops_from_pipeline(pipeline)?;
-    let secondary = load_secondary_bases_for_pipeline(platform_store_url, pipeline, &ops).await?;
+    let (secondary, secondary_columns) =
+        load_secondary_bases_and_columns_for_pipeline(platform_store_url, pipeline, &ops).await?;
     let base_maps: Vec<_> = base_rows.iter().map(|r| r.data.clone()).collect();
     let derived_rows = evaluate_transform_with_bases(&ops, &base_maps, &secondary)
         .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
 
-    let derived_columns = derived_columns_for_ops(&base.columns, &ops, &derived_rows);
+    let derived_columns =
+        derived_columns_for_ops(&base.columns, &ops, &derived_rows, &secondary_columns);
     let source_columns = source_columns_for_pipeline(
         deployment,
         &pipeline.source_schema,
@@ -1731,14 +1747,17 @@ async fn deliver_transform_pipeline_with_options(
     Ok(())
 }
 
-/// Columns for a Derived Dataset after project/addFields/rename/remove/equiLookup/groupBy,
+/// Columns for a Derived Dataset after project/addFields/rename/remove/equiLookup/unwind/groupBy,
 /// unioned with keys observed in Derived rows. Works for empty Derived results.
 /// Aggregate/`addFields`/`rename` aliases inherit the source field's Oracle type metadata.
-/// `equiLookup` `as` arrays are nested documents (no Oracle scalar type).
+/// `equiLookup` `as` arrays are nested documents (no Oracle scalar type). `unwind` of that
+/// path flattens object elements so the path is no longer nested — foreign Base column
+/// metadata in `secondary_columns` supplies types for those flattened fields.
 fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
     ops: &[TransformOp],
     derived_rows: &[serde_json::Map<String, serde_json::Value>],
+    secondary_columns: &[BaseColumn],
 ) -> Vec<BaseColumn> {
     let base_names: Vec<String> = base_columns.iter().map(|c| c.name.clone()).collect();
     let mut names: BTreeSet<String> = derived_output_field_names(ops, &base_names)
@@ -1747,10 +1766,14 @@ fn derived_columns_for_ops(
     for row in derived_rows {
         names.extend(row.keys().cloned());
     }
-    let by_name: BTreeMap<&str, &BaseColumn> = base_columns
+    let mut by_name: BTreeMap<&str, &BaseColumn> = base_columns
         .iter()
         .map(|c| (c.name.as_str(), c))
         .collect();
+    // Primary wins on name clashes; secondary fills unwind-flattened foreign fields.
+    for col in secondary_columns {
+        by_name.entry(col.name.as_str()).or_insert(col);
+    }
     let mut alias_source: BTreeMap<String, String> = BTreeMap::new();
     let mut nested_document_fields: BTreeSet<String> = BTreeSet::new();
     for op in ops {
@@ -1787,6 +1810,10 @@ fn derived_columns_for_ops(
             }
             TransformOp::EquiLookup { as_name, .. } => {
                 nested_document_fields.insert(as_name.clone());
+            }
+            TransformOp::Unwind { path } => {
+                // Object-element flatten removes the array path from Derived output.
+                nested_document_fields.remove(path);
             }
             TransformOp::AddToSet { as_name, .. } => {
                 // Distinct values collected into a JSON array.
@@ -1977,12 +2004,26 @@ async fn maintain_transform_pipeline_for_change(
         None
     };
 
+    // Load secondary Bases before Affect Analysis so equiLookup+unwind can expand
+    // 1→N Output Identities (including disappeared identities on foreign delete).
+    let (mut secondary, secondary_columns) =
+        load_secondary_bases_and_columns_for_pipeline(platform_store_url, pipeline, &ops).await?;
+    if !is_primary {
+        for sec in secondary_base_refs(&ops) {
+            if sec.table.eq_ignore_ascii_case(changed_table) {
+                // Incremental Delivery runs before the changed Base is persisted —
+                // prefer the in-memory after-image for the table that just changed.
+                secondary.insert(sec.table, changed_base_rows.to_vec());
+            }
+        }
+    }
+
     let outcome = if let (true, Some(state)) = (is_primary && needs_ms, maintenance.as_ref()) {
         analyze_affect_with_maintenance(&ops, kind, pre_apply, after.as_ref(), state).map_err(
             |err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)),
         )?
     } else {
-        analyze_affect_on_base(
+        analyze_affect_on_base_with_bases(
             &ops,
             changed_table,
             &pipeline.source_table,
@@ -1990,6 +2031,7 @@ async fn maintain_transform_pipeline_for_change(
             pre_apply,
             after.as_ref(),
             &primary_rows,
+            &secondary,
         )
         .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?
     };
@@ -2026,22 +2068,12 @@ async fn maintain_transform_pipeline_for_change(
                 pipeline.name,
                 identities.len()
             );
-            let mut secondary =
-                load_secondary_bases_for_pipeline(platform_store_url, pipeline, &ops).await?;
-            // Incremental Delivery runs before the changed Base is persisted — prefer
-            // the in-memory after-image for the table that just changed.
-            if !is_primary {
-                for sec in secondary_base_refs(&ops) {
-                    if sec.table.eq_ignore_ascii_case(changed_table) {
-                        secondary.insert(sec.table, changed_base_rows.to_vec());
-                    }
-                }
-            }
             recompute_and_deliver_affected_identities(
                 platform_store_url,
                 pipeline,
                 mongo,
                 &primary_columns,
+                &secondary_columns,
                 &primary_rows,
                 &secondary,
                 &ops,
@@ -2057,6 +2089,7 @@ async fn recompute_and_deliver_affected_identities(
     pipeline: &Pipeline,
     mongo: &MongoTargetConnection,
     base_columns: &[BaseColumn],
+    secondary_columns: &[BaseColumn],
     primary_rows: &[serde_json::Map<String, serde_json::Value>],
     secondary_bases: &BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
     ops: &[TransformOp],
@@ -2112,7 +2145,8 @@ async fn recompute_and_deliver_affected_identities(
         .collect();
     merged.extend(recomputed.clone());
 
-    let derived_columns = derived_columns_for_ops(base_columns, ops, &merged);
+    let derived_columns =
+        derived_columns_for_ops(base_columns, ops, &merged, secondary_columns);
     dataset.status = "materialized".to_string();
     dataset.columns = derived_columns.clone();
     dataset.row_count = merged.len() as i32;

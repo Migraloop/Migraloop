@@ -306,6 +306,29 @@ async fn lab_scenario_list_includes_rt_equilookup() {
 }
 
 #[tokio::test]
+async fn lab_scenario_list_includes_rt_unwind() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("rt-unwind"),
+        "catalog must list Rich Transform unwind Scenario, got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("unwind"),
+        "rt-unwind summary should mention unwind, got:\n{out}"
+    );
+}
+
+#[tokio::test]
 async fn lab_scenario_list_includes_rt_distinct_addtoset() {
     let list = Command::new(bin())
         .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
