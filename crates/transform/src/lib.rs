@@ -1196,11 +1196,14 @@ fn analyze_foreign_equi_lookup_affect(
     let group_keys = group_by_keys(ops);
     let mut identities = Vec::new();
     for op in &lookups {
-        let TransformOp::EquiLookup { local_field, .. } = op else {
+        let TransformOp::EquiLookup { local_field, from, .. } = op else {
             continue;
         };
         for primary in primary_rows {
-            let Some(local_val) = primary.get(local_field) else {
+            // localField is read from the shaped stream (after prior project/rename/…),
+            // not raw Base column names — match Mongo-style stage ordering.
+            let shaped = shape_row_until_equi_lookup(ops, primary, from)?;
+            let Some(local_val) = shaped.get(local_field) else {
                 continue;
             };
             if !join_values.iter().any(|jv| json_values_eq(jv, local_val)) {
@@ -1216,6 +1219,32 @@ fn analyze_foreign_equi_lookup_affect(
         }
     }
     Ok(AffectOutcome::Recompute { identities })
+}
+
+/// Shape a primary Base row through operators before the target `equiLookup.from` step.
+fn shape_row_until_equi_lookup(
+    ops: &[TransformOp],
+    row: &Map<String, Value>,
+    from_table: &str,
+) -> Result<Map<String, Value>, TransformError> {
+    let mut current = vec![row.clone()];
+    let empty = BTreeMap::new();
+    for op in ops {
+        match op {
+            TransformOp::EquiLookup { from, .. } if table_names_eq(from, from_table) => {
+                break;
+            }
+            TransformOp::FilterEq { .. } | TransformOp::GroupBy { .. } => {}
+            TransformOp::EquiLookup { .. } => {
+                // Prior equiLookup against another table still needs secondary Bases;
+                // for join-key matching we only need field shaping, so skip.
+            }
+            other => {
+                current = apply_op(other, current, &empty)?;
+            }
+        }
+    }
+    Ok(current.into_iter().next().unwrap_or_default())
 }
 
 fn push_unique_join_value(values: &mut Vec<Value>, value: Value) {
@@ -1235,41 +1264,41 @@ fn is_equi_lookup_from_table(ops: &[TransformOp], table: &str) -> bool {
     })
 }
 
-/// Whether an equiLookup `as` field still contributes to Derived output.
+/// Whether an equiLookup `as` field (possibly renamed) still contributes to Derived output.
 fn equi_lookup_as_survives(ops: &[TransformOp], as_name: &str) -> bool {
-    let mut present = false;
+    let mut names: BTreeSet<String> = BTreeSet::new();
     for op in ops {
         match op {
             TransformOp::EquiLookup {
                 as_name: name, ..
             } if name == as_name => {
-                present = true;
+                names.insert(name.clone());
             }
             TransformOp::Project { fields } => {
-                present = fields.iter().any(|f| f == as_name);
+                names.retain(|n| fields.iter().any(|f| f == n));
             }
             TransformOp::Remove { fields } => {
-                if fields.iter().any(|f| f == as_name) {
-                    present = false;
+                for field in fields {
+                    names.remove(field);
                 }
             }
             TransformOp::Rename { fields } => {
                 for spec in fields {
-                    if spec.from == as_name {
-                        present = true;
-                        // renamed away from as_name — still "used" via new name, but
-                        // foreign embedding is under the new key; treat as surviving.
+                    if names.remove(&spec.from) {
+                        names.insert(spec.to.clone());
                     }
                 }
             }
             TransformOp::GroupBy { keys, aggregates } => {
-                present = keys.iter().any(|k| k == as_name)
-                    || aggregates.iter().any(|a| a.as_name == as_name || a.field == as_name);
+                names.retain(|n| {
+                    keys.iter().any(|k| k == n)
+                        || aggregates.iter().any(|a| a.as_name == *n || a.field == *n)
+                });
             }
             _ => {}
         }
     }
-    present
+    !names.is_empty()
 }
 
 fn identity_from_row(
@@ -2748,6 +2777,53 @@ mod tests {
             "pipeline-style equiLookup must be Invalid, got {err:?}"
         );
         assert!(err.to_string().to_ascii_lowercase().contains("pipeline"));
+    }
+
+    #[test]
+    fn equi_lookup_foreign_affect_uses_shaped_local_field() {
+        // rename ID → customerId, then equiLookup on customerId — foreign Affect must
+        // still resolve primary Output Identities.
+        let ops = parse_transform_steps(&[
+            json!({"rename": {"fields": [{"from": "ID", "to": "customerId"}]}}),
+            json!({
+                "equiLookup": {
+                    "from": "ORDERS",
+                    "localField": "customerId",
+                    "foreignField": "CUSTOMER_ID",
+                    "as": "orders"
+                }
+            }),
+            json!({"rename": {"fields": [{"from": "orders", "to": "orderList"}]}}),
+        ])
+        .unwrap();
+        let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("Alice"))])];
+        let order_pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("42.50")),
+        ]);
+        let order_after = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("50.00")),
+        ]);
+        match analyze_affect_on_base(
+            &ops,
+            "ORDERS",
+            "CUSTOMERS",
+            BaseChangeKind::Update,
+            Some(&order_pre),
+            Some(&order_after),
+            &customers,
+        )
+        .unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("customerId"), Some(&json!(1)));
+            }
+            other => panic!("expected shaped-localField Recompute, got {other:?}"),
+        }
     }
 
     #[test]
