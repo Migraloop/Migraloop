@@ -582,6 +582,14 @@ fn validate_tls_spec(system: &str, spec: &SystemSpec) -> Result<(), CliError> {
                 "{system}.tls.caFile must not be empty when set"
             )));
         }
+        if system == "source" || spec.kind == V1_SOURCE_KIND {
+            return Err(CliError::Failed(
+                "source.tls.caFile is not used for Oracle TCPS; set \
+                 source.tls.walletLocation to an Instant Client wallet directory \
+                 (MongoDB Target uses tls.caFile)"
+                    .to_string(),
+            ));
+        }
     }
     if let Some(wallet) = tls.wallet_location.as_deref() {
         if wallet.trim().is_empty() {
@@ -596,19 +604,6 @@ fn validate_tls_spec(system: &str, spec: &SystemSpec) -> Result<(), CliError> {
                     .to_string(),
             ));
         }
-    }
-    if tls.enabled {
-        // Paths are validated for existence at apply time (after config parse) so
-        // operators get a clear TLS misconfig error before connect.
-        if system == "target" && tls.ca_file.is_none() && !tls.insecure_skip_verify {
-            // caFile optional: Mongo can use system/Mozilla roots; still TLS-on.
-        }
-    } else if tls.insecure_skip_verify
-        || tls.ca_file.is_some()
-        || tls.wallet_location.is_some()
-    {
-        // Allow declaring paths with enabled:false (ignored), but surface guidance.
-        // No hard fail — cleartext remains explicitly choosable.
     }
     Ok(())
 }

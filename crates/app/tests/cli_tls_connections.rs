@@ -289,6 +289,141 @@ spec:
 }
 
 #[tokio::test]
+async fn apply_rejects_ca_file_on_oracle_source() {
+    let url = ephemeral_database_url().await;
+    migrate(&url);
+    let dir = TempDir::new().expect("tempdir");
+    let ca = dir.path().join("oracle-ca.pem");
+    fs::write(&ca, "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+        .expect("write ca");
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &format!(
+            r#"
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: bad-source-ca
+spec:
+  source:
+    kind: oracle
+    host: stub
+    port: 1521
+    database: STUB
+    username: sync_user
+    password:
+      fromEnv: ORACLE_PASSWORD
+    tls:
+      enabled: true
+      caFile: {}
+  target:
+    kind: mongodb
+    host: mongo.example.com
+    port: 27017
+    database: appdb
+    username: deliver_user
+    password:
+      fromEnv: MONGO_PASSWORD
+"#,
+            ca.display()
+        ),
+    );
+
+    let apply = Command::new(bin())
+        .env("ORACLE_PASSWORD", "x")
+        .env("MONGO_PASSWORD", "y")
+        .args([
+            "apply",
+            "--platform-store-url",
+            &url,
+            "--file",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run apply");
+    assert!(!apply.status.success(), "Oracle caFile must be rejected");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let lower = combined.to_ascii_lowercase();
+    assert!(
+        lower.contains("cafile") && lower.contains("walletlocation"),
+        "expected Oracle caFile → walletLocation guidance, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn apply_rejects_missing_source_wallet_location_when_tls_enabled() {
+    let url = ephemeral_database_url().await;
+    migrate(&url);
+    let dir = TempDir::new().expect("tempdir");
+    let missing = dir.path().join("missing-wallet");
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &format!(
+            r#"
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: bad-source-wallet
+spec:
+  source:
+    kind: oracle
+    host: stub
+    port: 1521
+    database: STUB
+    username: sync_user
+    password:
+      fromEnv: ORACLE_PASSWORD
+    tls:
+      enabled: true
+      walletLocation: {}
+  target:
+    kind: mongodb
+    host: mongo.example.com
+    port: 27017
+    database: appdb
+    username: deliver_user
+    password:
+      fromEnv: MONGO_PASSWORD
+"#,
+            missing.display()
+        ),
+    );
+
+    let apply = Command::new(bin())
+        .env("ORACLE_PASSWORD", "x")
+        .env("MONGO_PASSWORD", "y")
+        .args([
+            "apply",
+            "--platform-store-url",
+            &url,
+            "--file",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run apply");
+    assert!(
+        !apply.status.success(),
+        "missing Oracle walletLocation must fail apply"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let lower = combined.to_ascii_lowercase();
+    assert!(
+        lower.contains("tls") && lower.contains("walletlocation"),
+        "expected clear Source TLS walletLocation error, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
 async fn apply_rejects_wallet_location_on_mongodb_target() {
     let url = ephemeral_database_url().await;
     migrate(&url);
@@ -475,7 +610,8 @@ async fn platform_store_sslmode_require_against_cleartext_fails_clearly() {
     );
     let lower = combined.to_ascii_lowercase();
     assert!(
-        lower.contains("tls") || lower.contains("ssl"),
-        "expected TLS/SSL Platform Store error, got:\n{combined}"
+        (lower.contains("tls") || lower.contains("ssl"))
+            && lower.contains("no cleartext fallback"),
+        "expected required-TLS Platform Store error, got:\n{combined}"
     );
 }

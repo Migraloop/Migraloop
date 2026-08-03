@@ -264,7 +264,7 @@ Env names and defaults for the in-process LogMiner harness live in [Source Syste
 | Field | Source | Target | Notes |
 | --- | --- | --- | --- |
 | `enabled` | optional | optional | When `true`, connect with TLS; misconfig fails clearly (no silent cleartext fallback) |
-| `caFile` | optional path | optional path | Mongo CA file; filesystem path only (not PEM inline) |
+| `caFile` | **invalid** (use `walletLocation`) | optional path | Mongo CA file; filesystem path only (not PEM inline) |
 | `walletLocation` | optional directory | **invalid** | Oracle Instant Client wallet directory |
 | `insecureSkipVerify` | optional bool | optional bool | Dev/lab only; default `false` |
 

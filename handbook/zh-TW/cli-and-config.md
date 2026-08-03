@@ -264,7 +264,7 @@ Lab 是手動驗證—不是 Release Quality Gate，也不是 contract/stub LogM
 | 欄位 | Source | Target | 說明 |
 | --- | --- | --- | --- |
 | `enabled` | 可選 | 可選 | 為 `true` 時以 TLS 連線；設定錯誤會明確失敗（不靜默回退 cleartext） |
-| `caFile` | 可選路徑 | 可選路徑 | Mongo CA 檔；僅檔案系統路徑（不可 inline PEM） |
+| `caFile` | **無效**（請用 `walletLocation`） | 可選路徑 | Mongo CA 檔；僅檔案系統路徑（不可 inline PEM） |
 | `walletLocation` | 可選目錄 | **無效** | Oracle Instant Client wallet 目錄 |
 | `insecureSkipVerify` | 可選 bool | 可選 bool | 僅供開發/Lab；預設 `false` |
 

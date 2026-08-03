@@ -102,10 +102,6 @@ pub struct TlsSettings {
 }
 
 impl TlsSettings {
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     pub fn display_summary(&self) -> String {
         if !self.enabled {
             return "tls=disabled".to_string();
@@ -326,9 +322,11 @@ pub fn platform_store_url_requires_tls(database_url: &str) -> bool {
 fn map_store_connect_error(database_url: &str, err: sqlx::Error) -> PlatformStoreError {
     let detail = err.to_string();
     if platform_store_url_requires_tls(database_url) {
+        // Keep the underlying cause (handshake, auth, DNS, …) but make the
+        // required-TLS contract visible — no silent cleartext fallback.
         PlatformStoreError::Connect(sqlx::Error::Protocol(format!(
-            "TLS was requested for Platform Store (sslmode=require|verify-ca|verify-full) \
-             but could not be established: {detail}"
+            "Platform Store URL requires TLS (sslmode=require|verify-ca|verify-full); \
+             connection failed with no cleartext fallback: {detail}"
         )))
     } else {
         PlatformStoreError::Connect(err)

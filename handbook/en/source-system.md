@@ -15,7 +15,7 @@ Under `spec.source` in the Deployment config:
 | `username` | Sync account (minimum Required Privileges; not admin-only-by-default) |
 | `password` | Secret reference: `fromEnv`, `fromFile`, or `fromDockerSecret` |
 | `timezone` | Optional IANA name or Oracle-style offset (`+09:00`). Used when naive DATE/TIMESTAMP must be interpreted and the Source DB timezone is unreadable |
-| `tls` | Optional. Set `enabled: true` for TCPS; use `walletLocation` for an Instant Client wallet directory. Paths only—never PEM inline. See [Security](security.md) |
+| `tls` | Optional. Set `enabled: true` for TCPS; use `walletLocation` for an Instant Client wallet directory (`caFile` is rejected—Oracle does not use PEM CA files here). Paths only—never PEM inline. See [Security](security.md) |
 
 Real Oracle hosts use the **OCI** path for both **Initial Load** (schema discovery + snapshot) and **LogMiner Incremental Capture**. Without Oracle Instant Client / OCI libraries in the runtime, apply/sync fail fast naming LogMiner/OCI—there is no silent fallback to the stub catalog. When `tls.enabled: true`, the connect string uses TCPS and misconfig fails clearly (no silent cleartext fallback). Install Instant Client (Basic or Basic Light) and set `LD_LIBRARY_PATH` to its directory before running the app against a live Source.
 

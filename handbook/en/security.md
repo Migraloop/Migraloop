@@ -38,7 +38,7 @@ Optional block on each system. Omit the block (or set `enabled: false`) for clea
 | Field | Source (Oracle) | Target (MongoDB) | Notes |
 | --- | --- | --- | --- |
 | `enabled` | yes to require TCPS | yes to require Mongo TLS | Default when omitted: disabled (cleartext allowed) |
-| `caFile` | optional path | CA path (`tlsCAFile`) | Filesystem path only—never paste PEM into YAML or `password` |
+| `caFile` | **invalid** (apply rejects; use `walletLocation`) | CA path (`tlsCAFile`) | Filesystem path only—never paste PEM into YAML or `password` |
 | `walletLocation` | Instant Client wallet directory | **invalid** (apply rejects) | Oracle `MY_WALLET_DIRECTORY` |
 | `insecureSkipVerify` | optional (`SSL_SERVER_DN_MATCH=no`) | optional (allow invalid certs) | Dev/lab only; keep `false` in production |
 

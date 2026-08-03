@@ -38,7 +38,7 @@ TLS **支持** Source、Target 与 Platform Store 连接，并在生产环境 **
 | 字段 | Source（Oracle） | Target（MongoDB） | 说明 |
 | --- | --- | --- | --- |
 | `enabled` | `true` 要求 TCPS | `true` 要求 Mongo TLS | 省略时默认：禁用（允许 cleartext） |
-| `caFile` | 可选路径 | CA 路径（`tlsCAFile`） | 仅文件系统路径—绝不要把 PEM 贴进 YAML 或 `password` |
+| `caFile` | **无效**（apply 会拒绝；请用 `walletLocation`） | CA 路径（`tlsCAFile`） | 仅文件系统路径—绝不要把 PEM 贴进 YAML 或 `password` |
 | `walletLocation` | Instant Client wallet 目录 | **无效**（apply 会拒绝） | Oracle `MY_WALLET_DIRECTORY` |
 | `insecureSkipVerify` | 可选（`SSL_SERVER_DN_MATCH=no`） | 可选（允许无效证书） | 仅供开发/Lab；生产环境保持 `false` |
 
