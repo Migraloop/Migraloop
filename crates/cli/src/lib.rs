@@ -15,39 +15,36 @@ use migraloop_capture::{
     alignment_check_read_for_source, check_oracle_source_prerequisites, classify_number,
     classify_schema_impact, discover_source_schema, initial_load_chunk_for_source,
     is_allow_listed_oracle_type, load_injected_schema_changes, normalize_change_temporals,
-    open_oracle_incremental_capture, AlignmentCheckSample, CapturePosition, ChangeEvent,
-    ChangeOp, IncrementalCapture, InitialLoadChunkOptions, NumberMongoMapping,
-    OracleSourceConnect, PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn,
-    TypeError,
+    open_oracle_incremental_capture, AlignmentCheckSample, CapturePosition, ChangeEvent, ChangeOp,
+    IncrementalCapture, InitialLoadChunkOptions, NumberMongoMapping, OracleSourceConnect,
+    PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
     DeliveryDocument, ManagedFieldAs, MongoTargetConnection,
 };
 use migraloop_platform_store::{
-    acquire_incremental_sync_lock, append_base_dataset_chunk, base_dataset_exists,
-    check_store_settings, clear_schema_change_impacts, delete_base_datasets_not_in,
-    delete_maintenance_state, delete_pipeline, disk_warn_message, filter_unapplied_change_ids,
-    get_base_rows, get_derived_rows, get_maintenance_state_json, health,
-    list_applied_change_ids_from_position, list_base_datasets, list_deployments,
+    acquire_incremental_sync_lock, check_store_settings, clear_schema_change_impacts,
+    delete_base_datasets_not_in, delete_maintenance_state, delete_pipeline, disk_warn_message,
+    filter_unapplied_change_ids, get_base_rows, get_derived_rows, get_maintenance_state_json,
+    health, list_applied_change_ids_from_position, list_base_datasets, list_deployments,
     list_derived_datasets, list_pipelines, list_quarantined_changes, list_schema_change_impacts,
-    migrate, probe_store_resources, probe_store_settings, record_applied_source_changes,
-    replace_base_dataset, replace_derived_dataset, replace_maintenance_state, replace_pipelines,
-    set_pipeline_paused, update_base_primary_key, update_pipeline_delivery_lag,
-    update_pipeline_delivery_progress, update_pipeline_delivery_progress_with_lag,
-    update_pipeline_drift_status, upsert_deployment, upsert_quarantined_change,
-    upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment, DerivedDataset,
-    OmittedColumn, Pipeline, PlatformStoreHealth, QuarantinedChange, SchemaChangeImpact,
-    SecretRef, SystemConnection,
+    probe_store_resources, probe_store_settings, record_applied_source_changes,
+    replace_base_dataset, replace_derived_dataset, replace_maintenance_state, set_pipeline_paused,
+    update_pipeline_delivery_lag, update_pipeline_delivery_progress,
+    update_pipeline_delivery_progress_with_lag, update_pipeline_drift_status,
+    upsert_quarantined_change, upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment,
+    DerivedDataset, OmittedColumn, Pipeline, PlatformStore, PlatformStoreHealth, QuarantinedChange,
+    SchemaChangeImpact, SecretRef, SystemConnection,
 };
-use migraloop_types::resolve_secret_ref;
 use migraloop_transform::{
     analyze_affect_on_base_with_bases, analyze_affect_with_maintenance, build_maintenance_state,
-    derived_output_field_names, evaluate_transform_with_bases,
-    evaluate_transform_for_identities_with_bases, identity_matches_row, maintain_state_for_change,
+    derived_output_field_names, evaluate_transform_for_identities_with_bases,
+    evaluate_transform_with_bases, identity_matches_row, maintain_state_for_change,
     parse_transform_steps, requires_maintenance_state, secondary_base_refs, used_base_fields,
     AffectOutcome, BaseChangeKind, MaintenanceState, TransformOp,
 };
+use migraloop_types::resolve_secret_ref;
 use thiserror::Error;
 
 use crate::config::{
@@ -222,8 +219,16 @@ pub fn parse() -> Cli {
 
 async fn apply_migrations(platform_store_url: &str) -> Result<(), CliError> {
     // Reject absurd under-provisioning before applying schema (ADR-0010).
-    enforce_store_guardrails(platform_store_url).await?;
-    migrate(platform_store_url)
+    let store = PlatformStore::open(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let settings = store
+        .probe_settings()
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    check_store_settings(&settings).map_err(|err| CliError::Failed(err.to_string()))?;
+    store
+        .migrate()
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     println!("Platform Store migrations applied");
@@ -251,7 +256,10 @@ async fn report_store_resource_warnings(platform_store_url: &str) -> Result<(), 
             "platform_store_disk_warn",
             &[
                 ("free_disk_bytes", EventValue::from(free as i64)),
-                ("warn_threshold_bytes", EventValue::from(migraloop_platform_store::DISK_FREE_WARN_BYTES as i64)),
+                (
+                    "warn_threshold_bytes",
+                    EventValue::from(migraloop_platform_store::DISK_FREE_WARN_BYTES as i64),
+                ),
                 ("auto_pause", EventValue::from(false)),
             ],
         );
@@ -333,19 +341,16 @@ fn pipeline_from_spec(deployment_name: &str, pipeline: &PipelineSpec) -> Pipelin
         })
         .collect();
     let output_identity = pipeline.output_identity.clone().unwrap_or_default();
-    let transform_json = pipeline.transform.as_ref().map(|steps| {
-        serde_json::Value::Array(steps.clone())
-    });
+    let transform_json = pipeline
+        .transform
+        .as_ref()
+        .map(|steps| serde_json::Value::Array(steps.clone()));
     Pipeline {
         deployment_name: deployment_name.to_string(),
         name: pipeline.name.clone(),
         mode: pipeline.mode.clone(),
         source_table: pipeline.source.table.clone(),
-        source_schema: pipeline
-            .source
-            .schema
-            .clone()
-            .unwrap_or_default(),
+        source_schema: pipeline.source.schema.clone().unwrap_or_default(),
         target_collection,
         delivery_status,
         delivery_applied_changes: 0,
@@ -381,19 +386,17 @@ fn output_identity_from_row(
     }
     if identity_fields.len() == 1 {
         let key = &identity_fields[0];
-        return row.get(key).cloned().ok_or_else(|| {
-            CliError::Failed(format!(
-                "row missing Output Identity column {key}"
-            ))
-        });
+        return row
+            .get(key)
+            .cloned()
+            .ok_or_else(|| CliError::Failed(format!("row missing Output Identity column {key}")));
     }
     let mut identity = serde_json::Map::new();
     for key in identity_fields {
-        let value = row.get(key).cloned().ok_or_else(|| {
-            CliError::Failed(format!(
-                "row missing Output Identity column {key}"
-            ))
-        })?;
+        let value = row
+            .get(key)
+            .cloned()
+            .ok_or_else(|| CliError::Failed(format!("row missing Output Identity column {key}")))?;
         identity.insert(key.clone(), value);
     }
     Ok(serde_json::Value::Object(identity))
@@ -412,9 +415,8 @@ fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformOp>, 
             pipeline.name
         ))
     })?;
-    parse_transform_steps(steps).map_err(|err| {
-        CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name))
-    })
+    parse_transform_steps(steps)
+        .map_err(|err| CliError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))
 }
 
 /// Base Dataset (schema, table) pairs a Pipeline references — primary `source.table`
@@ -422,14 +424,15 @@ fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformOp>, 
 fn pipeline_base_table_refs(pipeline: &Pipeline) -> Vec<(String, String)> {
     let mut tables = BTreeSet::new();
     if !pipeline.source_table.is_empty() {
-        tables.insert((pipeline.source_schema.clone(), pipeline.source_table.clone()));
+        tables.insert((
+            pipeline.source_schema.clone(),
+            pipeline.source_table.clone(),
+        ));
     }
     if pipeline.mode == "transform" {
         if let Ok(ops) = transform_ops_from_pipeline(pipeline) {
             for sec in secondary_base_refs(&ops) {
-                let schema = sec
-                    .schema
-                    .unwrap_or_else(|| pipeline.source_schema.clone());
+                let schema = sec.schema.unwrap_or_else(|| pipeline.source_schema.clone());
                 tables.insert((schema, sec.table));
             }
         }
@@ -477,15 +480,14 @@ async fn load_secondary_bases_and_columns_for_pipeline(
                 columns.push(col);
             }
         }
-        secondary.insert(
-            sec.table,
-            rows.into_iter().map(|r| r.data).collect(),
-        );
+        secondary.insert(sec.table, rows.into_iter().map(|r| r.data).collect());
     }
     Ok((secondary, columns))
 }
 
-fn mongo_target_from_deployment(deployment: &Deployment) -> Result<MongoTargetConnection, CliError> {
+fn mongo_target_from_deployment(
+    deployment: &Deployment,
+) -> Result<MongoTargetConnection, CliError> {
     if deployment.target.port <= 0 || deployment.target.port > u16::MAX as i32 {
         return Err(CliError::Failed(
             "target.port must be a valid TCP port".to_string(),
@@ -597,7 +599,9 @@ fn validate_pipeline_managed_fields(
                     pipeline.name, field
                 )));
             }
-            Some(col) if !col.supported || !is_allow_listed_oracle_type(&col.oracle_type, col.size) => {
+            Some(col)
+                if !col.supported || !is_allow_listed_oracle_type(&col.oracle_type, col.size) =>
+            {
                 if *mapping != ManagedFieldAs::Omit {
                     return Err(CliError::Failed(format!(
                         "Pipeline {}: {} (column {field})",
@@ -657,12 +661,41 @@ fn delivery_document_for_row(
 }
 
 async fn ensure_store_healthy(platform_store_url: &str) -> Result<(), CliError> {
-    match health(platform_store_url).await {
+    let store = PlatformStore::open(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    ensure_store_session_healthy(&store).await
+}
+
+async fn ensure_store_session_healthy(store: &PlatformStore) -> Result<(), CliError> {
+    match store.health().await {
         PlatformStoreHealth::Healthy { .. } => {
             // Settings guardrails reject absurd under-provisioning; disk warn is
             // intentionally not a hard failure here (ADR-0010 warn-only).
-            enforce_store_guardrails(platform_store_url).await?;
-            report_store_resource_warnings(platform_store_url).await?;
+            let settings = store
+                .probe_settings()
+                .await
+                .map_err(|err| CliError::Failed(err.to_string()))?;
+            check_store_settings(&settings).map_err(|err| CliError::Failed(err.to_string()))?;
+            let resources = store
+                .probe_resources()
+                .await
+                .map_err(|err| CliError::Failed(err.to_string()))?;
+            if let (true, Some(free)) = (resources.disk_warn, resources.free_disk_bytes) {
+                let msg = disk_warn_message(free);
+                println!("{msg}");
+                emit_event(
+                    "platform_store_disk_warn",
+                    &[
+                        ("free_disk_bytes", EventValue::from(free as i64)),
+                        (
+                            "warn_threshold_bytes",
+                            EventValue::from(migraloop_platform_store::DISK_FREE_WARN_BYTES as i64),
+                        ),
+                        ("auto_pause", EventValue::from(false)),
+                    ],
+                );
+            }
             Ok(())
         }
         PlatformStoreHealth::Unhealthy { reason } => Err(CliError::Failed(format!(
@@ -675,7 +708,7 @@ async fn ensure_store_healthy(platform_store_url: &str) -> Result<(), CliError> 
 }
 
 async fn sync_base_datasets_for_pipelines(
-    platform_store_url: &str,
+    store: &PlatformStore,
     deployment: &Deployment,
     pipelines: &[Pipeline],
 ) -> Result<(), CliError> {
@@ -690,19 +723,21 @@ async fn sync_base_datasets_for_pipelines(
     let keep: Vec<(String, String)> = tables.iter().cloned().collect();
 
     // Capture scope follows Pipeline references: drop Bases for tables no longer referenced.
-    delete_base_datasets_not_in(platform_store_url, deployment_name, &keep)
+    store
+        .delete_base_datasets_not_in(deployment_name, &keep)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
     for (schema, table) in tables {
-        let existing = if base_dataset_exists(platform_store_url, deployment_name, &schema, &table)
+        let existing = if store
+            .base_dataset_exists(deployment_name, &schema, &table)
             .await
             .map_err(|err| CliError::Failed(err.to_string()))?
         {
-            let (dataset, _) =
-                get_base_rows(platform_store_url, &table, Some(deployment_name))
-                    .await
-                    .map_err(|err| CliError::Failed(err.to_string()))?;
+            let (dataset, _) = store
+                .get_base_rows(&table, Some(deployment_name))
+                .await
+                .map_err(|err| CliError::Failed(err.to_string()))?;
             Some(dataset)
         } else {
             None
@@ -713,20 +748,13 @@ async fn sync_base_datasets_for_pipelines(
                 || dataset.status == "initial_load_paused";
             if !resumable {
                 // Existing Bases stay; do not reload on Pipeline re-apply (ADR-0019).
-                ensure_base_primary_key(
-                    platform_store_url,
-                    deployment,
-                    &schema,
-                    &table,
-                    configured_tz,
-                )
-                .await?;
+                ensure_base_primary_key(store, deployment, &schema, &table, configured_tz).await?;
                 continue;
             }
         }
 
         run_chunked_initial_load(
-            platform_store_url,
+            store,
             deployment,
             pipelines,
             &schema,
@@ -775,7 +803,7 @@ fn initial_load_store_delay_ms() -> Option<u64> {
 }
 
 async fn run_chunked_initial_load(
-    platform_store_url: &str,
+    store: &PlatformStore,
     deployment: &Deployment,
     pipelines: &[Pipeline],
     schema: &str,
@@ -806,9 +834,9 @@ async fn run_chunked_initial_load(
 
     loop {
         // Honor durable Pipeline pause between chunks (Operator `migraloop pause`).
-        if initial_load_should_pause(platform_store_url, deployment_name, table, pipelines).await? {
+        if initial_load_should_pause(store, deployment_name, table, pipelines).await? {
             persist_initial_load_pause(
-                platform_store_url,
+                store,
                 deployment_name,
                 schema,
                 table,
@@ -915,7 +943,8 @@ async fn run_chunked_initial_load(
         if let Some(ms) = store_delay {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
-        append_base_dataset_chunk(platform_store_url, &dataset, &rows, start_ordinal)
+        store
+            .append_base_dataset_chunk(&dataset, &rows, start_ordinal)
             .await
             .map_err(|err| CliError::Failed(err.to_string()))?;
         let persist_ms = persist_started.elapsed().as_millis() as u64;
@@ -999,7 +1028,7 @@ async fn run_chunked_initial_load(
 
         if pause_after.is_some_and(|n| chunks_done >= n) {
             persist_initial_load_pause(
-                platform_store_url,
+                store,
                 deployment_name,
                 schema,
                 table,
@@ -1017,12 +1046,13 @@ async fn run_chunked_initial_load(
 }
 
 async fn initial_load_should_pause(
-    platform_store_url: &str,
+    store: &PlatformStore,
     deployment_name: &str,
     table: &str,
     pipelines: &[Pipeline],
 ) -> Result<bool, CliError> {
-    let live = list_pipelines(platform_store_url)
+    let live = store
+        .list_pipelines()
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     for pipeline in pipelines {
@@ -1047,7 +1077,7 @@ async fn initial_load_should_pause(
 }
 
 async fn persist_initial_load_pause(
-    platform_store_url: &str,
+    store: &PlatformStore,
     deployment_name: &str,
     schema: &str,
     table: &str,
@@ -1078,7 +1108,8 @@ async fn persist_initial_load_pause(
         source_alignment_mismatched_rows: 0,
         initial_load_cursor: cursor,
     };
-    append_base_dataset_chunk(platform_store_url, &dataset, &[], rows_loaded as i32)
+    store
+        .append_base_dataset_chunk(&dataset, &[], rows_loaded as i32)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     println!(
@@ -1091,10 +1122,7 @@ async fn persist_initial_load_pause(
         &[
             ("table", EventValue::from(table)),
             ("rows", EventValue::from(rows_loaded as i64)),
-            (
-                "low_watermark",
-                EventValue::from(wm.unwrap_or(0)),
-            ),
+            ("low_watermark", EventValue::from(wm.unwrap_or(0))),
             ("deployment", EventValue::from(deployment_name)),
         ],
     );
@@ -1102,14 +1130,15 @@ async fn persist_initial_load_pause(
 }
 
 async fn ensure_base_primary_key(
-    platform_store_url: &str,
+    store: &PlatformStore,
     deployment: &Deployment,
     source_schema: &str,
     source_table: &str,
     configured_timezone: Option<&str>,
 ) -> Result<(), CliError> {
     let deployment_name = &deployment.name;
-    let (dataset, _) = get_base_rows(platform_store_url, source_table, Some(deployment_name))
+    let (dataset, _) = store
+        .get_base_rows(source_table, Some(deployment_name))
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     if !dataset.primary_key.is_empty() {
@@ -1138,15 +1167,15 @@ async fn ensure_base_primary_key(
         )));
     }
 
-    update_base_primary_key(
-        platform_store_url,
-        deployment_name,
-        source_schema,
-        source_table,
-        &chunk.primary_key,
-    )
-    .await
-    .map_err(|err| CliError::Failed(err.to_string()))?;
+    store
+        .update_base_primary_key(
+            deployment_name,
+            source_schema,
+            source_table,
+            &chunk.primary_key,
+        )
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
     Ok(())
 }
 
@@ -1343,9 +1372,9 @@ async fn deliver_pipelines_with_options(
     reconcile_deletes: bool,
     ignore_paused: bool,
 ) -> Result<(), CliError> {
-    let needs_delivery = pipelines.iter().any(|p| {
-        pipeline_has_target(p) && (ignore_paused || !p.paused)
-    });
+    let needs_delivery = pipelines
+        .iter()
+        .any(|p| pipeline_has_target(p) && (ignore_paused || !p.paused));
     if !needs_delivery {
         return Ok(());
     }
@@ -1406,11 +1435,8 @@ async fn deliver_direct_pipeline_with_options(
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
 
-    let source_columns = source_columns_for_pipeline(
-        deployment,
-        &pipeline.source_schema,
-        &pipeline.source_table,
-    )?;
+    let source_columns =
+        source_columns_for_pipeline(deployment, &pipeline.source_schema, &pipeline.source_table)?;
     let managed_names: BTreeSet<String> = dataset
         .columns
         .iter()
@@ -1435,12 +1461,8 @@ async fn deliver_direct_pipeline_with_options(
     for row in &rows {
         // Direct Pipeline Managed fields default to all supported Base columns,
         // minus omit mappings; unsafe NUMBER requires string/omit (ADR-0023).
-        let document = delivery_document_for_row(
-            &row.data,
-            &dataset.primary_key,
-            &dataset.columns,
-            pipeline,
-        )?;
+        let document =
+            delivery_document_for_row(&row.data, &dataset.primary_key, &dataset.columns, pipeline)?;
         live_identities.insert(identity_key(&document.identity));
         documents.push(document);
     }
@@ -1451,12 +1473,8 @@ async fn deliver_direct_pipeline_with_options(
 
     let mut deleted = 0usize;
     if reconcile_deletes {
-        deleted = reconcile_target_deletes(
-            mongo,
-            &pipeline.target_collection,
-            &live_identities,
-        )
-        .await?;
+        deleted =
+            reconcile_target_deletes(mongo, &pipeline.target_collection, &live_identities).await?;
     }
 
     update_pipeline_delivery_progress(
@@ -1481,10 +1499,7 @@ async fn deliver_direct_pipeline_with_options(
     } else {
         println!(
             "Delivery complete: Pipeline {} → {}.{} ({} documents)",
-            pipeline.name,
-            deployment.target.database,
-            pipeline.target_collection,
-            delivered
+            pipeline.name, deployment.target.database, pipeline.target_collection, delivered
         );
     }
     emit_event(
@@ -1572,11 +1587,8 @@ async fn deliver_transform_pipeline_with_options(
 
     let derived_columns =
         derived_columns_for_ops(&base.columns, &ops, &derived_rows, &secondary_columns);
-    let source_columns = source_columns_for_pipeline(
-        deployment,
-        &pipeline.source_schema,
-        &pipeline.source_table,
-    )?;
+    let source_columns =
+        source_columns_for_pipeline(deployment, &pipeline.source_schema, &pipeline.source_table)?;
     let managed_names: BTreeSet<String> = derived_columns
         .iter()
         .map(|c| c.name.clone())
@@ -1610,13 +1622,7 @@ async fn deliver_transform_pipeline_with_options(
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
-    persist_maintenance_state_for_pipeline(
-        platform_store_url,
-        pipeline,
-        &ops,
-        &base_maps,
-    )
-    .await?;
+    persist_maintenance_state_for_pipeline(platform_store_url, pipeline, &ops, &base_maps).await?;
 
     println!(
         "Derived Dataset materialized: Pipeline {} ({} rows)",
@@ -1626,12 +1632,8 @@ async fn deliver_transform_pipeline_with_options(
     let mut documents = Vec::with_capacity(derived_rows.len());
     let mut live_identities = BTreeSet::new();
     for row in &derived_rows {
-        let document = delivery_document_for_row(
-            row,
-            &pipeline.output_identity,
-            &derived_columns,
-            pipeline,
-        )?;
+        let document =
+            delivery_document_for_row(row, &pipeline.output_identity, &derived_columns, pipeline)?;
         live_identities.insert(identity_key(&document.identity));
         documents.push(document);
     }
@@ -1642,12 +1644,8 @@ async fn deliver_transform_pipeline_with_options(
 
     let mut deleted = 0usize;
     if reconcile_deletes {
-        deleted = reconcile_target_deletes(
-            mongo,
-            &pipeline.target_collection,
-            &live_identities,
-        )
-        .await?;
+        deleted =
+            reconcile_target_deletes(mongo, &pipeline.target_collection, &live_identities).await?;
     }
 
     update_pipeline_delivery_progress(
@@ -1672,10 +1670,7 @@ async fn deliver_transform_pipeline_with_options(
     } else {
         println!(
             "Delivery complete: Pipeline {} → {}.{} ({} documents)",
-            pipeline.name,
-            deployment.target.database,
-            pipeline.target_collection,
-            delivered
+            pipeline.name, deployment.target.database, pipeline.target_collection, delivered
         );
     }
     Ok(())
@@ -1700,10 +1695,8 @@ fn derived_columns_for_ops(
     for row in derived_rows {
         names.extend(row.keys().cloned());
     }
-    let mut by_name: BTreeMap<&str, &BaseColumn> = base_columns
-        .iter()
-        .map(|c| (c.name.as_str(), c))
-        .collect();
+    let mut by_name: BTreeMap<&str, &BaseColumn> =
+        base_columns.iter().map(|c| (c.name.as_str(), c)).collect();
     // Primary wins on name clashes; secondary fills unwind-flattened foreign fields.
     for col in secondary_columns {
         by_name.entry(col.name.as_str()).or_insert(col);
@@ -1904,29 +1897,26 @@ async fn maintain_transform_pipeline_for_change(
         ChangeOp::Delete => None,
     };
 
-    let (primary_columns, primary_rows) = if changed_table.eq_ignore_ascii_case(&pipeline.source_table)
-    {
-        let (base, _) = get_base_rows(
-            platform_store_url,
-            &pipeline.source_table,
-            Some(&pipeline.deployment_name),
-        )
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-        (base.columns, changed_base_rows.to_vec())
-    } else {
-        let (base, rows) = get_base_rows(
-            platform_store_url,
-            &pipeline.source_table,
-            Some(&pipeline.deployment_name),
-        )
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-        (
-            base.columns,
-            rows.into_iter().map(|r| r.data).collect(),
-        )
-    };
+    let (primary_columns, primary_rows) =
+        if changed_table.eq_ignore_ascii_case(&pipeline.source_table) {
+            let (base, _) = get_base_rows(
+                platform_store_url,
+                &pipeline.source_table,
+                Some(&pipeline.deployment_name),
+            )
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+            (base.columns, changed_base_rows.to_vec())
+        } else {
+            let (base, rows) = get_base_rows(
+                platform_store_url,
+                &pipeline.source_table,
+                Some(&pipeline.deployment_name),
+            )
+            .await
+            .map_err(|err| CliError::Failed(err.to_string()))?;
+            (base.columns, rows.into_iter().map(|r| r.data).collect())
+        };
 
     let kind = base_change_kind(change.op);
     let is_primary = changed_table.eq_ignore_ascii_case(&pipeline.source_table);
@@ -2063,12 +2053,13 @@ async fn recompute_and_deliver_affected_identities(
             if grouped {
                 identity_matches_row(identity, row)
             } else {
-                pipeline.output_identity.iter().all(|key| {
-                    match (identity.get(key), row.get(key)) {
+                pipeline
+                    .output_identity
+                    .iter()
+                    .all(|key| match (identity.get(key), row.get(key)) {
                         (Some(a), Some(b)) => migraloop_transform::json_values_eq(a, b),
                         _ => false,
-                    }
-                })
+                    })
             }
         };
 
@@ -2079,8 +2070,7 @@ async fn recompute_and_deliver_affected_identities(
         .collect();
     merged.extend(recomputed.clone());
 
-    let derived_columns =
-        derived_columns_for_ops(base_columns, ops, &merged, secondary_columns);
+    let derived_columns = derived_columns_for_ops(base_columns, ops, &merged, secondary_columns);
     dataset.status = "materialized".to_string();
     dataset.columns = derived_columns.clone();
     dataset.row_count = merged.len() as i32;
@@ -2103,7 +2093,10 @@ async fn recompute_and_deliver_affected_identities(
             .iter()
             .any(|row| identity_targets_row(identity, row));
         if !still_present {
-            deletes.push(output_identity_from_row(identity, &pipeline.output_identity)?);
+            deletes.push(output_identity_from_row(
+                identity,
+                &pipeline.output_identity,
+            )?);
         }
     }
 
@@ -2141,7 +2134,10 @@ async fn recompute_and_deliver_affected_identities(
 }
 
 async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
+    let store = PlatformStore::open(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    ensure_store_session_healthy(&store).await?;
 
     let doc = load_deployment_config(file)?;
     let deployment = document_to_deployment(&doc)?;
@@ -2177,16 +2173,15 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         validate_pipeline_managed_fields(pipeline, &source_columns, &managed_names)?;
     }
 
-    let existing_pipelines = list_pipelines(platform_store_url)
+    let existing_pipelines = store
+        .list_pipelines()
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?
         .into_iter()
         .filter(|p| p.deployment_name == deployment.name)
         .collect::<Vec<_>>();
-    let existing_names: BTreeSet<String> = existing_pipelines
-        .iter()
-        .map(|p| p.name.clone())
-        .collect();
+    let existing_names: BTreeSet<String> =
+        existing_pipelines.iter().map(|p| p.name.clone()).collect();
     // Owned summaries so we can mutate `pipelines` below without overlapping borrows.
     let added_pipeline_summaries: Vec<(String, String)> = pipelines
         .iter()
@@ -2198,27 +2193,24 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
     // (and Operator pause) when the semantic declaration is unchanged.
     preserve_unchanged_pipeline_delivery(&existing_pipelines, &mut pipelines);
 
-    let revision_names: BTreeSet<String> = pipelines_needing_revision_rebuild(
-        &existing_pipelines,
-        &pipelines,
-    )
-    .into_iter()
-    .map(|p| p.name.clone())
-    .collect();
-    let metadata_only_names: BTreeSet<String> = pipelines_with_metadata_only_change(
-        &existing_pipelines,
-        &pipelines,
-    )
-    .into_iter()
-    .map(|p| p.name.clone())
-    .collect();
+    let revision_names: BTreeSet<String> =
+        pipelines_needing_revision_rebuild(&existing_pipelines, &pipelines)
+            .into_iter()
+            .map(|p| p.name.clone())
+            .collect();
+    let metadata_only_names: BTreeSet<String> =
+        pipelines_with_metadata_only_change(&existing_pipelines, &pipelines)
+            .into_iter()
+            .map(|p| p.name.clone())
+            .collect();
 
     // Change (ADR-0007): pause old Delivery before swapping the revision so a
     // concurrent sync cannot Deliver under the previous transform/binding.
     for name in &revision_names {
         if let Some(previous) = existing_pipelines.iter().find(|p| p.name == *name) {
             if !previous.paused {
-                set_pipeline_paused(platform_store_url, &deployment.name, name, true)
+                store
+                    .set_pipeline_paused(&deployment.name, name, true)
                     .await
                     .map_err(|err| CliError::Failed(err.to_string()))?;
             }
@@ -2239,17 +2231,19 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         }
     }
 
-    upsert_deployment(platform_store_url, &deployment)
+    store
+        .upsert_deployment(&deployment)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
-    replace_pipelines(platform_store_url, &deployment.name, &pipelines)
+    store
+        .replace_pipelines(&deployment.name, &pipelines)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
     // Table-level Initial Load only for newly referenced tables; existing Bases stay
     // on their incremental path (ADR-0019). Shared Bases are never rebuilt for a
     // Pipeline revision (ADR-0007 Change).
-    sync_base_datasets_for_pipelines(platform_store_url, &deployment, &pipelines).await?;
+    sync_base_datasets_for_pipelines(&store, &deployment, &pipelines).await?;
 
     if !existing_pipelines.is_empty() {
         for (name, source_table) in &added_pipeline_summaries {
@@ -2279,14 +2273,10 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         )
         .await?;
         for pipeline in &to_revise {
-            set_pipeline_paused(
-                platform_store_url,
-                &deployment.name,
-                &pipeline.name,
-                false,
-            )
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
+            store
+                .set_pipeline_paused(&deployment.name, &pipeline.name, false)
+                .await
+                .map_err(|err| CliError::Failed(err.to_string()))?;
             println!(
                 "Pipeline revision: {} — rebuilt and re-Delivered; incremental resumed",
                 pipeline.name
@@ -2307,7 +2297,9 @@ fn row_matches_identity(
     row: &serde_json::Map<String, serde_json::Value>,
     identity: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> bool {
-    identity.iter().all(|(key, expected)| row.get(key) == Some(expected))
+    identity
+        .iter()
+        .all(|(key, expected)| row.get(key) == Some(expected))
 }
 
 fn supported_row_from_change(
@@ -2484,10 +2476,7 @@ fn format_output_identity(identity: &serde_json::Value) -> String {
     }
 }
 
-fn identity_is_poison(
-    identity: &serde_json::Value,
-    poison_keys: &BTreeSet<String>,
-) -> bool {
+fn identity_is_poison(identity: &serde_json::Value, poison_keys: &BTreeSet<String>) -> bool {
     if poison_keys.is_empty() {
         return false;
     }
@@ -2551,12 +2540,8 @@ async fn delete_with_bounded_retries(
                 format_output_identity(identity)
             );
         } else {
-            match delete_documents_by_identity(
-                mongo,
-                collection,
-                std::slice::from_ref(identity),
-            )
-            .await
+            match delete_documents_by_identity(mongo, collection, std::slice::from_ref(identity))
+                .await
             {
                 Ok(n) => return Ok(n),
                 Err(err) => last_error = err.to_string(),
@@ -2704,7 +2689,10 @@ fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineS
 }
 
 /// Operators after the `union.from` step for `table` (secondary contribution shape).
-fn union_suffix_ops_for_table<'a>(ops: &'a [TransformOp], table: &str) -> Option<&'a [TransformOp]> {
+fn union_suffix_ops_for_table<'a>(
+    ops: &'a [TransformOp],
+    table: &str,
+) -> Option<&'a [TransformOp]> {
     let idx = ops.iter().position(|op| match op {
         TransformOp::Union { from, .. } => from.eq_ignore_ascii_case(table),
         _ => false,
@@ -2993,7 +2981,8 @@ async fn align_one_base(
         base_by_id.insert(key, row.data.clone());
     }
 
-    let mut repaired: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
+    let mut repaired: BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+        BTreeMap::new();
     let mut mismatched = 0i32;
     let mut repaired_count = 0i32;
     let mut checked_ids: BTreeSet<String> = BTreeSet::new();
@@ -3123,12 +3112,8 @@ async fn drift_check(
         .into_iter()
         .filter(|p| {
             pipeline_has_target(p)
-                && pipeline_name
-                    .map(|n| p.name == n)
-                    .unwrap_or(true)
-                && deployment
-                    .map(|d| p.deployment_name == d)
-                    .unwrap_or(true)
+                && pipeline_name.map(|n| p.name == n).unwrap_or(true)
+                && deployment.map(|d| p.deployment_name == d).unwrap_or(true)
         })
         .collect();
     if targets.is_empty() {
@@ -3189,11 +3174,7 @@ async fn drift_one_pipeline(
 
     for expected in &expected_docs {
         let key = identity_key(&expected.identity);
-        let managed_keys: Vec<&str> = expected
-            .managed_fields
-            .keys()
-            .map(|k| k.as_str())
-            .collect();
+        let managed_keys: Vec<&str> = expected.managed_fields.keys().map(|k| k.as_str()).collect();
         let drifted = match target_by_id.get(&key) {
             Some(target_doc) => {
                 !managed_fields_match_target(target_doc, &expected.managed_fields, &managed_keys)
@@ -3433,9 +3414,9 @@ fn normalize_json_for_drift(value: &serde_json::Value) -> serde_json::Value {
                 value.clone()
             }
         }
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items.iter().map(normalize_json_for_drift).collect(),
-        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(normalize_json_for_drift).collect())
+        }
         other => other.clone(),
     }
 }
@@ -3491,18 +3472,14 @@ async fn supervise_continuous_incremental_sync(platform_store_url: String) {
         let url = platform_store_url.clone();
         match tokio::spawn(async move { run_continuous_incremental_sync(url).await }).await {
             Ok(()) => {
-                eprintln!(
-                    "Continuous Incremental Capture task ended unexpectedly; restarting"
-                );
+                eprintln!("Continuous Incremental Capture task ended unexpectedly; restarting");
                 emit_event(
                     "continuous_sync_error",
                     &[("error", EventValue::from("task ended unexpectedly"))],
                 );
             }
             Err(join_err) => {
-                eprintln!(
-                    "Continuous Incremental Capture task panicked: {join_err}; restarting"
-                );
+                eprintln!("Continuous Incremental Capture task panicked: {join_err}; restarting");
                 emit_event(
                     "continuous_sync_error",
                     &[("error", EventValue::from(join_err.to_string()))],
@@ -3546,8 +3523,8 @@ async fn run_incremental_sync(
     let max_poison_attempts = poison_max_attempts();
     let queue_capacity = sync_queue_capacity();
     let downstream_delay = delivery_delay_ms().is_some();
-    let injected_schema_changes = load_injected_schema_changes()
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let injected_schema_changes =
+        load_injected_schema_changes().map_err(|err| CliError::Failed(err.to_string()))?;
     let mut applied_this_run: u32 = 0;
     let mut progressed = false;
     let quiet = matches!(invocation, SyncInvocation::ContinuousCycle);
@@ -3681,12 +3658,7 @@ async fn run_incremental_sync(
                     .map_err(|err| CliError::Failed(err.to_string()))?;
                 let source_pending = source_pending_total.saturating_sub(applied_skip.len());
                 let fetched_changes = capture
-                    .fetch_changes_in_schema_limited(
-                        &schema,
-                        &table,
-                        resume_from,
-                        fetch_limit,
-                    )
+                    .fetch_changes_in_schema_limited(&schema, &table, resume_from, fetch_limit)
                     .map_err(|err| CliError::Failed(err.to_string()))?;
                 let candidate_changes: Vec<_> = fetched_changes
                     .into_iter()
@@ -3703,11 +3675,7 @@ async fn run_incremental_sync(
                     .iter()
                     .map(|c| c.change_id.clone())
                     .collect();
-                candidate_ids.extend(
-                    table_schema_changes
-                        .iter()
-                        .map(|c| c.change_id.clone()),
-                );
+                candidate_ids.extend(table_schema_changes.iter().map(|c| c.change_id.clone()));
                 let unapplied_ids = filter_unapplied_change_ids(
                     platform_store_url,
                     &deployment.name,
@@ -3745,13 +3713,12 @@ async fn run_incremental_sync(
                 }
 
                 if items.is_empty() {
-                    let status = if windows_processed == 0
-                        && dataset.status == "initial_load_complete"
-                    {
-                        dataset.status.clone()
-                    } else {
-                        "incremental".to_string()
-                    };
+                    let status =
+                        if windows_processed == 0 && dataset.status == "initial_load_complete" {
+                            dataset.status.clone()
+                        } else {
+                            "incremental".to_string()
+                        };
                     let caught_up = base_with_sync_progress(
                         &dataset,
                         status,
@@ -3808,10 +3775,7 @@ async fn run_incremental_sync(
                             ("queue_depth", EventValue::from(queue_depth)),
                             ("capacity", EventValue::from(queue_capacity)),
                             ("lag", EventValue::from(reported_lag)),
-                            (
-                                "deployment",
-                                EventValue::from(deployment.name.as_str()),
-                            ),
+                            ("deployment", EventValue::from(deployment.name.as_str())),
                         ],
                     );
                 }
@@ -3839,14 +3803,8 @@ async fn run_incremental_sync(
                         ("queue_depth", EventValue::from(queue_depth)),
                         ("capacity", EventValue::from(queue_capacity)),
                         ("lag", EventValue::from(reported_lag)),
-                        (
-                            "deployment",
-                            EventValue::from(deployment.name.as_str()),
-                        ),
-                        (
-                            "resume_from",
-                            EventValue::from(resume_from.to_string()),
-                        ),
+                        ("deployment", EventValue::from(deployment.name.as_str())),
+                        ("resume_from", EventValue::from(resume_from.to_string())),
                     ],
                 );
 
@@ -3938,132 +3896,132 @@ async fn run_incremental_sync(
                                             continue;
                                         }
                                         match change.op {
-                                        ChangeOp::Insert | ChangeOp::Update => {
-                                            let Some(base_row) = rows.iter().find(|row| {
-                                                row_matches_identity(row, &change.identity)
-                                            }) else {
-                                                return Err(CliError::Failed(format!(
+                                            ChangeOp::Insert | ChangeOp::Update => {
+                                                let Some(base_row) = rows.iter().find(|row| {
+                                                    row_matches_identity(row, &change.identity)
+                                                }) else {
+                                                    return Err(CliError::Failed(format!(
                                                     "Base Dataset {} missing row for Output Identity {:?}",
                                                     pipeline.source_table, change.identity
                                                 )));
-                                            };
-                                            let document = delivery_document_for_row(
-                                                base_row,
-                                                &dataset.primary_key,
-                                                &dataset.columns,
-                                                pipeline,
-                                            )?;
-                                            match upsert_with_bounded_retries(
-                                                &mongo,
-                                                &pipeline.target_collection,
-                                                &document,
-                                                max_poison_attempts,
-                                            )
-                                            .await
-                                            {
-                                                Ok(upserted) => {
-                                                    update_pipeline_delivery_progress_with_lag(
-                                                        platform_store_url,
-                                                        &pipeline.deployment_name,
-                                                        &pipeline.name,
-                                                        "delivered",
-                                                        Some(upserted as i32),
-                                                        Some(lag),
-                                                    )
-                                                    .await
-                                                    .map_err(|err| {
-                                                        CliError::Failed(err.to_string())
-                                                    })?;
-                                                    println!(
+                                                };
+                                                let document = delivery_document_for_row(
+                                                    base_row,
+                                                    &dataset.primary_key,
+                                                    &dataset.columns,
+                                                    pipeline,
+                                                )?;
+                                                match upsert_with_bounded_retries(
+                                                    &mongo,
+                                                    &pipeline.target_collection,
+                                                    &document,
+                                                    max_poison_attempts,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(upserted) => {
+                                                        update_pipeline_delivery_progress_with_lag(
+                                                            platform_store_url,
+                                                            &pipeline.deployment_name,
+                                                            &pipeline.name,
+                                                            "delivered",
+                                                            Some(upserted as i32),
+                                                            Some(lag),
+                                                        )
+                                                        .await
+                                                        .map_err(|err| {
+                                                            CliError::Failed(err.to_string())
+                                                        })?;
+                                                        println!(
                                                         "Delivery complete: Pipeline {} upserts={upserted} \
                                                          deletes=0 (checkpoint-bound)",
                                                         pipeline.name
                                                     );
-                                                }
-                                                Err((attempts, last_error)) => {
-                                                    quarantine_poison_change(
-                                                        platform_store_url,
-                                                        pipeline,
-                                                        &schema,
-                                                        &table,
-                                                        change,
-                                                        document.identity.clone(),
-                                                        "delivery",
-                                                        attempts,
-                                                        &last_error,
-                                                    )
-                                                    .await?;
-                                                    update_pipeline_delivery_lag(
-                                                        platform_store_url,
-                                                        &pipeline.deployment_name,
-                                                        &pipeline.name,
-                                                        lag,
-                                                    )
-                                                    .await
-                                                    .map_err(|err| {
-                                                        CliError::Failed(err.to_string())
-                                                    })?;
+                                                    }
+                                                    Err((attempts, last_error)) => {
+                                                        quarantine_poison_change(
+                                                            platform_store_url,
+                                                            pipeline,
+                                                            &schema,
+                                                            &table,
+                                                            change,
+                                                            document.identity.clone(),
+                                                            "delivery",
+                                                            attempts,
+                                                            &last_error,
+                                                        )
+                                                        .await?;
+                                                        update_pipeline_delivery_lag(
+                                                            platform_store_url,
+                                                            &pipeline.deployment_name,
+                                                            &pipeline.name,
+                                                            lag,
+                                                        )
+                                                        .await
+                                                        .map_err(|err| {
+                                                            CliError::Failed(err.to_string())
+                                                        })?;
+                                                    }
                                                 }
                                             }
-                                        }
-                                        ChangeOp::Delete => {
-                                            let identity = identity_value_from_change(
-                                                change,
-                                                &dataset.primary_key,
-                                            )?;
-                                            match delete_with_bounded_retries(
-                                                &mongo,
-                                                &pipeline.target_collection,
-                                                &identity,
-                                                max_poison_attempts,
-                                            )
-                                            .await
-                                            {
-                                                Ok(deleted) => {
-                                                    update_pipeline_delivery_progress_with_lag(
-                                                        platform_store_url,
-                                                        &pipeline.deployment_name,
-                                                        &pipeline.name,
-                                                        "delivered",
-                                                        Some(deleted as i32),
-                                                        Some(lag),
-                                                    )
-                                                    .await
-                                                    .map_err(|err| {
-                                                        CliError::Failed(err.to_string())
-                                                    })?;
-                                                    println!(
+                                            ChangeOp::Delete => {
+                                                let identity = identity_value_from_change(
+                                                    change,
+                                                    &dataset.primary_key,
+                                                )?;
+                                                match delete_with_bounded_retries(
+                                                    &mongo,
+                                                    &pipeline.target_collection,
+                                                    &identity,
+                                                    max_poison_attempts,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(deleted) => {
+                                                        update_pipeline_delivery_progress_with_lag(
+                                                            platform_store_url,
+                                                            &pipeline.deployment_name,
+                                                            &pipeline.name,
+                                                            "delivered",
+                                                            Some(deleted as i32),
+                                                            Some(lag),
+                                                        )
+                                                        .await
+                                                        .map_err(|err| {
+                                                            CliError::Failed(err.to_string())
+                                                        })?;
+                                                        println!(
                                                         "Delivery complete: Pipeline {} upserts=0 \
                                                          deletes={deleted} (checkpoint-bound)",
                                                         pipeline.name
                                                     );
-                                                }
-                                                Err((attempts, last_error)) => {
-                                                    quarantine_poison_change(
-                                                        platform_store_url,
-                                                        pipeline,
-                                                        &schema,
-                                                        &table,
-                                                        change,
-                                                        identity,
-                                                        "delivery",
-                                                        attempts,
-                                                        &last_error,
-                                                    )
-                                                    .await?;
-                                                    update_pipeline_delivery_lag(
-                                                        platform_store_url,
-                                                        &pipeline.deployment_name,
-                                                        &pipeline.name,
-                                                        lag,
-                                                    )
-                                                    .await
-                                                    .map_err(|err| {
-                                                        CliError::Failed(err.to_string())
-                                                    })?;
+                                                    }
+                                                    Err((attempts, last_error)) => {
+                                                        quarantine_poison_change(
+                                                            platform_store_url,
+                                                            pipeline,
+                                                            &schema,
+                                                            &table,
+                                                            change,
+                                                            identity,
+                                                            "delivery",
+                                                            attempts,
+                                                            &last_error,
+                                                        )
+                                                        .await?;
+                                                        update_pipeline_delivery_lag(
+                                                            platform_store_url,
+                                                            &pipeline.deployment_name,
+                                                            &pipeline.name,
+                                                            lag,
+                                                        )
+                                                        .await
+                                                        .map_err(|err| {
+                                                            CliError::Failed(err.to_string())
+                                                        })?;
+                                                    }
                                                 }
                                             }
-                                        }
                                         }
                                     }
                                     "transform" => {
@@ -4180,8 +4138,7 @@ async fn run_incremental_sync(
                             println!(
                                 "Incremental Capture: Base Dataset {table} applied change_id={} \
                                  checkpoint={current_checkpoint} lag={lag} rows={}",
-                                change.change_id,
-                                updated.row_count
+                                change.change_id, updated.row_count
                             );
                         }
                     }
@@ -4201,11 +4158,7 @@ async fn run_incremental_sync(
                 // Stay on the last applied SCN (inclusive). Already-applied change ids are
                 // skipped on the next fetch so same-SCN siblings still drain; exclusive
                 // SCN+1 advance would gap unapplied peers (issue #143).
-                let last_pos = items
-                    .last()
-                    .expect("non-empty window")
-                    .position()
-                    .as_i64();
+                let last_pos = items.last().expect("non-empty window").position().as_i64();
                 resume_from = CapturePosition::from_i64(last_pos).ok_or_else(|| {
                     CliError::Failed(format!(
                         "invalid capture position advance for Base Dataset {table}: {last_pos}"
@@ -4214,7 +4167,6 @@ async fn run_incremental_sync(
                 windows_processed += 1;
                 progressed = true;
             }
-
         }
     }
 
@@ -4550,7 +4502,10 @@ async fn print_base(
 
     for row in rows {
         let value = serde_json::Value::Object(row.data);
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
     }
 
     Ok(())
@@ -4581,7 +4536,10 @@ async fn print_derived(
     println!("columns: [{columns}]");
     for row in rows {
         let value = serde_json::Value::Object(row.data);
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
     }
     Ok(())
 }
@@ -4844,13 +4802,9 @@ async fn remove_pipeline_command(
         }
     }
     let keep_tables: Vec<(String, String)> = keep.into_iter().collect();
-    delete_base_datasets_not_in(
-        platform_store_url,
-        &pipeline.deployment_name,
-        &keep_tables,
-    )
-    .await
-    .map_err(|err| CliError::Failed(err.to_string()))?;
+    delete_base_datasets_not_in(platform_store_url, &pipeline.deployment_name, &keep_tables)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
 
     println!(
         "Pipeline {} removed (Deployment {}) — Delivery/processing stopped; \
@@ -4916,23 +4870,17 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             platform_store_url,
             pipeline,
             deployment,
-        } => {
-            pause_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await
-        }
+        } => pause_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await,
         Command::Resume {
             platform_store_url,
             pipeline,
             deployment,
-        } => {
-            resume_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await
-        }
+        } => resume_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await,
         Command::Remove {
             platform_store_url,
             pipeline,
             deployment,
-        } => {
-            remove_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await
-        }
+        } => remove_pipeline_command(&platform_store_url, &pipeline, deployment.as_deref()).await,
         Command::Run {
             platform_store_url,
             metrics_addr,
