@@ -65,6 +65,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run bounded-backpressure
 ./target/debug/migraloop lab scenario run observability-surface
 ./target/debug/migraloop lab scenario run platform-store-guardrails
+./target/debug/migraloop lab scenario run initial-load-throttled
 ./target/debug/migraloop lab scenario run backward-compatible-upgrades
 # keep-on-finish 后 lab status 会标出 leftover Namespace；也可用 base / derived / target 查看。
 # 重跑会先 wipe Namespace；或：lab scenario remove <id> / run --auto-remove

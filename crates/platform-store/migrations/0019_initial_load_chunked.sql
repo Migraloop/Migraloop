@@ -1,4 +1,6 @@
--- Chunked / pausable Initial Load (issue #124): durable in-progress status + keyset cursor.
+-- Chunked / pausable Initial Load (issue #124): durable in-progress/paused status +
+-- Operator-visible resume cursor (PK of last persisted row). Resume offset is
+-- durable row_count; cursor_json is observational/status surface.
 
 ALTER TABLE base_datasets
     DROP CONSTRAINT IF EXISTS base_datasets_status_check;

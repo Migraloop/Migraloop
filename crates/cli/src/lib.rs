@@ -819,6 +819,7 @@ async fn run_chunked_initial_load(
             return Ok(());
         }
 
+        let source_started = std::time::Instant::now();
         let chunk = initial_load_chunk_for_source(
             &connect,
             &password,
@@ -832,6 +833,7 @@ async fn run_chunked_initial_load(
             },
         )
         .map_err(|err| CliError::Failed(err.to_string()))?;
+        let source_ms = source_started.elapsed().as_millis() as u64;
 
         if primary_key.is_empty() {
             primary_key = chunk.primary_key.clone();
@@ -934,12 +936,18 @@ async fn run_chunked_initial_load(
         }
         emit_event("initial_load_progress", &progress_fields);
 
-        // Back off when Downstream/store pressure is visible (ADR-0020 spirit for Initial Load).
-        if store_delay.is_some() || persist_ms >= 25 {
-            let backoff_ms = store_delay.unwrap_or(persist_ms).max(10);
+        // Back off when Downstream/store or Source pressure is visible (issue #124).
+        let pressure_ms = store_delay.unwrap_or(0).max(persist_ms).max(source_ms);
+        if store_delay.is_some() || persist_ms >= 25 || source_ms >= 25 {
+            let backoff_ms = pressure_ms.max(10);
+            let pressure = if store_delay.is_some() || persist_ms >= source_ms {
+                "Downstream/store"
+            } else {
+                "Source"
+            };
             println!(
                 "Initial Load backoff: {table} delay_ms={backoff_ms} \
-                 (Downstream/store pressure; chunk window stays bounded)"
+                 ({pressure} pressure; chunk window stays bounded)"
             );
             emit_event(
                 "initial_load_backoff",
@@ -947,6 +955,7 @@ async fn run_chunked_initial_load(
                     ("table", EventValue::from(table)),
                     ("delay_ms", EventValue::from(backoff_ms as i64)),
                     ("chunk_size", EventValue::from(chunk_size)),
+                    ("pressure", EventValue::from(pressure)),
                     ("deployment", EventValue::from(deployment_name.as_str())),
                 ],
             );
@@ -1101,17 +1110,23 @@ async fn ensure_base_primary_key(
         return Ok(());
     }
 
+    // Metadata-only: one bounded chunk for PK — never a full-table Initial Load slam.
     let connect = oracle_source_connect(&deployment.source)?;
     let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
-    let snapshot = initial_load_for_source(
+    let chunk = initial_load_chunk_for_source(
         &connect,
         &password,
         source_schema,
         source_table,
         configured_timezone,
+        &InitialLoadChunkOptions {
+            chunk_size: 1,
+            offset: 0,
+            established_watermark: None,
+        },
     )
     .map_err(|err| CliError::Failed(err.to_string()))?;
-    if snapshot.primary_key.is_empty() {
+    if chunk.primary_key.is_empty() {
         return Err(CliError::Failed(format!(
             "Source table {source_table} has no primary key for Output Identity"
         )));
@@ -1122,7 +1137,7 @@ async fn ensure_base_primary_key(
         deployment_name,
         source_schema,
         source_table,
-        &snapshot.primary_key,
+        &chunk.primary_key,
     )
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
