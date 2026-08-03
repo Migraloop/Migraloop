@@ -181,7 +181,9 @@ secondary schema（預設為 Pipeline source schema）。
 自由形式的 Mongo `$unionWith`（含 `pipeline` / `coll` 擴充）會被拒絕—請用此宣告式形狀，
 以便 **Affect Analysis** 保持正確。任一貢獻 Base 的變更只更新受影響的 Output Identities；
 後續 `project` 未使用的欄位（例如 EMAIL）仍會 skip 重算。v1 不允許 `union` 與
-`distinct` / `addToSet` 併用。
+`distinct` / `addToSet` 併用。請選擇跨貢獻 Bases 仍唯一的 **Output Identity**—Delivery
+對每個 identity upsert 一份 Target 文件（SQL `UNION ALL` 的列多重性不會為同一 key 建立多份
+Mongo 文件）。
 
 ## Output Identity
 

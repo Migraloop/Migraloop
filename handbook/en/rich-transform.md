@@ -189,7 +189,9 @@ Free-form Mongo `$unionWith` (including `pipeline` / `coll` extensions) is rejec
 this declarative form so **Affect Analysis** stays correct. A change on either contributing
 Base updates only the affected Output Identities; unused fields after a following `project`
 (for example EMAIL) still skip recompute. v1 does not combine `union` with `distinct` /
-`addToSet`.
+`addToSet`. Choose **Output Identity** values that stay unique across contributing Bases—
+Delivery upserts one Target document per identity (SQL `UNION ALL` row multiplicity does not
+create multiple Mongo documents for the same key).
 
 ## Output Identity
 

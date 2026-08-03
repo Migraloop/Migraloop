@@ -2680,7 +2680,7 @@ fn apply_union(
     secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
     from: &str,
 ) -> Result<Vec<Map<String, Value>>, TransformError> {
-    let foreign_rows = secondary_bases
+    let secondary_rows = secondary_bases
         .get(from)
         .or_else(|| {
             secondary_bases
@@ -2694,7 +2694,7 @@ fn apply_union(
             ))
         })?;
     let mut out = rows;
-    out.extend(foreign_rows.iter().cloned());
+    out.extend(secondary_rows.iter().cloned());
     Ok(out)
 }
 

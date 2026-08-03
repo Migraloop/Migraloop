@@ -2706,9 +2706,28 @@ fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineS
                 for field in &pipeline.output_identity {
                     dependency_columns.insert(field.clone());
                 }
+            } else if let Ok(ops) = transform_ops_from_pipeline(pipeline) {
+                if let Some(suffix) = union_suffix_ops_for_table(&ops, &dataset.source_table) {
+                    // union.from rows are shaped only by steps after the union —
+                    // Schema Change deps match Affect Analysis used fields.
+                    let used = used_base_fields(suffix);
+                    if used.is_empty() {
+                        for col in &dataset.columns {
+                            dependency_columns.insert(col.name.clone());
+                        }
+                    } else {
+                        dependency_columns.extend(used);
+                    }
+                    for field in &pipeline.output_identity {
+                        dependency_columns.insert(field.clone());
+                    }
+                } else {
+                    // equiLookup embeds full foreign rows — any column drop/type change blocks.
+                    for col in &dataset.columns {
+                        dependency_columns.insert(col.name.clone());
+                    }
+                }
             } else {
-                // equiLookup embeds full foreign rows; union concatenates secondary
-                // rows — any column drop/type change on a secondary Base blocks.
                 for col in &dataset.columns {
                     dependency_columns.insert(col.name.clone());
                 }
@@ -2725,6 +2744,15 @@ fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineS
         source_schema: dataset.source_schema.clone(),
         dependency_columns,
     }
+}
+
+/// Operators after the `union.from` step for `table` (secondary contribution shape).
+fn union_suffix_ops_for_table<'a>(ops: &'a [TransformOp], table: &str) -> Option<&'a [TransformOp]> {
+    let idx = ops.iter().position(|op| match op {
+        TransformOp::Union { from, .. } => from.eq_ignore_ascii_case(table),
+        _ => false,
+    })?;
+    Some(&ops[idx + 1..])
 }
 
 /// Classify Schema Change impact for Pipelines on this table; warn+pause on Blocking.
