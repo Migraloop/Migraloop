@@ -47,7 +47,7 @@ migraloop status
 ## Logs 與 metrics
 
 - App/CLI 在 Initial Load、Incremental Capture、Delivery、Backpressure、Poison Change quarantine、blocking Schema Change，以及 Platform Store 可用磁碟警告會發出 **structured JSON** operator event lines（並保留 human-readable 對應行）（`migraloop` 行程 / container logs 的 stdout/stderr）。請找 `"event":"…"` 欄位，例如 `initial_load_progress`、`initial_load_paused`、`initial_load_backoff`、`initial_load_complete`、`incremental_capture`、`delivery_complete`、`backpressure`、`poison_quarantine`、`schema_change_blocked`、`platform_store_disk_warn`。
-- `migraloop run` 在 `http://<metrics-addr>/metrics` 提供 Prometheus scrape endpoint（預設 `0.0.0.0:9090`，可用 `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` 覆寫）。Compose 會公布 host port `9090`。Metrics 包含 Sync/Delivery lag（`migraloop_sync_lag`、`migraloop_delivery_lag`）、Pipeline pause、可告警 failure gauges（`migraloop_quarantined_changes`、`migraloop_failures`，皆自耐久 Platform Store state 讀取），以及 Platform Store disk gauges（`migraloop_platform_store_disk_free_bytes`、`migraloop_platform_store_disk_warn` — warn-only；絕不自動 pause）。
+- `migraloop run` 會對已套用 Pipelines 持續執行 Incremental Capture → Delivery，並在同一個 single active instance 上於 `http://<metrics-addr>/metrics` 提供 Prometheus scrape endpoint（預設 `0.0.0.0:9090`，可用 `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` 覆寫）。Compose 會公布 host port `9090`。Metrics 包含 Sync/Delivery lag（`migraloop_sync_lag`、`migraloop_delivery_lag`）、Pipeline pause、可告警 failure gauges（`migraloop_quarantined_changes`、`migraloop_failures`，皆自耐久 Platform Store state 讀取），以及 Platform Store disk gauges（`migraloop_platform_store_disk_free_bytes`、`migraloop_platform_store_disk_warn` — warn-only；絕不自動 pause）。
 - `status` 仍是 Operator 解讀 lag/checkpoint/error 的主要迴圈；用 scrape `/metrics` 做 alerting 與 dashboards。
 
 ## 相關章節
