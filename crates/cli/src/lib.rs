@@ -14,11 +14,11 @@ use lab::{run_lab, LabCommand};
 use migraloop_capture::{
     alignment_check_read_for_source, check_oracle_source_prerequisites, classify_number,
     classify_schema_impact, discover_source_schema, initial_load_chunk_for_source,
-    initial_load_for_source, is_allow_listed_oracle_type, load_injected_schema_changes,
-    normalize_change_temporals, open_oracle_incremental_capture, AlignmentCheckSample,
-    CapturePosition, ChangeEvent, ChangeOp, IncrementalCapture, InitialLoadChunkOptions,
-    NumberMongoMapping, OracleSourceConnect, OracleTlsSettings, PipelineSchemaDeps,
-    SchemaChangeEvent, SchemaImpact, SourceColumn, TypeError,
+    is_allow_listed_oracle_type, load_injected_schema_changes, normalize_change_temporals,
+    open_oracle_incremental_capture, AlignmentCheckSample, CapturePosition, ChangeEvent,
+    ChangeOp, IncrementalCapture, InitialLoadChunkOptions, NumberMongoMapping,
+    OracleSourceConnect, OracleTlsSettings, PipelineSchemaDeps, SchemaChangeEvent,
+    SchemaImpact, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
