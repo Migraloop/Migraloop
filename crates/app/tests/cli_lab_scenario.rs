@@ -550,6 +550,33 @@ async fn lab_scenario_list_includes_backward_compatible_upgrades() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_initial_load_throttled() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("initial-load-throttled"),
+        "catalog must list initial-load-throttled Lab Scenario (#124), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("chunk")
+            || lower.contains("rate")
+            || lower.contains("pause")
+            || lower.contains("backoff")
+            || lower.contains("throttl"),
+        "initial-load-throttled summary should mention chunk/rate/pause/backoff, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {

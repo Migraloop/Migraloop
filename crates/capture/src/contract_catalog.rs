@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     accounts_fixture, customers_fixture, events_fixture, is_allow_listed_oracle_type,
     normalize_snapshot_temporals, orders_fixture, CaptureError, CapturePosition,
-    InitialLoadSnapshot, SourceColumn,
+    InitialLoadChunk, InitialLoadChunkOptions, InitialLoadSnapshot, SourceColumn,
 };
 
 /// Env var: path to a JSON file that lists harness catalog tables for injection.
@@ -102,11 +102,89 @@ impl ContractSourceCatalog {
         Ok(snapshot)
     }
 
+    /// Bounded Initial Load chunk over the injected catalog (issue #124).
+    pub fn initial_load_chunk(
+        &self,
+        table: &str,
+        configured_timezone: Option<&str>,
+        options: &InitialLoadChunkOptions,
+    ) -> Result<InitialLoadChunk, CaptureError> {
+        if options.chunk_size == 0 {
+            return Err(CaptureError::ContractCatalog {
+                detail: "Initial Load chunk_size must be >= 1".to_string(),
+            });
+        }
+        let mut snapshot = self.snapshot(table)?.clone();
+        // Stable PK order so OFFSET resume matches OCI keyset/offset semantics.
+        snapshot.rows.sort_by(|a, b| cmp_pk_rows(a, b, &snapshot.primary_key));
+        normalize_snapshot_temporals(&mut snapshot, configured_timezone)?;
+
+        let low_watermark = options
+            .established_watermark
+            .unwrap_or(snapshot.low_watermark);
+        let start = options.offset.min(snapshot.rows.len());
+        let end = (start + options.chunk_size).min(snapshot.rows.len());
+        let rows = snapshot.rows[start..end].to_vec();
+        let exhausted = end >= snapshot.rows.len();
+        let cursor_pk = rows.last().map(|last| {
+            snapshot
+                .primary_key
+                .iter()
+                .map(|pk| last.get(pk).cloned().unwrap_or(serde_json::Value::Null))
+                .collect()
+        });
+
+        Ok(InitialLoadChunk {
+            table: snapshot.table,
+            low_watermark,
+            primary_key: snapshot.primary_key,
+            columns: snapshot.columns,
+            rows,
+            cursor_pk,
+            exhausted,
+        })
+    }
+
     fn snapshot(&self, table: &str) -> Result<&InitialLoadSnapshot, CaptureError> {
         let key = table.trim().to_ascii_uppercase();
         self.tables
             .get(&key)
             .ok_or_else(|| CaptureError::UnknownTable(key))
+    }
+}
+
+fn cmp_pk_rows(
+    a: &std::collections::BTreeMap<String, serde_json::Value>,
+    b: &std::collections::BTreeMap<String, serde_json::Value>,
+    primary_key: &[String],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for pk in primary_key {
+        let av = a.get(pk).unwrap_or(&serde_json::Value::Null);
+        let bv = b.get(pk).unwrap_or(&serde_json::Value::Null);
+        match cmp_json_pk(av, bv) {
+            Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    Ordering::Equal
+}
+
+fn cmp_json_pk(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    use serde_json::Value;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Number(x), Value::Number(y)) => {
+            let xf = x.as_f64().unwrap_or(0.0);
+            let yf = y.as_f64().unwrap_or(0.0);
+            xf.partial_cmp(&yf).unwrap_or(Ordering::Equal)
+        }
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => a.to_string().cmp(&b.to_string()),
     }
 }
 

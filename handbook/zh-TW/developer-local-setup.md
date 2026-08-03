@@ -65,6 +65,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run bounded-backpressure
 ./target/debug/migraloop lab scenario run observability-surface
 ./target/debug/migraloop lab scenario run platform-store-guardrails
+./target/debug/migraloop lab scenario run initial-load-throttled
 ./target/debug/migraloop lab scenario run backward-compatible-upgrades
 # keep-on-finish 後 lab status 會標出 leftover Namespace；也可用 base / derived / target 檢視。
 # 重跑會先 wipe Namespace；或：lab scenario remove <id> / run --auto-remove
@@ -177,7 +178,7 @@ Lab Fixture lifecycle seam（預設 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine、schema-change-pause 、source-alignment、drift-check 、bounded-backpressure、observability-surface 、platform-store-guardrails 與 backward-compatible-upgrades seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）。這些是**手動 Lab** seams—不是 Release Quality Gate 證據，也不應接到 CI：
+Lab Scenario Direct Pipeline、Rich Transform `project`/`filter`、多表 Transform Pipeline、concurrent Source workload、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine、schema-change-pause 、source-alignment、drift-check 、bounded-backpressure、observability-surface 、platform-store-guardrails 、backward-compatible-upgrades 與 initial-load-throttled seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）。這些是**手動 Lab** seams—不是 Release Quality Gate 證據，也不應接到 CI：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient

@@ -45,6 +45,18 @@ migraloop drift [--pipeline customers] [--max-rows 1000]
 
 The check reads at most `--max-rows` expected Output Identities (default `1000` — not a full slam), compares Managed fields to the Target, and by default **auto-repairs** Managed drift via Managed-only upsert. **Non-Managed Target fields are ignored** and left untouched. It does not add Source load beyond the Alignment baseline. `status` shows `Drift: ok|partial|unknown` with checked/mismatched counts (`partial` = budget truncated). See [CLI & Config](cli-and-config.md) and [Observability](observability.md).
 
+## Initial Load (chunked, rate-limited, pausable)
+
+Initial Load for a newly needed Base Dataset must not overwhelm Oracle with an unbounded full-table slam:
+
+- Source reads use a bounded chunk window (`MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE`, default `1000`); `apply` prints `Initial Load progress` and structured `initial_load_progress` events
+- Optional throttle: `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` (visible as `rate_limit=` / `rate_limit_rows_per_sec`)
+- Pause mid-load without tearing down the Deployment: `migraloop pause --pipeline <name>` is honored between chunks, or Lab inject `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS`. Durable Base status becomes `initial_load_paused` with rows + cutover low-watermark retained; re-run `migraloop apply` to resume
+- Under Downstream / Platform Store pressure, Initial Load prints `Initial Load backoff` / `initial_load_backoff` and keeps only one chunk in memory rather than growing without bound
+- No-gap cutover (ADR-0004) still establishes the low-watermark before the first chunk; Incremental Capture overlap/dedupe is unchanged
+
+Lab Scenario `initial-load-throttled` exercises chunked progress, pause/resume, rate limit, and backoff on the disposable Fixture.
+
 ## Backpressure
 
 When Platform Store apply, Derived maintenance, or Target Delivery cannot keep up (ADR-0020):

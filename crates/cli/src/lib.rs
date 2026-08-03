@@ -13,29 +13,30 @@ use clap::{Parser, Subcommand};
 use lab::{run_lab, LabCommand};
 use migraloop_capture::{
     alignment_check_read_for_source, check_oracle_source_prerequisites, classify_number,
-    classify_schema_impact, discover_source_schema, initial_load_for_source,
+    classify_schema_impact, discover_source_schema, initial_load_chunk_for_source,
     is_allow_listed_oracle_type, load_injected_schema_changes, normalize_change_temporals,
-    open_oracle_incremental_capture, AlignmentCheckSample, CapturePosition, ChangeEvent, ChangeOp,
-    IncrementalCapture, NumberMongoMapping, OracleSourceConnect, OracleTlsSettings,
-    PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn, TypeError,
+    open_oracle_incremental_capture, AlignmentCheckSample, CapturePosition, ChangeEvent,
+    ChangeOp, IncrementalCapture, InitialLoadChunkOptions, NumberMongoMapping,
+    OracleSourceConnect, OracleTlsSettings, PipelineSchemaDeps, SchemaChangeEvent,
+    SchemaImpact, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
     DeliveryDocument, ManagedFieldAs, MongoTargetConnection, MongoTlsSettings,
 };
 use migraloop_platform_store::{
-    base_dataset_exists, check_store_settings, clear_schema_change_impacts,
-    delete_base_datasets_not_in, delete_pipeline, disk_warn_message, filter_unapplied_change_ids,
-    get_base_rows, get_derived_rows, health, list_base_datasets, list_deployments,
-    list_derived_datasets, list_pipelines, list_quarantined_changes, list_schema_change_impacts,
-    migrate, probe_store_resources, probe_store_settings, record_applied_source_changes,
-    replace_base_dataset, replace_derived_dataset, replace_pipelines, set_pipeline_paused,
-    update_base_primary_key, update_pipeline_delivery_lag, update_pipeline_delivery_progress,
-    update_pipeline_delivery_progress_with_lag, update_pipeline_drift_status, upsert_deployment,
-    upsert_quarantined_change, upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment,
-    DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth,
-    QuarantinedChange, SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection,
-    TlsSettings,
+    append_base_dataset_chunk, base_dataset_exists, check_store_settings,
+    clear_schema_change_impacts, delete_base_datasets_not_in, delete_pipeline, disk_warn_message,
+    filter_unapplied_change_ids, get_base_rows, get_derived_rows, health, list_base_datasets,
+    list_deployments, list_derived_datasets, list_pipelines, list_quarantined_changes,
+    list_schema_change_impacts, migrate, probe_store_resources, probe_store_settings,
+    record_applied_source_changes, replace_base_dataset, replace_derived_dataset, replace_pipelines,
+    set_pipeline_paused, update_base_primary_key, update_pipeline_delivery_lag,
+    update_pipeline_delivery_progress, update_pipeline_delivery_progress_with_lag,
+    update_pipeline_drift_status, upsert_deployment, upsert_quarantined_change,
+    upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment, DerivedDataset,
+    FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth, QuarantinedChange,
+    SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
 };
 use migraloop_transform::{
     analyze_affect, derived_projected_fields, evaluate_transform,
@@ -690,50 +691,176 @@ async fn sync_base_datasets_for_pipelines(
         .map_err(|err| CliError::Failed(err.to_string()))?;
 
     for (schema, table) in tables {
-        let already = base_dataset_exists(platform_store_url, deployment_name, &schema, &table)
+        let existing = if base_dataset_exists(platform_store_url, deployment_name, &schema, &table)
             .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-        if already {
-            // Existing Bases stay; do not reload on Pipeline re-apply (ADR-0019).
-            // Backfill Output Identity PK metadata when an older Base predates Delivery.
-            ensure_base_primary_key(
-                platform_store_url,
-                deployment,
-                &schema,
-                &table,
-                configured_tz,
-            )
-            .await?;
-            continue;
+            .map_err(|err| CliError::Failed(err.to_string()))?
+        {
+            let (dataset, _) =
+                get_base_rows(platform_store_url, &table, Some(deployment_name))
+                    .await
+                    .map_err(|err| CliError::Failed(err.to_string()))?;
+            Some(dataset)
+        } else {
+            None
+        };
+
+        if let Some(ref dataset) = existing {
+            let resumable = dataset.status == "initial_load_in_progress"
+                || dataset.status == "initial_load_paused";
+            if !resumable {
+                // Existing Bases stay; do not reload on Pipeline re-apply (ADR-0019).
+                ensure_base_primary_key(
+                    platform_store_url,
+                    deployment,
+                    &schema,
+                    &table,
+                    configured_tz,
+                )
+                .await?;
+                continue;
+            }
         }
 
-        // ADR-0004: establish low-watermark first, then snapshot (live Oracle or contract).
-        let connect = oracle_source_connect(&deployment.source)?;
-        let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
-        let snapshot = initial_load_for_source(
-            &connect,
-            &password,
+        run_chunked_initial_load(
+            platform_store_url,
+            deployment,
+            pipelines,
             &schema,
             &table,
             configured_tz,
+            existing.as_ref(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Default Initial Load Source read window (issue #124). Override via
+/// `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` (must be > 0).
+fn initial_load_chunk_size() -> usize {
+    std::env::var("MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(1000)
+}
+
+/// Optional Operator throttle for Initial Load (rows/sec). `0` / unset = no artificial cap.
+fn initial_load_rows_per_sec() -> Option<u64> {
+    std::env::var("MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+}
+
+/// Test/Lab inject: pause Initial Load after N successful chunks.
+fn initial_load_pause_after_chunks() -> Option<u64> {
+    std::env::var("MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+}
+
+/// Test/Lab inject: artificial Platform Store / Downstream pressure during Initial Load.
+fn initial_load_store_delay_ms() -> Option<u64> {
+    std::env::var("MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+}
+
+async fn run_chunked_initial_load(
+    platform_store_url: &str,
+    deployment: &Deployment,
+    pipelines: &[Pipeline],
+    schema: &str,
+    table: &str,
+    configured_tz: Option<&str>,
+    existing: Option<&BaseDataset>,
+) -> Result<(), CliError> {
+    let deployment_name = &deployment.name;
+    let connect = oracle_source_connect(&deployment.source)?;
+    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
+    let chunk_size = initial_load_chunk_size();
+    let rate_limit = initial_load_rows_per_sec();
+    let pause_after = initial_load_pause_after_chunks();
+    let store_delay = initial_load_store_delay_ms();
+
+    let mut offset = existing.map(|d| d.row_count.max(0) as usize).unwrap_or(0);
+    let mut established = existing
+        .and_then(|d| d.capture_low_watermark)
+        .and_then(CapturePosition::from_i64);
+    let mut chunks_done: u64 = 0;
+    let mut primary_key = existing.map(|d| d.primary_key.clone()).unwrap_or_default();
+    let mut columns = existing.map(|d| d.columns.clone()).unwrap_or_default();
+    let mut omitted_columns = existing
+        .map(|d| d.omitted_columns.clone())
+        .unwrap_or_default();
+    let mut supported_names: BTreeSet<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let mut low_watermark = established;
+
+    loop {
+        // Honor durable Pipeline pause between chunks (Operator `migraloop pause`).
+        if initial_load_should_pause(platform_store_url, deployment_name, table, pipelines).await? {
+            persist_initial_load_pause(
+                platform_store_url,
+                deployment_name,
+                schema,
+                table,
+                &primary_key,
+                &columns,
+                &omitted_columns,
+                offset,
+                low_watermark,
+                existing.and_then(|d| d.initial_load_cursor.clone()),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let source_started = std::time::Instant::now();
+        let chunk = initial_load_chunk_for_source(
+            &connect,
+            &password,
+            schema,
+            table,
+            configured_tz,
+            &InitialLoadChunkOptions {
+                chunk_size,
+                offset,
+                established_watermark: established,
+            },
         )
         .map_err(|err| CliError::Failed(err.to_string()))?;
-        let low_watermark = snapshot.low_watermark;
+        let source_ms = source_started.elapsed().as_millis() as u64;
 
-        let supported = snapshot.supported_columns();
-        let columns = base_columns_from_source(&supported);
-        let omitted_columns: Vec<OmittedColumn> = snapshot
-            .omitted_columns()
-            .into_iter()
-            .map(|c| OmittedColumn {
-                name: c.name.clone(),
-                oracle_type: c.oracle_type.clone(),
-            })
-            .collect();
-        let supported_names: BTreeSet<String> =
-            columns.iter().map(|c| c.name.clone()).collect();
+        if primary_key.is_empty() {
+            primary_key = chunk.primary_key.clone();
+        }
+        if columns.is_empty() {
+            let supported = chunk
+                .columns
+                .iter()
+                .filter(|c| c.supported)
+                .collect::<Vec<_>>();
+            columns = base_columns_from_source(&supported);
+            omitted_columns = chunk
+                .columns
+                .iter()
+                .filter(|c| !c.supported)
+                .map(|c| OmittedColumn {
+                    name: c.name.clone(),
+                    oracle_type: c.oracle_type.clone(),
+                })
+                .collect();
+            supported_names = columns.iter().map(|c| c.name.clone()).collect();
+        }
 
-        let rows: Vec<serde_json::Map<String, serde_json::Value>> = snapshot
+        low_watermark = Some(chunk.low_watermark);
+        established = Some(chunk.low_watermark);
+
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> = chunk
             .rows
             .into_iter()
             .map(|row| {
@@ -743,49 +870,228 @@ async fn sync_base_datasets_for_pipelines(
             })
             .collect();
 
+        let start_ordinal = offset as i32;
+        offset = offset.saturating_add(rows.len());
+        chunks_done = chunks_done.saturating_add(1);
+
+        let status = if chunk.exhausted {
+            "initial_load_complete"
+        } else {
+            "initial_load_in_progress"
+        };
+        let cursor = if chunk.exhausted {
+            None
+        } else {
+            chunk.cursor_pk.clone()
+        };
+        let wm = chunk.low_watermark;
         let dataset = BaseDataset {
             deployment_name: deployment_name.to_string(),
-            source_table: table.clone(),
-            source_schema: schema,
-            status: "initial_load_complete".to_string(),
-            primary_key: snapshot.primary_key,
-            columns,
-            omitted_columns,
-            row_count: rows.len() as i32,
+            source_table: table.to_string(),
+            source_schema: schema.to_string(),
+            status: status.to_string(),
+            primary_key: primary_key.clone(),
+            columns: columns.clone(),
+            omitted_columns: omitted_columns.clone(),
+            row_count: offset as i32,
             sync_applied_changes: 0,
             sync_health: "unknown".to_string(),
-            capture_low_watermark: Some(low_watermark.as_i64()),
+            capture_low_watermark: Some(wm.as_i64()),
             // Checkpoint starts at watermark-1 so first Incremental includes the overlap window
             // via exclusive resume (checkpoint+1 == low-watermark).
-            capture_checkpoint: Some(low_watermark.as_i64().saturating_sub(1)),
+            capture_checkpoint: Some(wm.as_i64().saturating_sub(1)),
             sync_lag: 0,
             source_alignment: "unknown".to_string(),
             source_alignment_checked_rows: 0,
             source_alignment_mismatched_rows: 0,
+            initial_load_cursor: cursor.clone(),
         };
 
-        replace_base_dataset(platform_store_url, &dataset, &rows)
+        let persist_started = std::time::Instant::now();
+        if let Some(ms) = store_delay {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+        append_base_dataset_chunk(platform_store_url, &dataset, &rows, start_ordinal)
             .await
             .map_err(|err| CliError::Failed(err.to_string()))?;
+        let persist_ms = persist_started.elapsed().as_millis() as u64;
 
+        let rate_note = rate_limit
+            .map(|r| format!(" rate_limit={r}/s"))
+            .unwrap_or_default();
         println!(
-            "Initial Load complete: Base Dataset {table} ({} rows) low-watermark={}",
-            dataset.row_count, low_watermark
+            "Initial Load progress: {table} chunk={chunks_done} rows={offset} \
+             chunk_size={chunk_size}{rate_note} low-watermark={wm}"
         );
-        emit_event(
-            "initial_load_complete",
-            &[
-                ("table", EventValue::from(table.as_str())),
-                ("rows", EventValue::from(dataset.row_count)),
-                ("low_watermark", EventValue::from(low_watermark.as_i64())),
-                (
-                    "deployment",
-                    EventValue::from(dataset.deployment_name.as_str()),
-                ),
-            ],
-        );
-    }
+        let mut progress_fields = vec![
+            ("table", EventValue::from(table)),
+            ("chunk", EventValue::from(chunks_done as i64)),
+            ("rows", EventValue::from(offset as i64)),
+            ("chunk_size", EventValue::from(chunk_size)),
+            ("low_watermark", EventValue::from(wm.as_i64())),
+            ("deployment", EventValue::from(deployment_name.as_str())),
+        ];
+        if let Some(rate) = rate_limit {
+            progress_fields.push(("rate_limit_rows_per_sec", EventValue::from(rate as i64)));
+        }
+        emit_event("initial_load_progress", &progress_fields);
 
+        // Back off when Downstream/store or Source pressure is visible (issue #124).
+        let pressure_ms = store_delay.unwrap_or(0).max(persist_ms).max(source_ms);
+        if store_delay.is_some() || persist_ms >= 25 || source_ms >= 25 {
+            let backoff_ms = pressure_ms.max(10);
+            let pressure = if store_delay.is_some() || persist_ms >= source_ms {
+                "Downstream/store"
+            } else {
+                "Source"
+            };
+            println!(
+                "Initial Load backoff: {table} delay_ms={backoff_ms} \
+                 ({pressure} pressure; chunk window stays bounded)"
+            );
+            emit_event(
+                "initial_load_backoff",
+                &[
+                    ("table", EventValue::from(table)),
+                    ("delay_ms", EventValue::from(backoff_ms as i64)),
+                    ("chunk_size", EventValue::from(chunk_size)),
+                    ("pressure", EventValue::from(pressure)),
+                    ("deployment", EventValue::from(deployment_name.as_str())),
+                ],
+            );
+            if store_delay.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms.min(250))).await;
+            }
+        }
+
+        if let Some(rate) = rate_limit {
+            if !rows.is_empty() {
+                let sleep_ms = (rows.len() as u128)
+                    .saturating_mul(1000)
+                    .saturating_div(rate as u128) as u64;
+                if sleep_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                }
+            }
+        }
+
+        if chunk.exhausted {
+            println!(
+                "Initial Load complete: Base Dataset {table} ({} rows) low-watermark={wm}",
+                offset
+            );
+            emit_event(
+                "initial_load_complete",
+                &[
+                    ("table", EventValue::from(table)),
+                    ("rows", EventValue::from(offset as i64)),
+                    ("low_watermark", EventValue::from(wm.as_i64())),
+                    ("deployment", EventValue::from(deployment_name.as_str())),
+                    ("chunk_size", EventValue::from(chunk_size)),
+                ],
+            );
+            return Ok(());
+        }
+
+        if pause_after.is_some_and(|n| chunks_done >= n) {
+            persist_initial_load_pause(
+                platform_store_url,
+                deployment_name,
+                schema,
+                table,
+                &primary_key,
+                &columns,
+                &omitted_columns,
+                offset,
+                Some(wm),
+                cursor,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+}
+
+async fn initial_load_should_pause(
+    platform_store_url: &str,
+    deployment_name: &str,
+    table: &str,
+    pipelines: &[Pipeline],
+) -> Result<bool, CliError> {
+    let live = list_pipelines(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    for pipeline in pipelines {
+        if pipeline.source_table != table || pipeline.deployment_name != deployment_name {
+            // `pipelines` arg may still have deployment_name unset before persist; match by name.
+            if pipeline.source_table != table {
+                continue;
+            }
+        }
+        if let Some(stored) = live
+            .iter()
+            .find(|p| p.deployment_name == deployment_name && p.name == pipeline.name)
+        {
+            if stored.paused {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn persist_initial_load_pause(
+    platform_store_url: &str,
+    deployment_name: &str,
+    schema: &str,
+    table: &str,
+    primary_key: &[String],
+    columns: &[BaseColumn],
+    omitted_columns: &[OmittedColumn],
+    rows_loaded: usize,
+    low_watermark: Option<CapturePosition>,
+    cursor: Option<Vec<serde_json::Value>>,
+) -> Result<(), CliError> {
+    let wm = low_watermark.map(|w| w.as_i64());
+    let dataset = BaseDataset {
+        deployment_name: deployment_name.to_string(),
+        source_table: table.to_string(),
+        source_schema: schema.to_string(),
+        status: "initial_load_paused".to_string(),
+        primary_key: primary_key.to_vec(),
+        columns: columns.to_vec(),
+        omitted_columns: omitted_columns.to_vec(),
+        row_count: rows_loaded as i32,
+        sync_applied_changes: 0,
+        sync_health: "unknown".to_string(),
+        capture_low_watermark: wm,
+        capture_checkpoint: wm.map(|w| w.saturating_sub(1)),
+        sync_lag: 0,
+        source_alignment: "unknown".to_string(),
+        source_alignment_checked_rows: 0,
+        source_alignment_mismatched_rows: 0,
+        initial_load_cursor: cursor,
+    };
+    append_base_dataset_chunk(platform_store_url, &dataset, &[], rows_loaded as i32)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    println!(
+        "Initial Load paused: Base Dataset {table} ({} rows) — durable progress retained; \
+         re-run `migraloop apply` (or resume + apply) to continue without tearing down the Deployment",
+        rows_loaded
+    );
+    emit_event(
+        "initial_load_paused",
+        &[
+            ("table", EventValue::from(table)),
+            ("rows", EventValue::from(rows_loaded as i64)),
+            (
+                "low_watermark",
+                EventValue::from(wm.unwrap_or(0)),
+            ),
+            ("deployment", EventValue::from(deployment_name)),
+        ],
+    );
     Ok(())
 }
 
@@ -804,17 +1110,23 @@ async fn ensure_base_primary_key(
         return Ok(());
     }
 
+    // Metadata-only: one bounded chunk for PK — never a full-table Initial Load slam.
     let connect = oracle_source_connect(&deployment.source)?;
     let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
-    let snapshot = initial_load_for_source(
+    let chunk = initial_load_chunk_for_source(
         &connect,
         &password,
         source_schema,
         source_table,
         configured_timezone,
+        &InitialLoadChunkOptions {
+            chunk_size: 1,
+            offset: 0,
+            established_watermark: None,
+        },
     )
     .map_err(|err| CliError::Failed(err.to_string()))?;
-    if snapshot.primary_key.is_empty() {
+    if chunk.primary_key.is_empty() {
         return Err(CliError::Failed(format!(
             "Source table {source_table} has no primary key for Output Identity"
         )));
@@ -825,7 +1137,7 @@ async fn ensure_base_primary_key(
         deployment_name,
         source_schema,
         source_table,
-        &snapshot.primary_key,
+        &chunk.primary_key,
     )
     .await
     .map_err(|err| CliError::Failed(err.to_string()))?;
@@ -2194,6 +2506,7 @@ fn base_with_sync_progress(
         source_alignment: dataset.source_alignment.clone(),
         source_alignment_checked_rows: dataset.source_alignment_checked_rows,
         source_alignment_mismatched_rows: dataset.source_alignment_mismatched_rows,
+        initial_load_cursor: dataset.initial_load_cursor.clone(),
     }
 }
 
@@ -2430,6 +2743,7 @@ async fn align_one_base(
         source_alignment: alignment_status.to_string(),
         source_alignment_checked_rows: checked,
         source_alignment_mismatched_rows: mismatched,
+        initial_load_cursor: None,
     };
 
     replace_base_dataset(platform_store_url, &updated, &rows)
@@ -3569,8 +3883,22 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                 "Base Dataset: {} status={} rows={} columns=[{}] omittedUnsupported=[{}]",
                 base.source_table, base.status, base.row_count, columns, omitted
             );
-            if base.status == "initial_load_complete" {
-                println!("  Initial Load complete");
+            match base.status.as_str() {
+                "initial_load_complete" => println!("  Initial Load complete"),
+                "initial_load_in_progress" => {
+                    println!(
+                        "  Initial Load in progress (rows={} chunk cursor present={})",
+                        base.row_count,
+                        base.initial_load_cursor.is_some()
+                    );
+                }
+                "initial_load_paused" => {
+                    println!(
+                        "  Initial Load paused (rows={}; re-run apply to resume)",
+                        base.row_count
+                    );
+                }
+                _ => {}
             }
             match (base.capture_low_watermark, base.capture_checkpoint) {
                 (Some(wm), Some(cp)) => {

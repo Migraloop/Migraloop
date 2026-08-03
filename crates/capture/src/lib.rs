@@ -36,7 +36,8 @@ pub use contract_catalog::{
     ContractSourceCatalogFile, CONTRACT_SOURCE_CATALOG_ENV,
 };
 pub use oracle_source::{
-    alignment_check_read_for_source, discover_source_schema, initial_load_for_source,
+    alignment_check_read_for_source, discover_source_schema, initial_load_chunk_for_source,
+    initial_load_for_source,
 };
 pub use oracle_types::{
     aware_temporal_to_utc, classify_number, is_allow_listed_oracle_type, naive_temporal_to_utc,
@@ -170,6 +171,31 @@ pub struct InitialLoadSnapshot {
     pub primary_key: Vec<String>,
     pub columns: Vec<SourceColumn>,
     pub rows: Vec<BTreeMap<String, serde_json::Value>>,
+}
+
+/// Options for one bounded Initial Load chunk read (issue #124).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InitialLoadChunkOptions {
+    /// Maximum Source rows to read in this chunk (must be >= 1).
+    pub chunk_size: usize,
+    /// Rows already persisted — Source read skips this many PK-ordered rows.
+    pub offset: usize,
+    /// When resuming, reuse the durable low-watermark instead of reading a new SCN.
+    pub established_watermark: Option<CapturePosition>,
+}
+
+/// One bounded Initial Load chunk from the Source (never an unbounded full slam).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InitialLoadChunk {
+    pub table: String,
+    /// Low-watermark established before the first chunk (ADR-0004); stable across resume.
+    pub low_watermark: CapturePosition,
+    pub primary_key: Vec<String>,
+    pub columns: Vec<SourceColumn>,
+    pub rows: Vec<BTreeMap<String, serde_json::Value>>,
+    /// Primary-key values of the last row in this chunk (Operator-visible resume cursor).
+    pub cursor_pk: Option<Vec<serde_json::Value>>,
+    pub exhausted: bool,
 }
 
 /// Resource-gated Source sample for Source Alignment Check (issue #24).
