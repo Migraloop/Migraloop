@@ -2671,13 +2671,6 @@ impl IncrementalItem {
             Self::Schema(c) => c.position,
         }
     }
-
-    fn change_id(&self) -> &str {
-        match self {
-            Self::Row(c) => &c.change_id,
-            Self::Schema(c) => &c.change_id,
-        }
-    }
 }
 
 /// Dependency columns for Schema Change impact classification.
@@ -3690,11 +3683,10 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                         .filter(|c| unapplied_set.contains(&c.change_id))
                         .map(IncrementalItem::Schema),
                 );
-                items.sort_by(|a, b| {
-                    a.position()
-                        .cmp(&b.position())
-                        .then_with(|| a.change_id().cmp(b.change_id()))
-                });
+                // Stable sort by SCN only so same-SCN row order from LogMiner
+                // (RS_ID/SSN) is preserved — do not re-order by change_id string
+                // (op sorts before rs_id/ssn and can invert capture order).
+                items.sort_by(|a, b| a.position().cmp(&b.position()));
                 if items.len() > queue_capacity {
                     items.truncate(queue_capacity);
                 }

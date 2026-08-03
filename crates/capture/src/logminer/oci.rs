@@ -364,24 +364,19 @@ fn read_mined_contents(
 
 fn read_rs_id(row: &oracle::Row, host: &str) -> Result<String, CaptureError> {
     // Prefer textual RS_ID; fall back to hex for RAW bindings.
-    if let Ok(value) = row.get::<_, Option<String>>(4) {
-        return Ok(value.unwrap_or_default());
+    match row.get::<_, Option<String>>(4) {
+        Ok(value) => Ok(value.unwrap_or_default()),
+        Err(string_err) => match row.get::<_, Option<Vec<u8>>>(4) {
+            Ok(bytes) => Ok(bytes
+                .map(|b| {
+                    b.iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default()),
+            Err(_) => Err(map_oracle_error(host, string_err)),
+        },
     }
-    if let Ok(bytes) = row.get::<_, Option<Vec<u8>>>(4) {
-        return Ok(bytes
-            .map(|b| {
-                b.iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            })
-            .unwrap_or_default());
-    }
-    Err(map_oracle_error(
-        host,
-        row.get::<_, Option<String>>(4)
-            .err()
-            .expect("RS_ID read failed"),
-    ))
 }
 
 fn identity_from_row(
