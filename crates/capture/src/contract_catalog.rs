@@ -1,15 +1,15 @@
 //! Contract/stub Source catalog for CI and local slices.
 //!
-//! Named default fixtures keep scenario tests readable. Product discovery and
-//! Initial Load on harness hosts read this catalog as data — not a closed
-//! business-table match arm. Tests may inject additional tables via
-//! `MIGRALOOP_CONTRACT_SOURCE_CATALOG` (JSON file path).
+//! Product discovery and Initial Load on harness hosts read an **injected**
+//! catalog only (`MIGRALOOP_CONTRACT_SOURCE_CATALOG` and/or a thread-local
+//! override). Named scenario fixtures (CUSTOMERS / ORDERS / …) remain available
+//! via [`ContractSourceCatalog::with_default_fixtures`] for tests to inject —
+//! they are not loaded by the shipped product path (ADR-0026 / issue #120).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,7 @@ use crate::{
     InitialLoadSnapshot, SourceColumn,
 };
 
-/// Env var: path to a JSON file that merges/overrides harness catalog tables.
+/// Env var: path to a JSON file that lists harness catalog tables for injection.
 pub const CONTRACT_SOURCE_CATALOG_ENV: &str = "MIGRALOOP_CONTRACT_SOURCE_CATALOG";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -43,6 +43,9 @@ impl ContractSourceCatalog {
     }
 
     /// Named scenario fixtures (CUSTOMERS / ORDERS / EVENTS / ACCOUNTS).
+    ///
+    /// **Test-only helper.** The product load path does not call this — tests
+    /// must inject the result (thread override or `MIGRALOOP_CONTRACT_SOURCE_CATALOG`).
     pub fn with_default_fixtures() -> Self {
         let mut catalog = Self::empty();
         for snapshot in [
@@ -54,6 +57,13 @@ impl ContractSourceCatalog {
             catalog.insert(snapshot);
         }
         catalog
+    }
+
+    /// Serialize catalog tables for `MIGRALOOP_CONTRACT_SOURCE_CATALOG` JSON.
+    pub fn to_file(&self) -> ContractSourceCatalogFile {
+        ContractSourceCatalogFile {
+            tables: self.tables.values().cloned().collect(),
+        }
     }
 
     pub fn insert(&mut self, snapshot: InitialLoadSnapshot) {
@@ -101,13 +111,13 @@ impl ContractSourceCatalog {
 }
 
 /// Load the harness catalog: optional thread-local unit-test override, else
-/// defaults + env JSON merge.
+/// empty catalog + optional env JSON (no in-binary business fixtures).
 pub fn load_contract_source_catalog() -> Result<ContractSourceCatalog, CaptureError> {
     if let Some(override_catalog) = thread_catalog_override() {
         return Ok(override_catalog);
     }
 
-    let mut catalog = ContractSourceCatalog::with_default_fixtures();
+    let mut catalog = ContractSourceCatalog::empty();
     if let Some(path) = std::env::var_os(CONTRACT_SOURCE_CATALOG_ENV) {
         let path = Path::new(&path);
         let file = load_catalog_file(path)?;
@@ -137,17 +147,8 @@ thread_local! {
     static THREAD_CATALOG_OVERRIDE: RefCell<Option<ContractSourceCatalog>> = const { RefCell::new(None) };
 }
 
-/// Serializes tests that mutate process-global `MIGRALOOP_CONTRACT_SOURCE_CATALOG`.
-static CONTRACT_CATALOG_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
 fn thread_catalog_override() -> Option<ContractSourceCatalog> {
     THREAD_CATALOG_OVERRIDE.with(|cell| cell.borrow().clone())
-}
-
-fn lock_contract_catalog_env_for_test() -> MutexGuard<'static, ()> {
-    CONTRACT_CATALOG_ENV_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Install a thread-local catalog override (unit tests). Clear with [`clear_contract_source_catalog_override`].
@@ -185,7 +186,17 @@ mod tests {
     use super::*;
     use crate::{col, number_col};
     use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Serializes tests that mutate process-global `MIGRALOOP_CONTRACT_SOURCE_CATALOG`.
+    static CONTRACT_CATALOG_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_contract_catalog_env_for_test() -> MutexGuard<'static, ()> {
+        CONTRACT_CATALOG_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn widgets_snapshot() -> InitialLoadSnapshot {
         let mut row = BTreeMap::new();
@@ -236,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn env_catalog_file_merges_arbitrary_table_into_process_catalog() {
+    fn env_catalog_file_is_sole_process_catalog_without_named_defaults() {
         let _lock = lock_contract_catalog_env_for_test();
         clear_contract_source_catalog_override();
         let file = ContractSourceCatalogFile {
@@ -256,9 +267,22 @@ mod tests {
         std::env::remove_var(CONTRACT_SOURCE_CATALOG_ENV);
         let _ = fs::remove_file(&path);
 
-        assert!(catalog.schema("CUSTOMERS").is_ok(), "defaults retained");
+        assert!(
+            catalog.schema("CUSTOMERS").is_err(),
+            "product load path must not auto-include named fixtures"
+        );
         let widgets = catalog.initial_load("WIDGETS", None).expect("widgets");
         assert_eq!(widgets.rows[0].get("LABEL"), Some(&json!("alpha")));
+    }
+
+    #[test]
+    fn product_load_path_without_env_is_empty() {
+        let _lock = lock_contract_catalog_env_for_test();
+        clear_contract_source_catalog_override();
+        std::env::remove_var(CONTRACT_SOURCE_CATALOG_ENV);
+        let catalog = load_contract_source_catalog().expect("load");
+        assert!(catalog.table_names().is_empty());
+        assert!(catalog.schema("CUSTOMERS").is_err());
     }
 
     #[test]

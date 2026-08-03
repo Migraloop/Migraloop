@@ -3,8 +3,9 @@
 //! Incremental Capture for Oracle is LogMiner-backed (ADR-0003 / ADR-0013):
 //! contract harness for local/CI slices, OCI adapter for real Oracle hosts.
 //! Initial Load / schema discovery use the live Oracle Source on real hosts.
-//! Contract/stub hosts use [`contract_catalog`] (default named fixtures for
-//! scenario tests; injectable tables via `MIGRALOOP_CONTRACT_SOURCE_CATALOG`).
+//! Contract/stub hosts use an **injected** [`contract_catalog`] only
+//! (`MIGRALOOP_CONTRACT_SOURCE_CATALOG`); named scenario fixtures are test
+//! doubles, not a shipped product Source path (ADR-0026 / issue #120).
 
 mod contract_catalog;
 mod logminer;
@@ -16,10 +17,10 @@ mod schema_change;
 
 pub use logminer::{
     change_events_from_logminer_contents, load_injected_logminer_contents, logminer_change_id,
-    open_oracle_incremental_capture, ContractLogMiner, IncrementalCapture, LogMinerContent,
-    LogMinerInjectError, LogMinerOperation, OciLogMiner, OracleSourceConnect,
-    DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR, INJECT_LOGMINER_CONTENTS_ENV,
-    V_LOGMNR_CONTENTS_QUERY,
+    named_scenario_logminer_contents, open_oracle_incremental_capture, ContractLogMiner,
+    IncrementalCapture, LogMinerContent, LogMinerInjectError, LogMinerOperation, OciLogMiner,
+    OracleSourceConnect, DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR,
+    INJECT_LOGMINER_CONTENTS_ENV, V_LOGMNR_CONTENTS_QUERY,
 };
 
 // Re-export session helper used by the OCI adapter surface.
@@ -213,7 +214,7 @@ pub fn stub_db_timezone() -> Option<String> {
 
 /// Discover contract/stub Source schema for a table (no temporal normalization).
 ///
-/// Uses the process contract catalog (default named fixtures + optional env merge).
+/// Uses the process contract catalog (thread override and/or env inject only).
 pub fn source_schema_stub(table: &str) -> Result<Vec<SourceColumn>, CaptureError> {
     load_contract_source_catalog()?.schema(table)
 }
@@ -466,29 +467,32 @@ fn json_num(value: i64) -> serde_json::Value {
 
 /// Emit Incremental Capture changes via the LogMiner contract harness.
 ///
-/// Retained for unit-test convenience. Product CLI uses
+/// Retained for unit-test convenience. Uses the product Default path (inject
+/// only). Scenario Incremental fixtures require
+/// [`ContractLogMiner::with_default_fixtures`]. Product CLI uses
 /// [`open_oracle_incremental_capture`] so Incremental Capture is always
 /// LogMiner-backed (contract or OCI).
 pub fn incremental_changes_stub(
     table: &str,
     from_position: CapturePosition,
 ) -> Result<Vec<ChangeEvent>, CaptureError> {
-    match table {
-        "CUSTOMERS" | "ORDERS" | "EVENTS" | "ACCOUNTS" => {
-            ContractLogMiner::default().fetch_changes(table, from_position)
-        }
-        other => Err(CaptureError::UnknownTable(other.to_string())),
-    }
+    ContractLogMiner::default().fetch_changes(table, from_position)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn install_named_scenario_catalog() {
+        set_contract_source_catalog_override(ContractSourceCatalog::with_default_fixtures());
+    }
+
     #[test]
     fn initial_load_establishes_low_watermark_before_snapshot_rows() {
+        install_named_scenario_catalog();
         let snapshot =
             initial_load_stub("CUSTOMERS", None).expect("customers snapshot");
+        clear_contract_source_catalog_override();
         assert_eq!(snapshot.low_watermark, CUSTOMERS_LOW_WATERMARK);
         assert!(snapshot
             .rows
@@ -502,7 +506,8 @@ mod tests {
 
     #[test]
     fn incremental_from_low_watermark_includes_overlap_window() {
-        let changes = incremental_changes_stub("CUSTOMERS", CUSTOMERS_LOW_WATERMARK)
+        let changes = ContractLogMiner::with_default_fixtures()
+            .fetch_changes("CUSTOMERS", CUSTOMERS_LOW_WATERMARK)
             .expect("incremental from watermark");
         assert_eq!(changes.len(), 3);
         assert!(changes.iter().any(|c| c.change_id.contains("1050")));
@@ -510,14 +515,17 @@ mod tests {
 
     #[test]
     fn incremental_after_last_change_is_empty() {
-        let changes =
-            incremental_changes_stub("CUSTOMERS", CapturePosition(1071)).expect("past end");
+        let changes = ContractLogMiner::with_default_fixtures()
+            .fetch_changes("CUSTOMERS", CapturePosition(1071))
+            .expect("past end");
         assert!(changes.is_empty());
     }
 
     #[test]
     fn events_initial_load_normalizes_naive_date_with_configured_timezone() {
+        install_named_scenario_catalog();
         let snapshot = initial_load_stub("EVENTS", Some("America/New_York")).expect("events");
+        clear_contract_source_catalog_override();
         let occurred = snapshot.rows[0]
             .get("OCCURRED_AT")
             .and_then(|v| v.as_str())
@@ -532,16 +540,31 @@ mod tests {
 
     #[test]
     fn events_initial_load_fails_without_timezone_when_db_unreadable() {
+        install_named_scenario_catalog();
         std::env::remove_var("MIGRALOOP_STUB_DB_TIMEZONE");
         let err = initial_load_stub("EVENTS", None).expect_err("needs tz");
+        clear_contract_source_catalog_override();
         assert!(err.to_string().contains("timezone"));
     }
 
     #[test]
     fn blob_is_not_allow_listed() {
+        install_named_scenario_catalog();
         let snapshot = initial_load_stub("CUSTOMERS", None).unwrap();
+        clear_contract_source_catalog_override();
         let bio = snapshot.columns.iter().find(|c| c.name == "BIO").unwrap();
         assert!(!bio.supported);
         assert!(!is_allow_listed_oracle_type("BLOB", None));
+    }
+
+    #[test]
+    fn product_stub_helpers_have_no_named_fixtures_without_inject() {
+        clear_contract_source_catalog_override();
+        std::env::remove_var(CONTRACT_SOURCE_CATALOG_ENV);
+        let err = initial_load_stub("CUSTOMERS", None).expect_err("no defaults");
+        assert!(err.to_string().contains("unknown Source table"));
+        let changes = incremental_changes_stub("CUSTOMERS", CUSTOMERS_LOW_WATERMARK)
+            .expect("empty incremental ok");
+        assert!(changes.is_empty());
     }
 }

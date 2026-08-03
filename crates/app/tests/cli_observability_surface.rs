@@ -125,26 +125,40 @@ spec:
     )
 }
 
-fn write_injected_logminer_contents(dir: &TempDir, extra_rows: usize) -> PathBuf {
-    let path = dir.path().join("inject_contents.json");
-    let mut rows = Vec::new();
-    for i in 0..extra_rows {
+/// Extra CUSTOMERS inserts beyond the named-scenario fixture (for lag/poison probes).
+fn extra_logminer_backlog(count: usize) -> Vec<migraloop_capture::LogMinerContent> {
+    use migraloop_capture::{LogMinerContent, LogMinerOperation};
+    use std::collections::BTreeMap;
+
+    let mut contents = Vec::with_capacity(count);
+    for i in 0..count {
         let id = 100 + i as i64;
-        rows.push(serde_json::json!({
-            "change_id": format!("inject-{id}"),
-            "table": "CUSTOMERS",
-            "op": "insert",
-            "scn": 9000 + id,
-            "rowid": format!("AAAINJ{id:08}"),
-            "primary_key": {"ID": id},
-            "after": {"ID": id, "NAME": format!("User{id}")}
-        }));
+        let scn = 1080 + i as u64;
+        contents.push(LogMinerContent {
+            scn,
+            operation: LogMinerOperation::Insert,
+            seg_owner: "APP".to_string(),
+            table_name: "CUSTOMERS".to_string(),
+            identity: BTreeMap::from([("ID".to_string(), serde_json::json!(id))]),
+            after_image: Some(BTreeMap::from([
+                ("ID".to_string(), serde_json::json!(id)),
+                ("NAME".to_string(), serde_json::json!(format!("User{id}"))),
+                (
+                    "EMAIL".to_string(),
+                    serde_json::json!(format!("user{id}@example.com")),
+                ),
+                ("ACTIVE".to_string(), serde_json::json!(1)),
+                (
+                    "BIO".to_string(),
+                    serde_json::json!(format!("blob-bytes-{id}")),
+                ),
+            ])),
+        });
     }
-    fs::write(&path, serde_json::to_string(&rows).expect("serialize inject")).expect("write inject");
-    path
+    contents
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -155,9 +169,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -263,30 +280,31 @@ async fn observability_surface_exposes_metrics_structured_logs_and_health() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let extra = extra_logminer_backlog(20);
+    let doubles =
+        common::NamedScenarioDoubles::install_with_extra_logminer(dir.path(), &extra);
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery(&mongo_database),
     );
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     // Structured logs on Initial Load / Delivery path (apply already ran).
     // Drive Incremental with Downstream delay + poison so lag + failure counters appear.
-    let inject = write_injected_logminer_contents(&dir, 20);
     const CAPACITY: &str = "2";
 
-    let slow = Command::new(bin())
+    let mut slow = Command::new(bin());
+    slow
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env(
-            "MIGRALOOP_INJECT_LOGMINER_CONTENTS",
-            inject.to_str().unwrap(),
-        )
         .env("MIGRALOOP_SYNC_QUEUE_CAPACITY", CAPACITY)
         .env("MIGRALOOP_DELIVERY_DELAY_MS", "80")
         .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "1")
         .env("MIGRALOOP_DELIVERY_POISON_IDENTITIES", "100")
-        .env("MIGRALOOP_POISON_MAX_ATTEMPTS", "2")
+        .env("MIGRALOOP_POISON_MAX_ATTEMPTS", "2");
+    doubles.apply_env(&mut slow);
+    let slow = slow
         .args(["sync", "--platform-store-url", &url])
         .output()
         .expect("run sync under Observability Surface probes");

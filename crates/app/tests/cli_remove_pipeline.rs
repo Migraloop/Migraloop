@@ -158,7 +158,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -169,9 +169,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -181,6 +184,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -189,13 +193,17 @@ fn migrate_and_apply(url: &str, config: &Path) {
     );
 }
 
-fn run_sync(url: &str) -> String {
-    let sync = Command::new(bin())
+fn run_sync(url: &str, doubles: &common::NamedScenarioDoubles) -> String {
+    let mut sync = Command::new(bin());
+    sync
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut sync);
+    let sync = sync
         .args(["sync", "--platform-store-url", url])
         .output()
         .expect("run sync");
+
     assert!(
         sync.status.success(),
         "sync failed: stdout={} stderr={}",
@@ -322,13 +330,14 @@ async fn remove_stops_pipeline_delivery_status_inactive_deployment_remains() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &two_direct_pipelines(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let remove_out = remove_pipeline(&url, "customers");
     assert!(
@@ -365,7 +374,7 @@ async fn remove_stops_pipeline_delivery_status_inactive_deployment_remains() {
         "removed Pipeline Target retains last Delivered state, got:\n{customers_target_before_sync}"
     );
 
-    let sync_out = run_sync(&url);
+    let sync_out = run_sync(&url, &doubles);
     assert!(
         !delivery_complete_for(&sync_out, "customers"),
         "removed Pipeline must not Deliver during sync, got:\n{sync_out}"
@@ -399,13 +408,14 @@ async fn remove_keeps_shared_base_for_remaining_pipeline() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &two_pipelines_shared_customers(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let status_before = status(&url);
     assert!(
@@ -440,7 +450,7 @@ async fn remove_keeps_shared_base_for_remaining_pipeline() {
         "Shared Base rows must remain inspectable after remove, got:\n{base}"
     );
 
-    let sync_out = run_sync(&url);
+    let sync_out = run_sync(&url, &doubles);
     assert!(
         !delivery_complete_for(&sync_out, "customers"),
         "removed Pipeline must not Deliver, got:\n{sync_out}"

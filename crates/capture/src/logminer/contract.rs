@@ -4,6 +4,12 @@
 //! `V$LOGMNR_CONTENTS` after supplemental-logging reconstruction). Used when
 //! Source host is `contract` or `stub` so operator-seam tests can exercise the
 //! LogMiner product path without Instant Client.
+//!
+//! The product path loads **injected** contents only
+//! (`MIGRALOOP_INJECT_LOGMINER_CONTENTS`). Named scenario Incremental rows
+//! (CUSTOMERS / ORDERS) remain available via [`ContractLogMiner::with_default_fixtures`]
+//! for tests to inject — they are not baked into the shipped Default path
+//! (ADR-0026 / issue #120).
 
 use std::collections::BTreeMap;
 
@@ -28,15 +34,22 @@ pub struct ContractLogMiner {
 
 impl Default for ContractLogMiner {
     fn default() -> Self {
-        Self::with_default_fixtures()
+        Self::from_env_inject()
     }
 }
 
 impl ContractLogMiner {
+    /// Product / Default path: only `MIGRALOOP_INJECT_LOGMINER_CONTENTS` (empty if unset).
+    pub fn from_env_inject() -> Self {
+        let contents = load_injected_logminer_contents().unwrap_or_default();
+        Self { contents }
+    }
+
+    /// Named scenario Incremental fixtures (CUSTOMERS / ORDERS) plus optional env inject.
+    ///
+    /// **Test-only helper.** Not used by [`Default`] / the product open path.
     pub fn with_default_fixtures() -> Self {
-        let mut contents = customers_logminer_fixture();
-        contents.extend(orders_logminer_fixture());
-        // Test/Lab inject merges extra Incremental backlog (ADR-0020 / issue #26).
+        let mut contents = named_scenario_logminer_contents();
         if let Ok(extra) = load_injected_logminer_contents() {
             contents.extend(extra);
             contents.sort_by(|a, b| {
@@ -71,8 +84,8 @@ impl ContractLogMiner {
         from_position: CapturePosition,
         limit: Option<usize>,
     ) -> Result<Vec<ChangeEvent>, CaptureError> {
-        // Unknown tables yield empty incremental streams (same as prior stub for
-        // ORDERS/EVENTS/ACCOUNTS). Initial Load still owns table existence checks.
+        // Unknown tables yield empty incremental streams. Initial Load still
+        // owns table existence checks against the injected catalog.
         Ok(change_events_from_logminer_contents_limited(
             &self.contents,
             table,
@@ -98,6 +111,13 @@ impl ContractLogMiner {
         // Contract harness reuses the env-driven read-only probe (never mutates Source).
         probe_oracle_source_prerequisites_stub()
     }
+}
+
+/// Named scenario Incremental contents for tests to inject (not product Default).
+pub fn named_scenario_logminer_contents() -> Vec<LogMinerContent> {
+    let mut contents = customers_logminer_fixture();
+    contents.extend(orders_logminer_fixture());
+    contents
 }
 
 fn customers_logminer_fixture() -> Vec<LogMinerContent> {
@@ -212,8 +232,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contract_emits_overlap_window_from_low_watermark() {
+    fn default_product_path_has_no_named_scenario_incremental_rows() {
         let miner = ContractLogMiner::default();
+        let changes = miner
+            .fetch_changes("CUSTOMERS", CUSTOMERS_LOW_WATERMARK)
+            .expect("fetch");
+        assert!(
+            changes.is_empty(),
+            "Default must not bake CUSTOMERS Incremental fixtures"
+        );
+    }
+
+    #[test]
+    fn with_default_fixtures_emits_overlap_window_from_low_watermark() {
+        let miner = ContractLogMiner::with_default_fixtures();
         let changes = miner
             .fetch_changes("CUSTOMERS", CUSTOMERS_LOW_WATERMARK)
             .expect("fetch");
@@ -222,8 +254,8 @@ mod tests {
     }
 
     #[test]
-    fn contract_past_end_is_empty() {
-        let miner = ContractLogMiner::default();
+    fn with_default_fixtures_past_end_is_empty() {
+        let miner = ContractLogMiner::with_default_fixtures();
         let changes = miner
             .fetch_changes("CUSTOMERS", CapturePosition(1071))
             .expect("fetch");

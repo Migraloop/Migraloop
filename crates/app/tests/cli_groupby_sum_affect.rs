@@ -113,7 +113,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) -> String {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> String {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -124,9 +124,12 @@ fn migrate_and_apply(url: &str, config: &Path) -> String {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -136,6 +139,7 @@ fn migrate_and_apply(url: &str, config: &Path) -> String {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -147,23 +151,31 @@ fn migrate_and_apply(url: &str, config: &Path) -> String {
     out
 }
 
-fn run_sync(url: &str) -> std::process::Output {
-    Command::new(bin())
+fn run_sync(url: &str, doubles: &common::NamedScenarioDoubles) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut cmd);
+    cmd
         .args(["sync", "--platform-store-url", url])
         .output()
         .expect("run sync")
+
 }
 
-fn run_sync_fail_after(url: &str, after: u32) -> std::process::Output {
-    Command::new(bin())
+fn run_sync_fail_after(url: &str, after: u32, doubles: &common::NamedScenarioDoubles) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", after.to_string())
+        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", after.to_string());
+    doubles.apply_env(&mut cmd);
+    cmd
         .args(["sync", "--platform-store-url", url])
         .output()
         .expect("run sync with fail-after")
+
 }
 
 fn delivery_applied_changes(status_out: &str, pipeline: &str) -> Option<i32> {
@@ -269,13 +281,14 @@ async fn groupby_sum_affect_analysis_skips_unused_and_updates_affected_identitie
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &order_totals_deployment(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     // Initial Load: customer 1 sum=52.50 (42.50+10.00), customer 2 sum=5.00.
     let derived_initial = derived_stdout(&url);
@@ -304,7 +317,7 @@ async fn groupby_sum_affect_analysis_skips_unused_and_updates_affected_identitie
     );
 
     // Change 1 (ORDERS SCN 510): ADDRESS-only update on order 100 — unused by sum(AMOUNT).
-    let sync_unused = run_sync_fail_after(&url, 1);
+    let sync_unused = run_sync_fail_after(&url, 1, &doubles);
     let unused_out = format!(
         "{}{}",
         String::from_utf8_lossy(&sync_unused.stdout),
@@ -332,7 +345,7 @@ async fn groupby_sum_affect_analysis_skips_unused_and_updates_affected_identitie
 
     // Change 2 (ORDERS SCN 520): AMOUNT update on order 100 → customer 1 sum becomes 60.00.
     // fail_after=1 so later SCN 530 group-key move stays for issue #18 coverage.
-    let sync_used = run_sync_fail_after(&url, 1);
+    let sync_used = run_sync_fail_after(&url, 1, &doubles);
     let used_out = format!(
         "{}{}",
         String::from_utf8_lossy(&sync_used.stdout),
@@ -385,17 +398,18 @@ async fn groupby_key_change_updates_old_and_new_output_identities() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &order_totals_deployment(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     // Advance past ADDRESS (510) + AMOUNT (520); leave SCN 530 for the group-key move.
-    let _ = run_sync_fail_after(&url, 1);
-    let _ = run_sync_fail_after(&url, 1);
+    let _ = run_sync_fail_after(&url, 1, &doubles);
+    let _ = run_sync_fail_after(&url, 1, &doubles);
 
     let derived_before = derived_stdout(&url);
     assert!(
@@ -414,7 +428,7 @@ async fn groupby_key_change_updates_old_and_new_output_identities() {
     );
 
     // Change 3 (ORDERS SCN 530): order 200 CUSTOMER_ID 2 → 3 (group key change).
-    let sync_key = run_sync(&url);
+    let sync_key = run_sync(&url, &doubles);
     assert!(
         sync_key.status.success(),
         "sync after group-key change failed: stdout={} stderr={}",

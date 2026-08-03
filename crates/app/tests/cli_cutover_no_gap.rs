@@ -105,7 +105,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) -> std::process::Output {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) -> std::process::Output {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -116,9 +116,12 @@ fn migrate_and_apply(url: &str, config: &Path) -> std::process::Output {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    Command::new(bin())
+    let mut cmd = Command::new(bin());
+    cmd
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut cmd);
+    cmd
         .args([
             "apply",
             "--platform-store-url",
@@ -128,15 +131,20 @@ fn migrate_and_apply(url: &str, config: &Path) -> std::process::Output {
         ])
         .output()
         .expect("run apply")
+
 }
 
-fn run_sync(url: &str) -> std::process::Output {
-    Command::new(bin())
+fn run_sync(url: &str, doubles: &common::NamedScenarioDoubles) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut cmd);
+    cmd
         .args(["sync", "--platform-store-url", url])
         .output()
         .expect("run sync")
+
 }
 
 #[tokio::test]
@@ -144,13 +152,14 @@ async fn cutover_establishes_low_watermark_and_loses_no_source_changes() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
     );
 
-    let apply = migrate_and_apply(&url, &config);
+    let apply = migrate_and_apply(&url, &config, &doubles);
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -186,7 +195,7 @@ async fn cutover_establishes_low_watermark_and_loses_no_source_changes() {
         "Base inspect must surface cutover low-watermark, got:\n{before}"
     );
 
-    let sync = run_sync(&url);
+    let sync = run_sync(&url, &doubles);
     assert!(
         sync.status.success(),
         "sync failed: stdout={} stderr={}",
@@ -241,16 +250,17 @@ async fn overlapping_cutover_changes_are_idempotent_on_reapply() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
     );
 
-    let apply = migrate_and_apply(&url, &config);
+    let apply = migrate_and_apply(&url, &config, &doubles);
     assert!(apply.status.success());
 
-    let sync1 = run_sync(&url);
+    let sync1 = run_sync(&url, &doubles);
     assert!(
         sync1.status.success(),
         "first sync failed: stdout={} stderr={}",
@@ -273,7 +283,7 @@ async fn overlapping_cutover_changes_are_idempotent_on_reapply() {
     let first_status = String::from_utf8_lossy(&status_after_first.stdout).to_string();
 
     // Re-run sync: overlapping/replayed change_ids must not corrupt Base/Target.
-    let sync2 = run_sync(&url);
+    let sync2 = run_sync(&url, &doubles);
     assert!(
         sync2.status.success(),
         "second sync (overlap reapply) failed: stdout={} stderr={}",
@@ -363,13 +373,14 @@ async fn incremental_without_low_watermark_is_rejected() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
     );
 
-    let apply = migrate_and_apply(&url, &config);
+    let apply = migrate_and_apply(&url, &config, &doubles);
     assert!(apply.status.success());
 
     // Simulate a Base Dataset that somehow completed a snapshot without cutover watermark
@@ -391,7 +402,7 @@ async fn incremental_without_low_watermark_is_rejected() {
     .await
     .expect("clear cutover watermark for reject fixture");
 
-    let sync = run_sync(&url);
+    let sync = run_sync(&url, &doubles);
     assert!(
         !sync.status.success(),
         "Incremental without low-watermark overlap must be rejected, but sync succeeded:\n{}",

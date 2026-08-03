@@ -114,7 +114,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -125,9 +125,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -137,6 +140,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -202,13 +206,14 @@ async fn align_detects_mismatch_repairs_base_without_writing_source() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     // Controlled Base≠Source mismatch: corrupt Base only; Source catalog stays Alice.
     corrupt_base_customer_name(&url, 1, "WRONG").await;
@@ -224,9 +229,12 @@ async fn align_detects_mismatch_repairs_base_without_writing_source() {
         "Base must show controlled mismatch before align:\n{before_out}"
     );
 
-    let align = Command::new(bin())
+    let mut align = Command::new(bin());
+    align
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut align);
+    let align = align
         .args([
             "align",
             "--platform-store-url",
@@ -236,6 +244,7 @@ async fn align_detects_mismatch_repairs_base_without_writing_source() {
         ])
         .output()
         .expect("run align");
+
     let align_out = format!(
         "{}{}",
         String::from_utf8_lossy(&align.stdout),
@@ -269,8 +278,11 @@ async fn align_detects_mismatch_repairs_base_without_writing_source() {
     );
 
     // Re-align: Source catalog still Alice (never written); no further mismatches.
-    let align2 = Command::new(bin())
-        .env("ORACLE_PASSWORD", "oracle-secret-value")
+    let mut align2 = Command::new(bin());
+    align2
+        .env("ORACLE_PASSWORD", "oracle-secret-value");
+    doubles.apply_env(&mut align2);
+    let align2 = align2
         .args([
             "align",
             "--platform-store-url",
@@ -280,6 +292,7 @@ async fn align_detects_mismatch_repairs_base_without_writing_source() {
         ])
         .output()
         .expect("run align second time");
+
     let align2_out = format!(
         "{}{}",
         String::from_utf8_lossy(&align2.stdout),
@@ -310,20 +323,24 @@ async fn align_is_resource_gated_by_max_rows_not_full_slam() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     // Corrupt Bob (ID=2). With max-rows=1 the check reads only the first Source
     // row (Alice/ID=1) and must not slam/repair the rest of the Base.
     corrupt_base_customer_name(&url, 2, "CORRUPT_BOB").await;
 
-    let align_gated = Command::new(bin())
-        .env("ORACLE_PASSWORD", "oracle-secret-value")
+    let mut align_gated = Command::new(bin());
+    align_gated
+        .env("ORACLE_PASSWORD", "oracle-secret-value");
+    doubles.apply_env(&mut align_gated);
+    let align_gated = align_gated
         .args([
             "align",
             "--platform-store-url",
@@ -335,6 +352,7 @@ async fn align_is_resource_gated_by_max_rows_not_full_slam() {
         ])
         .output()
         .expect("run gated align");
+
     let gated_out = format!(
         "{}{}",
         String::from_utf8_lossy(&align_gated.stdout),
@@ -362,8 +380,11 @@ async fn align_is_resource_gated_by_max_rows_not_full_slam() {
         "max-rows=1 must not full-slam repair Bob:\n{gated_base}"
     );
 
-    let align_full = Command::new(bin())
-        .env("ORACLE_PASSWORD", "oracle-secret-value")
+    let mut align_full = Command::new(bin());
+    align_full
+        .env("ORACLE_PASSWORD", "oracle-secret-value");
+    doubles.apply_env(&mut align_full);
+    let align_full = align_full
         .args([
             "align",
             "--platform-store-url",
@@ -375,6 +396,7 @@ async fn align_is_resource_gated_by_max_rows_not_full_slam() {
         ])
         .output()
         .expect("run full-budget align");
+
     let full_out = format!(
         "{}{}",
         String::from_utf8_lossy(&align_full.stdout),

@@ -104,7 +104,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -115,9 +115,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -127,6 +130,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -140,13 +144,14 @@ async fn after_initial_load_mongo_documents_exist_with_output_identity_from_sour
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let status = Command::new(bin())
         .args(["status", "--platform-store-url", &url])
@@ -235,6 +240,7 @@ async fn managed_field_upsert_preserves_non_managed_target_fields() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
@@ -248,7 +254,7 @@ async fn managed_field_upsert_preserves_non_managed_target_fields() {
         r#"{"_id": 1, "NAME": "Stale", "EMAIL": "stale@example.com", "ACTIVE": 0, "EXTRA": "keep-me"}"#,
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let target = Command::new(bin())
         .env("MONGO_PASSWORD", "mongo-secret-value")
@@ -293,6 +299,7 @@ async fn existing_base_without_target_can_later_deliver_with_output_identity() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
 
     let base_only = write_config(
         &dir,
@@ -330,7 +337,7 @@ spec:
             port = mongo_port(),
         ),
     );
-    migrate_and_apply(&url, &base_only);
+    migrate_and_apply(&url, &base_only, &doubles);
 
     // Simulate a pre-Delivery Base (migration default / older slice) with empty PK metadata.
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -350,9 +357,12 @@ spec:
         "with-delivery.yaml",
         &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
     );
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -362,6 +372,7 @@ spec:
         ])
         .output()
         .expect("re-apply with Target Binding");
+
     assert!(
         apply.status.success(),
         "Delivery apply after existing Base failed: stdout={} stderr={}",
@@ -403,13 +414,14 @@ async fn new_identities_insert_identity_and_managed_fields_only() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery("CUSTOMERS", "customers", &mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     let target = Command::new(bin())
         .env("MONGO_PASSWORD", "mongo-secret-value")

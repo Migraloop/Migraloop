@@ -114,7 +114,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -125,9 +125,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -137,6 +140,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -145,9 +149,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
     );
 }
 
-fn align_base(url: &str) {
-    let align = Command::new(bin())
-        .env("ORACLE_PASSWORD", "oracle-secret-value")
+fn align_base(url: &str, doubles: &common::NamedScenarioDoubles) {
+    let mut align = Command::new(bin());
+    align
+        .env("ORACLE_PASSWORD", "oracle-secret-value");
+    doubles.apply_env(&mut align);
+    let align = align
         .args([
             "align",
             "--platform-store-url",
@@ -157,6 +164,7 @@ fn align_base(url: &str) {
         ])
         .output()
         .expect("run align");
+
     let align_out = format!(
         "{}{}",
         String::from_utf8_lossy(&align.stdout),
@@ -208,15 +216,16 @@ async fn drift_detects_managed_mismatch_repairs_without_touching_non_managed() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
     // Domain: Drift baseline requires Source Alignment for Bases.
-    align_base(&url);
+    align_base(&url, &doubles);
 
     drift_target_document(&mongo_database);
 
@@ -242,9 +251,12 @@ async fn drift_detects_managed_mismatch_repairs_without_touching_non_managed() {
         "non-Managed EXTRA must be present before repair:\n{before_out}"
     );
 
-    let drift = Command::new(bin())
+    let mut drift = Command::new(bin());
+    drift
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut drift);
+    let drift = drift
         .args([
             "drift",
             "--platform-store-url",
@@ -254,6 +266,7 @@ async fn drift_detects_managed_mismatch_repairs_without_touching_non_managed() {
         ])
         .output()
         .expect("run drift");
+
     let drift_out = format!(
         "{}{}",
         String::from_utf8_lossy(&drift.stdout),
@@ -336,14 +349,15 @@ async fn drift_is_resource_gated_by_max_rows_not_full_slam() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
-    align_base(&url);
+    migrate_and_apply(&url, &config, &doubles);
+    align_base(&url, &doubles);
 
     // Drift Bob (ID=2). With max-rows=1 the check only inspects the first
     // expected identity (Alice/ID=1) and must not slam/repair Bob.

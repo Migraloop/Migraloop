@@ -113,7 +113,7 @@ spec:
     )
 }
 
-fn migrate_and_apply(url: &str, config: &Path) {
+fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDoubles) {
     let migrate = Command::new(bin())
         .args(["migrate", "--platform-store-url", url])
         .output()
@@ -124,9 +124,12 @@ fn migrate_and_apply(url: &str, config: &Path) {
         String::from_utf8_lossy(&migrate.stderr)
     );
 
-    let apply = Command::new(bin())
+    let mut apply = Command::new(bin());
+    apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
+    doubles.apply_env(&mut apply);
+    let apply = apply
         .args([
             "apply",
             "--platform-store-url",
@@ -136,6 +139,7 @@ fn migrate_and_apply(url: &str, config: &Path) {
         ])
         .output()
         .expect("run apply");
+
     assert!(
         apply.status.success(),
         "apply failed: stdout={} stderr={}",
@@ -149,25 +153,30 @@ async fn poison_identity_is_quarantined_pipeline_continues_status_unhealthy() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
     let config = write_config(
         &dir,
         "deployment.yaml",
         &deployment_with_direct_delivery(&mongo_database),
     );
 
-    migrate_and_apply(&url, &config);
+    migrate_and_apply(&url, &config, &doubles);
 
     // Contract Incremental batch: update identity 1 (Alice→Alicia), insert 3 (Carol),
     // delete 2 (Bob). Poison only identity 1 Delivery so the Pipeline must quarantine
     // that key and still Deliver the other identities.
-    let sync = Command::new(bin())
+    let mut sync = Command::new(bin());
+    sync
         .env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
         .env("MIGRALOOP_DELIVERY_POISON_IDENTITIES", "1")
-        .env("MIGRALOOP_POISON_MAX_ATTEMPTS", "2")
+        .env("MIGRALOOP_POISON_MAX_ATTEMPTS", "2");
+    doubles.apply_env(&mut sync);
+    let sync = sync
         .args(["sync", "--platform-store-url", &url])
         .output()
         .expect("run sync");
+
     assert!(
         sync.status.success(),
         "sync must succeed after quarantine (Pipeline continues): stdout={} stderr={}",
