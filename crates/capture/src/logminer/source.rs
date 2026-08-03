@@ -1,20 +1,16 @@
 //! Pluggable Oracle Incremental Capture backends behind LogMiner (ADR-0003).
 
+use migraloop_types::TlsSettings;
+
 use crate::oracle_prerequisites::OracleSourcePrerequisiteState;
 use crate::{CaptureError, CapturePosition, ChangeEvent};
 
 use super::contract::ContractLogMiner;
 use super::oci::OciLogMiner;
 
-/// Non-secret TLS settings for an Oracle Source connection (ADR-0017).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct OracleTlsSettings {
-    pub enabled: bool,
-    /// Instant Client wallet directory (`MY_WALLET_DIRECTORY`).
-    pub wallet_location: String,
-    /// When true, set `SSL_SERVER_DN_MATCH=no` (dev/lab only).
-    pub insecure_skip_verify: bool,
-}
+/// Expand-contract leftover alias — prefer [`TlsSettings`] on the apply path.
+#[deprecated(note = "use migraloop_types::TlsSettings — temporary expand-contract leftover")]
+pub type OracleTlsSettings = TlsSettings;
 
 /// Non-secret Oracle Source connection identity used to select a capture backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +19,8 @@ pub struct OracleSourceConnect {
     pub port: u16,
     pub database: String,
     pub username: String,
-    pub tls: OracleTlsSettings,
+    /// Shared TLS settings; Oracle wire adapters use `wallet_location` / DN match.
+    pub tls: TlsSettings,
 }
 
 impl OracleSourceConnect {

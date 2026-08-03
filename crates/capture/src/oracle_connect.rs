@@ -100,7 +100,7 @@ fn map_oracle_connect_error(host: &str, tls_enabled: bool, err: oracle::Error) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logminer::OracleTlsSettings;
+    use migraloop_types::TlsSettings;
 
     fn base_source() -> OracleSourceConnect {
         OracleSourceConnect {
@@ -108,7 +108,7 @@ mod tests {
             port: 1521,
             database: "FREEPDB1".into(),
             username: "sync_user".into(),
-            tls: OracleTlsSettings::default(),
+            tls: TlsSettings::default(),
         }
     }
 
@@ -122,8 +122,9 @@ mod tests {
     fn connect_string_uses_tcps_description_when_tls_enabled() {
         let mut source = base_source();
         source.port = 2484;
-        source.tls = OracleTlsSettings {
+        source.tls = TlsSettings {
             enabled: true,
+            ca_file: String::new(),
             wallet_location: "/etc/oracle/wallet".into(),
             insecure_skip_verify: false,
         };
@@ -140,8 +141,9 @@ mod tests {
     #[test]
     fn tls_insecure_skip_verify_disables_dn_match() {
         let mut source = base_source();
-        source.tls = OracleTlsSettings {
+        source.tls = TlsSettings {
             enabled: true,
+            ca_file: String::new(),
             wallet_location: String::new(),
             insecure_skip_verify: true,
         };

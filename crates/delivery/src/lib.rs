@@ -13,11 +13,18 @@ use std::time::Duration;
 
 use bson::{doc, Bson, Document};
 use chrono::{DateTime, Utc};
+use migraloop_types::TlsSettings;
 use mongodb::options::{ClientOptions, Tls, TlsOptions, UpdateOptions};
 use mongodb::{Client, Collection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+pub use migraloop_types::ManagedFieldAs;
+
+/// Expand-contract leftover alias — prefer [`TlsSettings`] on the apply path.
+#[deprecated(note = "use migraloop_types::TlsSettings — temporary expand-contract leftover")]
+pub type MongoTlsSettings = TlsSettings;
 
 /// Module seam marker retained by the single app binary.
 pub const SEAM: &str = "delivery";
@@ -73,16 +80,6 @@ pub enum DeliveryError {
     Conversion { field: String, reason: String },
 }
 
-/// Non-secret TLS settings for Mongo Target Delivery (ADR-0017).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MongoTlsSettings {
-    pub enabled: bool,
-    /// Path to CA certificate (`tlsCAFile`). Empty uses driver root store.
-    pub ca_file: String,
-    /// When true, allow invalid certificates (dev/lab only).
-    pub insecure_skip_verify: bool,
-}
-
 /// Non-secret Target System connection used for Mongo Delivery.
 #[derive(Debug, Clone)]
 pub struct MongoTargetConnection {
@@ -91,38 +88,8 @@ pub struct MongoTargetConnection {
     pub database: String,
     pub username: String,
     pub password: String,
-    pub tls: MongoTlsSettings,
-}
-
-/// How a Managed field is mapped for Delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ManagedFieldAs {
-    /// Default schema-driven mapping.
-    Default,
-    /// Explicit string map (required for unsafe NUMBER).
-    String,
-    /// Remove from Managed output (not delivered).
-    Omit,
-}
-
-impl ManagedFieldAs {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "default" => Some(Self::Default),
-            "string" => Some(Self::String),
-            "omit" => Some(Self::Omit),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::String => "string",
-            Self::Omit => "omit",
-        }
-    }
+    /// Shared TLS settings; Mongo wire adapters use `ca_file` / skip-verify.
+    pub tls: TlsSettings,
 }
 
 /// Column schema used for schema-driven BSON conversion.
@@ -160,8 +127,8 @@ fn build_uri(target: &MongoTargetConnection) -> String {
     )
 }
 
-/// Build Mongo `Tls` options when Target TLS is enabled (unit-test seam).
-pub fn mongo_tls_options(tls: &MongoTlsSettings) -> Option<Tls> {
+/// Build Mongo `Tls` options when Target TLS is enabled (thin wire adapter).
+pub fn mongo_tls_options(tls: &TlsSettings) -> Option<Tls> {
     if !tls.enabled {
         return None;
     }
@@ -552,15 +519,16 @@ mod tests {
 
     #[test]
     fn mongo_tls_options_none_when_disabled() {
-        let tls = MongoTlsSettings::default();
+        let tls = TlsSettings::default();
         assert!(mongo_tls_options(&tls).is_none());
     }
 
     #[test]
     fn mongo_tls_options_enabled_with_ca_file() {
-        let tls = MongoTlsSettings {
+        let tls = TlsSettings {
             enabled: true,
             ca_file: "/etc/certs/mongo-ca.pem".into(),
+            wallet_location: String::new(),
             insecure_skip_verify: false,
         };
         match mongo_tls_options(&tls) {

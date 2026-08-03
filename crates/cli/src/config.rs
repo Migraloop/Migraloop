@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use migraloop_types::{resolve_secret_ref, SecretRef, SecretRefKind, TlsSettings};
 use serde::Deserialize;
 
 use crate::CliError;
@@ -187,30 +188,28 @@ impl PasswordField {
 
     /// Resolve a secret reference from env, a mounted file, or a Docker secret.
     /// Returns the secret value only for validation; callers must not persist it.
+    ///
+    /// Uses the shared [`resolve_secret_ref`] path so config parse and runtime apply
+    /// do not fork PasswordField / SecretRef logic.
     pub fn resolve(&self, field: &str) -> Result<String, CliError> {
-        match self.resolved_ref(field)? {
-            ResolvedSecretRef::Env(name) => std::env::var(&name).map_err(|_| {
-                CliError::Failed(format!(
-                    "unresolvable secret reference: {field} fromEnv {name} is missing"
-                ))
-            }),
-            ResolvedSecretRef::File(path) => {
-                let contents = fs::read_to_string(&path).map_err(|err| {
-                    CliError::Failed(format!(
-                        "unresolvable secret reference: {field} {}: {err}",
-                        path.display()
-                    ))
-                })?;
-                let trimmed = contents.trim_end_matches(['\n', '\r']).to_string();
-                if trimmed.is_empty() {
-                    return Err(CliError::Failed(format!(
-                        "unresolvable secret reference: {field} {} is empty",
-                        path.display()
-                    )));
-                }
-                Ok(trimmed)
-            }
-        }
+        let reference = secret_ref_from_resolved(self.resolved_ref(field)?);
+        resolve_secret_ref(&reference, field).map_err(|err| CliError::Failed(err.to_string()))
+    }
+}
+
+/// Collapse config wire resolution (`ResolvedSecretRef`) into the shared [`SecretRef`].
+///
+/// Docker secrets are already file paths here; store persistence never sees a third kind.
+pub fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
+    match resolved {
+        ResolvedSecretRef::Env(name) => SecretRef {
+            kind: SecretRefKind::Env,
+            value: name,
+        },
+        ResolvedSecretRef::File(path) => SecretRef {
+            kind: SecretRefKind::File,
+            value: path.display().to_string(),
+        },
     }
 }
 
@@ -610,13 +609,13 @@ fn validate_tls_spec(system: &str, spec: &SystemSpec) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Resolve TLS settings from config and verify referenced paths exist when enabled.
+/// Resolve TLS settings from config wire (`TlsSpec`) into the shared [`TlsSettings`].
 pub fn resolve_tls_settings(
     field_prefix: &str,
     tls: Option<&TlsSpec>,
-) -> Result<migraloop_platform_store::TlsSettings, CliError> {
+) -> Result<TlsSettings, CliError> {
     let Some(tls) = tls else {
-        return Ok(migraloop_platform_store::TlsSettings::default());
+        return Ok(TlsSettings::default());
     };
     let ca_file = tls
         .ca_file
@@ -655,7 +654,7 @@ pub fn resolve_tls_settings(
         }
     }
 
-    Ok(migraloop_platform_store::TlsSettings {
+    Ok(TlsSettings {
         enabled: tls.enabled,
         ca_file,
         wallet_location,
