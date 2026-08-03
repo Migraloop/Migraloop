@@ -82,7 +82,7 @@ Lab Scenario `platform-store-guardrails` 可在可拋棄 Fixture 上演練隨附
 
 - Platform Store schema 變更以啟動時套用的版本化 migrations 出貨（`migraloop run` / `migraloop migrate`）
 - 較新的 app 必須能繼續既有 Deployments 與可接受的舊設定，而不是 wipe-and-rebuild
-- Deployment config `apiVersion` 在 major `1` 上為 SemVer-compatible：正式寫法 `migraloop.dev/v1`，較舊可接受形式如 `migraloop.dev/v1.0` / `migraloop.dev/v1.0.0` 仍可套用；不相容 major 會以清楚錯誤拒絕
+- Deployment config `apiVersion` 在 major `1` 上為 SemVer 較舊或相等：正式寫法 `migraloop.dev/v1`，較舊可接受形式如 `migraloop.dev/v1.0` / `migraloop.dev/v1.0.0` 仍可套用；較新 minor/patch 與不相容 major 會以清楚錯誤拒絕
 - 單 instance 升級期間允許短暫 sync pause；不得遺失 checkpoint/資料
 - v1 不要求支援 downgrade
 

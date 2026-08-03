@@ -4787,11 +4787,10 @@ deployment={BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"
             "store must stay healthy after upgrade migrate:\n{status_after_migrate}"
         )));
     }
-    if !status_after_migrate.contains(schema_line.trim())
-        && !status_after_migrate.contains("Schema version:")
-    {
+    if !status_after_migrate.contains(schema_line.trim()) {
         return Err(CliError::Failed(format!(
-            "Schema version must remain visible after upgrade migrate:\n{status_after_migrate}"
+            "Schema version must remain at latest after upgrade migrate \
+             (expected `{schema_line}`):\n{status_after_migrate}"
         )));
     }
     if !status_after_migrate

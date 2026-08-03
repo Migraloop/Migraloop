@@ -239,7 +239,7 @@ Env names and defaults for the in-process LogMiner harness live in [Source Syste
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `apiVersion` | yes | `migraloop.dev/v1` (SemVer-compatible major 1 also accepts `migraloop.dev/v1.0` / `migraloop.dev/v1.0.0`; incompatible majors rejected) |
+| `apiVersion` | yes | `migraloop.dev/v1` (SemVer older-or-equal within major 1: also accepts `migraloop.dev/v1.0` / `migraloop.dev/v1.0.0`; newer minors/patches and other majors rejected) |
 | `kind` | yes | `Deployment` |
 | `metadata.name` | yes | Non-empty Deployment name |
 | `spec.source` | yes | See below |

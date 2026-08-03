@@ -239,7 +239,7 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 
 | 字段 | 必要 | 说明 |
 | --- | --- | --- |
-| `apiVersion` | 是 | `migraloop.dev/v1`（SemVer-compatible major 1 也接受 `migraloop.dev/v1.0` / `migraloop.dev/v1.0.0`；不相容 major 会被拒绝） |
+| `apiVersion` | 是 | `migraloop.dev/v1`（major 1 内 SemVer 较旧或相等：也接受 `migraloop.dev/v1.0` / `migraloop.dev/v1.0.0`；较新 minor/patch 与其他 major 会被拒绝） |
 | `kind` | 是 | `Deployment` |
 | `metadata.name` | 是 | 非空 Deployment 名称 |
 | `spec.source` | 是 | 见下 |

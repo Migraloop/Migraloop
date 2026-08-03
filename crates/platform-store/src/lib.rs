@@ -289,9 +289,10 @@ pub async fn migrate(database_url: &str) -> Result<(), PlatformStoreError> {
 
 /// Apply only migrations with version `<= through_version` (inclusive).
 ///
-/// Used to seed a prior-release Platform Store schema for upgrade-smoke tests /
-/// Lab verification. Production operators use [`migrate`] (or `migraloop run`),
+/// Upgrade-smoke / CI helper for seeding a prior-release Platform Store schema.
+/// Production operators use [`migrate`] (or `migraloop run` / `migraloop migrate`),
 /// which always applies every pending migration.
+#[doc(hidden)]
 pub async fn migrate_through(
     database_url: &str,
     through_version: i64,

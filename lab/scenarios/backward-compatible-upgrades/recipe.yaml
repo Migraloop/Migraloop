@@ -17,9 +17,11 @@ workload:
     - prepare Scenario Namespace table + seed + table-level supplemental logging
     - apply Deployment via real product path (Initial Load + Delivery)
     - note Schema version / Base rows via status
-    - run migraloop migrate (upgrade path) and confirm Schema version + Deployment preserved
+    - run migraloop migrate (operator upgrade path) and confirm Schema version + Deployment preserved
     - apply older SemVer-compatible config (apiVersion migraloop.dev/v1.0.0)
     - assert no Initial Load rebuild; Base/Target data remain
+    # Prior-release schema → latest migrate is covered by the non-ignored CI twin
+    # (cli_backward_compatible_upgrades); Lab Fixture store is already current.
 checks:
   correctness:
     - "migrate after an existing Deployment leaves Platform Store healthy at latest schema"

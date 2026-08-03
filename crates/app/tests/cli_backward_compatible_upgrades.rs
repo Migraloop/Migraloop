@@ -78,11 +78,10 @@ fn unique_mongo_database() -> String {
     format!("appdb_{suffix}")
 }
 
-/// Older SemVer-compatible config shape (prior accepted apiVersion form).
-fn older_compatible_deployment(mongo_database: &str) -> String {
+fn deployment_with_api_version(api_version: &str, mongo_database: &str) -> String {
     format!(
         r#"
-apiVersion: migraloop.dev/v1.0.0
+apiVersion: {api_version}
 kind: Deployment
 metadata:
   name: oracle-to-mongo
@@ -116,41 +115,13 @@ spec:
     )
 }
 
+/// Older SemVer-compatible config shape (prior accepted apiVersion form).
+fn older_compatible_deployment(mongo_database: &str) -> String {
+    deployment_with_api_version("migraloop.dev/v1.0.0", mongo_database)
+}
+
 fn current_deployment(mongo_database: &str) -> String {
-    format!(
-        r#"
-apiVersion: migraloop.dev/v1
-kind: Deployment
-metadata:
-  name: oracle-to-mongo
-spec:
-  source:
-    kind: oracle
-    host: stub
-    port: 1521
-    database: STUB
-    username: sync_user
-    password:
-      fromEnv: ORACLE_PASSWORD
-  target:
-    kind: mongodb
-    host: {host}
-    port: {port}
-    database: {mongo_database}
-    username: deliver_user
-    password:
-      fromEnv: MONGO_PASSWORD
-  pipelines:
-    - name: customers
-      mode: direct
-      source:
-        table: CUSTOMERS
-      target:
-        collection: customers
-"#,
-        host = mongo_host(),
-        port = mongo_port(),
-    )
+    deployment_with_api_version("migraloop.dev/v1", mongo_database)
 }
 
 /// Seed Deployment + Pipeline + Base rows at the prior-release schema cut.
@@ -391,38 +362,15 @@ async fn older_semver_compatible_config_still_applies_after_upgrade() {
     );
 }
 
-#[tokio::test]
-async fn incompatible_config_major_is_rejected() {
+async fn assert_apply_rejects_api_version(api_version: &str, must_mention: &str) {
     let url = ephemeral_database_url().await;
     let dir = TempDir::new().expect("tempdir");
     migrate_cli(&url);
 
     let bad = write_config(
         &dir,
-        "v2.yaml",
-        r#"
-apiVersion: migraloop.dev/v2
-kind: Deployment
-metadata:
-  name: oracle-to-mongo
-spec:
-  source:
-    kind: oracle
-    host: stub
-    port: 1521
-    database: STUB
-    username: sync_user
-    password:
-      fromEnv: ORACLE_PASSWORD
-  target:
-    kind: mongodb
-    host: 127.0.0.1
-    port: 27017
-    database: unused
-    username: deliver_user
-    password:
-      fromEnv: MONGO_PASSWORD
-"#,
+        "bad.yaml",
+        &deployment_with_api_version(api_version, "unused"),
     );
 
     let apply = Command::new(bin())
@@ -439,7 +387,7 @@ spec:
         .expect("run apply");
     assert!(
         !apply.status.success(),
-        "incompatible major must fail apply"
+        "apiVersion {api_version} must fail apply"
     );
     let combined = format!(
         "{}{}",
@@ -447,9 +395,20 @@ spec:
         String::from_utf8_lossy(&apply.stderr)
     );
     assert!(
-        combined.contains("unsupported apiVersion") && combined.contains("v2"),
-        "expected clear incompatible-major error, got:\n{combined}"
+        combined.contains("unsupported apiVersion") && combined.contains(must_mention),
+        "expected clear unsupported-apiVersion error mentioning {must_mention}, got:\n{combined}"
     );
+}
+
+#[tokio::test]
+async fn incompatible_config_major_is_rejected() {
+    assert_apply_rejects_api_version("migraloop.dev/v2", "v2").await;
+}
+
+#[tokio::test]
+async fn newer_same_major_config_is_rejected() {
+    // Forward minors within major 1 are not silently accepted (older-or-equal only).
+    assert_apply_rejects_api_version("migraloop.dev/v1.1.0", "v1.1.0").await;
 }
 
 #[tokio::test]

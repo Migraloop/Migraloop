@@ -9,8 +9,9 @@ use crate::CliError;
 
 /// Canonical apiVersion for the current config major line.
 const SUPPORTED_API_VERSION: &str = "migraloop.dev/v1";
-/// SemVer major accepted by this app (ADR-0014: older compatible configs still apply).
-const ACCEPTED_CONFIG_MAJOR: u64 = 1;
+/// Current config SemVer this binary authors/understands (ADR-0014).
+/// Older same-major forms (`v1.0`, `v1.0.0`) still apply; newer minors/patches do not.
+const CURRENT_CONFIG_VERSION: (u64, u64, u64) = (1, 0, 0);
 const API_VERSION_PREFIX: &str = "migraloop.dev/v";
 const V1_SOURCE_KIND: &str = "oracle";
 const V1_TARGET_KIND: &str = "mongodb";
@@ -372,12 +373,23 @@ fn parse_api_version_semver(api_version: &str) -> Result<(u64, u64, u64), CliErr
 }
 
 fn validate_api_version(api_version: &str) -> Result<(), CliError> {
-    let (major, _minor, _patch) = parse_api_version_semver(api_version)?;
-    if major != ACCEPTED_CONFIG_MAJOR {
+    let (major, minor, patch) = parse_api_version_semver(api_version)?;
+    let (cur_major, cur_minor, cur_patch) = CURRENT_CONFIG_VERSION;
+    if major != cur_major {
         return Err(CliError::Failed(format!(
             "unsupported apiVersion {api_version:?}; this app accepts SemVer-compatible \
-             major {ACCEPTED_CONFIG_MAJOR} ({SUPPORTED_API_VERSION}, migraloop.dev/v1.0, \
+             major {cur_major} ({SUPPORTED_API_VERSION}, migraloop.dev/v1.0, \
              migraloop.dev/v1.0.0) — incompatible major requires an explicit upgrade path"
+        )));
+    }
+    // Older-or-equal within the current major only (not forward-compat with newer apps).
+    let newer_than_this_app =
+        (minor, patch) > (cur_minor, cur_patch);
+    if newer_than_this_app {
+        return Err(CliError::Failed(format!(
+            "unsupported apiVersion {api_version:?}; this app reads older-or-equal \
+             SemVer within major {cur_major} up to {cur_major}.{cur_minor}.{cur_patch} \
+             (canonical {SUPPORTED_API_VERSION})"
         )));
     }
     Ok(())
