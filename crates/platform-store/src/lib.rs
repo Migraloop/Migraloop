@@ -132,6 +132,20 @@ pub struct Pipeline {
     /// Declarative Rich Transform JSON (null/empty for Direct).
     #[serde(default)]
     pub transform_json: Option<serde_json::Value>,
+    /// Drift Check result: unknown | ok | partial (issue #25).
+    /// `partial` means the last check was resource-gated (budget truncated).
+    #[serde(default = "default_drift_unknown")]
+    pub drift_status: String,
+    /// Output Identities compared against Target in the last Drift Check.
+    #[serde(default)]
+    pub drift_checked_rows: i32,
+    /// Managed-field mismatches detected in the last Drift Check (before repair).
+    #[serde(default)]
+    pub drift_mismatched_rows: i32,
+}
+
+fn default_drift_unknown() -> String {
+    "unknown".to_string()
 }
 
 /// Platform-managed Derived Dataset for one Transform Pipeline.
@@ -383,8 +397,9 @@ pub async fn replace_pipelines(
             INSERT INTO pipelines (
                 deployment_name, name, mode, source_table, source_schema,
                 target_collection, delivery_status, delivery_applied_changes, paused,
-                description, field_mappings_json, output_identity_json, transform_json, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+                description, field_mappings_json, output_identity_json, transform_json,
+                drift_status, drift_checked_rows, drift_mismatched_rows, applied_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
             "#,
         )
         .bind(&pipeline.deployment_name)
@@ -400,6 +415,9 @@ pub async fn replace_pipelines(
         .bind(&field_mappings_json)
         .bind(&output_identity_json)
         .bind(&transform_json)
+        .bind(&pipeline.drift_status)
+        .bind(pipeline.drift_checked_rows)
+        .bind(pipeline.drift_mismatched_rows)
         .execute(&mut *tx)
         .await
         .map_err(PlatformStoreError::Persist)?;
@@ -541,7 +559,8 @@ pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, Platfor
         r#"
         SELECT deployment_name, name, mode, source_table, source_schema,
                target_collection, delivery_status, delivery_applied_changes, paused,
-               description, field_mappings_json, output_identity_json, transform_json
+               description, field_mappings_json, output_identity_json, transform_json,
+               drift_status, drift_checked_rows, drift_mismatched_rows
         FROM pipelines
         ORDER BY deployment_name, name
         "#,
@@ -626,6 +645,42 @@ pub async fn update_pipeline_delivery_status(
         None,
     )
     .await
+}
+
+/// Persist Drift Check status for one Pipeline (issue #25).
+pub async fn update_pipeline_drift_status(
+    database_url: &str,
+    deployment_name: &str,
+    pipeline_name: &str,
+    drift_status: &str,
+    drift_checked_rows: i32,
+    drift_mismatched_rows: i32,
+) -> Result<(), PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    let result = sqlx::query(
+        r#"
+        UPDATE pipelines
+        SET drift_status = $3,
+            drift_checked_rows = $4,
+            drift_mismatched_rows = $5
+        WHERE deployment_name = $1 AND name = $2
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .bind(drift_status)
+    .bind(drift_checked_rows)
+    .bind(drift_mismatched_rows)
+    .execute(&pool)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    if result.rows_affected() == 0 {
+        return Err(PlatformStoreError::NotFound(format!(
+            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+        )));
+    }
+    Ok(())
 }
 
 /// Update Delivery status and optionally accumulate applied Output Identity changes.
@@ -863,6 +918,9 @@ struct PipelineRow {
     field_mappings_json: String,
     output_identity_json: String,
     transform_json: String,
+    drift_status: String,
+    drift_checked_rows: i32,
+    drift_mismatched_rows: i32,
 }
 
 impl PipelineRow {
@@ -892,6 +950,9 @@ impl PipelineRow {
             field_mappings,
             output_identity,
             transform_json,
+            drift_status: self.drift_status,
+            drift_checked_rows: self.drift_checked_rows,
+            drift_mismatched_rows: self.drift_mismatched_rows,
         })
     }
 }

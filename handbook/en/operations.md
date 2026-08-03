@@ -35,6 +35,16 @@ migraloop align [--table CUSTOMERS] [--max-rows 1000]
 
 The check reads at most `--max-rows` Source rows (default `1000` — not a full slam), compares them to Base by primary key, and repairs Base from those Source reads when misaligned. It **never writes Source**. `status` shows `Source Alignment: aligned|partial|unknown` with checked/mismatched counts from the last run (`partial` = budget truncated). See [CLI & Config](cli-and-config.md) and [Observability](observability.md).
 
+## Drift Check
+
+Delivery Health alone does not prove Managed fields on the Target match the platform expected dataset. Operators run a schedulable, resource-gated **Drift Check** after Source Alignment (for Direct Pipelines) so Base/Derived is a trusted baseline:
+
+```bash
+migraloop drift [--pipeline customers] [--max-rows 1000]
+```
+
+The check reads at most `--max-rows` expected Output Identities (default `1000` — not a full slam), compares Managed fields to the Target, and by default **auto-repairs** Managed drift via Managed-only upsert. **Non-Managed Target fields are ignored** and left untouched. It does not add Source load beyond the Alignment baseline. `status` shows `Drift: ok|partial|unknown` with checked/mismatched counts (`partial` = budget truncated). See [CLI & Config](cli-and-config.md) and [Observability](observability.md).
+
 ## Backpressure
 
 When Platform Store apply, Derived maintenance, or Target Delivery cannot keep up (ADR-0020):

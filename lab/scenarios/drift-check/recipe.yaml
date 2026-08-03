@@ -1,0 +1,31 @@
+# Lab Scenario recipe (ADR-0025 / issue #25).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: drift-check
+summary: Drift Check detects Managed-field Target drift, auto-repairs Managed only, preserves non-Managed
+namespace:
+  source_tables:
+    - LAB_DC_CUSTOMERS
+  target_collections:
+    - lab_dc_customers
+  deployment: lab-drift-check
+  pipelines:
+    - lab-dc-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery)
+    - align Base so it is a trusted Drift baseline
+    - mutate Target Managed NAME + plant non-Managed EXTRA (controlled drift; no sync)
+    - run drift (default max-rows budget) — detect mismatch, auto-repair Managed fields
+    - assert Managed restored, non-Managed EXTRA preserved, status shows Drift
+    - mutate Target ID=2; drift --max-rows 1 — assert resource gate (not full slam)
+    - drift with larger budget — repair remaining Managed drift
+checks:
+  correctness:
+    - "drift detects Managed-field Target drift after controlled mutation (mismatched/repaired lines)"
+    - "Managed fields auto-repaired to platform expected values; non-Managed EXTRA preserved"
+    - "status shows Drift after check"
+    - "drift --max-rows 1 is resource-gated (partial/truncated; does not repair unchecked identities)"
+thresholds: {}

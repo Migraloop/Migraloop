@@ -115,6 +115,22 @@ migraloop align --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" [--table CU
 | `--deployment` | 多个 Bases 共用表名时用以消歧 |
 | `--max-rows` | 每个 Base 最多读取的 Source 行数（resource gate；默认 `1000`） |
 
+### `drift`
+
+运行 **Drift Check**（issue #25）：以非实时、**resource-gated** 方式验证 Target 上的 Managed fields 是否匹配平台 expected dataset（Direct 用 Base，Transform 用 Derived）。默认会对检测到的 Managed drift 走与 Delivery 相同的 Managed-only upsert 路径做 **auto-repair**；**non-Managed Target fields 会被忽略**、不会被覆盖。对 Direct Pipelines，Base 必须已有 Source Alignment（`aligned` 或 `partial`）—先运行 `migraloop align`。Auto-repair 不会在 Alignment baseline 之外再增加 Source load。
+
+默认 `--max-rows` 为 `1000`，方便 Operator 调度检查而不做全 collection slam。更大 budget（或重复执行）可覆盖其余 Output Identities；`status` 显示上次执行的 `Drift: ok|partial|unknown` 与 checked/mismatched 计数（`partial` 表示 budget 被截断）。
+
+```bash
+migraloop drift --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" [--pipeline customers] [--deployment oracle-to-mongo] [--max-rows 1000]
+```
+
+| 旗标 | 含义 |
+| --- | --- |
+| `--pipeline` | Pipeline 名称（默认：所有具 Target Binding 的 Pipelines） |
+| `--deployment` | 多个 Deployments 共用同名 Pipeline 时用以消歧 |
+| `--max-rows` | 每个 Pipeline 最多检查的 Output Identities（resource gate；默认 `1000`） |
+
 ### `pause`
 
 暂停一条 Pipeline，且不重启 Deployment（ADR-0007）。停止该 Pipeline 后续的 Delivery/processing；耐久的 Base/checkpoint 状态会保留。其他 Pipelines 继续运行。
@@ -180,8 +196,8 @@ migraloop lab scenario remove <scenario-id> [--lab-dir lab]
 | `up` | 启动可丢弃 Fixture；就绪时打印连接细节 |
 | `status` | 报告 Fixture 就绪状态（engines + Oracle prerequisites + Platform Store），以及哪个 Scenario Namespace 为 **active**（run 进行中）或 **leftover**（run 结束后保留），或各自为 `(none)`。在你套用配置或运行 Lab Scenario 之前也会显示 `Deployment: (none)` / `Pipeline: (none)` — 请用 Scenario run / leftover 行判断，不必从那些行自行猜测 |
 | `down` | 拆除 containers 与 volumes |
-| `scenario list` | 按 `--lab-dir` 磁盘上的 recipe 列出可选 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已注册 runner）。summary 来自各 recipe—例如 `direct-pipeline`、`rt-project`、`rt-filter`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`、`idempotent-redelivery`、`pause-resume`、`remove-pipeline`、`change-pipeline`、`poison-quarantine`、`schema-change-pause`、`source-alignment`。list 也会回报已出货 capability 覆盖（complete vs gaps；见 `lab/scenarios/COVERAGE.md`） |
-| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。若 Source/Target 不是 Lab Fixture engines 也会拒绝（客户／生产数据库不在 Lab 范围—那些请用普通的 `apply`/`sync`）。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定义的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 与 operational metrics 等权）。`rt-project` / `rt-filter` 覆盖已出货 Rich Transform `project` 与 `filter` operators；`concurrent-source-workload` 在单一 Scenario 内跑并行 Source sessions；`bulk-load` 会 bulk-insert 约 100k Source rows，且 metric thresholds 可独立于 correctness 让 run 失败；`idempotent-redelivery` 会强制对同一批 Output Identities 做 duplicate-safe re-Delivery，并检查 Managed Target 结果仍正确；`pause-resume` 覆盖 `pause` / `resume` CLI 动词（一条 Pipeline 停止 Delivery、另一条继续；resume 自耐久 Base catch-up）。`remove-pipeline` 覆盖 `remove`（停止 Delivery；仍被引用的 Shared Base 保留；status 不再列出该 Pipeline）；`change-pipeline` 覆盖通过 `apply` 的 Pipeline revision（暂停旧 Delivery → 重建该 Pipeline 的 Derived／重新 Delivery；Shared Bases 不重建；仅 `description` 的 metadata-only 变更可跳过 rebuild）；`poison-quarantine` 在有界重试后 quarantine 单个 poison Output Identity 并 ALERT，Pipeline 继续，且 `status` 显示 unhealthy / not aligned；`schema-change-pause` 会在 blocking DDL 时 WARN 并 pause 受影响的 Pipeline（与 poison quarantine 不同）；`source-alignment` 会检测 Base≠Source、仅用 Source reads 修复 Base，并练习 resource-gated `--max-rows`。第二个 Scenario run 仍会被拒绝。默认 keep-on-finish 保留 Namespace 供实时 `base`/`derived`/`target` 检查；成功后若要删除可传 `--auto-remove` |
+| `scenario list` | 按 `--lab-dir` 磁盘上的 recipe 列出可选 Lab Scenarios（`lab/scenarios/<id>/recipe.yaml` + `deployment.yaml`，且已注册 runner）。summary 来自各 recipe—例如 `direct-pipeline`、`rt-project`、`rt-filter`、`transform-pipeline`、`concurrent-source-workload`、`bulk-load`、`idempotent-redelivery`、`pause-resume`、`remove-pipeline`、`change-pipeline`、`poison-quarantine`、`schema-change-pause`、`source-alignment`、`drift-check`。list 也会回报已出货 capability 覆盖（complete vs gaps；见 `lab/scenarios/COVERAGE.md`） |
+| `scenario run` | 按 id 运行一个 Lab Scenario。若已有 Scenario 正在运行则拒绝。若 Source/Target 不是 Lab Fixture engines 也会拒绝（客户／生产数据库不在 Lab 范围—那些请用普通的 `apply`/`sync`）。重跑同一 Scenario 会先完整移除其 Namespace 再重建。回报 pass/fail 以及 `duration_ms`、rows/throughput、lag，以及 Scenario 定义的 thresholds（例如 settle time，或 bulk-load 的 lag／throughput／duration，若有）（correctness 与 operational metrics 等权）。`rt-project` / `rt-filter` 覆盖已出货 Rich Transform `project` 与 `filter` operators；`concurrent-source-workload` 在单一 Scenario 内跑并行 Source sessions；`bulk-load` 会 bulk-insert 约 100k Source rows，且 metric thresholds 可独立于 correctness 让 run 失败；`idempotent-redelivery` 会强制对同一批 Output Identities 做 duplicate-safe re-Delivery，并检查 Managed Target 结果仍正确；`pause-resume` 覆盖 `pause` / `resume` CLI 动词（一条 Pipeline 停止 Delivery、另一条继续；resume 自耐久 Base catch-up）。`remove-pipeline` 覆盖 `remove`（停止 Delivery；仍被引用的 Shared Base 保留；status 不再列出该 Pipeline）；`change-pipeline` 覆盖通过 `apply` 的 Pipeline revision（暂停旧 Delivery → 重建该 Pipeline 的 Derived／重新 Delivery；Shared Bases 不重建；仅 `description` 的 metadata-only 变更可跳过 rebuild）；`poison-quarantine` 在有界重试后 quarantine 单个 poison Output Identity 并 ALERT，Pipeline 继续，且 `status` 显示 unhealthy / not aligned；`schema-change-pause` 会在 blocking DDL 时 WARN 并 pause 受影响的 Pipeline（与 poison quarantine 不同）；`source-alignment` 会检测 Base≠Source、仅用 Source reads 修复 Base，并练习 resource-gated `--max-rows`；`drift-check` 覆盖 Drift Check（Managed Target drift 检测 + 默认 Managed auto-repair；保留 non-Managed；resource-gated `--max-rows`）。第二个 Scenario run 仍会被拒绝。默认 keep-on-finish 保留 Namespace 供实时 `base`/`derived`/`target` 检查；成功后若要删除可传 `--auto-remove` |
 | `scenario remove` | 完整移除 Scenario Namespace（Source tables、Target collections、Platform Store Deployment），且不启动 run。若已有 Scenario 作用中则拒绝。已不存在时为 idempotent |
 
 | Flag | 含义 |
