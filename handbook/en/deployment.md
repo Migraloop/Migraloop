@@ -40,7 +40,7 @@ migraloop lab scenario run direct-pipeline   # needs host Instant Client (LD_LIB
 migraloop lab scenario run rt-project   # Rich Transform project → Derived → Delivery
 migraloop lab scenario run rt-filter   # Rich Transform filter → Derived → Delivery
 migraloop lab scenario run rt-field-ops   # Rich Transform addFields/rename/remove → Derived → Delivery
-migraloop lab scenario run transform-pipeline   # multi-table Transform → Derived → Delivery
+migraloop lab scenario run transform-pipeline   # multi-table groupBy sum/count/min/max/avg → Derived → Delivery
 migraloop lab scenario run concurrent-source-workload   # intra-Scenario parallel Source contention
 migraloop lab scenario run bulk-load   # ~100k Source inserts + lag/throughput/duration thresholds
 migraloop lab scenario run idempotent-redelivery   # duplicate-safe Delivery re-apply

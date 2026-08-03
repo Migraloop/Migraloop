@@ -179,7 +179,7 @@ Lab Fixture lifecycle seam (ignored by default; requires Docker Compose + Lab Or
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline, Rich Transform `project`/`filter`/`addFields`/`rename`/`remove`, multi-table Transform Pipeline, concurrent Source workload, bulk-load, idempotent-redelivery, pause-resume, remove-pipeline, change-pipeline, poison-quarantine, schema-change-pause, source-alignment, drift-check, bounded-backpressure, observability-surface, platform-store-guardrails, backward-compatible-upgrades, and initial-load-throttled seams (ignored by default; requires Docker Lab Fixture + Instant Client). These are **manual Lab** seams—not Release Quality Gate evidence and not something to wire into CI:
+Lab Scenario Direct Pipeline, Rich Transform `project`/`filter`/`addFields`/`rename`/`remove`, multi-table Transform Pipeline (`groupBy` sum/count/min/max/avg), concurrent Source workload, bulk-load, idempotent-redelivery, pause-resume, remove-pipeline, change-pipeline, poison-quarantine, schema-change-pause, source-alignment, drift-check, bounded-backpressure, observability-surface, platform-store-guardrails, backward-compatible-upgrades, and initial-load-throttled seams (ignored by default; requires Docker Lab Fixture + Instant Client). These are **manual Lab** seams—not Release Quality Gate evidence and not something to wire into CI:
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient

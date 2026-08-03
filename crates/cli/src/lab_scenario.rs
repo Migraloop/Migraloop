@@ -1492,6 +1492,11 @@ deployment={TRANSFORM_PIPELINE_DEPLOYMENT}"
         && inspect_mentions_amount(&totals_target, "50")
         && !inspect_mentions_amount(&totals_target, "30")
         && managed_field_present(&totals_target, "ORDER_COUNT", "2")
+        && managed_field_present(&totals_target, "ORDER_COUNT", "1")
+        && (managed_field_present(&totals_target, "MIN_AMOUNT", "15")
+            || managed_field_present(&totals_target, "MIN_AMOUNT", "15.00"))
+        && (managed_field_present(&totals_target, "MAX_AMOUNT", "20")
+            || managed_field_present(&totals_target, "MAX_AMOUNT", "20.00"))
         && (managed_field_present(&totals_target, "AVG_AMOUNT", "17.5")
             || managed_field_present(&totals_target, "AVG_AMOUNT", "17.50"));
 
