@@ -7,12 +7,13 @@
 //! Decimal128 (never default IEEE double); temporals → UTC DateTime.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
 use bson::{doc, Bson, Document};
 use chrono::{DateTime, Utc};
-use mongodb::options::{ClientOptions, UpdateOptions};
+use mongodb::options::{ClientOptions, Tls, TlsOptions, UpdateOptions};
 use mongodb::{Client, Collection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -72,6 +73,16 @@ pub enum DeliveryError {
     Conversion { field: String, reason: String },
 }
 
+/// Non-secret TLS settings for Mongo Target Delivery (ADR-0017).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MongoTlsSettings {
+    pub enabled: bool,
+    /// Path to CA certificate (`tlsCAFile`). Empty uses driver root store.
+    pub ca_file: String,
+    /// When true, allow invalid certificates (dev/lab only).
+    pub insecure_skip_verify: bool,
+}
+
 /// Non-secret Target System connection used for Mongo Delivery.
 #[derive(Debug, Clone)]
 pub struct MongoTargetConnection {
@@ -80,6 +91,7 @@ pub struct MongoTargetConnection {
     pub database: String,
     pub username: String,
     pub password: String,
+    pub tls: MongoTlsSettings,
 }
 
 /// How a Managed field is mapped for Delivery.
@@ -148,6 +160,36 @@ fn build_uri(target: &MongoTargetConnection) -> String {
     )
 }
 
+/// Build Mongo `Tls` options when Target TLS is enabled (unit-test seam).
+pub fn mongo_tls_options(tls: &MongoTlsSettings) -> Option<Tls> {
+    if !tls.enabled {
+        return None;
+    }
+    let mut options = TlsOptions::default();
+    let ca = tls.ca_file.trim();
+    if !ca.is_empty() {
+        options.ca_file_path = Some(PathBuf::from(ca));
+    }
+    if tls.insecure_skip_verify {
+        options.allow_invalid_certificates = Some(true);
+    }
+    Some(Tls::Enabled(options))
+}
+
+fn map_mongo_connect_error(target: &MongoTargetConnection, err: impl ToString) -> DeliveryError {
+    let detail = err.to_string();
+    if target.tls.enabled {
+        DeliveryError::Connect(format!(
+            "Target System TLS was requested but could not be established \
+             (host={}, caFile={:?}): {detail} (no silent cleartext fallback)",
+            target.host,
+            target.tls.ca_file
+        ))
+    } else {
+        DeliveryError::Connect(detail)
+    }
+}
+
 async fn collection(
     target: &MongoTargetConnection,
     collection_name: &str,
@@ -155,11 +197,22 @@ async fn collection(
     let uri = build_uri(target);
     let mut options = ClientOptions::parse(&uri)
         .await
-        .map_err(|err| DeliveryError::Connect(err.to_string()))?;
+        .map_err(|err| map_mongo_connect_error(target, err))?;
     options.server_selection_timeout = Some(Duration::from_secs(5));
     options.connect_timeout = Some(Duration::from_secs(5));
-    let client =
-        Client::with_options(options).map_err(|err| DeliveryError::Connect(err.to_string()))?;
+    if let Some(tls) = mongo_tls_options(&target.tls) {
+        options.tls = Some(tls);
+    }
+    let client = Client::with_options(options).map_err(|err| map_mongo_connect_error(target, err))?;
+    if target.tls.enabled {
+        // Force the TLS handshake now so misconfig fails as Connect (not a later Apply),
+        // with no silent cleartext fallback.
+        client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .await
+            .map_err(|err| map_mongo_connect_error(target, err))?;
+    }
     Ok(client
         .database(&target.database)
         .collection::<Document>(collection_name))
@@ -449,6 +502,31 @@ pub async fn list_target_documents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mongo_tls_options_none_when_disabled() {
+        let tls = MongoTlsSettings::default();
+        assert!(mongo_tls_options(&tls).is_none());
+    }
+
+    #[test]
+    fn mongo_tls_options_enabled_with_ca_file() {
+        let tls = MongoTlsSettings {
+            enabled: true,
+            ca_file: "/etc/certs/mongo-ca.pem".into(),
+            insecure_skip_verify: false,
+        };
+        match mongo_tls_options(&tls) {
+            Some(Tls::Enabled(opts)) => {
+                assert_eq!(
+                    opts.ca_file_path.as_deref(),
+                    Some(std::path::Path::new("/etc/certs/mongo-ca.pem"))
+                );
+                assert_ne!(opts.allow_invalid_certificates, Some(true));
+            }
+            other => panic!("expected Enabled TLS options, got {other:?}"),
+        }
+    }
 
     #[test]
     fn number_long_not_double() {

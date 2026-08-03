@@ -71,6 +71,8 @@ Stream-wide blockers (for example unblockable DDL) still follow [Operations](ope
 
 Which Source tables enter Sync is determined by Pipeline `source.table` references. Each table has at most one Base Dataset per Deployment, shared across Pipelines. New tables get table-level Initial Load only.
 
+Source/Target TLS and secrets belong on the enclosing Deployment `spec.source` / `spec.target` (not on Pipeline entries)—see [Security](security.md) and [CLI & Config](cli-and-config.md).
+
 ## Related chapters
 
 - Source prerequisites and types: [Source System](source-system.md)

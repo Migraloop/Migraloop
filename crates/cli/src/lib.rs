@@ -16,12 +16,12 @@ use migraloop_capture::{
     classify_schema_impact, discover_source_schema, initial_load_for_source,
     is_allow_listed_oracle_type, load_injected_schema_changes, normalize_change_temporals,
     open_oracle_incremental_capture, AlignmentCheckSample, CapturePosition, ChangeEvent, ChangeOp,
-    IncrementalCapture, NumberMongoMapping, OracleSourceConnect, PipelineSchemaDeps,
-    SchemaChangeEvent, SchemaImpact, SourceColumn, TypeError,
+    IncrementalCapture, NumberMongoMapping, OracleSourceConnect, OracleTlsSettings,
+    PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn, TypeError,
 };
 use migraloop_delivery::{
     delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
-    DeliveryDocument, ManagedFieldAs, MongoTargetConnection,
+    DeliveryDocument, ManagedFieldAs, MongoTargetConnection, MongoTlsSettings,
 };
 use migraloop_platform_store::{
     base_dataset_exists, check_store_settings, clear_schema_change_impacts,
@@ -35,6 +35,7 @@ use migraloop_platform_store::{
     upsert_quarantined_change, upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment,
     DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth,
     QuarantinedChange, SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection,
+    TlsSettings,
 };
 use migraloop_transform::{
     analyze_affect, derived_projected_fields, evaluate_transform,
@@ -43,7 +44,10 @@ use migraloop_transform::{
 };
 use thiserror::Error;
 
-use crate::config::{load_deployment_config, DeploymentDocument, PipelineSpec, ResolvedSecretRef};
+use crate::config::{
+    load_deployment_config, resolve_tls_settings, DeploymentDocument, PipelineSpec,
+    ResolvedSecretRef,
+};
 use crate::observability::{emit_event, EventValue};
 
 #[derive(Debug, Error)]
@@ -257,6 +261,8 @@ fn document_to_deployment(doc: &DeploymentDocument) -> Result<Deployment, CliErr
         secret_ref_from_resolved(doc.spec.source.password.resolved_ref("source.password")?);
     let target_password_ref =
         secret_ref_from_resolved(doc.spec.target.password.resolved_ref("target.password")?);
+    let source_tls = resolve_tls_settings("source", doc.spec.source.tls.as_ref())?;
+    let target_tls = resolve_tls_settings("target", doc.spec.target.tls.as_ref())?;
 
     Ok(Deployment {
         name: doc.metadata.name.clone(),
@@ -275,6 +281,7 @@ fn document_to_deployment(doc: &DeploymentDocument) -> Result<Deployment, CliErr
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
+            tls: source_tls,
         },
         target: SystemConnection {
             kind: doc.spec.target.kind.clone(),
@@ -284,6 +291,7 @@ fn document_to_deployment(doc: &DeploymentDocument) -> Result<Deployment, CliErr
             username: doc.spec.target.username.clone(),
             password_ref: target_password_ref,
             timezone: String::new(),
+            tls: target_tls,
         },
     })
 }
@@ -439,7 +447,24 @@ fn mongo_target_from_deployment(deployment: &Deployment) -> Result<MongoTargetCo
         database: deployment.target.database.clone(),
         username: deployment.target.username.clone(),
         password,
+        tls: mongo_tls_from_settings(&deployment.target.tls),
     })
+}
+
+fn mongo_tls_from_settings(tls: &TlsSettings) -> MongoTlsSettings {
+    MongoTlsSettings {
+        enabled: tls.enabled,
+        ca_file: tls.ca_file.clone(),
+        insecure_skip_verify: tls.insecure_skip_verify,
+    }
+}
+
+fn oracle_tls_from_settings(tls: &TlsSettings) -> OracleTlsSettings {
+    OracleTlsSettings {
+        enabled: tls.enabled,
+        wallet_location: tls.wallet_location.clone(),
+        insecure_skip_verify: tls.insecure_skip_verify,
+    }
 }
 
 fn secret_ref_from_resolved(resolved: ResolvedSecretRef) -> SecretRef {
@@ -462,14 +487,15 @@ fn format_system_line(label: &str, system: &SystemConnection) -> String {
         system.timezone.clone()
     };
     format!(
-        "  {label}: {} {}:{} database={} username={} passwordRef={} timezone={}",
+        "  {label}: {} {}:{} database={} username={} passwordRef={} timezone={} {}",
         system.kind,
         system.host,
         system.port,
         system.database,
         system.username,
         system.password_ref.display(),
-        timezone
+        timezone,
+        system.tls.display_summary()
     )
 }
 
@@ -831,6 +857,7 @@ fn oracle_source_connect(source: &SystemConnection) -> Result<OracleSourceConnec
         port: source.port as u16,
         database: source.database.clone(),
         username: source.username.clone(),
+        tls: oracle_tls_from_settings(&source.tls),
     })
 }
 

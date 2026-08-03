@@ -19,7 +19,7 @@ pub use logminer::{
     change_events_from_logminer_contents, load_injected_logminer_contents, logminer_change_id,
     named_scenario_logminer_contents, open_oracle_incremental_capture, ContractLogMiner,
     IncrementalCapture, LogMinerContent, LogMinerInjectError, LogMinerOperation, OciLogMiner,
-    OracleSourceConnect, DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR,
+    OracleSourceConnect, OracleTlsSettings, DBMS_LOGMNR_END_LOGMNR, DBMS_LOGMNR_START_LOGMNR,
     INJECT_LOGMINER_CONTENTS_ENV, V_LOGMNR_CONTENTS_QUERY,
 };
 

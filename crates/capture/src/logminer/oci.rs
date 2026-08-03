@@ -487,6 +487,7 @@ mod tests {
                 port: 1,
                 database: "NOPE".into(),
                 username: "sync_user".into(),
+                tls: Default::default(),
             },
             "bad".into(),
         );

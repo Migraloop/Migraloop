@@ -216,7 +216,7 @@ Lab is manual verification—not the Release Quality Gate and not the contract/s
 
 | Variable | Meaning |
 | --- | --- |
-| `MIGRALOOP_PLATFORM_STORE_URL` | Platform Store connection URL (`postgres://...`) used by Operator CLI commands and compose `app` |
+| `MIGRALOOP_PLATFORM_STORE_URL` | Platform Store connection URL (`postgres://...`) used by Operator CLI commands and compose `app`. For TLS use `sslmode=require\|verify-ca\|verify-full` and optional `sslrootcert=/path/to/ca.pem` |
 | `MIGRALOOP_PLATFORM_STORE_DATA_DIR` | Path on the app filesystem to observe Platform Store free disk (compose mounts the store data volume read-only at `/var/lib/migraloop/platform-store-data`) |
 | `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES` | Optional Operator/orchestrator-supplied free-disk bytes when a filesystem probe is unavailable (overrides directory probe for the warn threshold) |
 | `MIGRALOOP_METRICS_ADDR` | Prometheus scrape listen address for `migraloop run` (default `0.0.0.0:9090`) |
@@ -257,6 +257,18 @@ Env names and defaults for the in-process LogMiner harness live in [Source Syste
 | `username` | yes | yes | Also the default Oracle schema/owner when Pipeline `source.schema` is omitted |
 | `password` | yes | yes | Exactly one of `fromEnv`, `fromFile`, `fromDockerSecret` |
 | `timezone` | optional | n/a | IANA or `±HH:MM` for naive temporals |
+| `tls` | optional | optional | See below; omit/`enabled: false` keeps cleartext allowed |
+
+#### `tls` (optional)
+
+| Field | Source | Target | Notes |
+| --- | --- | --- | --- |
+| `enabled` | optional | optional | When `true`, connect with TLS; misconfig fails clearly (no silent cleartext fallback) |
+| `caFile` | optional path | optional path | Mongo CA file; filesystem path only (not PEM inline) |
+| `walletLocation` | optional directory | **invalid** | Oracle Instant Client wallet directory |
+| `insecureSkipVerify` | optional bool | optional bool | Dev/lab only; default `false` |
+
+Platform Store TLS is configured on `MIGRALOOP_PLATFORM_STORE_URL` (`sslmode=require|verify-ca|verify-full`, optional `sslrootcert=…`)—see [Security](security.md).
 
 Docker secrets resolve from `/run/secrets/<name>`.
 

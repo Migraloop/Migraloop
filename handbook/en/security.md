@@ -29,12 +29,52 @@ Platform Store URL in compose may embed a local password for the bundled lab-sty
 
 ## TLS / Connection Security
 
-TLS is **supported** for Source, Target, and Platform Store connections and **recommended in production** (ADR-0017). Cleartext remains allowed for local/dev or explicitly chosen setups in v1—the product does not hard-fail every non-TLS connection.
+TLS is **supported** for Source, Target, and Platform Store connections and **recommended in production** (ADR-0017). Cleartext remains allowed for local/dev or explicitly chosen setups in v1—the product does not hard-fail every non-TLS connection. When TLS is requested, misconfiguration fails clearly at apply/run with **no silent cleartext fallback**.
+
+### Source / Target (`spec.source.tls` / `spec.target.tls`)
+
+Optional block on each system. Omit the block (or set `enabled: false`) for cleartext Lab/dev.
+
+| Field | Source (Oracle) | Target (MongoDB) | Notes |
+| --- | --- | --- | --- |
+| `enabled` | yes to require TCPS | yes to require Mongo TLS | Default when omitted: disabled (cleartext allowed) |
+| `caFile` | optional path | CA path (`tlsCAFile`) | Filesystem path only—never paste PEM into YAML or `password` |
+| `walletLocation` | Instant Client wallet directory | **invalid** (apply rejects) | Oracle `MY_WALLET_DIRECTORY` |
+| `insecureSkipVerify` | optional (`SSL_SERVER_DN_MATCH=no`) | optional (allow invalid certs) | Dev/lab only; keep `false` in production |
+
+Example (paths are references, not secret bodies):
+
+```yaml
+source:
+  # ...
+  tls:
+    enabled: true
+    walletLocation: /etc/oracle/wallet
+target:
+  # ...
+  tls:
+    enabled: true
+    caFile: /etc/migraloop/certs/mongo-ca.pem
+```
+
+`migraloop status` surfaces non-secret TLS flags/paths (`tls=enabled|disabled`, `caFile=…`, `walletLocation=…`) and never prints PEM bodies or passwords.
+
+### Platform Store
+
+Set TLS on `MIGRALOOP_PLATFORM_STORE_URL` with Postgres libpq-style query params:
+
+| Param | Purpose |
+| --- | --- |
+| `sslmode=require` / `verify-ca` / `verify-full` | Require TLS (no cleartext fallback) |
+| `sslmode=prefer` / `disable` (or omit) | Cleartext-friendly local/dev |
+| `sslrootcert=/path/to/ca.pem` | CA file for verification modes |
+
+Example: `postgres://migraloop:***@db:5432/migraloop?sslmode=require&sslrootcert=/run/certs/pg-ca.pem`
 
 Operator guidance:
 
 - Prefer TLS-capable connection paths for Oracle, MongoDB, and Postgres in production networks
-- Keep secret material out of shell history and committed config
+- Keep secret material and certificate PEM bodies out of shell history and committed config—use mounted paths and secret references
 - Limit Required Privileges on Source/Target accounts (concrete grants below)
 
 ## Required Privileges (pointer)

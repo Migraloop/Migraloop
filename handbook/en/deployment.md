@@ -138,6 +138,9 @@ spec:
     password:
       fromEnv: ORACLE_PASSWORD
     timezone: Asia/Taipei          # optional; naive DATE/TIMESTAMP fallback
+    # tls:                         # optional; omit for cleartext Lab/dev
+    #   enabled: true
+    #   walletLocation: /etc/oracle/wallet
   target:
     kind: mongodb
     host: mongo.example.com
@@ -146,10 +149,13 @@ spec:
     username: deliver_user
     password:
       fromEnv: MONGO_PASSWORD
+    # tls:
+    #   enabled: true
+    #   caFile: /etc/migraloop/certs/mongo-ca.pem
   pipelines: []                    # see Pipeline chapter
 ```
 
-v1 requires `source.kind: oracle` and `target.kind: mongodb`. Passwords must be secret references—never plaintext.
+v1 requires `source.kind: oracle` and `target.kind: mongodb`. Passwords must be secret references—never plaintext. Optional `tls` blocks (and Platform Store `sslmode` on `MIGRALOOP_PLATFORM_STORE_URL`) are documented in [Security](security.md) and [CLI & Config](cli-and-config.md).
 
 Apply with `migraloop apply -f <file>`. Empty `pipelines` applies Deployment metadata only (no capture yet).
 
@@ -158,4 +164,5 @@ Apply with `migraloop apply -f <file>`. Empty `pipelines` applies Deployment met
 - Source connection and prerequisites: [Source System](source-system.md)
 - Target Binding and Delivery: [Target System](target-system.md)
 - Pipelines inside the Deployment: [Pipeline](pipeline.md)
+- Secrets and TLS: [Security](security.md)
 - Full field/flag list: [CLI & Config reference](cli-and-config.md)

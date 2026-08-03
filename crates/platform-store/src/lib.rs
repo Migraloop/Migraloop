@@ -82,6 +82,48 @@ impl SecretRef {
     }
 }
 
+/// Non-secret TLS settings for a Source or Target System connection (ADR-0017).
+///
+/// Paths point at mounted cert/wallet material; PEM bodies and passwords are never
+/// stored here (ADR-0006).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TlsSettings {
+    pub enabled: bool,
+    /// Filesystem path to a CA certificate (Mongo `tlsCAFile`; optional for Oracle).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ca_file: String,
+    /// Oracle Instant Client wallet directory (`MY_WALLET_DIRECTORY`). Empty for Mongo.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wallet_location: String,
+    /// When true, skip certificate verification (dev/lab only; never for production).
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+impl TlsSettings {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn display_summary(&self) -> String {
+        if !self.enabled {
+            return "tls=disabled".to_string();
+        }
+        let mut parts = vec!["tls=enabled".to_string()];
+        if !self.ca_file.is_empty() {
+            parts.push(format!("caFile={}", self.ca_file));
+        }
+        if !self.wallet_location.is_empty() {
+            parts.push(format!("walletLocation={}", self.wallet_location));
+        }
+        if self.insecure_skip_verify {
+            parts.push("insecureSkipVerify=true".to_string());
+        }
+        parts.join(" ")
+    }
+}
+
 /// Non-secret connection configuration for a Source or Target System.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemConnection {
@@ -95,6 +137,9 @@ pub struct SystemConnection {
     /// Empty means unset (ADR-0022).
     #[serde(default)]
     pub timezone: String,
+    /// TLS mode and non-secret cert/wallet paths (ADR-0017).
+    #[serde(default)]
+    pub tls: TlsSettings,
 }
 
 /// Durable Deployment pairing one Source System with one Target System.
@@ -260,7 +305,34 @@ pub(crate) async fn connect(database_url: &str) -> Result<PgPool, PlatformStoreE
         .acquire_timeout(Duration::from_secs(3))
         .connect(database_url)
         .await
-        .map_err(PlatformStoreError::Connect)
+        .map_err(|err| map_store_connect_error(database_url, err))
+}
+
+/// True when the Platform Store URL explicitly requests TLS (no cleartext fallback).
+pub fn platform_store_url_requires_tls(database_url: &str) -> bool {
+    database_url
+        .split(['?', '&'])
+        .skip(1)
+        .filter_map(|pair| pair.split_once('='))
+        .any(|(key, value)| {
+            key.eq_ignore_ascii_case("sslmode")
+                && matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "require" | "verify-ca" | "verify-full"
+                )
+        })
+}
+
+fn map_store_connect_error(database_url: &str, err: sqlx::Error) -> PlatformStoreError {
+    let detail = err.to_string();
+    if platform_store_url_requires_tls(database_url) {
+        PlatformStoreError::Connect(sqlx::Error::Protocol(format!(
+            "TLS was requested for Platform Store (sslmode=require|verify-ca|verify-full) \
+             but could not be established: {detail}"
+        )))
+    } else {
+        PlatformStoreError::Connect(err)
+    }
 }
 
 /// Embedded Platform Store migrator (all versioned schema migrations).
@@ -385,15 +457,19 @@ pub async fn upsert_deployment(
             name,
             source_kind, source_host, source_port, source_database, source_username,
             source_password_ref_kind, source_password_ref_value, source_timezone,
+            source_tls_json,
             target_kind, target_host, target_port, target_database, target_username,
             target_password_ref_kind, target_password_ref_value,
+            target_tls_json,
             applied_at
         ) VALUES (
             $1,
             $2, $3, $4, $5, $6,
             $7, $8, $9,
-            $10, $11, $12, $13, $14,
-            $15, $16,
+            $10,
+            $11, $12, $13, $14, $15,
+            $16, $17,
+            $18,
             now()
         )
         ON CONFLICT (name) DO UPDATE SET
@@ -405,6 +481,7 @@ pub async fn upsert_deployment(
             source_password_ref_kind = EXCLUDED.source_password_ref_kind,
             source_password_ref_value = EXCLUDED.source_password_ref_value,
             source_timezone = EXCLUDED.source_timezone,
+            source_tls_json = EXCLUDED.source_tls_json,
             target_kind = EXCLUDED.target_kind,
             target_host = EXCLUDED.target_host,
             target_port = EXCLUDED.target_port,
@@ -412,6 +489,7 @@ pub async fn upsert_deployment(
             target_username = EXCLUDED.target_username,
             target_password_ref_kind = EXCLUDED.target_password_ref_kind,
             target_password_ref_value = EXCLUDED.target_password_ref_value,
+            target_tls_json = EXCLUDED.target_tls_json,
             applied_at = now()
         "#,
     )
@@ -424,6 +502,7 @@ pub async fn upsert_deployment(
     .bind(deployment.source.password_ref.kind.as_str())
     .bind(&deployment.source.password_ref.value)
     .bind(&deployment.source.timezone)
+    .bind(tls_settings_to_json(&deployment.source.tls)?)
     .bind(&deployment.target.kind)
     .bind(&deployment.target.host)
     .bind(deployment.target.port)
@@ -431,10 +510,22 @@ pub async fn upsert_deployment(
     .bind(&deployment.target.username)
     .bind(deployment.target.password_ref.kind.as_str())
     .bind(&deployment.target.password_ref.value)
+    .bind(tls_settings_to_json(&deployment.target.tls)?)
     .execute(&pool)
     .await
     .map_err(PlatformStoreError::Persist)?;
     Ok(())
+}
+
+fn tls_settings_to_json(tls: &TlsSettings) -> Result<String, PlatformStoreError> {
+    serde_json::to_string(tls).map_err(PlatformStoreError::InvalidJson)
+}
+
+fn tls_settings_from_json(raw: &str) -> Result<TlsSettings, PlatformStoreError> {
+    if raw.trim().is_empty() || raw.trim() == "{}" {
+        return Ok(TlsSettings::default());
+    }
+    serde_json::from_str(raw).map_err(PlatformStoreError::InvalidJson)
 }
 
 /// Replace all Pipelines for a Deployment with the provided set.
@@ -611,8 +702,10 @@ pub async fn list_deployments(
             name,
             source_kind, source_host, source_port, source_database, source_username,
             source_password_ref_kind, source_password_ref_value, source_timezone,
+            source_tls_json,
             target_kind, target_host, target_port, target_database, target_username,
-            target_password_ref_kind, target_password_ref_value
+            target_password_ref_kind, target_password_ref_value,
+            target_tls_json
         FROM deployments
         ORDER BY name
         "#,
@@ -1023,6 +1116,7 @@ struct DeploymentRow {
     source_password_ref_kind: String,
     source_password_ref_value: String,
     source_timezone: String,
+    source_tls_json: String,
     target_kind: String,
     target_host: String,
     target_port: i32,
@@ -1030,6 +1124,7 @@ struct DeploymentRow {
     target_username: String,
     target_password_ref_kind: String,
     target_password_ref_value: String,
+    target_tls_json: String,
 }
 
 impl DeploymentRow {
@@ -1047,6 +1142,7 @@ impl DeploymentRow {
                     value: self.source_password_ref_value,
                 },
                 timezone: self.source_timezone,
+                tls: tls_settings_from_json(&self.source_tls_json)?,
             },
             target: SystemConnection {
                 kind: self.target_kind,
@@ -1059,6 +1155,7 @@ impl DeploymentRow {
                     value: self.target_password_ref_value,
                 },
                 timezone: String::new(),
+                tls: tls_settings_from_json(&self.target_tls_json)?,
             },
         })
     }
@@ -1866,4 +1963,49 @@ pub async fn clear_schema_change_impacts(
     .await
     .map_err(PlatformStoreError::Persist)?;
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_store_url_requires_tls_detects_explicit_modes() {
+        assert!(platform_store_url_requires_tls(
+            "postgres://u:p@h:5432/db?sslmode=require"
+        ));
+        assert!(platform_store_url_requires_tls(
+            "postgres://u:p@h:5432/db?sslmode=verify-full"
+        ));
+        assert!(platform_store_url_requires_tls(
+            "postgres://u:p@h:5432/db?connect_timeout=3&sslmode=verify-ca"
+        ));
+        assert!(!platform_store_url_requires_tls(
+            "postgres://u:p@h:5432/db"
+        ));
+        assert!(!platform_store_url_requires_tls(
+            "postgres://u:p@h:5432/db?sslmode=prefer"
+        ));
+        assert!(!platform_store_url_requires_tls(
+            "postgres://u:p@h:5432/db?sslmode=disable"
+        ));
+    }
+
+    #[test]
+    fn tls_settings_display_summary_surfaces_paths_not_pem() {
+        let disabled = TlsSettings::default();
+        assert_eq!(disabled.display_summary(), "tls=disabled");
+        let enabled = TlsSettings {
+            enabled: true,
+            ca_file: "/etc/certs/ca.pem".into(),
+            wallet_location: "/etc/oracle/wallet".into(),
+            insecure_skip_verify: true,
+        };
+        let summary = enabled.display_summary();
+        assert!(summary.contains("tls=enabled"));
+        assert!(summary.contains("caFile=/etc/certs/ca.pem"));
+        assert!(summary.contains("walletLocation=/etc/oracle/wallet"));
+        assert!(summary.contains("insecureSkipVerify=true"));
+        assert!(!summary.contains("BEGIN CERTIFICATE"));
+    }
 }
