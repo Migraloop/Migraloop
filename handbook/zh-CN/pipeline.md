@@ -71,7 +71,7 @@ Stream-wide blockers（例如无法解除的 DDL）仍按 [Operations](operation
 
 哪些 Source 表进入 Sync，由 Pipeline 的 `source.table` 引用**以及** Transform Pipeline 中任何 `equiLookup.from` / `union.from` secondary Base 决定。每张表在每个 Deployment 至多一个 Base Dataset，跨 Pipelines 共用。新表只做 table-level Initial Load。
 
-Source/Target 的 TLS 与 secrets 属于外层 Deployment 的 `spec.source` / `spec.target`（不在 Pipeline 项上）—见 [Security](security.md) 与 [CLI 与 Config](cli-and-config.md)。
+Source/Target 的 TLS、secrets，以及 Source `timezone`（IANA 或 Oracle 风格 `±HH:MM`，在 DB zone 不可读时供 naive DATE/TIMESTAMP 使用）属于外层 Deployment 的 `spec.source` / `spec.target`（不在 Pipeline 项上）—见 [Security](security.md)、[Source System](source-system.md) 与 [CLI 与 Config](cli-and-config.md)。
 
 ## 相关章节
 

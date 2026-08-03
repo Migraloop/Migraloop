@@ -71,7 +71,7 @@ Stream-wide blockers (for example unblockable DDL) still follow [Operations](ope
 
 Which Source tables enter Sync is determined by Pipeline `source.table` references **and** any `equiLookup.from` / `union.from` secondary Bases in Transform Pipelines. Each table has at most one Base Dataset per Deployment, shared across Pipelines. New tables get table-level Initial Load only.
 
-Source/Target TLS and secrets belong on the enclosing Deployment `spec.source` / `spec.target` (not on Pipeline entries)—see [Security](security.md) and [CLI & Config](cli-and-config.md).
+Source/Target TLS, secrets, and Source `timezone` (IANA or Oracle-style `±HH:MM` for naive DATE/TIMESTAMP when the DB zone is unreadable) belong on the enclosing Deployment `spec.source` / `spec.target` (not on Pipeline entries)—see [Security](security.md), [Source System](source-system.md), and [CLI & Config](cli-and-config.md).
 
 ## Related chapters
 

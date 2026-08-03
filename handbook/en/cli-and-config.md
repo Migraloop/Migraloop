@@ -265,7 +265,7 @@ Env names and defaults for the in-process LogMiner harness live in [Source Syste
 | `database` | yes | yes | |
 | `username` | yes | yes | Also the default Oracle schema/owner when Pipeline `source.schema` is omitted |
 | `password` | yes | yes | Exactly one of `fromEnv`, `fromFile`, `fromDockerSecret` |
-| `timezone` | optional | n/a | IANA or `±HH:MM` for naive temporals |
+| `timezone` | optional | n/a | IANA or Oracle-style `±HH:MM` for naive temporals; both forms accepted at `apply` |
 | `tls` | optional | optional | See below; omit/`enabled: false` keeps cleartext allowed |
 
 #### `tls` (optional)

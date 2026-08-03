@@ -14,7 +14,7 @@
 | `password` | Secret reference（`fromEnv`、`fromFile` 或 `fromDockerSecret`） |
 | `tls` | 可选。设 `enabled: true` 以使用 Mongo TLS；`caFile` 为文件系统 CA 路径（不可 inline PEM）。见 [Security](security.md) |
 
-v1 不配置 Target timezone—Delivery 对时间型 Managed 字段写入 UTC datetime。
+v1 不配置 Target timezone—Delivery 对时间型 Managed 字段写入 UTC datetime（值已由 Source DB timezone 或 Deployment Source `timezone` 正规化；后者可为 IANA 名称或 Oracle 风格 `±HH:MM`）。
 
 ## Target Binding
 

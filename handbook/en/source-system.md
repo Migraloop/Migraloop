@@ -14,7 +14,7 @@ Under `spec.source` in the Deployment config:
 | `database` | Service / database name |
 | `username` | Sync account (minimum Required Privileges; not admin-only-by-default) |
 | `password` | Secret reference: `fromEnv`, `fromFile`, or `fromDockerSecret` |
-| `timezone` | Optional IANA name or Oracle-style offset (`+09:00`). Used when naive DATE/TIMESTAMP must be interpreted and the Source DB timezone is unreadable |
+| `timezone` | Optional IANA name or Oracle-style offset (`+09:00` / `±HH:MM`). Accepted at `apply`. Used when naive DATE/TIMESTAMP must be interpreted and the Source DB timezone is unreadable |
 | `tls` | Optional. Set `enabled: true` for TCPS; use `walletLocation` for an Instant Client wallet directory (`caFile` is rejected—Oracle does not use PEM CA files here). Paths only—never PEM inline. See [Security](security.md) |
 
 Real Oracle hosts use the **OCI** path for both **Initial Load** (schema discovery + chunked snapshot) and **LogMiner Incremental Capture**. Initial Load reads PK-ordered `OFFSET`/`FETCH` windows (bounded by `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE`) rather than one unbounded full-table slam; see [Operations](operations.md) and [CLI & Config](cli-and-config.md). Without Oracle Instant Client / OCI libraries in the runtime, apply/sync fail fast naming LogMiner/OCI—there is no silent fallback to the stub catalog. When `tls.enabled: true`, the connect string uses TCPS and misconfig fails clearly (no silent cleartext fallback). Install Instant Client (Basic or Basic Light) and set `LD_LIBRARY_PATH` to its directory before running the app against a live Source.
@@ -152,7 +152,7 @@ Unsupported columns are **omitted** from the Base Dataset (the table still syncs
 
 **NUMBER:** mapped to precision-preserving Mongo types (`NumberLong` / `Decimal128`) when safe. Schema-unsafe NUMBER columns must be resolved at configure time via Pipeline `fields` (`as: string` or `as: omit`)—not quarantined row-by-row at runtime.
 
-**Temporals:** platform-internal UTC. Timezone-aware values become absolute instants. Naive DATE/TIMESTAMP use the Source DB timezone when readable, else the configured Source `timezone`.
+**Temporals:** platform-internal UTC. Timezone-aware values become absolute instants. Naive DATE/TIMESTAMP use the Source DB timezone when readable, else the configured Source `timezone` (IANA name or Oracle-style `±HH:MM`).
 
 ## Which tables are captured
 
