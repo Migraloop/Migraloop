@@ -69,18 +69,40 @@ Transform Pipelines 必須宣告：
 
 ### `groupBy`
 
-Group keys 加上 aggregates。v1 aggregate op：`sum`。
+Group keys 加上 aggregates。v1 aggregate ops：`sum`、`count`、`min`、`max`、`avg`。
+每個 aggregate 都需要 `field` 與 `as`。`count` 計算 `field` 的非 null 值數量
+（SQL `COUNT(field)`）。`min` / `max` / `avg` / `sum` 使用精度保留的 decimal 算術
+（非 IEEE double）。空 group 會被省略；若 `field` 全為 null，`min` / `max` / `avg`
+為 JSON `null`，`count` 為 `0`，`sum` 為 `0`。
 
 ```yaml
 - groupBy:
     keys: [CUSTOMER_ID]
     aggregates:
+      - op: count
+        field: ORDER_ID
+        as: ORDER_COUNT
+      - op: min
+        field: AMOUNT
+        as: MIN_AMOUNT
+      - op: max
+        field: AMOUNT
+        as: MAX_AMOUNT
+      - op: avg
+        field: AMOUNT
+        as: AVG_AMOUNT
       - op: sum
         field: AMOUNT
         as: TOTAL_AMOUNT
 ```
 
-領域 roadmap 也提到 equiLookup、unwind、count/min/max/avg、distinct/addToSet、union 等 operators。在它們進入 CLI config parser 之前，請只宣告上面的 operators—不支援的 operator 名稱會讓 apply 失敗。
+這些 aggregation **不會**額外發明 Maintenance State：incremental 更新只從 Base
+重算受影響的 Output Identities。未使用欄位變更（例如 aggregates 讀 ORDER_ID/AMOUNT
+時只改 ADDRESS）會略過 Derived 重算。
+
+領域 roadmap 也提到 equiLookup、unwind、distinct/addToSet、union 等 operators。在它們
+進入 CLI config parser 之前，請只宣告上面的 operators—不支援的 operator 名稱會讓
+apply 失敗。
 
 ## Output Identity
 

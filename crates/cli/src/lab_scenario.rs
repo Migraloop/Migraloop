@@ -293,7 +293,7 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (DIRECT_PIPELINE_ID, "Direct Pipeline Initial Load + insert/update/delete"),
         (
             TRANSFORM_PIPELINE_ID,
-            "multi-table Transform Pipeline (groupBy/sum)",
+            "multi-table Transform Pipeline (groupBy sum/count/min/max/avg)",
         ),
         (RT_PROJECT_ID, "Rich Transform project"),
         (RT_FILTER_ID, "Rich Transform filter"),
@@ -1475,13 +1475,30 @@ deployment={TRANSFORM_PIPELINE_DEPLOYMENT}"
     let customers_target_ok = managed_field_present(&customers_target, "NAME", "Alicia")
         && managed_field_present(&customers_target, "NAME", "Carol")
         && !managed_field_present(&customers_target, "NAME", "Bob");
-    // Orders Transform after mutate: cust1=20+15=35, cust2=50 (order 1 deleted, order 3 updated).
+    // Orders Transform after mutate: cust1=20+15 → sum 35 / count 2 / min 15 / max 20 / avg 17.5;
+    // cust2=50 (order 1 deleted, order 3 updated).
     let derived_ok = inspect_mentions_amount(&derived_after, "35")
         && inspect_mentions_amount(&derived_after, "50")
-        && !inspect_mentions_amount(&derived_after, "30");
+        && !inspect_mentions_amount(&derived_after, "30")
+        && managed_field_present(&derived_after, "ORDER_COUNT", "2")
+        && managed_field_present(&derived_after, "ORDER_COUNT", "1")
+        && (managed_field_present(&derived_after, "MIN_AMOUNT", "15")
+            || managed_field_present(&derived_after, "MIN_AMOUNT", "15.00"))
+        && (managed_field_present(&derived_after, "MAX_AMOUNT", "20")
+            || managed_field_present(&derived_after, "MAX_AMOUNT", "20.00"))
+        && (managed_field_present(&derived_after, "AVG_AMOUNT", "17.5")
+            || managed_field_present(&derived_after, "AVG_AMOUNT", "17.50"));
     let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
         && inspect_mentions_amount(&totals_target, "50")
-        && !inspect_mentions_amount(&totals_target, "30");
+        && !inspect_mentions_amount(&totals_target, "30")
+        && managed_field_present(&totals_target, "ORDER_COUNT", "2")
+        && managed_field_present(&totals_target, "ORDER_COUNT", "1")
+        && (managed_field_present(&totals_target, "MIN_AMOUNT", "15")
+            || managed_field_present(&totals_target, "MIN_AMOUNT", "15.00"))
+        && (managed_field_present(&totals_target, "MAX_AMOUNT", "20")
+            || managed_field_present(&totals_target, "MAX_AMOUNT", "20.00"))
+        && (managed_field_present(&totals_target, "AVG_AMOUNT", "17.5")
+            || managed_field_present(&totals_target, "AVG_AMOUNT", "17.50"));
 
     let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
 

@@ -69,18 +69,40 @@ Equality filter on one field:
 
 ### `groupBy`
 
-Group keys plus aggregates. v1 aggregate op: `sum`.
+Group keys plus aggregates. v1 aggregate ops: `sum`, `count`, `min`, `max`, `avg`.
+Each aggregate requires `field` and `as`. `count` counts non-null values of `field`
+(SQL `COUNT(field)`). `min` / `max` / `avg` / `sum` use precision-preserving decimal
+arithmetic (not IEEE double). Empty groups are omitted; `min` / `max` / `avg` over
+only-null field values yield JSON `null`, while `count` is `0` and `sum` is `0`.
 
 ```yaml
 - groupBy:
     keys: [CUSTOMER_ID]
     aggregates:
+      - op: count
+        field: ORDER_ID
+        as: ORDER_COUNT
+      - op: min
+        field: AMOUNT
+        as: MIN_AMOUNT
+      - op: max
+        field: AMOUNT
+        as: MAX_AMOUNT
+      - op: avg
+        field: AMOUNT
+        as: AVG_AMOUNT
       - op: sum
         field: AMOUNT
         as: TOTAL_AMOUNT
 ```
 
-Domain roadmap also names operators such as equiLookup, unwind, count/min/max/avg, distinct/addToSet, and union. Until those land in the CLI config parser, declare only the operators above—unsupported operator names fail apply.
+These aggregations do **not** invent Maintenance State: incremental updates recompute
+only affected Output Identities from Base. Unused-field changes (for example ADDRESS
+when aggregates read ORDER_ID/AMOUNT) skip Derived recompute.
+
+Domain roadmap also names operators such as equiLookup, unwind, distinct/addToSet, and
+union. Until those land in the CLI config parser, declare only the operators above—
+unsupported operator names fail apply.
 
 ## Output Identity
 

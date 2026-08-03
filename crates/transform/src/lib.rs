@@ -1,9 +1,9 @@
 //! Rich Transform operators and Affect Analysis.
 //!
-//! Declarative project, addFields, rename, remove, filter (eq), and groupBy (sum)
-//! over Base Dataset rows. Free-form scripts and unanalyzable operators are rejected
-//! at parse time. Affect Analysis skips Derived recompute when only unused Base
-//! fields change.
+//! Declarative project, addFields, rename, remove, filter (eq), and groupBy
+//! (sum/count/min/max/avg) over Base Dataset rows. Free-form scripts and
+//! unanalyzable operators are rejected at parse time. Affect Analysis skips
+//! Derived recompute when only unused Base fields change.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -37,6 +37,10 @@ pub struct AggregateSpec {
 #[serde(rename_all = "lowercase")]
 pub enum AggregateOp {
     Sum,
+    Count,
+    Min,
+    Max,
+    Avg,
 }
 
 /// Source for one `addFields` entry: literal JSON or copy from an existing field.
@@ -106,7 +110,7 @@ pub enum AffectOutcome {
 /// - `{ "rename": { "fields": [{ "from": "...", "to": "..." }] } }`
 /// - `{ "remove": { "fields": [...] } }`
 /// - `{ "filter": { "field": "...", "eq": ... } }`
-/// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum", "field": "...", "as": "..." }] } }`
+/// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum"|"count"|"min"|"max"|"avg", "field": "...", "as": "..." }] } }`
 /// Rejected shapes (clear errors):
 /// - `{ "script": "..." }` / `{ "function": "..." }`
 /// - any other operator object
@@ -495,9 +499,13 @@ fn parse_aggregate(value: &Value, index: usize) -> Result<AggregateSpec, Transfo
         })?;
     let op = match op_raw {
         "sum" => AggregateOp::Sum,
+        "count" => AggregateOp::Count,
+        "min" => AggregateOp::Min,
+        "max" => AggregateOp::Max,
+        "avg" => AggregateOp::Avg,
         other => {
             return Err(TransformError::Invalid(format!(
-                "groupBy.aggregates[{index}].op {other:?} is unsupported; v1 allows sum"
+                "groupBy.aggregates[{index}].op {other:?} is unsupported; v1 allows sum, count, min, max, avg"
             )));
         }
     };
@@ -1023,12 +1031,156 @@ fn apply_group_by(
         for agg in aggregates {
             let value = match agg.op {
                 AggregateOp::Sum => sum_field(&group_rows, &agg.field)?,
+                AggregateOp::Count => count_field(&group_rows, &agg.field),
+                AggregateOp::Min => min_field(&group_rows, &agg.field)?,
+                AggregateOp::Max => max_field(&group_rows, &agg.field)?,
+                AggregateOp::Avg => avg_field(&group_rows, &agg.field)?,
             };
             derived.insert(agg.as_name.clone(), value);
         }
         out.push(derived);
     }
     Ok(out)
+}
+
+/// Count non-null values of `field` in the group (SQL `COUNT(field)` semantics).
+fn count_field(rows: &[Map<String, Value>], field: &str) -> Value {
+    let count = rows
+        .iter()
+        .filter(|row| row.get(field).is_some_and(|v| !v.is_null()))
+        .count();
+    Value::Number(serde_json::Number::from(count as u64))
+}
+
+/// Precision-preserving min (ADR-0023): compare via scaled integer units.
+fn min_field(rows: &[Map<String, Value>], field: &str) -> Result<Value, TransformError> {
+    extreme_field(rows, field, Extreme::Min)
+}
+
+/// Precision-preserving max (ADR-0023): compare via scaled integer units.
+fn max_field(rows: &[Map<String, Value>], field: &str) -> Result<Value, TransformError> {
+    extreme_field(rows, field, Extreme::Max)
+}
+
+enum Extreme {
+    Min,
+    Max,
+}
+
+fn extreme_field(
+    rows: &[Map<String, Value>],
+    field: &str,
+    extreme: Extreme,
+) -> Result<Value, TransformError> {
+    let mut best: Option<(i128, usize, Value)> = None;
+    for row in rows {
+        let Some(value) = row.get(field) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let (units, scale) = parse_decimal_units(value).ok_or_else(|| {
+            TransformError::Invalid(format!(
+                "groupBy min/max field {field} is not numeric: {value}"
+            ))
+        })?;
+        match &mut best {
+            None => best = Some((units, scale, value.clone())),
+            Some((best_units, best_scale, best_value)) => {
+                let target_scale = (*best_scale).max(scale);
+                let aligned = scale_units(units, scale, target_scale).ok_or_else(|| {
+                    TransformError::Invalid("groupBy min/max scale overflow".into())
+                })?;
+                let best_aligned =
+                    scale_units(*best_units, *best_scale, target_scale).ok_or_else(|| {
+                        TransformError::Invalid("groupBy min/max scale overflow".into())
+                    })?;
+                let take = match extreme {
+                    Extreme::Min => aligned < best_aligned,
+                    Extreme::Max => aligned > best_aligned,
+                };
+                if take {
+                    *best_units = units;
+                    *best_scale = scale;
+                    *best_value = value.clone();
+                }
+            }
+        }
+    }
+    Ok(best.map(|(_, _, v)| v).unwrap_or(Value::Null))
+}
+
+/// Precision-preserving avg (ADR-0023): scaled sum / non-null count, never IEEE double.
+fn avg_field(rows: &[Map<String, Value>], field: &str) -> Result<Value, TransformError> {
+    let mut total_units: i128 = 0;
+    let mut max_scale: usize = 0;
+    let mut count: i128 = 0;
+    for row in rows {
+        let Some(value) = row.get(field) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let (units, scale) = parse_decimal_units(value).ok_or_else(|| {
+            TransformError::Invalid(format!(
+                "groupBy avg field {field} is not numeric: {value}"
+            ))
+        })?;
+        count += 1;
+        if scale > max_scale {
+            let factor = ten_pow_i128(scale - max_scale)?;
+            total_units = total_units
+                .checked_mul(factor)
+                .ok_or_else(|| TransformError::Invalid("groupBy avg overflow".into()))?;
+            max_scale = scale;
+        }
+        let aligned = if scale < max_scale {
+            let factor = ten_pow_i128(max_scale - scale)?;
+            units
+                .checked_mul(factor)
+                .ok_or_else(|| TransformError::Invalid("groupBy avg overflow".into()))?
+        } else {
+            units
+        };
+        total_units = total_units
+            .checked_add(aligned)
+            .ok_or_else(|| TransformError::Invalid("groupBy avg overflow".into()))?;
+    }
+    if count == 0 {
+        return Ok(Value::Null);
+    }
+    // Divide in fixed-point with enough extra scale for a stable decimal quotient.
+    // Result scale = max_scale + AVG_EXTRA_SCALE, then trim trailing zeros down to
+    // the input scale so money-like values keep two places when exact.
+    const AVG_EXTRA_SCALE: usize = 4;
+    let dividend_scale = max_scale + AVG_EXTRA_SCALE;
+    let factor = ten_pow_i128(AVG_EXTRA_SCALE)?;
+    let dividend = total_units
+        .checked_mul(factor)
+        .ok_or_else(|| TransformError::Invalid("groupBy avg overflow".into()))?;
+    let quotient = dividend / count;
+    let remainder = dividend % count;
+    // Round half away from zero on the final digit.
+    let mut rounded = quotient;
+    if remainder.abs() * 2 >= count {
+        rounded += if dividend >= 0 { 1 } else { -1 };
+    }
+    Ok(trim_decimal_units(rounded, dividend_scale, max_scale))
+}
+
+/// Format scaled units, trimming trailing fractional zeros down to `min_scale`
+/// so money-like inputs (scale 2) keep `"20.00"` while still dropping pure
+/// padding from the avg extra scale.
+fn trim_decimal_units(units: i128, scale: usize, min_scale: usize) -> Value {
+    let mut u = units;
+    let mut s = scale;
+    while s > min_scale && u % 10 == 0 {
+        u /= 10;
+        s -= 1;
+    }
+    format_decimal_units(u, s)
 }
 
 /// Precision-preserving sum (ADR-0023): scaled integer arithmetic, never IEEE double.
@@ -1323,6 +1475,273 @@ mod tests {
             .find(|r| r.get("CUSTOMER_ID") == Some(&json!(1)))
             .unwrap();
         assert_eq!(c1.get("TOTAL_AMOUNT"), Some(&json!("52.50")));
+    }
+
+    #[test]
+    fn group_by_accepts_count_min_max_avg() {
+        // Issue #126: parser must accept the remaining v1 groupBy aggregate ops.
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [
+                    {"op": "count", "field": "ORDER_ID", "as": "ORDER_COUNT"},
+                    {"op": "min", "field": "AMOUNT", "as": "MIN_AMOUNT"},
+                    {"op": "max", "field": "AMOUNT", "as": "MAX_AMOUNT"},
+                    {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"}
+                ]
+            }
+        })])
+        .unwrap();
+        match &ops[0] {
+            TransformOp::GroupBy { aggregates, .. } => {
+                assert_eq!(aggregates.len(), 4);
+                assert_eq!(aggregates[0].op, AggregateOp::Count);
+                assert_eq!(aggregates[1].op, AggregateOp::Min);
+                assert_eq!(aggregates[2].op, AggregateOp::Max);
+                assert_eq!(aggregates[3].op, AggregateOp::Avg);
+            }
+            other => panic!("expected GroupBy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_by_count_min_max_avg_totals() {
+        // Known-good literals: customer 1 has amounts 10.00 + 30.00 → count 2, min 10, max 30, avg 20.
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [
+                    {"op": "count", "field": "ORDER_ID", "as": "ORDER_COUNT"},
+                    {"op": "min", "field": "AMOUNT", "as": "MIN_AMOUNT"},
+                    {"op": "max", "field": "AMOUNT", "as": "MAX_AMOUNT"},
+                    {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"},
+                    {"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}
+                ]
+            }
+        })])
+        .unwrap();
+        let rows = vec![
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+                ("ADDRESS", json!("1 Main St")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("30.00")),
+                ("ADDRESS", json!("1 Main St")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(200)),
+                ("CUSTOMER_ID", json!(2)),
+                ("AMOUNT", json!("5.00")),
+                ("ADDRESS", json!("2 Side Rd")),
+            ]),
+        ];
+        let out = evaluate_transform(&ops, &rows).unwrap();
+        let c1 = out
+            .iter()
+            .find(|r| r.get("CUSTOMER_ID") == Some(&json!(1)))
+            .expect("customer 1");
+        assert_eq!(c1.get("ORDER_COUNT"), Some(&json!(2)));
+        assert_eq!(c1.get("MIN_AMOUNT"), Some(&json!("10.00")));
+        assert_eq!(c1.get("MAX_AMOUNT"), Some(&json!("30.00")));
+        assert_eq!(c1.get("AVG_AMOUNT"), Some(&json!("20.00")));
+        assert_eq!(c1.get("TOTAL_AMOUNT"), Some(&json!("40.00")));
+        let c2 = out
+            .iter()
+            .find(|r| r.get("CUSTOMER_ID") == Some(&json!(2)))
+            .expect("customer 2");
+        assert_eq!(c2.get("ORDER_COUNT"), Some(&json!(1)));
+        assert_eq!(c2.get("MIN_AMOUNT"), Some(&json!("5.00")));
+        assert_eq!(c2.get("MAX_AMOUNT"), Some(&json!("5.00")));
+        assert_eq!(c2.get("AVG_AMOUNT"), Some(&json!("5.00")));
+    }
+
+    #[test]
+    fn group_by_count_skips_null_field_values() {
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [{"op": "count", "field": "AMOUNT", "as": "AMOUNT_COUNT"}]
+            }
+        })])
+        .unwrap();
+        let rows = vec![
+            row(&[("CUSTOMER_ID", json!(1)), ("AMOUNT", json!("10.00"))]),
+            row(&[("CUSTOMER_ID", json!(1)), ("AMOUNT", Value::Null)]),
+            row(&[("CUSTOMER_ID", json!(1))]), // missing field
+        ];
+        let out = evaluate_transform(&ops, &rows).unwrap();
+        assert_eq!(out[0].get("AMOUNT_COUNT"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn group_by_avg_preserves_decimal_precision_without_ieee_double() {
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [{"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"}]
+            }
+        })])
+        .unwrap();
+        // 0.10 + 0.20 → avg 0.15 exactly (not IEEE 0.15000000000000002).
+        let rows = vec![
+            row(&[("CUSTOMER_ID", json!(1)), ("AMOUNT", json!("0.10"))]),
+            row(&[("CUSTOMER_ID", json!(1)), ("AMOUNT", json!("0.20"))]),
+        ];
+        let out = evaluate_transform(&ops, &rows).unwrap();
+        assert_eq!(out[0].get("AVG_AMOUNT"), Some(&json!("0.15")));
+    }
+
+    fn rich_groupby_ops() -> Vec<TransformOp> {
+        parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [
+                    {"op": "count", "field": "ORDER_ID", "as": "ORDER_COUNT"},
+                    {"op": "min", "field": "AMOUNT", "as": "MIN_AMOUNT"},
+                    {"op": "max", "field": "AMOUNT", "as": "MAX_AMOUNT"},
+                    {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"},
+                    {"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}
+                ]
+            }
+        })])
+        .unwrap()
+    }
+
+    #[test]
+    fn rich_groupby_affect_skips_unused_address_update() {
+        // Issue #126: unused-field changes must not trigger recompute for count/min/max/avg.
+        let ops = rich_groupby_ops();
+        let pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("10.00")),
+            ("ADDRESS", json!("1 Main St")),
+        ]);
+        let after = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("10.00")),
+            ("ADDRESS", json!("1 Main Ave")),
+        ]);
+        assert_eq!(
+            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after)).unwrap(),
+            AffectOutcome::SkipUnusedFields
+        );
+    }
+
+    #[test]
+    fn rich_groupby_affect_recomputes_on_amount_or_order_id_update() {
+        let ops = rich_groupby_ops();
+        let pre = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("10.00")),
+            ("ADDRESS", json!("1 Main Ave")),
+        ]);
+        let after_amount = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("40.00")),
+            ("ADDRESS", json!("1 Main Ave")),
+        ]);
+        match analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_amount)).unwrap()
+        {
+            AffectOutcome::Recompute { identities } => {
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].get("CUSTOMER_ID"), Some(&json!(1)));
+            }
+            other => panic!("expected Recompute on AMOUNT, got {other:?}"),
+        }
+
+        let after_order_id = row(&[
+            ("ORDER_ID", json!(199)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("10.00")),
+            ("ADDRESS", json!("1 Main Ave")),
+        ]);
+        assert!(matches!(
+            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_order_id)).unwrap(),
+            AffectOutcome::Recompute { .. }
+        ));
+    }
+
+    #[test]
+    fn rich_groupby_incremental_identities_stay_correct_for_insert_update_delete() {
+        // No Maintenance State: per-identity recompute from Base must match full eval.
+        let ops = rich_groupby_ops();
+        let mut base = vec![
+            row(&[
+                ("ORDER_ID", json!(100)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("10.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(101)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("30.00")),
+            ]),
+            row(&[
+                ("ORDER_ID", json!(200)),
+                ("CUSTOMER_ID", json!(2)),
+                ("AMOUNT", json!("5.00")),
+            ]),
+        ];
+
+        // Insert order 102 for customer 1: count 3, min 10, max 50, avg 30, sum 90.
+        base.push(row(&[
+            ("ORDER_ID", json!(102)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("50.00")),
+        ]));
+        let after_insert = evaluate_transform_for_identities(
+            &ops,
+            &base,
+            &[row(&[("CUSTOMER_ID", json!(1))])],
+        )
+        .unwrap();
+        assert_eq!(after_insert.len(), 1);
+        assert_eq!(after_insert[0].get("ORDER_COUNT"), Some(&json!(3)));
+        assert_eq!(after_insert[0].get("MIN_AMOUNT"), Some(&json!("10.00")));
+        assert_eq!(after_insert[0].get("MAX_AMOUNT"), Some(&json!("50.00")));
+        assert_eq!(after_insert[0].get("AVG_AMOUNT"), Some(&json!("30.00")));
+        assert_eq!(after_insert[0].get("TOTAL_AMOUNT"), Some(&json!("90.00")));
+
+        // Update order 100 amount 10→20: min 20, max 50, avg 100/3 kept exact at extra scale.
+        base[0] = row(&[
+            ("ORDER_ID", json!(100)),
+            ("CUSTOMER_ID", json!(1)),
+            ("AMOUNT", json!("20.00")),
+        ]);
+        let after_update = evaluate_transform_for_identities(
+            &ops,
+            &base,
+            &[row(&[("CUSTOMER_ID", json!(1))])],
+        )
+        .unwrap();
+        assert_eq!(after_update[0].get("ORDER_COUNT"), Some(&json!(3)));
+        assert_eq!(after_update[0].get("MIN_AMOUNT"), Some(&json!("20.00")));
+        assert_eq!(after_update[0].get("MAX_AMOUNT"), Some(&json!("50.00")));
+        assert_eq!(after_update[0].get("TOTAL_AMOUNT"), Some(&json!("100.00")));
+        // 100 / 3 = 33.3̅ → precision-preserving fixed-point (not IEEE double).
+        assert_eq!(after_update[0].get("AVG_AMOUNT"), Some(&json!("33.333333")));
+
+        // Delete last remaining row of customer 2 → identity omitted (caller deletes).
+        base.retain(|r| r.get("CUSTOMER_ID") != Some(&json!(2)));
+        let after_delete = evaluate_transform_for_identities(
+            &ops,
+            &base,
+            &[row(&[("CUSTOMER_ID", json!(2))])],
+        )
+        .unwrap();
+        assert!(
+            after_delete.is_empty(),
+            "empty group must be omitted so Delivery can delete the Output Identity"
+        );
     }
 
     #[test]
