@@ -253,15 +253,15 @@ async fn render_prometheus_metrics(platform_store_url: &str) -> Result<String, S
     }
 
     out.push_str(
-        "# HELP migraloop_failures_total Alertable failure counter (active quarantines + blocking Schema Change impacts).\n",
+        "# HELP migraloop_failures Alertable failure gauge (active quarantines + blocking Schema Change impacts).\n",
     );
-    out.push_str("# TYPE migraloop_failures_total gauge\n");
+    out.push_str("# TYPE migraloop_failures gauge\n");
     let blocking = schema_impacts
         .iter()
         .filter(|s| s.impact == "blocking")
         .count();
     let failures = quarantines.len() + blocking;
-    out.push_str(&format!("migraloop_failures_total {failures}\n"));
+    out.push_str(&format!("migraloop_failures {failures}\n"));
 
     Ok(out)
 }

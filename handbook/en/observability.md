@@ -47,7 +47,7 @@ Add `--deployment <name>` when multiple Deployments share table/collection/pipel
 ## Logs and metrics
 
 - App/CLI emit **structured JSON** operator event lines (plus human-readable companions) on Initial Load, Incremental Capture, Delivery, Backpressure, Poison Change quarantine, and blocking Schema Change (stdout/stderr of the `migraloop` process / container logs). Look for `"event":"…"` fields such as `initial_load_complete`, `incremental_capture`, `delivery_complete`, `backpressure`, `poison_quarantine`, `schema_change_blocked`.
-- `migraloop run` serves a Prometheus scrape endpoint at `http://<metrics-addr>/metrics` (default `0.0.0.0:9090`, override with `--metrics-addr` / `MIGRALOOP_METRICS_ADDR`). Compose publishes host port `9090`. Metrics include Sync/Delivery lag (`migraloop_sync_lag`, `migraloop_delivery_lag`), Pipeline pause, and alertable failure gauges (`migraloop_quarantined_changes`, `migraloop_failures_total`) read from durable Platform Store state.
+- `migraloop run` serves a Prometheus scrape endpoint at `http://<metrics-addr>/metrics` (default `0.0.0.0:9090`, override with `--metrics-addr` / `MIGRALOOP_METRICS_ADDR`). Compose publishes host port `9090`. Metrics include Sync/Delivery lag (`migraloop_sync_lag`, `migraloop_delivery_lag`), Pipeline pause, and alertable failure gauges (`migraloop_quarantined_changes`, `migraloop_failures`) read from durable Platform Store state.
 - `status` remains the primary Operator loop for lag/checkpoint/error lines; scrape `/metrics` for alerting and dashboards.
 
 ## Related chapters
