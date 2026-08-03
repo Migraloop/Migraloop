@@ -73,7 +73,7 @@ Root `compose.yaml` and `lab/compose.yaml` ship those defaults on the `platform-
 
 **How free disk is observed:** compose mounts the store data volume read-only into the app at `/var/lib/migraloop/platform-store-data` and sets `MIGRALOOP_PLATFORM_STORE_DATA_DIR` to that path. Operators/orchestrators may instead supply `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES` when a filesystem probe is unavailable.
 
-Lab Scenario `platform-store-guardrails` exercises reject-below-minimum and warn-only free-disk behavior on the disposable Fixture. Postgres backup remains an Operator responsibility.
+Lab Scenario `platform-store-guardrails` exercises bundled Guardrail minimums and warn-only free-disk behavior on the disposable Fixture (absurd-low rejection is covered by the contract-path CI twin). Postgres backup remains an Operator responsibility.
 
 ## Upgrades
 
