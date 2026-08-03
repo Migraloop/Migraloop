@@ -12,6 +12,7 @@
 | `host` / `port` / `database` | MongoDB 连接标识 |
 | `username` | 可对 bound collections 做 upsert/delete 的 Delivery 账号 |
 | `password` | Secret reference（`fromEnv`、`fromFile` 或 `fromDockerSecret`） |
+| `tls` | 可选。设 `enabled: true` 以使用 Mongo TLS；`caFile` 为文件系统 CA 路径（不可 inline PEM）。见 [Security](security.md) |
 
 v1 不配置 Target timezone—Delivery 对时间型 Managed 字段写入 UTC datetime。
 

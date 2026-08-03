@@ -25,6 +25,7 @@ Workspace members：`crates/app`（binary `migraloop`）、`cli`、`capture`、`
 ```bash
 docker compose up -d platform-store
 export MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
+# 本地 cleartext 即可。生产环境 store TLS：加上 ?sslmode=require&sslrootcert=/path/to/ca.pem
 cargo run -p migraloop-app -- migrate
 cargo run -p migraloop-app -- status
 ```
