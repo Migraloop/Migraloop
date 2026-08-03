@@ -4521,6 +4521,28 @@ collection={PLATFORM_STORE_GUARDRAILS_COLLECTION} deployment={PLATFORM_STORE_GUA
         )));
     }
 
+    println!("Lab Scenario: status rejects absurdly low shared_buffers (inject)...");
+    let (reject_ok, reject_out) = run_product_cli_allow_fail(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[(
+            "MIGRALOOP_INJECT_PLATFORM_STORE_SHARED_BUFFERS_BYTES",
+            "1048576",
+        )],
+    )
+    .await?;
+    if reject_ok {
+        return Err(CliError::Failed(format!(
+            "status must reject absurdly low shared_buffers:\n{reject_out}"
+        )));
+    }
+    let reject_lower = reject_out.to_ascii_lowercase();
+    if !(reject_lower.contains("guardrails") && reject_lower.contains("shared_buffers")) {
+        return Err(CliError::Failed(format!(
+            "expected Guardrails shared_buffers rejection:\n{reject_out}"
+        )));
+    }
+
     println!(
         "Lab Scenario: status with injected low free disk ({PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES} bytes)..."
     );

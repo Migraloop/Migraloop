@@ -74,7 +74,7 @@ Operator 依可見 lag 行動（擴充 Target、降低負載、檢查 Delivery �
 
 **如何觀測可用磁碟：** compose 會把 store data volume 以 read-only 掛進 app 的 `/var/lib/migraloop/platform-store-data`，並設定 `MIGRALOOP_PLATFORM_STORE_DATA_DIR` 指向該路徑。當無法做 filesystem probe 時，Operator／orchestrator 也可改供 `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES`。
 
-Lab Scenario `platform-store-guardrails` 可在可拋棄 Fixture 上演練隨附 Guardrail 下限與 warn-only 可用磁碟行為（過低設定拒絕由 contract-path CI twin 覆蓋）。Postgres 備份仍是 Operator 的責任。
+Lab Scenario `platform-store-guardrails` 可在可拋棄 Fixture 上演練隨附 Guardrail 下限、過低設定拒絕，以及 warn-only 可用磁碟行為。Postgres 備份仍是 Operator 的責任。
 
 ## Upgrades
 

@@ -3,10 +3,10 @@
 mod guardrails;
 
 pub use guardrails::{
-    check_store_settings, disk_warn_message, format_bytes, probe_store_resources,
-    probe_store_settings, GuardrailError, PlatformStoreResourceStatus, PlatformStoreSettings,
-    DISK_FREE_WARN_BYTES, MIN_MAINTENANCE_WORK_MEM_BYTES, MIN_MAX_CONNECTIONS,
-    MIN_SHARED_BUFFERS_BYTES, MIN_WORK_MEM_BYTES,
+    check_store_settings, disk_warn_message, probe_store_resources, probe_store_settings,
+    GuardrailError, PlatformStoreResourceStatus, PlatformStoreSettings, DISK_FREE_WARN_BYTES,
+    MIN_MAINTENANCE_WORK_MEM_BYTES, MIN_MAX_CONNECTIONS, MIN_SHARED_BUFFERS_BYTES,
+    MIN_WORK_MEM_BYTES,
 };
 
 use std::time::Duration;

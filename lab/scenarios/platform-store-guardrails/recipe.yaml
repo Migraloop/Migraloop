@@ -16,12 +16,14 @@ workload:
   steps:
     - prepare Scenario Namespace table + seed + table-level supplemental logging
     - apply Deployment via real product path (Initial Load + Delivery)
+    - status without inject still healthy (bundled Postgres meets guardrail minimums)
+    - status with absurdly low shared_buffers inject → Guardrails rejection
     - status with injected low free disk → WARN + structured event; Platform Store stays healthy
     - assert Pipeline is not auto-paused for disk pressure
-    - status without inject still healthy (bundled Postgres meets guardrail minimums)
 checks:
   correctness:
+    - "bundled Platform Store settings satisfy product minimums (status healthy without inject)"
+    - "status rejects absurdly low store settings via Guardrails"
     - "status under low free disk emits WARN and platform_store_disk_warn; store remains healthy"
     - "Pipeline is not paused solely because disk threshold crossed"
-    - "bundled Platform Store settings satisfy product minimums (status healthy without inject)"
 thresholds: {}

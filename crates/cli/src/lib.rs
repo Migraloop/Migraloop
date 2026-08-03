@@ -211,10 +211,11 @@ pub fn parse() -> Cli {
 }
 
 async fn apply_migrations(platform_store_url: &str) -> Result<(), CliError> {
+    // Reject absurd under-provisioning before applying schema (ADR-0010).
+    enforce_store_guardrails(platform_store_url).await?;
     migrate(platform_store_url)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
-    enforce_store_guardrails(platform_store_url).await?;
     println!("Platform Store migrations applied");
     Ok(())
 }
