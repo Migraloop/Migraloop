@@ -81,6 +81,7 @@ Upgrades are **backward compatible** (ADR-0014):
 
 - Platform Store schema changes ship as versioned migrations applied on startup (`migraloop run` / `migraloop migrate`)
 - A newer app must continue existing Deployments and accepted older config without wipe-and-rebuild
+- Deployment config `apiVersion` is SemVer older-or-equal within major `1`: canonical `migraloop.dev/v1`, and older accepted forms such as `migraloop.dev/v1.0` / `migraloop.dev/v1.0.0` still apply; newer minors/patches and incompatible majors are rejected with a clear error
 - Short sync pause during single-instance upgrade is allowed; checkpoint/data loss is not
 - Downgrade support is not required in v1
 
@@ -89,7 +90,10 @@ Recommended upgrade loop:
 1. `migraloop status` — note checkpoints and health
 2. Roll the new app image / binary
 3. Confirm migrations (`Schema version` in `status`)
-4. `migraloop sync` / watch Sync Health and Delivery Health
+4. Re-apply accepted older config if needed (must not Initial Load / rebuild Base from scratch)
+5. `migraloop sync` / watch Sync Health and Delivery Health
+
+Lab Scenario `backward-compatible-upgrades` exercises migrate-on-upgrade, older SemVer-compatible config apply, and no wipe-rebuild on the disposable Fixture.
 
 ## Restart resume
 

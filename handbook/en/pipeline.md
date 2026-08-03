@@ -11,7 +11,7 @@ A **Pipeline** is a user-defined flow inside a **Deployment** that produces one 
 
 ## Declaring Pipelines
 
-Pipelines live under `spec.pipelines` in the Deployment document:
+Pipelines live under `spec.pipelines` in the Deployment document. The enclosing Deployment `apiVersion` must be SemVer older-or-equal within major `1` (canonical `migraloop.dev/v1`; older accepted forms such as `migraloop.dev/v1.0.0` still apply Pipeline declarations without wipe-rebuild — see [Operations](operations.md) Upgrades and [CLI & Config](cli-and-config.md)):
 
 ```yaml
 pipelines:

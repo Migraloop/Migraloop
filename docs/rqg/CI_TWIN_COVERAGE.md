@@ -32,6 +32,7 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | Bounded backpressure with visible lag | `bounded-backpressure` | `cli_bounded_backpressure.rs` | Downstream Delivery delay + tiny queue capacity → Backpressure signal; queue_depth ≤ capacity; Sync/Delivery Health lag > 0 mid-sync; Pipeline not paused; catch-up lag → 0 |
 | Observability Surface (logs, health, Prometheus) | `observability-surface` | `cli_observability_surface.rs` | Structured JSON operator events on sync; `status` Sync/Delivery Health + Pipeline; `run --metrics-addr` Prometheus `/metrics` exposes lag + alertable failure counters |
 | Platform Store Guardrails and warn-only disk thresholds | `platform-store-guardrails` | `cli_platform_store_guardrails.rs` | Absurdly low store settings rejected on migrate; free-disk warn on `status` / metrics (`platform_store_disk_warn`) while store stays healthy; Pipeline not auto-paused for disk pressure |
+| Backward-compatible upgrades / Platform Store migrations | `backward-compatible-upgrades` | `cli_backward_compatible_upgrades.rs` | Prior-schema `migrate` preserves Deployment/Base; SemVer-compatible older `apiVersion` (`migraloop.dev/v1.0.0`) applies without Initial Load; upgrade smoke without wipe-rebuild. Lab Scenario covers operator migrate + older-config re-apply on a live Fixture (prior-schema cut is CI twin) |
 
 ## Explicitly not gate evidence
 

@@ -1,0 +1,30 @@
+# Lab Scenario: backward-compatible-upgrades
+# Disposable Lab Oracle → Lab Mongo; upgrade migrate + older config (ADR-0014).
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-backward-compatible-upgrades
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-upg-customers
+      mode: direct
+      source:
+        table: LAB_UPG_CUSTOMERS
+      target:
+        collection: lab_upg_customers

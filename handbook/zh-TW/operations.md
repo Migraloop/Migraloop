@@ -82,6 +82,7 @@ Lab Scenario `platform-store-guardrails` 可在可拋棄 Fixture 上演練隨附
 
 - Platform Store schema 變更以啟動時套用的版本化 migrations 出貨（`migraloop run` / `migraloop migrate`）
 - 較新的 app 必須能繼續既有 Deployments 與可接受的舊設定，而不是 wipe-and-rebuild
+- Deployment config `apiVersion` 在 major `1` 上為 SemVer 較舊或相等：正式寫法 `migraloop.dev/v1`，較舊可接受形式如 `migraloop.dev/v1.0` / `migraloop.dev/v1.0.0` 仍可套用；較新 minor/patch 與不相容 major 會以清楚錯誤拒絕
 - 單 instance 升級期間允許短暫 sync pause；不得遺失 checkpoint/資料
 - v1 不要求支援 downgrade
 
@@ -90,7 +91,10 @@ Lab Scenario `platform-store-guardrails` 可在可拋棄 Fixture 上演練隨附
 1. `migraloop status` — 記下 checkpoints 與健康
 2. 滾動新的 app image / binary
 3. 確認 migrations（`status` 中的 `Schema version`）
-4. `migraloop sync` / 監看 Sync Health 與 Delivery Health
+4. 若需要，重新套用已接受的較舊 config（不得 Initial Load／從頭 rebuild Base）
+5. `migraloop sync` / 監看 Sync Health 與 Delivery Health
+
+Lab Scenario `backward-compatible-upgrades` 可在可拋棄 Fixture 上演練升級時 migrate、較舊 SemVer-compatible config apply，以及不做 wipe-rebuild。
 
 ## 重啟後 resume
 
