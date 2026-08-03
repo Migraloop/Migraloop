@@ -116,7 +116,7 @@ Recipe 慣例與短清單亦見 `lab/scenarios/README.md`。已出貨 capability
 | **Handbook guard** | `cargo test -p handbook-guard` 加上 handbook check entrypoint | 見下方「Handbook guard」一節 |
 | **rqg-unit** | workspace crate 測試，排除 `migraloop-app` 與 `handbook-guard`（不需 Postgres/Mongo） | `cargo test --workspace --exclude migraloop-app --exclude handbook-guard` |
 | **rqg-integration** | 非 ignored 的 `migraloop-app` 測試（正確性、contract、fault、capability CI twins） | 下方 CI 對齊 env，再 `cargo test -p migraloop-app` |
-| **rqg-perf** | contract/stub 上固定 Direct Pipeline microbench，對照 committed baseline（約 20% regression；失敗可重試一次） | 下方 CI 對齊 env，再 `bash ci/rqg/run_direct_pipeline_microbench.sh` |
+| **rqg-perf** | contract/stub 上固定 Direct Pipeline microbench，對照 committed baseline（`allowed_regression_pct` 約 55，因應 hosted runner 噪訊；最多 3 次 attempts） | 下方 CI 對齊 env，再 `bash ci/rqg/run_direct_pipeline_microbench.sh` |
 
 `rqg-integration` 與 `rqg-perf` 使用與 CI 相同的 service 憑證。執行那些 cargo／bash 指令前請設定：
 

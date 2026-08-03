@@ -1,8 +1,9 @@
 # Release Quality Gate — performance microbench
 
-`rqg-perf` runs a fixed Direct Pipeline microbench on the **contract/stub** path
-(seed N → Initial Load → Incremental → Delivery) and compares wall-clock duration
-and throughput to the committed baseline below.
+Part of ADR-0011 / ADR-0028 (PRD #30). `rqg-perf` runs a fixed Direct Pipeline
+microbench on the **contract/stub** path (seed N → Initial Load → Incremental →
+Delivery) and compares wall-clock duration and throughput to the committed
+baseline below.
 
 | Artifact | Purpose |
 | --- | --- |
