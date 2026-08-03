@@ -234,7 +234,7 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` | 仅供 Test/Lab inject：成功 N 个 chunks 后 pause Initial Load，以便演练 durable pause/resume（不是 production Operator 控制；Operators 请在 chunks 之间使用 `migraloop pause`） |
 | `MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS` | 仅供 Test/Lab inject：Initial Load 期间人工延迟 Platform Store／Downstream，以便演练 backoff（不是 production Operator 控制） |
 | `MIGRALOOP_DELIVERY_DELAY_MS` | 仅 Test/Lab fault injection：人工 Downstream Delivery 延迟（毫秒），用来演练 bounded backpressure 与可见 lag（不是 production Operator 控制） |
-| `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | 仅 Test/Lab injection：contract LogMiner contents 的 JSON 文件路径（`contents: [{scn, operation, table_name, identity, after_image}, …]`），供 `contract`/`stub` hosts 的 Incremental Capture（未设置时 harness Incremental 流为空；不是 production Operator 控制） |
+| `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | 仅 Test/Lab injection：contract LogMiner contents 的 JSON 文件路径（`contents: [{scn, operation, table_name, identity, after_image, rs_id?, ssn?}, …]`），供 `contract`/`stub` hosts 的 Incremental Capture。可选的 `rs_id` / `ssn` 是 LogMiner ordering keys，让同一 SCN 的多行在 dedupe 与 resume-safe catch-up 时保持可区分（未设置时 harness Incremental 流为空；不是 production Operator 控制） |
 | Lab disposable defaults | `migraloop lab up` 之后：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`（仅本地 Lab） |
 
 ### Contract-harness Source Prerequisite probes（仅 host `stub` / `contract`）

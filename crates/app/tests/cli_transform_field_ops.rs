@@ -533,7 +533,9 @@ async fn transform_email_only_update_skips_when_removed() {
             ("ACTIVE", json_num(1)),
             ("BIO", json_str("blob-bytes-alice")),
         ])),
-    }];
+            rs_id: String::new(),
+            ssn: 0,
+        }];
     let doubles = common::NamedScenarioDoubles::install_with_extra_logminer(dir.path(), &extra);
     let pipeline = r#"
     - name: no-email

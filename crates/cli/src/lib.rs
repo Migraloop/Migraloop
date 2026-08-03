@@ -28,9 +28,10 @@ use migraloop_platform_store::{
     append_base_dataset_chunk, base_dataset_exists, check_store_settings,
     clear_schema_change_impacts, delete_base_datasets_not_in, delete_maintenance_state,
     delete_pipeline, disk_warn_message, filter_unapplied_change_ids, get_base_rows,
-    get_derived_rows, get_maintenance_state_json, health, list_base_datasets, list_deployments,
-    list_derived_datasets, list_pipelines, list_quarantined_changes, list_schema_change_impacts,
-    migrate, probe_store_resources, probe_store_settings, record_applied_source_changes,
+    get_derived_rows, get_maintenance_state_json, health, list_applied_change_ids_from_position,
+    list_base_datasets, list_deployments, list_derived_datasets, list_pipelines,
+    list_quarantined_changes, list_schema_change_impacts, migrate, probe_store_resources,
+    probe_store_settings, record_applied_source_changes,
     replace_base_dataset, replace_derived_dataset, replace_maintenance_state, replace_pipelines,
     set_pipeline_paused, update_base_primary_key, update_pipeline_delivery_lag,
     update_pipeline_delivery_progress, update_pipeline_delivery_progress_with_lag,
@@ -968,7 +969,7 @@ async fn run_chunked_initial_load(
             sync_health: "unknown".to_string(),
             capture_low_watermark: Some(wm.as_i64()),
             // Checkpoint starts at watermark-1 so first Incremental includes the overlap window
-            // via exclusive resume (checkpoint+1 == low-watermark).
+            // via inclusive resume from checkpoint (== low-watermark-1) covering overlap.
             capture_checkpoint: Some(wm.as_i64().saturating_sub(1)),
             sync_lag: 0,
             source_alignment: "unknown".to_string(),
@@ -3540,10 +3541,12 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             );
         }
 
-        // Resume from durable Platform Store checkpoint (exclusive). Initial Load sets
+        // Resume from durable Platform Store checkpoint (inclusive SCN). Initial Load sets
         // checkpoint = low-watermark-1 so the first Incremental still covers the ADR-0004
-        // overlap window. Prefer duplicates over gaps: Deliver each change before durable
-        // Base/checkpoint/change-id persistence so a Delivery failure can retry.
+        // overlap window. Inclusive resume plus change-id dedupe keeps same-SCN siblings
+        // visible after a mid-SCN stop or bounded window (issue #143). Prefer duplicates
+        // over gaps: Deliver each change before durable Base/checkpoint/change-id
+        // persistence so a Delivery failure can retry.
         let mongo = mongo_target_from_deployment(deployment)?;
 
         for (schema, table) in tables {
@@ -3565,14 +3568,11 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             })?;
 
             let mut resume_from = match dataset.capture_checkpoint {
-                Some(cp) => {
-                    let next = cp.saturating_add(1);
-                    CapturePosition::from_i64(next).ok_or_else(|| {
-                        CliError::Failed(format!(
-                            "invalid capture checkpoint for Base Dataset {table}: {cp}"
-                        ))
-                    })?
-                }
+                Some(cp) => CapturePosition::from_i64(cp).ok_or_else(|| {
+                    CliError::Failed(format!(
+                        "invalid capture checkpoint for Base Dataset {table}: {cp}"
+                    ))
+                })?,
                 None => low_watermark,
             };
 
@@ -3613,19 +3613,40 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
             // queue_capacity; Downstream slowness drains slowly and backpressures
             // further fetch instead of buffering the full backlog in RAM.
             loop {
+                // Already-applied ids at/after the inclusive resume SCN must be skipped
+                // *before* the bounded window limit so same-SCN siblings are not starved
+                // by re-fetched duplicates (issue #143).
+                let applied_at_or_after = list_applied_change_ids_from_position(
+                    platform_store_url,
+                    &deployment.name,
+                    &schema,
+                    &table,
+                    resume_from.as_i64(),
+                )
+                .await
+                .map_err(|err| CliError::Failed(err.to_string()))?;
+                let applied_skip: BTreeSet<_> = applied_at_or_after.into_iter().collect();
+                let fetch_limit = Some(queue_capacity.saturating_add(applied_skip.len()));
+
                 // Count Source backlog without materializing row images so Sync/
                 // Delivery Health lag can reflect delay under a bounded window.
-                let source_pending = capture
+                let source_pending_total = capture
                     .count_changes_in_schema(&schema, &table, resume_from)
                     .map_err(|err| CliError::Failed(err.to_string()))?;
-                let candidate_changes = capture
+                let source_pending = source_pending_total.saturating_sub(applied_skip.len());
+                let fetched_changes = capture
                     .fetch_changes_in_schema_limited(
                         &schema,
                         &table,
                         resume_from,
-                        Some(queue_capacity),
+                        fetch_limit,
                     )
                     .map_err(|err| CliError::Failed(err.to_string()))?;
+                let candidate_changes: Vec<_> = fetched_changes
+                    .into_iter()
+                    .filter(|c| !applied_skip.contains(&c.change_id))
+                    .take(queue_capacity)
+                    .collect();
                 let table_schema_changes: Vec<SchemaChangeEvent> = injected_schema_changes
                     .iter()
                     .filter(|c| c.table.eq_ignore_ascii_case(&table))
@@ -3655,7 +3676,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                     .iter()
                     .filter(|c| unapplied_set.contains(&c.change_id))
                     .count();
-                // Source count is from resume_from (exclusive of durable checkpoint).
+                // Source count is from inclusive resume_from minus already-applied ids.
                 // Window fetch may be smaller; lag uses full Source+schema pending.
                 let pending_at_window_start = source_pending.saturating_add(schema_pending);
                 let mut items: Vec<IncrementalItem> = candidate_changes
@@ -3694,7 +3715,8 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                         if windows_processed == 0 {
                             dataset.capture_checkpoint
                         } else {
-                            Some(resume_from.as_i64().saturating_sub(1))
+                            // Inclusive resume cursor sits on the drained SCN.
+                            Some(resume_from.as_i64())
                         },
                         0,
                     );
@@ -3750,7 +3772,7 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                 if windows_processed == 0 {
                     println!(
                         "Incremental Capture: resuming Base Dataset {table} from \
-                         checkpoint={checkpoint_before} (exclusive next={resume_from}, \
+                         checkpoint={checkpoint_before} (inclusive resume={resume_from}, \
                          queue_depth={queue_depth}, capacity={queue_capacity}, \
                          low-watermark={low_watermark})"
                     );
@@ -4127,18 +4149,19 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
                     }
                 }
 
+                // Stay on the last applied SCN (inclusive). Already-applied change ids are
+                // skipped on the next fetch so same-SCN siblings still drain; exclusive
+                // SCN+1 advance would gap unapplied peers (issue #143).
                 let last_pos = items
                     .last()
                     .expect("non-empty window")
                     .position()
                     .as_i64();
-                resume_from = CapturePosition::from_i64(last_pos.saturating_add(1)).ok_or_else(
-                    || {
-                        CliError::Failed(format!(
-                            "invalid capture position advance for Base Dataset {table}: {last_pos}"
-                        ))
-                    },
-                )?;
+                resume_from = CapturePosition::from_i64(last_pos).ok_or_else(|| {
+                    CliError::Failed(format!(
+                        "invalid capture position advance for Base Dataset {table}: {last_pos}"
+                    ))
+                })?;
                 windows_processed += 1;
             }
 

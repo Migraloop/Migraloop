@@ -1492,6 +1492,36 @@ impl BaseDatasetRow {
     }
 }
 
+/// List applied source change ids at or after `from_position` for resume-safe
+/// same-SCN Incremental windows (issue #143).
+pub async fn list_applied_change_ids_from_position(
+    database_url: &str,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    from_position: i64,
+) -> Result<Vec<String>, PlatformStoreError> {
+    let pool = connect(database_url).await?;
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT change_id
+        FROM applied_source_changes
+        WHERE deployment_name = $1
+          AND source_schema = $2
+          AND source_table = $3
+          AND position >= $4
+        ORDER BY position ASC, change_id ASC
+        "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(from_position)
+    .fetch_all(&pool)
+    .await
+    .map_err(PlatformStoreError::Load)
+}
+
 /// Filter `change_ids` down to those not yet applied into this Base Dataset.
 pub async fn filter_unapplied_change_ids(
     database_url: &str,

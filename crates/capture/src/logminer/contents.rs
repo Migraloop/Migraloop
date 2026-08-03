@@ -1,8 +1,8 @@
 //! Normalized LogMiner contents → platform [`ChangeEvent`].
 //!
 //! Mirrors the fields Incremental Capture needs from `V$LOGMNR_CONTENTS`
-//! (SCN, OPERATION, SEG_OWNER, TABLE_NAME, and reconstructed row images from
-//! supplemental logging) without parsing SQL_REDO text.
+//! (SCN, OPERATION, SEG_OWNER, TABLE_NAME, RS_ID, SSN, and reconstructed row
+//! images from supplemental logging) without parsing SQL_REDO text.
 
 use std::collections::BTreeMap;
 
@@ -42,6 +42,7 @@ impl LogMinerOperation {
 ///
 /// `identity` is the primary-key column map (from supplemental logging).
 /// `after_image` is the full after-row for INSERT/UPDATE; `None` for DELETE.
+/// `rs_id` / `ssn` are LogMiner ordering keys that distinguish multiple rows at one SCN.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogMinerContent {
     pub scn: u64,
@@ -50,9 +51,59 @@ pub struct LogMinerContent {
     pub table_name: String,
     pub identity: BTreeMap<String, Value>,
     pub after_image: Option<BTreeMap<String, Value>>,
+    /// LogMiner `RS_ID` (row change identifier within an SCN).
+    #[serde(default)]
+    pub rs_id: String,
+    /// LogMiner `SSN` (SQL sequence number within an `RS_ID`).
+    #[serde(default)]
+    pub ssn: u32,
 }
 
-/// Stable Platform Store dedupe id derived from LogMiner SCN + row identity.
+impl LogMinerContent {
+    /// Build a content row with empty LogMiner ordering keys.
+    ///
+    /// Prefer setting [`Self::rs_id`] / [`Self::ssn`] for same-SCN multi-row streams.
+    pub fn new(
+        scn: u64,
+        operation: LogMinerOperation,
+        seg_owner: impl Into<String>,
+        table_name: impl Into<String>,
+        identity: BTreeMap<String, Value>,
+        after_image: Option<BTreeMap<String, Value>>,
+    ) -> Self {
+        Self {
+            scn,
+            operation,
+            seg_owner: seg_owner.into(),
+            table_name: table_name.into(),
+            identity,
+            after_image,
+            rs_id: String::new(),
+            ssn: 0,
+        }
+    }
+
+    /// Attach LogMiner ordering keys (RS_ID / SSN).
+    pub fn with_order(mut self, rs_id: impl Into<String>, ssn: u32) -> Self {
+        self.rs_id = rs_id.into();
+        self.ssn = ssn;
+        self
+    }
+}
+
+/// Compare LogMiner contents in capture order: SCN, then RS_ID, then SSN, then table.
+pub fn logminer_content_order(a: &LogMinerContent, b: &LogMinerContent) -> std::cmp::Ordering {
+    a.scn
+        .cmp(&b.scn)
+        .then_with(|| a.rs_id.cmp(&b.rs_id))
+        .then_with(|| a.ssn.cmp(&b.ssn))
+        .then_with(|| a.table_name.cmp(&b.table_name))
+}
+
+/// Stable Platform Store dedupe id derived from LogMiner SCN + ordering key + row identity.
+///
+/// Includes `RS_ID`/`SSN` so distinct LogMiner rows that share one SCN (and even the
+/// same operation + PK) remain unique — SCN+op+identity alone is not enough.
 pub fn logminer_change_id(content: &LogMinerContent) -> String {
     let mut identity_parts: Vec<String> = content
         .identity
@@ -61,11 +112,13 @@ pub fn logminer_change_id(content: &LogMinerContent) -> String {
         .collect();
     identity_parts.sort();
     format!(
-        "logminer:{}:{}:{}:{}",
+        "logminer:{}:{}:{}:{}:{}:{}",
         content.table_name,
         content.scn,
         content.operation.as_str(),
-        identity_parts.join(",")
+        identity_parts.join(","),
+        content.rs_id,
+        content.ssn
     )
 }
 
@@ -144,25 +197,27 @@ mod tests {
     #[test]
     fn maps_insert_update_delete_preserving_scn_and_identity() {
         let rows = vec![
-            LogMinerContent {
-                scn: 1050,
-                operation: LogMinerOperation::Update,
-                seg_owner: "APP".into(),
-                table_name: "CUSTOMERS".into(),
-                identity: BTreeMap::from([("ID".into(), num(1))]),
-                after_image: Some(BTreeMap::from([
+            LogMinerContent::new(
+                1050,
+                LogMinerOperation::Update,
+                "APP",
+                "CUSTOMERS",
+                BTreeMap::from([("ID".into(), num(1))]),
+                Some(BTreeMap::from([
                     ("ID".into(), num(1)),
                     ("NAME".into(), s("Alicia")),
                 ])),
-            },
-            LogMinerContent {
-                scn: 1070,
-                operation: LogMinerOperation::Delete,
-                seg_owner: "APP".into(),
-                table_name: "CUSTOMERS".into(),
-                identity: BTreeMap::from([("ID".into(), num(2))]),
-                after_image: None,
-            },
+            )
+            .with_order("0x000001.00000001.0001", 1),
+            LogMinerContent::new(
+                1070,
+                LogMinerOperation::Delete,
+                "APP",
+                "CUSTOMERS",
+                BTreeMap::from([("ID".into(), num(2))]),
+                None,
+            )
+            .with_order("0x000001.00000002.0001", 1),
         ];
 
         let events = change_events_from_logminer_contents(&rows, "CUSTOMERS", CapturePosition(1000));
@@ -170,23 +225,121 @@ mod tests {
         assert_eq!(events[0].op, ChangeOp::Update);
         assert_eq!(events[0].position, CapturePosition(1050));
         assert!(events[0].change_id.starts_with("logminer:CUSTOMERS:1050:UPDATE:"));
+        assert!(events[0].change_id.contains("0x000001.00000001.0001:1"));
         assert_eq!(events[1].op, ChangeOp::Delete);
         assert!(events[1].row.is_none());
     }
 
     #[test]
     fn filters_by_from_position_and_table() {
-        let rows = vec![LogMinerContent {
-            scn: 900,
-            operation: LogMinerOperation::Insert,
-            seg_owner: "APP".into(),
-            table_name: "CUSTOMERS".into(),
-            identity: BTreeMap::from([("ID".into(), num(9))]),
-            after_image: Some(BTreeMap::from([("ID".into(), num(9))])),
-        }];
+        let rows = vec![LogMinerContent::new(
+            900,
+            LogMinerOperation::Insert,
+            "APP",
+            "CUSTOMERS",
+            BTreeMap::from([("ID".into(), num(9))]),
+            Some(BTreeMap::from([("ID".into(), num(9))])),
+        )];
         let events = change_events_from_logminer_contents(&rows, "CUSTOMERS", CapturePosition(1000));
         assert!(events.is_empty());
         let other = change_events_from_logminer_contents(&rows, "ORDERS", CapturePosition(1));
         assert!(other.is_empty());
+    }
+
+    #[test]
+    fn same_scn_rows_get_distinct_change_ids_from_rs_id_ssn() {
+        let a = LogMinerContent::new(
+            1050,
+            LogMinerOperation::Update,
+            "APP",
+            "CUSTOMERS",
+            BTreeMap::from([("ID".into(), num(1))]),
+            Some(BTreeMap::from([
+                ("ID".into(), num(1)),
+                ("NAME".into(), s("A1")),
+            ])),
+        )
+        .with_order("0xAAA", 1);
+        let b = LogMinerContent::new(
+            1050,
+            LogMinerOperation::Update,
+            "APP",
+            "CUSTOMERS",
+            BTreeMap::from([("ID".into(), num(1))]),
+            Some(BTreeMap::from([
+                ("ID".into(), num(1)),
+                ("NAME".into(), s("A2")),
+            ])),
+        )
+        .with_order("0xAAA", 2);
+
+        let id_a = logminer_change_id(&a);
+        let id_b = logminer_change_id(&b);
+        assert_ne!(
+            id_a, id_b,
+            "same SCN+op+identity must still be distinct via RS_ID/SSN"
+        );
+        assert!(id_a.ends_with(":0xAAA:1"));
+        assert!(id_b.ends_with(":0xAAA:2"));
+    }
+
+    #[test]
+    fn same_scn_events_preserve_rs_id_ssn_order() {
+        let rows = vec![
+            LogMinerContent::new(
+                1050,
+                LogMinerOperation::Update,
+                "APP",
+                "CUSTOMERS",
+                BTreeMap::from([("ID".into(), num(1))]),
+                Some(BTreeMap::from([
+                    ("ID".into(), num(1)),
+                    ("NAME".into(), s("A2")),
+                ])),
+            )
+            .with_order("0xBBB", 2),
+            LogMinerContent::new(
+                1050,
+                LogMinerOperation::Insert,
+                "APP",
+                "CUSTOMERS",
+                BTreeMap::from([("ID".into(), num(4))]),
+                Some(BTreeMap::from([
+                    ("ID".into(), num(4)),
+                    ("NAME".into(), s("Dana")),
+                ])),
+            )
+            .with_order("0xCCC", 1),
+            LogMinerContent::new(
+                1050,
+                LogMinerOperation::Update,
+                "APP",
+                "CUSTOMERS",
+                BTreeMap::from([("ID".into(), num(1))]),
+                Some(BTreeMap::from([
+                    ("ID".into(), num(1)),
+                    ("NAME".into(), s("A1")),
+                ])),
+            )
+            .with_order("0xBBB", 1),
+        ];
+        let mut ordered = rows;
+        ordered.sort_by(logminer_content_order);
+
+        let events =
+            change_events_from_logminer_contents(&ordered, "CUSTOMERS", CapturePosition(1000));
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].row.as_ref().unwrap().get("NAME"),
+            Some(&s("A1"))
+        );
+        assert_eq!(
+            events[1].row.as_ref().unwrap().get("NAME"),
+            Some(&s("A2"))
+        );
+        assert_eq!(
+            events[2].row.as_ref().unwrap().get("NAME"),
+            Some(&s("Dana"))
+        );
     }
 }

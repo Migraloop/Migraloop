@@ -105,6 +105,8 @@ fn distinct_addtoset_logminer_contents() -> Vec<LogMinerContent> {
                 ("AMOUNT", json_str("42.50")),
                 ("ADDRESS", json_str("1 Main Ave")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         // 2) Duplicate CUSTOMER_ID insert — distinct value-level skip; addToSet may
         //    skip if AMOUNT already in set (42.50 is already present for customer 1).
@@ -120,6 +122,8 @@ fn distinct_addtoset_logminer_contents() -> Vec<LogMinerContent> {
                 ("AMOUNT", json_str("42.50")),
                 ("ADDRESS", json_str("1 Main Ave")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         // 3) New AMOUNT for customer 1 — addToSet recompute; distinct still skip
         //    (CUSTOMER_ID already counted).
@@ -135,6 +139,8 @@ fn distinct_addtoset_logminer_contents() -> Vec<LogMinerContent> {
                 ("AMOUNT", json_str("7.00")),
                 ("ADDRESS", json_str("1 Main Ave")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         // 4) Last order for customer 2 moves to customer 3 — distinct removes 2 / adds 3.
         LogMinerContent {
@@ -149,6 +155,8 @@ fn distinct_addtoset_logminer_contents() -> Vec<LogMinerContent> {
                 ("AMOUNT", json_str("5.00")),
                 ("ADDRESS", json_str("2 Side Rd")),
             ])),
+            rs_id: String::new(),
+            ssn: 0,
         },
         // 5) Delete last remaining order for customer 3 — both Pipelines drop identity 3.
         LogMinerContent {
@@ -158,6 +166,8 @@ fn distinct_addtoset_logminer_contents() -> Vec<LogMinerContent> {
             table_name: "ORDERS".to_string(),
             identity: row(&[("ORDER_ID", json_num(200))]),
             after_image: None,
+            rs_id: String::new(),
+            ssn: 0,
         },
     ]
 }

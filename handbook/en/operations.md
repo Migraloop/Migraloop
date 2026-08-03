@@ -109,7 +109,7 @@ Lab Scenario `backward-compatible-upgrades` exercises migrate-on-upgrade, older 
 
 ## Restart resume
 
-Durable capture and Delivery progress live in the Platform Store. After process restart, `migraloop sync` resumes Incremental Capture from the stored checkpoint (exclusive) and continues Delivery—Operators should not need local-only recovery files.
+Durable capture and Delivery progress live in the Platform Store. After process restart, `migraloop sync` resumes Incremental Capture from the stored checkpoint (inclusive SCN, with change-id dedupe so same-SCN peers are not skipped) and continues Delivery—Operators should not need local-only recovery files.
 
 ## Related chapters
 
