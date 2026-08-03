@@ -148,8 +148,23 @@ Base；`from` 命名 secondary Base（Initial Load 與 Incremental Capture 都�
 Output Identities；未使用的 primary 欄位（例如 `project` 之後的 EMAIL）仍會略過重算。
 嵌入的 foreign rows 包含完整 Base 欄位，因此 foreign 側欄位變更會重算相符的 identities。
 
-領域 roadmap 也提到 unwind、union 等 operators。在它們進入 CLI config parser
-之前，請只宣告上面的 operators—不支援的 operator 名稱會讓 apply 失敗。
+### `unwind`
+
+把陣列欄位展開成每個元素一列 Derived（1→N 粒度）。常見組合是先 `equiLookup`
+再 `unwind`，讓 Delivery 能以展開後的 Output Identity（例如 `ORDER_ID`）為文件鍵。
+
+```yaml
+- unwind:
+    path: orders
+```
+
+當陣列元素是物件時，其欄位會**合併進 parent 列**，並移除陣列 path（利於 Delivery 的 flatten）。
+純量元素則替換該 path 的值（Mongo 風格）。缺失、null 或空陣列不產生列。自由形式的
+`$unwind` 以及 `preserveNullAndEmptyArrays` / `includeArrayIndex` 等選項會被拒絕，以便
+**Affect Analysis** 只展開受影響的 Output Identities—包括陣列成員消失時的 deletes。
+
+領域 roadmap 也提到 **union**。在它進入 CLI config parser 之前，請只宣告上面的
+operators—不支援的 operator 名稱會讓 apply 失敗。
 
 ## Output Identity
 
