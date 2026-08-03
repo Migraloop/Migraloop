@@ -58,7 +58,22 @@ Operators act on visible lag (scale Target, reduce load, inspect Delivery errors
 
 ## Platform Store Guardrails
 
-The bundled PostgreSQL Platform Store ships with safe defaults and product-enforced minimums (ADR-0010). Crossing a safe threshold (for example free disk) must **warn only**—the platform does not auto-pause solely for resource pressure. Postgres backup remains an Operator responsibility.
+The bundled PostgreSQL Platform Store ships with safe defaults and product-enforced minimums (ADR-0010 / issue #28). Operators may raise settings; the app **rejects** absurd lows so migrate / status / sync / apply / run fail with a Guardrails message rather than running under-provisioned.
+
+| Setting | Compose default | Product minimum (floor) |
+| --- | --- | --- |
+| `shared_buffers` | `128MB` | ≥ `64MB` |
+| `work_mem` | `8MB` | ≥ `4MB` |
+| `maintenance_work_mem` | `128MB` | ≥ `64MB` |
+| `max_connections` | `100` | ≥ `20` |
+
+Root `compose.yaml` and `lab/compose.yaml` ship those defaults on the `platform-store` service.
+
+**Free-disk warn (warn-only):** when free space on the Platform Store data volume drops below **1 GiB**, the product prints `WARN: …` on `migraloop status` (and on sync / apply / run paths), emits structured event `platform_store_disk_warn`, and exposes Prometheus gauges `migraloop_platform_store_disk_free_bytes` and `migraloop_platform_store_disk_warn`. Crossing the threshold does **not** auto-pause Pipelines—Platform Store stays healthy unless something else is wrong; acting on the warning is an Operator responsibility.
+
+**How free disk is observed:** compose mounts the store data volume read-only into the app at `/var/lib/migraloop/platform-store-data` and sets `MIGRALOOP_PLATFORM_STORE_DATA_DIR` to that path. Operators/orchestrators may instead supply `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES` when a filesystem probe is unavailable.
+
+Lab Scenario `platform-store-guardrails` exercises bundled Guardrail minimums, absurd-low rejection, and warn-only free-disk behavior on the disposable Fixture. Postgres backup remains an Operator responsibility.
 
 ## Upgrades
 

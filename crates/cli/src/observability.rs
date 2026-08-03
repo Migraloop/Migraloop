@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 
 use migraloop_platform_store::{
     list_base_datasets, list_pipelines, list_quarantined_changes, list_schema_change_impacts,
+    probe_store_resources,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -262,6 +263,30 @@ async fn render_prometheus_metrics(platform_store_url: &str) -> Result<String, S
         .count();
     let failures = quarantines.len() + blocking;
     out.push_str(&format!("migraloop_failures {failures}\n"));
+
+    // Platform Store resource signals (ADR-0010): warn-only disk threshold.
+    let resources = probe_store_resources(platform_store_url)
+        .await
+        .map_err(|err| err.to_string())?;
+    out.push_str(
+        "# HELP migraloop_platform_store_disk_free_bytes Free bytes on the Platform Store data volume when known (-1 if unknown).\n",
+    );
+    out.push_str("# TYPE migraloop_platform_store_disk_free_bytes gauge\n");
+    let free_metric = resources
+        .free_disk_bytes
+        .map(|b| b as i64)
+        .unwrap_or(-1);
+    out.push_str(&format!(
+        "migraloop_platform_store_disk_free_bytes {free_metric}\n"
+    ));
+    out.push_str(
+        "# HELP migraloop_platform_store_disk_warn Whether Platform Store free disk is below the warn threshold (1) or not (0). Warn-only — never auto-pauses Pipelines.\n",
+    );
+    out.push_str("# TYPE migraloop_platform_store_disk_warn gauge\n");
+    out.push_str(&format!(
+        "migraloop_platform_store_disk_warn {}\n",
+        if resources.disk_warn { 1 } else { 0 }
+    ));
 
     Ok(out)
 }

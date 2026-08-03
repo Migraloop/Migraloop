@@ -1,0 +1,30 @@
+# Lab Scenario: platform-store-guardrails
+# Disposable Lab Oracle → Lab Mongo; Platform Store Guardrails (ADR-0010).
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-platform-store-guardrails
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-guard-customers
+      mode: direct
+      source:
+        table: LAB_GUARD_CUSTOMERS
+      target:
+        collection: lab_guard_customers

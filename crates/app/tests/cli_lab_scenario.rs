@@ -498,6 +498,32 @@ async fn lab_scenario_list_includes_observability_surface() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_platform_store_guardrails() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("platform-store-guardrails"),
+        "catalog must list platform-store-guardrails Lab Scenario (#28), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("guardrail")
+            || lower.contains("disk")
+            || lower.contains("warn")
+            || lower.contains("threshold"),
+        "platform-store-guardrails summary should mention guardrails/disk/warn, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {

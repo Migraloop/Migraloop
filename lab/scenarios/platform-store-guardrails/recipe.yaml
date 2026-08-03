@@ -1,0 +1,29 @@
+# Lab Scenario recipe (ADR-0025 / issue #28 / ADR-0010).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: platform-store-guardrails
+summary: Platform Store Guardrails reject absurd settings; free-disk warn only (no auto-pause)
+namespace:
+  source_tables:
+    - LAB_GUARD_CUSTOMERS
+  target_collections:
+    - lab_guard_customers
+  deployment: lab-platform-store-guardrails
+  pipelines:
+    - lab-guard-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery)
+    - status without inject still healthy (bundled Postgres meets guardrail minimums)
+    - status with absurdly low shared_buffers inject → Guardrails rejection
+    - status with injected low free disk → WARN + structured event; Platform Store stays healthy
+    - assert Pipeline is not auto-paused for disk pressure
+checks:
+  correctness:
+    - "bundled Platform Store settings satisfy product minimums (status healthy without inject)"
+    - "status rejects absurdly low store settings via Guardrails"
+    - "status under low free disk emits WARN and platform_store_disk_warn; store remains healthy"
+    - "Pipeline is not paused solely because disk threshold crossed"
+thresholds: {}

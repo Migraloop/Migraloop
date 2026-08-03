@@ -29,6 +29,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Drift Check with Managed-field auto-repair | `drift-check` |
 | Bounded backpressure with visible lag | `bounded-backpressure` |
 | Observability Surface (logs, health, Prometheus) | `observability-surface` |
+| Platform Store Guardrails and warn-only disk thresholds | `platform-store-guardrails` |
 
 ## Visible gaps (not yet shipped)
 

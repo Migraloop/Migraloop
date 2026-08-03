@@ -161,6 +161,13 @@ const OBSERVABILITY_SURFACE_DELAY_MS: &str = "80";
 const OBSERVABILITY_SURFACE_FAIL_AFTER: &str = "1";
 const OBSERVABILITY_SURFACE_BACKLOG: i64 = 20;
 
+const PLATFORM_STORE_GUARDRAILS_ID: &str = "platform-store-guardrails";
+const PLATFORM_STORE_GUARDRAILS_TABLE: &str = "LAB_GUARD_CUSTOMERS";
+const PLATFORM_STORE_GUARDRAILS_COLLECTION: &str = "lab_guard_customers";
+const PLATFORM_STORE_GUARDRAILS_DEPLOYMENT: &str = "lab-platform-store-guardrails";
+/// 512 MiB — below the 1 GiB product warn threshold (ADR-0010).
+const PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES: &str = "536870912";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -248,6 +255,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         DRIFT_CHECK_ID,
         BOUNDED_BACKPRESSURE_ID,
         OBSERVABILITY_SURFACE_ID,
+        PLATFORM_STORE_GUARDRAILS_ID,
     ]
 }
 
@@ -307,6 +315,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             OBSERVABILITY_SURFACE_ID,
             "Observability Surface (logs, health, Prometheus)",
+        ),
+        (
+            PLATFORM_STORE_GUARDRAILS_ID,
+            "Platform Store Guardrails and warn-only disk thresholds",
         ),
     ]
 }
@@ -605,6 +617,7 @@ async fn scenario_run(
         DRIFT_CHECK_ID => run_drift_check(lab_dir).await,
         BOUNDED_BACKPRESSURE_ID => run_bounded_backpressure(lab_dir).await,
         OBSERVABILITY_SURFACE_ID => run_observability_surface(lab_dir).await,
+        PLATFORM_STORE_GUARDRAILS_ID => run_platform_store_guardrails(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -700,6 +713,7 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         DRIFT_CHECK_ID => remove_drift_check_namespace(lab_dir).await,
         BOUNDED_BACKPRESSURE_ID => remove_bounded_backpressure_namespace(lab_dir).await,
         OBSERVABILITY_SURFACE_ID => remove_observability_surface_namespace(lab_dir).await,
+        PLATFORM_STORE_GUARDRAILS_ID => remove_platform_store_guardrails_namespace(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -4454,6 +4468,220 @@ EXIT;\n"
         })
 }
 
+async fn run_platform_store_guardrails(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {PLATFORM_STORE_GUARDRAILS_ID}");
+    println!(
+        "Scenario Namespace: table={PLATFORM_STORE_GUARDRAILS_TABLE} \
+collection={PLATFORM_STORE_GUARDRAILS_COLLECTION} deployment={PLATFORM_STORE_GUARDRAILS_DEPLOYMENT}"
+    );
+
+    prepare_platform_store_guardrails_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, PLATFORM_STORE_GUARDRAILS_ID)?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!("Lab Scenario: status without disk inject (bundled settings must pass guardrails)...");
+    let status_ok = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !status_ok.contains("Platform Store: healthy") {
+        return Err(CliError::Failed(format!(
+            "bundled Platform Store must satisfy Guardrail minimums:\n{status_ok}"
+        )));
+    }
+    if status_ok.contains("Guardrails rejected") {
+        return Err(CliError::Failed(format!(
+            "bundled Platform Store settings must not be rejected by Guardrails:\n{status_ok}"
+        )));
+    }
+
+    println!("Lab Scenario: status rejects absurdly low shared_buffers (inject)...");
+    let (reject_ok, reject_out) = run_product_cli_allow_fail(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[(
+            "MIGRALOOP_INJECT_PLATFORM_STORE_SHARED_BUFFERS_BYTES",
+            "1048576",
+        )],
+    )
+    .await?;
+    if reject_ok {
+        return Err(CliError::Failed(format!(
+            "status must reject absurdly low shared_buffers:\n{reject_out}"
+        )));
+    }
+    let reject_lower = reject_out.to_ascii_lowercase();
+    if !(reject_lower.contains("guardrails") && reject_lower.contains("shared_buffers")) {
+        return Err(CliError::Failed(format!(
+            "expected Guardrails shared_buffers rejection:\n{reject_out}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: status with injected low free disk ({PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES} bytes)..."
+    );
+    let status_warn = run_product_cli_with_env(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        &[(
+            "MIGRALOOP_INJECT_PLATFORM_STORE_FREE_DISK_BYTES",
+            PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES,
+        )],
+    )
+    .await?;
+    if !status_warn.contains("Platform Store: healthy") {
+        return Err(CliError::Failed(format!(
+            "disk warn must leave Platform Store healthy:\n{status_warn}"
+        )));
+    }
+    let warn_lower = status_warn.to_ascii_lowercase();
+    if !(status_warn.contains("WARN:") && warn_lower.contains("disk")) {
+        return Err(CliError::Failed(format!(
+            "expected free-disk WARN on status:\n{status_warn}"
+        )));
+    }
+    if !(status_warn.contains("platform_store_disk_warn")
+        || status_warn.contains("\"event\":\"platform_store_disk_warn\""))
+    {
+        return Err(CliError::Failed(format!(
+            "expected structured platform_store_disk_warn event:\n{status_warn}"
+        )));
+    }
+    if status_warn.contains("Delivery Health: paused")
+        || status_warn
+            .lines()
+            .any(|line| line.contains("Pipeline:") && line.contains("paused"))
+    {
+        return Err(CliError::Failed(format!(
+            "disk threshold must not auto-pause Pipelines:\n{status_warn}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out);
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (Guardrails minimums ok; disk warn-only; Pipeline not paused)"
+    );
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: "LogMiner".to_string(),
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_platform_store_guardrails_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={PLATFORM_STORE_GUARDRAILS_TABLE}, collection={PLATFORM_STORE_GUARDRAILS_COLLECTION}, \
+          deployment={PLATFORM_STORE_GUARDRAILS_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {PLATFORM_STORE_GUARDRAILS_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for platform-store-guardrails:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{PLATFORM_STORE_GUARDRAILS_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for platform-store-guardrails:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(LAB_PLATFORM_STORE_URL, PLATFORM_STORE_GUARDRAILS_DEPLOYMENT)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to delete Platform Store Deployment `{PLATFORM_STORE_GUARDRAILS_DEPLOYMENT}` \
+                 for Scenario Namespace cleanup:\n{err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+async fn prepare_platform_store_guardrails_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_platform_store_guardrails_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {PLATFORM_STORE_GUARDRAILS_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {PLATFORM_STORE_GUARDRAILS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {PLATFORM_STORE_GUARDRAILS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {PLATFORM_STORE_GUARDRAILS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare platform-store-guardrails Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
 /// Start `migraloop run --metrics-addr`, scrape `/metrics`, then stop the process.
 async fn scrape_run_metrics(bin: &Path, platform_store_url: &str) -> Result<String, CliError> {
     use std::net::TcpListener;
@@ -6556,6 +6784,10 @@ mod tests {
         assert!(
             ids.iter().any(|id| id == OBSERVABILITY_SURFACE_ID),
             "catalog must include observability-surface for Observability Surface"
+        );
+        assert!(
+            ids.iter().any(|id| id == PLATFORM_STORE_GUARDRAILS_ID),
+            "catalog must include platform-store-guardrails for Platform Store Guardrails"
         );
         let coverage = lab.join("scenarios/COVERAGE.md");
         let body = fs::read_to_string(&coverage).expect("COVERAGE.md");

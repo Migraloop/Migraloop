@@ -18,6 +18,17 @@ services:
       POSTGRES_USER: migraloop
       POSTGRES_PASSWORD: migraloop
       POSTGRES_DB: migraloop
+    # Same Platform Store Guardrails defaults as root compose.yaml (ADR-0010).
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=100
     volumes:
       - lab_platform_store_data:/var/lib/postgresql/data
     healthcheck:
@@ -93,6 +104,10 @@ services:
       MIGRALOOP_PLATFORM_STORE_URL: postgres://migraloop:migraloop@127.0.0.1:5432/migraloop
       # Observability Surface Prometheus scrape (ADR-0008 / issue #27); host network shares :9090
       MIGRALOOP_METRICS_ADDR: 0.0.0.0:9090
+      # Free-disk warn probe (ADR-0010): same store volume, read-only
+      MIGRALOOP_PLATFORM_STORE_DATA_DIR: /var/lib/migraloop/platform-store-data
+    volumes:
+      - lab_platform_store_data:/var/lib/migraloop/platform-store-data:ro
     # ENTRYPOINT is already `migraloop`; only override the subcommand.
     command: ["run"]
     healthcheck:

@@ -24,12 +24,13 @@ use migraloop_delivery::{
     DeliveryDocument, ManagedFieldAs, MongoTargetConnection,
 };
 use migraloop_platform_store::{
-    base_dataset_exists, clear_schema_change_impacts, delete_base_datasets_not_in, delete_pipeline,
-    filter_unapplied_change_ids, get_base_rows, get_derived_rows, health, list_base_datasets,
-    list_deployments, list_derived_datasets, list_pipelines, list_quarantined_changes,
-    list_schema_change_impacts, migrate, record_applied_source_changes, replace_base_dataset,
-    replace_derived_dataset, replace_pipelines, set_pipeline_paused, update_base_primary_key,
-    update_pipeline_delivery_lag, update_pipeline_delivery_progress,
+    base_dataset_exists, check_store_settings, clear_schema_change_impacts,
+    delete_base_datasets_not_in, delete_pipeline, disk_warn_message, filter_unapplied_change_ids,
+    get_base_rows, get_derived_rows, health, list_base_datasets, list_deployments,
+    list_derived_datasets, list_pipelines, list_quarantined_changes, list_schema_change_impacts,
+    migrate, probe_store_resources, probe_store_settings, record_applied_source_changes,
+    replace_base_dataset, replace_derived_dataset, replace_pipelines, set_pipeline_paused,
+    update_base_primary_key, update_pipeline_delivery_lag, update_pipeline_delivery_progress,
     update_pipeline_delivery_progress_with_lag, update_pipeline_drift_status, upsert_deployment,
     upsert_quarantined_change, upsert_schema_change_impact, BaseColumn, BaseDataset, Deployment,
     DerivedDataset, FieldMappingAs, OmittedColumn, Pipeline, PlatformStoreHealth,
@@ -210,10 +211,41 @@ pub fn parse() -> Cli {
 }
 
 async fn apply_migrations(platform_store_url: &str) -> Result<(), CliError> {
+    // Reject absurd under-provisioning before applying schema (ADR-0010).
+    enforce_store_guardrails(platform_store_url).await?;
     migrate(platform_store_url)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     println!("Platform Store migrations applied");
+    Ok(())
+}
+
+/// Reject absurdly low Platform Store settings (ADR-0010). Warn-only disk
+/// thresholds are handled separately and must not fail this check.
+async fn enforce_store_guardrails(platform_store_url: &str) -> Result<(), CliError> {
+    let settings = probe_store_settings(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    check_store_settings(&settings).map_err(|err| CliError::Failed(err.to_string()))
+}
+
+/// Surface free-disk warn threshold (warn only — never pauses Pipelines).
+async fn report_store_resource_warnings(platform_store_url: &str) -> Result<(), CliError> {
+    let resources = probe_store_resources(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    if let (true, Some(free)) = (resources.disk_warn, resources.free_disk_bytes) {
+        let msg = disk_warn_message(free);
+        println!("{msg}");
+        emit_event(
+            "platform_store_disk_warn",
+            &[
+                ("free_disk_bytes", EventValue::from(free as i64)),
+                ("warn_threshold_bytes", EventValue::from(migraloop_platform_store::DISK_FREE_WARN_BYTES as i64)),
+                ("auto_pause", EventValue::from(false)),
+            ],
+        );
+    }
     Ok(())
 }
 
@@ -594,7 +626,13 @@ fn delivery_document_for_row(
 
 async fn ensure_store_healthy(platform_store_url: &str) -> Result<(), CliError> {
     match health(platform_store_url).await {
-        PlatformStoreHealth::Healthy { .. } => Ok(()),
+        PlatformStoreHealth::Healthy { .. } => {
+            // Settings guardrails reject absurd under-provisioning; disk warn is
+            // intentionally not a hard failure here (ADR-0010 warn-only).
+            enforce_store_guardrails(platform_store_url).await?;
+            report_store_resource_warnings(platform_store_url).await?;
+            Ok(())
+        }
         PlatformStoreHealth::Unhealthy { reason } => Err(CliError::Failed(format!(
             "Platform Store is not healthy; run `migraloop migrate` first: {reason}"
         ))),
@@ -3402,8 +3440,16 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
 async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     match health(platform_store_url).await {
         PlatformStoreHealth::Healthy { schema_version } => {
+            // Reject absurd settings even when migrations are present.
+            if let Err(err) = enforce_store_guardrails(platform_store_url).await {
+                println!("Platform Store: unhealthy");
+                eprintln!("{err}");
+                return Err(err);
+            }
             println!("Platform Store: healthy");
             println!("Schema version: {schema_version}");
+            // Warn-only: free-disk pressure must not flip health or pause Pipelines.
+            report_store_resource_warnings(platform_store_url).await?;
         }
         PlatformStoreHealth::Unhealthy { reason } => {
             println!("Platform Store: unhealthy");
@@ -4088,6 +4134,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             metrics_addr,
         } => {
             apply_migrations(&platform_store_url).await?;
+            // Warn-only disk threshold at process start (never auto-pauses Pipelines).
+            report_store_resource_warnings(&platform_store_url).await?;
             println!("migraloop is running");
             let addr: SocketAddr = metrics_addr.parse().map_err(|err| {
                 CliError::Failed(format!(
