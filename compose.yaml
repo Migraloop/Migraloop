@@ -23,6 +23,10 @@ services:
         condition: service_healthy
     environment:
       MIGRALOOP_PLATFORM_STORE_URL: postgres://migraloop:migraloop@platform-store:5432/migraloop
+      # Observability Surface Prometheus scrape (ADR-0008 / issue #27)
+      MIGRALOOP_METRICS_ADDR: 0.0.0.0:9090
+    ports:
+      - "9090:9090"
     # ENTRYPOINT is already `migraloop`; only override the subcommand.
     command: ["run"]
 
