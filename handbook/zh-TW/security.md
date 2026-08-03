@@ -35,7 +35,18 @@ Operator 指引：
 
 - 正式網路中優先為 Oracle、MongoDB、Postgres 使用可 TLS 的連線路徑
 - 密鑰材料不要進 shell history 或已提交的設定
-- 限制 Source/Target 帳號的 Required Privileges（見 [Source System](source-system.md) 與 [Target System](target-system.md)）
+- 限制 Source/Target 帳號的 Required Privileges（具體 grants 見下方）
+
+## Required Privileges (pointer)
+
+ADR-0016：記載並偏好剛好足以運作的最小權限—不是預設就要 DBA/admin。各引擎的具體 grants 放在連線章節：
+
+| 帳號 | 章節 | 涵蓋 |
+| --- | --- | --- |
+| Oracle Source sync 使用者 | [Source System → Required Privileges](source-system.md#required-privileges) | Initial Load、LogMiner Incremental Capture、Prerequisites probe、schema discovery；必要 vs 僅 Lab vs 由 DBA 套用的 Prerequisites DDL |
+| MongoDB Target Delivery 使用者 | [Target System → Required Privileges](target-system.md#required-privileges-target) | Delivery upsert/delete、Target 檢視；`readWrite` vs collection 範圍自訂 role；Lab root 不是正式預設 |
+
+這些帳號只能用 secret reference（`fromEnv` / `fromFile` / `fromDockerSecret`）寫入 Deployment 設定—YAML 中禁止明文密碼。
 
 ## 公開環境變數面
 
@@ -49,3 +60,5 @@ Operator 指引：
 - 設定形狀：[CLI 與 Config 參考](cli-and-config.md)
 - 安裝預設：[Deployment](deployment.md)
 - 本機 compose 密碼：[Developer 本機設定](developer-local-setup.md)
+- Oracle sync grants：[Source System](source-system.md#required-privileges)
+- MongoDB Delivery grants：[Target System](target-system.md#required-privileges-target)

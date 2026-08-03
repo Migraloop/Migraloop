@@ -35,7 +35,18 @@ Operator guidance:
 
 - Prefer TLS-capable connection paths for Oracle, MongoDB, and Postgres in production networks
 - Keep secret material out of shell history and committed config
-- Limit Required Privileges on Source/Target accounts (see [Source System](source-system.md) and [Target System](target-system.md))
+- Limit Required Privileges on Source/Target accounts (concrete grants below)
+
+## Required Privileges (pointer)
+
+ADR-0016: document and prefer the minimum rights sufficient to run—not DBA/admin-only-by-default. Concrete engine grants live with the connection chapters:
+
+| Account | Chapter | Covers |
+| --- | --- | --- |
+| Oracle Source sync user | [Source System → Required Privileges](source-system.md#required-privileges) | Initial Load, LogMiner Incremental Capture, Prerequisites probes, schema discovery; required vs Lab-only vs DBA-applied Prerequisites DDL |
+| MongoDB Target Delivery user | [Target System → Required Privileges](target-system.md#required-privileges-target) | Delivery upsert/delete, Target inspection; `readWrite` vs collection-scoped custom role; Lab root is not the production default |
+
+Wire those accounts into Deployment config with secret references only (`fromEnv` / `fromFile` / `fromDockerSecret`)—never plaintext passwords in YAML.
 
 ## Public env surface
 
@@ -49,3 +60,5 @@ Operator guidance:
 - Config shapes: [CLI & Config reference](cli-and-config.md)
 - Install defaults: [Deployment](deployment.md)
 - Local compose passwords: [Developer local setup](developer-local-setup.md)
+- Oracle sync grants: [Source System](source-system.md#required-privileges)
+- MongoDB Delivery grants: [Target System](target-system.md#required-privileges-target)
