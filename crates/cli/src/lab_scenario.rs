@@ -168,6 +168,12 @@ const PLATFORM_STORE_GUARDRAILS_DEPLOYMENT: &str = "lab-platform-store-guardrail
 /// 512 MiB — below the 1 GiB product warn threshold (ADR-0010).
 const PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES: &str = "536870912";
 
+const BACKWARD_COMPATIBLE_UPGRADES_ID: &str = "backward-compatible-upgrades";
+const BACKWARD_COMPATIBLE_UPGRADES_TABLE: &str = "LAB_UPG_CUSTOMERS";
+const BACKWARD_COMPATIBLE_UPGRADES_COLLECTION: &str = "lab_upg_customers";
+const BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT: &str = "lab-backward-compatible-upgrades";
+const BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG: &str = "deployment-v1.0.0.yaml";
+
 /// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
@@ -256,6 +262,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         BOUNDED_BACKPRESSURE_ID,
         OBSERVABILITY_SURFACE_ID,
         PLATFORM_STORE_GUARDRAILS_ID,
+        BACKWARD_COMPATIBLE_UPGRADES_ID,
     ]
 }
 
@@ -319,6 +326,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             PLATFORM_STORE_GUARDRAILS_ID,
             "Platform Store Guardrails and warn-only disk thresholds",
+        ),
+        (
+            BACKWARD_COMPATIBLE_UPGRADES_ID,
+            "Backward-compatible upgrades / Platform Store migrations",
         ),
     ]
 }
@@ -618,6 +629,7 @@ async fn scenario_run(
         BOUNDED_BACKPRESSURE_ID => run_bounded_backpressure(lab_dir).await,
         OBSERVABILITY_SURFACE_ID => run_observability_surface(lab_dir).await,
         PLATFORM_STORE_GUARDRAILS_ID => run_platform_store_guardrails(lab_dir).await,
+        BACKWARD_COMPATIBLE_UPGRADES_ID => run_backward_compatible_upgrades(lab_dir).await,
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no runner"
         ))),
@@ -714,6 +726,9 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
         BOUNDED_BACKPRESSURE_ID => remove_bounded_backpressure_namespace(lab_dir).await,
         OBSERVABILITY_SURFACE_ID => remove_observability_surface_namespace(lab_dir).await,
         PLATFORM_STORE_GUARDRAILS_ID => remove_platform_store_guardrails_namespace(lab_dir).await,
+        BACKWARD_COMPATIBLE_UPGRADES_ID => {
+            remove_backward_compatible_upgrades_namespace(lab_dir).await
+        }
         _ => Err(CliError::Failed(format!(
             "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
         ))),
@@ -4682,6 +4697,249 @@ EXIT;\n"
         })
 }
 
+async fn run_backward_compatible_upgrades(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+    println!("Lab Scenario: {BACKWARD_COMPATIBLE_UPGRADES_ID}");
+    println!(
+        "Scenario Namespace: table={BACKWARD_COMPATIBLE_UPGRADES_TABLE} \
+collection={BACKWARD_COMPATIBLE_UPGRADES_COLLECTION} \
+deployment={BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"
+    );
+
+    prepare_backward_compatible_upgrades_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let config_path = deployment_config_path(lab_dir, BACKWARD_COMPATIBLE_UPGRADES_ID)?;
+    let older_config_path = scenario_config_path(
+        lab_dir,
+        BACKWARD_COMPATIBLE_UPGRADES_ID,
+        BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG,
+    )?;
+    let bin = lab_migraloop_bin();
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+    let older_config_str = older_config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario older-config path is not valid UTF-8".to_string())
+    })?;
+
+    println!("Lab Scenario: apply Deployment via real product path...");
+    let apply_out = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            config_str,
+        ],
+    )
+    .await?;
+    if !(apply_out.contains("Initial Load")
+        || apply_out.to_ascii_lowercase().contains("initial_load"))
+    {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
+        )));
+    }
+
+    println!("Lab Scenario: status before upgrade migrate...");
+    let status_before = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !status_before.contains("Platform Store: healthy")
+        || !status_before.contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
+        || !status_before.contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
+    {
+        return Err(CliError::Failed(format!(
+            "pre-upgrade status missing healthy store / Deployment / Base:\n{status_before}"
+        )));
+    }
+    let schema_line = status_before
+        .lines()
+        .find(|l| l.starts_with("Schema version:"))
+        .unwrap_or("Schema version: (missing)")
+        .to_string();
+
+    println!("Lab Scenario: migraloop migrate (upgrade path)...");
+    let migrate_out = run_product_cli(
+        &bin,
+        &["migrate", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !migrate_out.to_ascii_lowercase().contains("migration")
+        && !migrate_out.contains("Platform Store")
+    {
+        return Err(CliError::Failed(format!(
+            "migrate did not report Platform Store migration success:\n{migrate_out}"
+        )));
+    }
+
+    println!("Lab Scenario: status after upgrade migrate...");
+    let status_after_migrate = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !status_after_migrate.contains("Platform Store: healthy") {
+        return Err(CliError::Failed(format!(
+            "store must stay healthy after upgrade migrate:\n{status_after_migrate}"
+        )));
+    }
+    if !status_after_migrate.contains(schema_line.trim())
+        && !status_after_migrate.contains("Schema version:")
+    {
+        return Err(CliError::Failed(format!(
+            "Schema version must remain visible after upgrade migrate:\n{status_after_migrate}"
+        )));
+    }
+    if !status_after_migrate
+        .contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
+        || !status_after_migrate
+            .contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
+    {
+        return Err(CliError::Failed(format!(
+            "Deployment/Base must survive upgrade migrate (no wipe):\n{status_after_migrate}"
+        )));
+    }
+
+    println!(
+        "Lab Scenario: apply older SemVer-compatible config ({BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG})..."
+    );
+    let older_apply = run_product_cli(
+        &bin,
+        &[
+            "apply",
+            "--platform-store-url",
+            LAB_PLATFORM_STORE_URL,
+            "--file",
+            older_config_str,
+        ],
+    )
+    .await?;
+    if older_apply.contains("Initial Load complete") {
+        return Err(CliError::Failed(format!(
+            "older compatible config must not rebuild Base from scratch:\n{older_apply}"
+        )));
+    }
+
+    let status_final = run_product_cli(
+        &bin,
+        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if !status_final.contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
+        || !status_final.contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
+    {
+        return Err(CliError::Failed(format!(
+            "Deployment/Base must remain after older config apply:\n{status_final}"
+        )));
+    }
+
+    let rows_applied = count_delivery_ops(&apply_out);
+    println!(
+        "Lab Scenario: correctness checks passed \
+         (migrate preserved Deployment; older v1.0.0 config applies without rebuild)"
+    );
+
+    Ok(ScenarioReport {
+        correctness: true,
+        rows_applied,
+        detail: String::new(),
+        capture_path_note: "LogMiner".to_string(),
+        settle_ms: None,
+        max_settle_ms: None,
+        lag: None,
+        max_lag: None,
+        min_rows_per_s: None,
+        max_duration_ms: None,
+        measured_rows_per_s: None,
+        measured_duration_ms: None,
+        thresholds_ok: true,
+    })
+}
+
+async fn remove_backward_compatible_upgrades_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    println!(
+        "Lab Scenario: removing Namespace \
+         (table={BACKWARD_COMPATIBLE_UPGRADES_TABLE}, \
+collection={BACKWARD_COMPATIBLE_UPGRADES_COLLECTION}, \
+deployment={BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT})"
+    );
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+BEGIN\n\
+  EXECUTE IMMEDIATE 'DROP TABLE {BACKWARD_COMPATIBLE_UPGRADES_TABLE} PURGE';\n\
+EXCEPTION\n\
+  WHEN OTHERS THEN\n\
+    IF SQLCODE != -942 THEN RAISE; END IF;\n\
+END;\n\
+/\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to drop Oracle Scenario Namespace table for backward-compatible-upgrades:\n{err}"
+            ))
+        })?;
+
+    let js = format!("db.getCollection('{BACKWARD_COMPATIBLE_UPGRADES_COLLECTION}').drop();");
+    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to drop Mongo Scenario Namespace collection for backward-compatible-upgrades:\n{err}"
+        ))
+    })?;
+
+    delete_deployment(
+        LAB_PLATFORM_STORE_URL,
+        BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT,
+    )
+    .await
+    .map_err(|err| {
+        CliError::Failed(format!(
+            "Failed to delete Platform Store Deployment `{BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}` \
+             for Scenario Namespace cleanup:\n{err}"
+        ))
+    })?;
+
+    Ok(())
+}
+
+async fn prepare_backward_compatible_upgrades_namespace(lab_dir: &Path) -> Result<(), CliError> {
+    remove_backward_compatible_upgrades_namespace(lab_dir).await?;
+
+    let sql = format!(
+        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
+WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
+CREATE TABLE {BACKWARD_COMPATIBLE_UPGRADES_TABLE} (\n\
+  ID NUMBER(10) PRIMARY KEY,\n\
+  NAME VARCHAR2(100) NOT NULL,\n\
+  EMAIL VARCHAR2(200),\n\
+  ACTIVE NUMBER(1)\n\
+);\n\
+ALTER TABLE {BACKWARD_COMPATIBLE_UPGRADES_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
+INSERT INTO {BACKWARD_COMPATIBLE_UPGRADES_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
+INSERT INTO {BACKWARD_COMPATIBLE_UPGRADES_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
+COMMIT;\n\
+EXIT;\n"
+    );
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    sqlplus_in_oracle(lab_dir, &connect, &sql)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            CliError::Failed(format!(
+                "Failed to prepare backward-compatible-upgrades Scenario Namespace:\n{err}"
+            ))
+        })
+}
+
 /// Start `migraloop run --metrics-addr`, scrape `/metrics`, then stop the process.
 async fn scrape_run_metrics(bin: &Path, platform_store_url: &str) -> Result<String, CliError> {
     use std::net::TcpListener;
@@ -6788,6 +7046,10 @@ mod tests {
         assert!(
             ids.iter().any(|id| id == PLATFORM_STORE_GUARDRAILS_ID),
             "catalog must include platform-store-guardrails for Platform Store Guardrails"
+        );
+        assert!(
+            ids.iter().any(|id| id == BACKWARD_COMPATIBLE_UPGRADES_ID),
+            "catalog must include backward-compatible-upgrades for upgrade migrations"
         );
         let coverage = lab.join("scenarios/COVERAGE.md");
         let body = fs::read_to_string(&coverage).expect("COVERAGE.md");

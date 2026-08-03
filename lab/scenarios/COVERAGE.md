@@ -30,6 +30,7 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 | Bounded backpressure with visible lag | `bounded-backpressure` |
 | Observability Surface (logs, health, Prometheus) | `observability-surface` |
 | Platform Store Guardrails and warn-only disk thresholds | `platform-store-guardrails` |
+| Backward-compatible upgrades / Platform Store migrations | `backward-compatible-upgrades` |
 
 ## Visible gaps (not yet shipped)
 

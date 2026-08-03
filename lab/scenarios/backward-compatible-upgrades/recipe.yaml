@@ -1,0 +1,29 @@
+# Lab Scenario recipe (ADR-0025 / issue #29 / ADR-0014).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: backward-compatible-upgrades
+summary: Backward-compatible upgrades migrate Platform Store and keep Deployments without wipe-rebuild
+namespace:
+  source_tables:
+    - LAB_UPG_CUSTOMERS
+  target_collections:
+    - lab_upg_customers
+  deployment: lab-backward-compatible-upgrades
+  pipelines:
+    - lab-upg-customers
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace table + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Delivery)
+    - note Schema version / Base rows via status
+    - run migraloop migrate (upgrade path) and confirm Schema version + Deployment preserved
+    - apply older SemVer-compatible config (apiVersion migraloop.dev/v1.0.0)
+    - assert no Initial Load rebuild; Base/Target data remain
+checks:
+  correctness:
+    - "migrate after an existing Deployment leaves Platform Store healthy at latest schema"
+    - "Deployment / Pipeline / Base Dataset survive migrate (no wipe)"
+    - "older SemVer-compatible apiVersion (migraloop.dev/v1.0.0) still applies"
+    - "re-apply after upgrade does not Initial Load / rebuild Base from scratch"
+thresholds: {}

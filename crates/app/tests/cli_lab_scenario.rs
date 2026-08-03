@@ -524,6 +524,32 @@ async fn lab_scenario_list_includes_platform_store_guardrails() {
     );
 }
 
+#[tokio::test]
+async fn lab_scenario_list_includes_backward_compatible_upgrades() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("backward-compatible-upgrades"),
+        "catalog must list backward-compatible-upgrades Lab Scenario (#29), got:\n{out}"
+    );
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("upgrade")
+            || lower.contains("migrat")
+            || lower.contains("backward")
+            || lower.contains("compat"),
+        "backward-compatible-upgrades summary should mention upgrade/migrate, got:\n{out}"
+    );
+}
+
 /// Issue #66: gaps / catalog-complete status must be visible on `scenario list`.
 #[tokio::test]
 async fn lab_scenario_list_reports_catalog_complete_for_shipped_capabilities() {

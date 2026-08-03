@@ -9,6 +9,7 @@ pub use guardrails::{
     MIN_WORK_MEM_BYTES,
 };
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,12 +17,21 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use thiserror::Error;
 
+/// Prior-release Platform Store schema cut for upgrade-smoke verification.
+///
+/// Migrations `1..=4` cover bootstrap through Delivery binding — a store shape
+/// that pre-dates Incremental Sync Health / lag / quarantine columns. Newer apps
+/// must migrate forward from this cut without wiping Deployment data (ADR-0014).
+pub const PRIOR_RELEASE_SCHEMA_VERSION: i64 = 4;
+
 #[derive(Debug, Error)]
 pub enum PlatformStoreError {
     #[error("failed to connect to Platform Store: {0}")]
     Connect(#[source] sqlx::Error),
     #[error("failed to migrate Platform Store: {0}")]
     Migrate(#[source] sqlx::migrate::MigrateError),
+    #[error("unknown Platform Store migration version: {0}")]
+    UnknownMigrationVersion(i64),
     #[error("failed to persist Deployment: {0}")]
     Persist(#[source] sqlx::Error),
     #[error("failed to load Deployments: {0}")]
@@ -253,10 +263,58 @@ pub(crate) async fn connect(database_url: &str) -> Result<PgPool, PlatformStoreE
         .map_err(PlatformStoreError::Connect)
 }
 
+/// Embedded Platform Store migrator (all versioned schema migrations).
+fn store_migrator() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations")
+}
+
+/// Latest schema migration version shipped with this app binary.
+pub fn latest_migration_version() -> i64 {
+    store_migrator()
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Apply versioned Platform Store schema migrations.
 pub async fn migrate(database_url: &str) -> Result<(), PlatformStoreError> {
     let pool = connect(database_url).await?;
-    sqlx::migrate!("./migrations")
+    store_migrator()
+        .run(&pool)
+        .await
+        .map_err(PlatformStoreError::Migrate)?;
+    Ok(())
+}
+
+/// Apply only migrations with version `<= through_version` (inclusive).
+///
+/// Used to seed a prior-release Platform Store schema for upgrade-smoke tests /
+/// Lab verification. Production operators use [`migrate`] (or `migraloop run`),
+/// which always applies every pending migration.
+pub async fn migrate_through(
+    database_url: &str,
+    through_version: i64,
+) -> Result<(), PlatformStoreError> {
+    let full = store_migrator();
+    if !full.version_exists(through_version) {
+        return Err(PlatformStoreError::UnknownMigrationVersion(through_version));
+    }
+
+    let subset: Vec<_> = full
+        .iter()
+        .filter(|m| m.version <= through_version)
+        .cloned()
+        .collect();
+    let partial = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(subset),
+        ignore_missing: full.ignore_missing,
+        locking: full.locking,
+        no_tx: full.no_tx,
+    };
+
+    let pool = connect(database_url).await?;
+    partial
         .run(&pool)
         .await
         .map_err(PlatformStoreError::Migrate)?;

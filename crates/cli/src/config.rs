@@ -7,7 +7,11 @@ use serde::Deserialize;
 
 use crate::CliError;
 
+/// Canonical apiVersion for the current config major line.
 const SUPPORTED_API_VERSION: &str = "migraloop.dev/v1";
+/// SemVer major accepted by this app (ADR-0014: older compatible configs still apply).
+const ACCEPTED_CONFIG_MAJOR: u64 = 1;
+const API_VERSION_PREFIX: &str = "migraloop.dev/v";
 const V1_SOURCE_KIND: &str = "oracle";
 const V1_TARGET_KIND: &str = "mongodb";
 const DOCKER_SECRETS_DIR: &str = "/run/secrets";
@@ -325,13 +329,62 @@ fn looks_like_plaintext_password_error(err: &str, raw: &str) -> bool {
             || lower.contains("unknown field"))
 }
 
-fn validate_document(doc: &DeploymentDocument) -> Result<(), CliError> {
-    if doc.api_version != SUPPORTED_API_VERSION {
+/// Parse `migraloop.dev/v{major}` / `v{major}.{minor}` / `v{major}.{minor}.{patch}`.
+fn parse_api_version_semver(api_version: &str) -> Result<(u64, u64, u64), CliError> {
+    let Some(rest) = api_version.strip_prefix(API_VERSION_PREFIX) else {
         return Err(CliError::Failed(format!(
-            "unsupported apiVersion {:?}; expected {SUPPORTED_API_VERSION}",
-            doc.api_version
+            "unsupported apiVersion {api_version:?}; expected SemVer-compatible \
+             {SUPPORTED_API_VERSION} (also accepts migraloop.dev/v1.0 or migraloop.dev/v1.0.0)"
+        )));
+    };
+    if rest.is_empty() {
+        return Err(CliError::Failed(format!(
+            "unsupported apiVersion {api_version:?}; missing SemVer after {API_VERSION_PREFIX}"
         )));
     }
+    let parts: Vec<&str> = rest.split('.').collect();
+    if parts.len() > 3 {
+        return Err(CliError::Failed(format!(
+            "unsupported apiVersion {api_version:?}; expected SemVer-compatible \
+             {SUPPORTED_API_VERSION} (major[.minor[.patch]])"
+        )));
+    }
+    let mut nums = [0u64; 3];
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()) {
+            return Err(CliError::Failed(format!(
+                "unsupported apiVersion {api_version:?}; SemVer components must be non-negative integers"
+            )));
+        }
+        // Reject leading zeros like "01" except a lone "0".
+        if part.len() > 1 && part.starts_with('0') {
+            return Err(CliError::Failed(format!(
+                "unsupported apiVersion {api_version:?}; SemVer components must not have leading zeros"
+            )));
+        }
+        nums[i] = part.parse().map_err(|_| {
+            CliError::Failed(format!(
+                "unsupported apiVersion {api_version:?}; invalid SemVer component"
+            ))
+        })?;
+    }
+    Ok((nums[0], nums[1], nums[2]))
+}
+
+fn validate_api_version(api_version: &str) -> Result<(), CliError> {
+    let (major, _minor, _patch) = parse_api_version_semver(api_version)?;
+    if major != ACCEPTED_CONFIG_MAJOR {
+        return Err(CliError::Failed(format!(
+            "unsupported apiVersion {api_version:?}; this app accepts SemVer-compatible \
+             major {ACCEPTED_CONFIG_MAJOR} ({SUPPORTED_API_VERSION}, migraloop.dev/v1.0, \
+             migraloop.dev/v1.0.0) — incompatible major requires an explicit upgrade path"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_document(doc: &DeploymentDocument) -> Result<(), CliError> {
+    validate_api_version(&doc.api_version)?;
     if doc.kind != "Deployment" {
         return Err(CliError::Failed(format!(
             "unsupported kind {:?}; expected Deployment",
