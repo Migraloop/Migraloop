@@ -161,7 +161,7 @@ pub(crate) async fn quarantine_poison_change(
     };
     let identity_label = format_output_identity(&record.output_identity);
     store
-        .upsert_quarantined_change(&record)
+        .quarantine_change(&record)
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
     eprintln!(

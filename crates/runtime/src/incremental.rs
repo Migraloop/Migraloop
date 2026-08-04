@@ -293,11 +293,12 @@ async fn recompute_and_deliver_affected_identities<T: TargetEngine>(
 
     if delivered > 0 {
         store
-            .update_pipeline_delivery_progress(
+            .record_delivery_progress(
                 &pipeline.deployment_name,
                 &pipeline.name,
-                "delivered",
+                Some("delivered"),
                 Some(delivered),
+                None,
             )
             .await
             .map_err(|err| RuntimeError::Failed(err.to_string()))?;
@@ -399,10 +400,12 @@ async fn set_delivery_lag_for_table(
             continue;
         }
         store
-            .update_pipeline_delivery_lag(
+            .record_delivery_progress(
                 &pipeline.deployment_name,
                 &pipeline.name,
-                delivery_lag,
+                None,
+                None,
+                Some(delivery_lag),
             )
             .await
             .map_err(|err| RuntimeError::Failed(err.to_string()))?;
@@ -940,7 +943,8 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                         },
                         0,
                     );
-                    store.replace_base_dataset(&caught_up, &rows)
+                    store
+                        .record_sync_window_progress(&caught_up, &rows, &[])
                         .await
                         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                     set_delivery_lag_for_table(
@@ -1033,20 +1037,17 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                 Some(current_checkpoint),
                                 lag,
                             );
-                            store.replace_base_dataset(&updated, &rows)
+                            store
+                                .record_sync_window_progress(
+                                    &updated,
+                                    &rows,
+                                    &[(
+                                        schema_change.change_id.clone(),
+                                        schema_change.position.as_i64(),
+                                    )],
+                                )
                                 .await
                                 .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-                            store.record_applied_source_changes(
-                                                                &deployment.name,
-                                &schema,
-                                &table,
-                                &[(
-                                    schema_change.change_id.clone(),
-                                    schema_change.position.as_i64(),
-                                )],
-                            )
-                            .await
-                            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                             set_delivery_lag_for_table(
                                 store,
                                 deployment_pipelines,
@@ -1087,7 +1088,9 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                 );
                                 failed.sync_health =
                                     crate::observability::sync_health_label_failed().to_string();
-                                let _ = store.replace_base_dataset(&failed, &rows).await;
+                                let _ = store
+                                    .record_sync_window_progress(&failed, &rows, &[])
+                                    .await;
                                 return Err(err);
                             }
 
@@ -1139,17 +1142,18 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                                 .await
                                                 {
                                                     Ok(upserted) => {
-                                                        store.update_pipeline_delivery_progress_with_lag(
-                                                                                                                        &pipeline.deployment_name,
-                                                            &pipeline.name,
-                                                            "delivered",
-                                                            Some(upserted as i32),
-                                                            Some(lag),
-                                                        )
-                                                        .await
-                                                        .map_err(|err| {
-                                                            RuntimeError::Failed(err.to_string())
-                                                        })?;
+                                                        store
+                                                            .record_delivery_progress(
+                                                                &pipeline.deployment_name,
+                                                                &pipeline.name,
+                                                                Some("delivered"),
+                                                                Some(upserted as i32),
+                                                                Some(lag),
+                                                            )
+                                                            .await
+                                                            .map_err(|err| {
+                                                                RuntimeError::Failed(err.to_string())
+                                                            })?;
                                                         println!(
                                                         "Delivery complete: Pipeline {} upserts={upserted} \
                                                          deletes=0 (checkpoint-bound)",
@@ -1169,15 +1173,18 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                                             &last_error,
                                                         )
                                                         .await?;
-                                                        store.update_pipeline_delivery_lag(
-                                                                                                                        &pipeline.deployment_name,
-                                                            &pipeline.name,
-                                                            lag,
-                                                        )
-                                                        .await
-                                                        .map_err(|err| {
-                                                            RuntimeError::Failed(err.to_string())
-                                                        })?;
+                                                        store
+                                                            .record_delivery_progress(
+                                                                &pipeline.deployment_name,
+                                                                &pipeline.name,
+                                                                None,
+                                                                None,
+                                                                Some(lag),
+                                                            )
+                                                            .await
+                                                            .map_err(|err| {
+                                                                RuntimeError::Failed(err.to_string())
+                                                            })?;
                                                     }
                                                 }
                                             }
@@ -1197,17 +1204,18 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                                 .await
                                                 {
                                                     Ok(deleted) => {
-                                                        store.update_pipeline_delivery_progress_with_lag(
-                                                                                                                        &pipeline.deployment_name,
-                                                            &pipeline.name,
-                                                            "delivered",
-                                                            Some(deleted as i32),
-                                                            Some(lag),
-                                                        )
-                                                        .await
-                                                        .map_err(|err| {
-                                                            RuntimeError::Failed(err.to_string())
-                                                        })?;
+                                                        store
+                                                            .record_delivery_progress(
+                                                                &pipeline.deployment_name,
+                                                                &pipeline.name,
+                                                                Some("delivered"),
+                                                                Some(deleted as i32),
+                                                                Some(lag),
+                                                            )
+                                                            .await
+                                                            .map_err(|err| {
+                                                                RuntimeError::Failed(err.to_string())
+                                                            })?;
                                                         println!(
                                                         "Delivery complete: Pipeline {} upserts=0 \
                                                          deletes={deleted} (checkpoint-bound)",
@@ -1227,15 +1235,18 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                                             &last_error,
                                                         )
                                                         .await?;
-                                                        store.update_pipeline_delivery_lag(
-                                                                                                                        &pipeline.deployment_name,
-                                                            &pipeline.name,
-                                                            lag,
-                                                        )
-                                                        .await
-                                                        .map_err(|err| {
-                                                            RuntimeError::Failed(err.to_string())
-                                                        })?;
+                                                        store
+                                                            .record_delivery_progress(
+                                                                &pipeline.deployment_name,
+                                                                &pipeline.name,
+                                                                None,
+                                                                None,
+                                                                Some(lag),
+                                                            )
+                                                            .await
+                                                            .map_err(|err| {
+                                                                RuntimeError::Failed(err.to_string())
+                                                            })?;
                                                     }
                                                 }
                                             }
@@ -1297,13 +1308,16 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                                 .await?;
                                             }
                                         }
-                                        store.update_pipeline_delivery_lag(
-                                                                                                        &pipeline.deployment_name,
-                                            &pipeline.name,
-                                            lag,
-                                        )
-                                        .await
-                                        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+                                        store
+                                            .record_delivery_progress(
+                                                &pipeline.deployment_name,
+                                                &pipeline.name,
+                                                None,
+                                                None,
+                                                Some(lag),
+                                            )
+                                            .await
+                                            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                                     }
                                     other => {
                                         return Err(RuntimeError::Failed(format!(
@@ -1324,17 +1338,14 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                 lag,
                             );
 
-                            store.replace_base_dataset(&updated, &rows)
+                            store
+                                .record_sync_window_progress(
+                                    &updated,
+                                    &rows,
+                                    &[(change.change_id.clone(), change.position.as_i64())],
+                                )
                                 .await
                                 .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-                            store.record_applied_source_changes(
-                                                                &deployment.name,
-                                &schema,
-                                &table,
-                                &[(change.change_id.clone(), change.position.as_i64())],
-                            )
-                            .await
-                            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                             // Durable Base/checkpoint first, then Maintenance State — matches
                             // Delivery-before-checkpoint: Sync retries re-analyze with prior state.
                             for (pipeline, blob) in &pending_maintenance {
