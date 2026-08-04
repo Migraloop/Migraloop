@@ -16,9 +16,8 @@ use migraloop_platform_store::{
     PlatformStoreHealth, SystemConnection,
 };
 use migraloop_runtime::{
-    format_output_identity, incremental_capture_mechanism_label, inspect_base_rows,
-    inspect_derived_rows, inspect_target_documents, pipeline_delivery_health,
-    status_inventory_from_url,
+    format_output_identity, inspect_base_rows, inspect_derived_rows, inspect_target_documents,
+    oracle_source_connect, pipeline_delivery_health, status_inventory_from_url,
 };
 use thiserror::Error;
 
@@ -423,7 +422,7 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             println!("Platform Store: healthy");
             println!("Schema version: {schema_version}");
             // Warn-only: free-disk pressure must not flip health or pause Pipelines.
-            if let Some(free) = inventory.disk_warn_free_bytes {
+            if let (true, Some(free)) = (inventory.disk_warn, inventory.free_disk_bytes) {
                 let msg = disk_warn_message(free);
                 println!("{msg}");
                 emit_event(
@@ -463,7 +462,13 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             println!("Deployment: {}", deployment.name);
             println!("{}", format_system_line("Source", &deployment.source));
             println!("{}", format_system_line("Target", &deployment.target));
-            if let Some(mechanism) = incremental_capture_mechanism_label(&deployment.source)? {
+            if deployment.source.kind.eq_ignore_ascii_case("oracle") {
+                let connect = oracle_source_connect(&deployment.source)?;
+                let mechanism = if connect.is_contract_harness() {
+                    "LogMiner (contract)"
+                } else {
+                    "LogMiner (OCI)"
+                };
                 println!("  Incremental Capture: {mechanism}");
             }
         }

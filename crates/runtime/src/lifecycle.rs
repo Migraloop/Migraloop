@@ -39,8 +39,6 @@ pub struct StatusInventory {
     pub free_disk_bytes: Option<u64>,
     /// Whether free-disk is under the warn threshold (ADR-0010 warn-only).
     pub disk_warn: bool,
-    /// Present when free-disk is under the warn threshold (ADR-0010 warn-only).
-    pub disk_warn_free_bytes: Option<u64>,
     pub deployments: Vec<Deployment>,
     pub pipelines: Vec<Pipeline>,
     pub bases: Vec<BaseDataset>,
@@ -68,21 +66,6 @@ pub fn pipeline_delivery_health(
             _ => "unknown",
         }
     }
-}
-
-/// Operator-visible Incremental Capture mechanism label for a Deployment Source.
-pub fn incremental_capture_mechanism_label(
-    source: &migraloop_platform_store::SystemConnection,
-) -> Result<Option<&'static str>, RuntimeError> {
-    if !source.kind.eq_ignore_ascii_case("oracle") {
-        return Ok(None);
-    }
-    let connect = crate::oracle_source_connect(source)?;
-    Ok(Some(if connect.is_contract_harness() {
-        "LogMiner (contract)"
-    } else {
-        "LogMiner (OCI)"
-    }))
 }
 
 /// Load Base Dataset rows for Operator `base` inspect (session verb).
@@ -189,7 +172,6 @@ pub async fn status_inventory_from_url(
             guardrail_error: None,
             free_disk_bytes: None,
             disk_warn: false,
-            disk_warn_free_bytes: None,
             deployments: Vec::new(),
             pipelines: Vec::new(),
             bases: Vec::new(),
@@ -209,7 +191,6 @@ pub async fn status_inventory(store: &PlatformStore) -> Result<StatusInventory, 
     let mut guardrail_error = None;
     let mut free_disk_bytes = None;
     let mut disk_warn = false;
-    let mut disk_warn_free_bytes = None;
     let mut deployments = Vec::new();
     let mut pipelines = Vec::new();
     let mut bases = Vec::new();
@@ -237,9 +218,6 @@ pub async fn status_inventory(store: &PlatformStore) -> Result<StatusInventory, 
             .map_err(|err| RuntimeError::Failed(err.to_string()))?;
         free_disk_bytes = resources.free_disk_bytes;
         disk_warn = resources.disk_warn;
-        if let (true, Some(free)) = (resources.disk_warn, resources.free_disk_bytes) {
-            disk_warn_free_bytes = Some(free);
-        }
 
         deployments = store
             .list_deployments()
@@ -272,7 +250,6 @@ pub async fn status_inventory(store: &PlatformStore) -> Result<StatusInventory, 
         guardrail_error,
         free_disk_bytes,
         disk_warn,
-        disk_warn_free_bytes,
         deployments,
         pipelines,
         bases,

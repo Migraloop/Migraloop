@@ -41,10 +41,10 @@ pub use incremental::{
     SyncCycleOutcome, SyncInvocation,
 };
 pub use lifecycle::{
-    drift_check, incremental_capture_mechanism_label, inspect_base_rows, inspect_derived_rows,
-    inspect_target_documents, pause_pipeline, pipeline_delivery_health, remove_pipeline,
-    resume_pipeline, source_alignment_check, status_inventory, status_inventory_from_url,
-    StatusInventory, DEFAULT_ALIGNMENT_MAX_ROWS, DEFAULT_DRIFT_MAX_ROWS,
+    drift_check, inspect_base_rows, inspect_derived_rows, inspect_target_documents, pause_pipeline,
+    pipeline_delivery_health, remove_pipeline, resume_pipeline, source_alignment_check,
+    status_inventory, status_inventory_from_url, StatusInventory, DEFAULT_ALIGNMENT_MAX_ROWS,
+    DEFAULT_DRIFT_MAX_ROWS,
 };
 
 /// Dependency-graph seam marker (ADR-0024 modular monorepo).
