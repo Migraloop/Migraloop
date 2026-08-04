@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use lab::{run_lab, LabCommand};
-use migraloop_capture::OracleSourceConnect;
 use migraloop_delivery::ManagedFieldAs;
 use migraloop_platform_store::{
     check_store_settings, disk_warn_message, Deployment, Pipeline, PlatformStore,
@@ -390,19 +389,17 @@ fn pipeline_delivery_health(
     }
 }
 
-fn oracle_source_connect(source: &SystemConnection) -> Result<OracleSourceConnect, CliError> {
-    if source.port <= 0 || source.port > u16::MAX as i32 {
-        return Err(CliError::Failed(
-            "source.port must be a valid TCP port".to_string(),
-        ));
+/// Operator `status` Incremental Capture mechanism label for Oracle Sources.
+///
+/// Mirrors Source adapter harness selection (`host: contract|stub` → contract;
+/// otherwise OCI) without constructing a full capture connect object.
+fn oracle_incremental_capture_label(source: &SystemConnection) -> &'static str {
+    let host = source.host.trim();
+    if host.eq_ignore_ascii_case("contract") || host.eq_ignore_ascii_case("stub") {
+        "LogMiner (contract)"
+    } else {
+        "LogMiner (OCI)"
     }
-    Ok(OracleSourceConnect {
-        host: source.host.clone(),
-        port: source.port as u16,
-        database: source.database.clone(),
-        username: source.username.clone(),
-        tls: source.tls.clone(),
-    })
 }
 
 async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), CliError> {
@@ -505,13 +502,10 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             println!("{}", format_system_line("Source", &deployment.source));
             println!("{}", format_system_line("Target", &deployment.target));
             if deployment.source.kind.eq_ignore_ascii_case("oracle") {
-                let connect = oracle_source_connect(&deployment.source)?;
-                let mechanism = if connect.is_contract_harness() {
-                    "LogMiner (contract)"
-                } else {
-                    "LogMiner (OCI)"
-                };
-                println!("  Incremental Capture: {mechanism}");
+                println!(
+                    "  Incremental Capture: {}",
+                    oracle_incremental_capture_label(&deployment.source)
+                );
             }
         }
     }
