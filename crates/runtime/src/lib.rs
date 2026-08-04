@@ -9,14 +9,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use migraloop_capture::{
-    check_oracle_source_prerequisites, classify_number, discover_source_schema,
-    initial_load_chunk_for_source, is_allow_listed_oracle_type, open_oracle_incremental_capture,
-    CapturePosition, IncrementalCapture, InitialLoadChunkOptions, NumberMongoMapping,
-    OracleSourceConnect, SourceColumn, TypeError,
+    classify_number, is_allow_listed_oracle_type, CapturePosition, IncrementalCapture,
+    InitialLoadChunkOptions, NumberMongoMapping, OracleLogMinerSource, OracleSourceConnect,
+    SourceColumn, SourceEngine, TypeError,
 };
 use migraloop_delivery::{
-    delete_documents_by_identity, list_target_documents, upsert_managed_documents, DeliveryColumn,
-    DeliveryDocument, ManagedFieldAs, MongoTargetConnection,
+    DeliveryColumn, DeliveryDocument, ManagedFieldAs, MongoTargetConnection, TargetEngine,
 };
 use migraloop_platform_store::{
     check_store_settings, disk_warn_message, BaseColumn, BaseDataset, Deployment, DerivedDataset,
@@ -29,9 +27,12 @@ use migraloop_transform::{
 use migraloop_types::resolve_secret_ref;
 use thiserror::Error;
 
+mod engines;
 mod observability;
 mod incremental;
 mod lifecycle;
+
+pub use engines::deliver_initial_load_chunk_via_engines;
 
 use crate::observability::{emit_event, EventValue};
 
@@ -166,9 +167,18 @@ pub async fn load_secondary_bases_and_columns_for_pipeline(
     Ok((secondary, columns))
 }
 
-pub fn mongo_target_from_deployment(
+/// Open the v1 Target engine adapter for a Deployment (MongoDB document Delivery).
+///
+/// Runtime Delivery / Drift paths depend on [`TargetEngine`], not Mongo free functions.
+pub fn target_engine_from_deployment(
     deployment: &Deployment,
 ) -> Result<MongoTargetConnection, RuntimeError> {
+    if !deployment.target.kind.eq_ignore_ascii_case("mongodb") {
+        return Err(RuntimeError::Failed(format!(
+            "unsupported Target System kind {:?} (v1 ships MongoDB only)",
+            deployment.target.kind
+        )));
+    }
     if deployment.target.port <= 0 || deployment.target.port > u16::MAX as i32 {
         return Err(RuntimeError::Failed(
             "target.port must be a valid TCP port".to_string(),
@@ -183,6 +193,30 @@ pub fn mongo_target_from_deployment(
         password,
         tls: deployment.target.tls.clone(),
     })
+}
+
+/// Expand-contract alias — prefer [`target_engine_from_deployment`].
+pub fn mongo_target_from_deployment(
+    deployment: &Deployment,
+) -> Result<MongoTargetConnection, RuntimeError> {
+    target_engine_from_deployment(deployment)
+}
+
+/// Open the v1 Source engine adapter for a Deployment Source System connection.
+///
+/// Oracle LogMiner contract harness and OCI are selected inside the adapter (ADR-0003).
+pub fn source_engine_from_connection(
+    source: &SystemConnection,
+) -> Result<OracleLogMinerSource, RuntimeError> {
+    if !source.kind.eq_ignore_ascii_case("oracle") {
+        return Err(RuntimeError::Failed(format!(
+            "unsupported Source System kind {:?} (v1 ships Oracle LogMiner only)",
+            source.kind
+        )));
+    }
+    let connect = oracle_source_connect(source)?;
+    let password = resolve_secret_value(&source.password_ref, "source.password")?;
+    Ok(OracleLogMinerSource::new(connect, password))
 }
 
 pub fn source_timezone_opt(deployment: &Deployment) -> Option<&str> {
@@ -467,8 +501,7 @@ async fn run_chunked_initial_load(
     existing: Option<&BaseDataset>,
 ) -> Result<(), RuntimeError> {
     let deployment_name = &deployment.name;
-    let connect = oracle_source_connect(&deployment.source)?;
-    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
+    let source = source_engine_from_connection(&deployment.source)?;
     let chunk_size = initial_load_chunk_size();
     let rate_limit = initial_load_rows_per_sec();
     let pause_after = initial_load_pause_after_chunks();
@@ -507,19 +540,18 @@ async fn run_chunked_initial_load(
         }
 
         let source_started = std::time::Instant::now();
-        let chunk = initial_load_chunk_for_source(
-            &connect,
-            &password,
-            schema,
-            table,
-            configured_tz,
-            &InitialLoadChunkOptions {
-                chunk_size,
-                offset,
-                established_watermark: established,
-            },
-        )
-        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        let chunk = source
+            .initial_load_chunk(
+                schema,
+                table,
+                configured_tz,
+                &InitialLoadChunkOptions {
+                    chunk_size,
+                    offset,
+                    established_watermark: established,
+                },
+            )
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
         let source_ms = source_started.elapsed().as_millis() as u64;
 
         if primary_key.is_empty() {
@@ -801,21 +833,19 @@ async fn ensure_base_primary_key(
     }
 
     // Metadata-only: one bounded chunk for PK — never a full-table Initial Load slam.
-    let connect = oracle_source_connect(&deployment.source)?;
-    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
-    let chunk = initial_load_chunk_for_source(
-        &connect,
-        &password,
-        source_schema,
-        source_table,
-        configured_timezone,
-        &InitialLoadChunkOptions {
-            chunk_size: 1,
-            offset: 0,
-            established_watermark: None,
-        },
-    )
-    .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    let source = source_engine_from_connection(&deployment.source)?;
+    let chunk = source
+        .initial_load_chunk(
+            source_schema,
+            source_table,
+            configured_timezone,
+            &InitialLoadChunkOptions {
+                chunk_size: 1,
+                offset: 0,
+                established_watermark: None,
+            },
+        )
+        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
     if chunk.primary_key.is_empty() {
         return Err(RuntimeError::Failed(format!(
             "Source table {source_table} has no primary key for Output Identity"
@@ -836,15 +866,15 @@ async fn ensure_base_primary_key(
 
 /// Load Source schema metadata for apply-time Managed field validation.
 ///
-/// Real Oracle hosts use OCI discovery; contract/stub hosts use the contract catalog.
+/// Goes through the Source engine interface (contract catalog or OCI discovery).
 pub fn source_columns_for_pipeline(
     deployment: &Deployment,
     schema: &str,
     table: &str,
 ) -> Result<Vec<SourceColumn>, RuntimeError> {
-    let connect = oracle_source_connect(&deployment.source)?;
-    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
-    discover_source_schema(&connect, &password, schema, table)
+    let source = source_engine_from_connection(&deployment.source)?;
+    source
+        .discover_schema(schema, table)
         .map_err(|err| RuntimeError::Failed(err.to_string()))
 }
 
@@ -865,30 +895,36 @@ pub fn oracle_source_connect(
     })
 }
 
-/// Open LogMiner-backed Incremental Capture for a Deployment Source System.
+/// Open Incremental Capture via the Source engine interface.
 pub fn open_deployment_incremental_capture(
     source: &SystemConnection,
 ) -> Result<IncrementalCapture, RuntimeError> {
-    let connect = oracle_source_connect(source)?;
-    let password = resolve_secret_value(&source.password_ref, "source.password")?;
-    open_oracle_incremental_capture(&connect, &password)
+    let engine = source_engine_from_connection(source)?;
+    engine
+        .open_incremental_capture()
         .map_err(|err| RuntimeError::Failed(err.to_string()))
 }
 
-/// Fail-fast Oracle Source Prerequisites before capture runs (ADR-0021).
+/// Fail-fast Source Prerequisites before capture runs (ADR-0021).
 ///
-/// Probes via the same LogMiner capture backend the Sync path uses (contract or
-/// OCI). Read-only; never auto-alters customer Oracle config.
+/// Delegates to the Source engine adapter (contract or OCI). Read-only; never
+/// auto-alters customer Source configuration.
+pub fn ensure_source_prerequisites(
+    source: &SystemConnection,
+    source_tables: &[String],
+) -> Result<(), RuntimeError> {
+    let engine = source_engine_from_connection(source)?;
+    engine
+        .check_prerequisites(source_tables)
+        .map_err(|err| RuntimeError::Failed(err.to_string()))
+}
+
+/// Expand-contract alias — prefer [`ensure_source_prerequisites`].
 pub fn ensure_oracle_source_prerequisites(
     source: &SystemConnection,
     source_tables: &[String],
 ) -> Result<(), RuntimeError> {
-    let capture = open_deployment_incremental_capture(source)?;
-    let state = capture
-        .probe_prerequisites()
-        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-    check_oracle_source_prerequisites(&state, source_tables)
-        .map_err(|err| RuntimeError::Failed(err.to_string()))
+    ensure_source_prerequisites(source, source_tables)
 }
 
 fn pipeline_source_tables(pipelines: &[Pipeline]) -> Vec<String> {
@@ -1036,7 +1072,7 @@ pub async fn deliver_pipelines_with_options(
         return Ok(());
     }
 
-    let mongo = mongo_target_from_deployment(deployment)?;
+    let target = target_engine_from_deployment(deployment)?;
 
     for pipeline in pipelines {
         if !pipeline_has_target(pipeline) || (!ignore_paused && pipeline.paused) {
@@ -1049,7 +1085,7 @@ pub async fn deliver_pipelines_with_options(
                     store,
                     deployment,
                     pipeline,
-                    &mongo,
+                    &target,
                     reconcile_deletes,
                 )
                 .await?;
@@ -1059,7 +1095,7 @@ pub async fn deliver_pipelines_with_options(
                     store,
                     deployment,
                     pipeline,
-                    &mongo,
+                    &target,
                     reconcile_deletes,
                 )
                 .await?;
@@ -1077,11 +1113,11 @@ pub async fn deliver_pipelines_with_options(
 
 /// Direct Pipeline Delivery. When `reconcile_deletes` is true (resume / revision),
 /// also remove Target documents whose Output Identity is no longer in Base.
-pub async fn deliver_direct_pipeline_with_options(
+pub async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipeline: &Pipeline,
-    mongo: &MongoTargetConnection,
+    target: &T,
     reconcile_deletes: bool,
 ) -> Result<(), RuntimeError> {
     let (dataset, rows) = store
@@ -1121,14 +1157,15 @@ pub async fn deliver_direct_pipeline_with_options(
         documents.push(document);
     }
 
-    let delivered = upsert_managed_documents(mongo, &pipeline.target_collection, &documents)
+    let delivered = target
+        .upsert_managed(&pipeline.target_collection, &documents)
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
     let mut deleted = 0usize;
     if reconcile_deletes {
         deleted =
-            reconcile_target_deletes(mongo, &pipeline.target_collection, &live_identities).await?;
+            reconcile_target_deletes(target, &pipeline.target_collection, &live_identities).await?;
     }
 
     store
@@ -1183,12 +1220,13 @@ pub fn target_document_identity_key(document: &serde_json::Value) -> Option<Stri
     document.get("_id").map(identity_key)
 }
 
-async fn reconcile_target_deletes(
-    mongo: &MongoTargetConnection,
+async fn reconcile_target_deletes<T: TargetEngine>(
+    target: &T,
     collection: &str,
     live_identities: &BTreeSet<String>,
 ) -> Result<usize, RuntimeError> {
-    let documents = list_target_documents(mongo, collection)
+    let documents = target
+        .list_documents(collection)
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
     let mut stale = Vec::new();
@@ -1205,16 +1243,17 @@ async fn reconcile_target_deletes(
     if stale.is_empty() {
         return Ok(0);
     }
-    delete_documents_by_identity(mongo, collection, &stale)
+    target
+        .delete_by_identity(collection, &stale)
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))
 }
 
-pub async fn deliver_transform_pipeline_with_options(
+pub async fn deliver_transform_pipeline_with_options<T: TargetEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipeline: &Pipeline,
-    mongo: &MongoTargetConnection,
+    target: &T,
     reconcile_deletes: bool,
 ) -> Result<(), RuntimeError> {
     if pipeline.output_identity.is_empty() {
@@ -1296,14 +1335,15 @@ pub async fn deliver_transform_pipeline_with_options(
         documents.push(document);
     }
 
-    let delivered = upsert_managed_documents(mongo, &pipeline.target_collection, &documents)
+    let delivered = target
+        .upsert_managed(&pipeline.target_collection, &documents)
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
     let mut deleted = 0usize;
     if reconcile_deletes {
         deleted =
-            reconcile_target_deletes(mongo, &pipeline.target_collection, &live_identities).await?;
+            reconcile_target_deletes(target, &pipeline.target_collection, &live_identities).await?;
     }
 
     store
@@ -1428,7 +1468,7 @@ pub async fn apply(
     // Deployment-only apply (no Pipeline tables) does not open LogMiner yet.
     let source_tables = pipeline_source_tables(&pipelines);
     if deployment.source.kind.eq_ignore_ascii_case("oracle") && !source_tables.is_empty() {
-        ensure_oracle_source_prerequisites(&deployment.source, &source_tables)?;
+        ensure_source_prerequisites(&deployment.source, &source_tables)?;
     }
 
     // Apply-time Managed validation before Initial Load / Delivery so unsafe NUMBER
