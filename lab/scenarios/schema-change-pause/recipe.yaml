@@ -20,6 +20,18 @@ workload:
     - sync with Schema Change event for that DDL (inject bridges LogMiner DDL capture gap)
     - assert WARN + pause (not poison quarantine)
     - assert status Delivery Health paused + Schema Change blocking visibility
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_delivery: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "Blocking DDL emits WARN and pauses the affected Pipeline"

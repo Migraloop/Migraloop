@@ -44,6 +44,7 @@ workload:
       require_derived: false      # set true for Transform Derived materialization
     sync:
       require_logminer: true
+      # allow_fail: true         # ops escapes that intentionally stop mid-sync
 checks:
   correctness:
     - Expected Managed Base/Target/Derived outcomes
@@ -54,18 +55,19 @@ thresholds:                     # optional; equal weight with correctness
   min_rows_per_s: 50.0
 ```
 
-Typed `workload.product_path` steps (issue #173): `prepare_namespace`, `product_apply`,
-`mutate`, `product_sync`, `assert`. The shared runner owns apply/sync on the real product
-CLI path; Scenario hooks only supply Namespace seed SQL, rare escapes (e.g. poison env),
-and correctness asserts. On this path: `direct-pipeline`, all `rt-*` Rich Transform Scenarios (`rt-project`,
-`rt-filter`, `rt-field-ops`, `rt-equilookup`, `rt-union`, `rt-unwind`,
-`rt-distinct-addtoset`), and `poison-quarantine`. Other Scenarios may still use a
-full `adapt_*` until migrated (see issue #179 for remaining ops/lifecycle Scenarios).
+Typed `workload.product_path` steps (issues #173 / #178 / #179): `prepare_namespace`,
+`product_apply`, `mutate`, `product_sync`, `assert`. The shared runner owns apply/sync on
+the real product CLI path; Scenario hooks only supply Namespace seed SQL, rare escapes
+(e.g. poison / schema-change inject env, `sync.allow_fail` mid-window stops), and
+correctness asserts. All selectable catalog Scenarios declare `product_path`.
+
+Optional `sync.allow_fail: true` keeps going after a non-zero sync exit so ops Scenarios
+(backpressure / observability) can observe mid-window stops, then finish in hooks.
 
 ## Adding a Scenario while building a feature
 
 1. Create `lab/scenarios/<id>/recipe.yaml` + `deployment.yaml` (reuse the operator Deployment format). Prefer `workload.product_path` for the common prepare→apply→mutate→sync→assert path.
-2. Register the Scenario id and implement thin hooks (Namespace prepare / mutate / assert / remove) — or a full `adapt_*` only when the Scenario cannot use `product_path` yet. Recipe `workload` / `checks` / `thresholds` are the recipe-driven runner interface — do not duplicate threshold values or the common product-path sequence as Rust constants.
+2. Register the Scenario id and implement thin hooks (Namespace prepare / mutate / assert / remove). Recipe `workload` / `checks` / `thresholds` are the recipe-driven runner interface — do not duplicate threshold values or the common product-path sequence as Rust constants.
 3. Confirm `migraloop lab scenario list` shows the new summary from the recipe.
 4. Manually verify with `migraloop lab scenario run <id>` on a Lab Fixture (`lab up`). Keep ignored CLI-seam coverage for the happy path; do **not** add a CI Release Quality Gate that runs the full catalog (ADR-0025 / ADR-0011).
 

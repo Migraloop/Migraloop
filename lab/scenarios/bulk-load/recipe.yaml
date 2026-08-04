@@ -17,6 +17,15 @@ workload:
     - prepare Scenario Namespace table + ~100k Source inserts + table-level supplemental logging
     - apply Deployment via real product path (Initial Load of bulk volume)
     - settle Delivery / Sync Health within max_duration_ms before final asserts
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - assert
+    apply:
+      require_initial_load: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - Base and Target Managed row counts equal bulk volume (100000)

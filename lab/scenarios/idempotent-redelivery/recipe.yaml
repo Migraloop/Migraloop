@@ -19,6 +19,18 @@ workload:
     - mutate Source insert/update/delete
     - sync Incremental Capture + Delivery via real LogMiner path
     - plant non-Managed Target field, then force duplicate-safe re-Delivery via real apply path
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_delivery: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "After duplicate-safe re-Delivery: Target Managed NAME Alicia and Carol present; Bob absent"

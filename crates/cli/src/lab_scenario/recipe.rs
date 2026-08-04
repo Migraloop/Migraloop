@@ -51,8 +51,8 @@ pub(crate) struct ScenarioRecipeWorkload {
     pub(crate) concurrency: String,
     #[serde(default)]
     pub(crate) steps: Vec<String>,
-    /// Optional typed product-path steps executed by the shared runner (#173).
-    /// When absent, the Scenario still uses a full `adapt_*` adapter.
+    /// Typed product-path steps executed by the shared runner (#173 / #178 / #179).
+    /// All shipped catalog Scenarios set this; absence is rejected at run time.
     #[serde(default)]
     pub(crate) product_path: Option<ScenarioRecipeProductPath>,
 }
@@ -101,12 +101,17 @@ impl Default for ProductPathApplyOpts {
 pub(crate) struct ProductPathSyncOpts {
     #[serde(default = "default_true")]
     pub(crate) require_logminer: bool,
+    /// When true, `product_sync` keeps going after a non-zero sync exit (Lab escapes
+    /// that intentionally stop mid-window, e.g. backpressure / observability).
+    #[serde(default)]
+    pub(crate) allow_fail: bool,
 }
 
 impl Default for ProductPathSyncOpts {
     fn default() -> Self {
         Self {
             require_logminer: true,
+            allow_fail: false,
         }
     }
 }

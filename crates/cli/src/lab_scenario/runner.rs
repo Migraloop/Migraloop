@@ -217,8 +217,8 @@ fn print_recipe_interface(recipe: &ScenarioRecipe) {
             product_path.apply.require_derived
         );
         println!(
-            "Lab Scenario product_path.sync: require_logminer={}",
-            product_path.sync.require_logminer
+            "Lab Scenario product_path.sync: require_logminer={} allow_fail={}",
+            product_path.sync.require_logminer, product_path.sync.allow_fail
         );
     }
     if !recipe.checks.correctness.is_empty() {
@@ -252,7 +252,7 @@ fn print_recipe_interface(recipe: &ScenarioRecipe) {
 
 /// Run a Scenario through the recipe-driven path:
 /// 1. Print id / namespace / workload / product_path / checks / thresholds from the recipe
-/// 2. Call adapter (full adapt_* or shared product-path hooks)
+/// 2. Call shared product-path hooks (Namespace seeds / escapes / asserts)
 /// 3. Evaluate thresholds from recipe against adapter metrics
 /// 4. Build ScenarioReport
 pub(crate) async fn run_recipe_driven<F, Fut>(

@@ -22,6 +22,15 @@ workload:
     - assert no Initial Load rebuild; Base/Target data remain
     # Prior-release schema → latest migrate is covered by the non-ignored CI twin
     # (cli_backward_compatible_upgrades); Lab Fixture store is already current.
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - assert
+    apply:
+      require_initial_load: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "migrate after an existing Deployment leaves Platform Store healthy at latest schema"

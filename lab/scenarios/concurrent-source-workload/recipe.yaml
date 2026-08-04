@@ -21,6 +21,17 @@ workload:
     - apply Deployment via real product path (Initial Load + Derived)
     - mutate with parallel Source sessions (customers + orders) inside one Scenario
     - settle sync/Delivery within max_settle_ms before final asserts
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - assert
+    apply:
+      require_initial_load: true
+      require_derived: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "Customers Base/Target Managed NAME: Alicia and Carol present; Bob absent"

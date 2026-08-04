@@ -20,6 +20,15 @@ workload:
     - status with absurdly low shared_buffers inject → Guardrails rejection
     - status with injected low free disk → WARN + structured event; Platform Store stays healthy
     - assert Pipeline is not auto-paused for disk pressure
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - assert
+    apply:
+      require_initial_load: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "bundled Platform Store settings satisfy product minimums (status healthy without inject)"
