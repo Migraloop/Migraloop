@@ -1,10 +1,10 @@
-//! Shared Connection Security, Managed-field, and Output Identity key types for the
-//! apply → Direct Delivery path.
+//! Shared Connection Security, Managed-field, column metadata, and Output Identity key
+//! types for the apply → Direct Delivery path.
 //!
 //! Config wire shapes, Platform Store persistence, Source adapters, and Target adapters
 //! consume these types (or thin wire adapters from them) so TLS settings, Managed-field
-//! mapping, secret-reference resolution, and Output Identity key encoding do not drift
-//! as parallel enums.
+//! mapping, column metadata, secret-reference resolution, and Output Identity key
+//! encoding do not drift as parallel enums.
 
 use std::fs;
 use std::path::Path;
@@ -19,6 +19,25 @@ use thiserror::Error;
 /// serializes the same way (issue #170).
 pub fn output_identity_key(identity: &serde_json::Value) -> String {
     serde_json::to_string(identity).unwrap_or_else(|_| identity.to_string())
+}
+
+/// Shared Managed / Base column metadata (issue #171).
+///
+/// Source adapters map engine-specific type discovery into [`ColumnShape::data_type`].
+/// Existing Oracle-named column fields on store/delivery/source types remain during
+/// the expand–contract migration (#181 / #182); this shape is the domain default for
+/// Managed/Base column metadata. Table and column layouts still come from Source
+/// schema discovery for Pipeline-referenced tables — not a platform business schema
+/// catalog (ADR-0026).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnShape {
+    pub name: String,
+    /// Source-declared type name at the shared layer (engine brand stays on adapters).
+    pub data_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<i32>,
 }
 
 /// How a secret is referenced (never stored as plaintext) — ADR-0006.
@@ -320,5 +339,27 @@ mod tests {
             output_identity_key(&serde_json::json!({"ID": 1, "REGION": "APAC"})),
             "{\"ID\":1,\"REGION\":\"APAC\"}"
         );
+    }
+
+    #[test]
+    fn column_shape_round_trips_managed_base_metadata() {
+        // Independent literals — schema comes from Source discovery, not a platform catalog.
+        let shape = ColumnShape {
+            name: "AMOUNT".into(),
+            data_type: "NUMBER".into(),
+            precision: Some(10),
+            scale: Some(2),
+        };
+        let json = serde_json::to_string(&shape).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"AMOUNT","data_type":"NUMBER","precision":10,"scale":2}"#
+        );
+        let back: ColumnShape = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, shape);
+        assert_eq!(back.name, "AMOUNT");
+        assert_eq!(back.data_type, "NUMBER");
+        assert_eq!(back.precision, Some(10));
+        assert_eq!(back.scale, Some(2));
     }
 }
