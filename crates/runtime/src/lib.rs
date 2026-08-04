@@ -1,8 +1,9 @@
-//! Deployment runtime: apply, table-level Initial Load, and Direct Pipeline Delivery.
+//! Deployment runtime: apply, table-level Initial Load, Direct Pipeline Delivery,
+//! and Incremental Sync orchestration.
 //!
-//! The Operator CLI is a thin adapter over this interface. Sync / Affect Analysis /
-//! lifecycle verbs deepen here in follow-up issues (#153–#155); this module owns the
-//! apply → Initial Load → Direct Delivery path (#152).
+//! The Operator CLI is a thin adapter over this interface. Affect Analysis deepening
+//! and lifecycle / Align / Drift verbs remain follow-ups (#154–#155). This module owns
+//! apply → Initial Load → Direct Delivery (#152) and Incremental Capture (#153).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,7 +30,15 @@ use migraloop_types::resolve_secret_ref;
 use thiserror::Error;
 
 mod observability;
+mod incremental;
+
 use crate::observability::{emit_event, EventValue};
+
+pub use incremental::{
+    apply_change_events_to_base_rows, format_output_identity, run_incremental_sync,
+    run_continuous_incremental_sync, supervise_continuous_incremental_sync, sync_incremental,
+    SyncCycleOutcome, SyncInvocation,
+};
 
 /// Dependency-graph seam marker (ADR-0024 modular monorepo).
 pub const SEAM: &str = "runtime";
