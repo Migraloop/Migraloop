@@ -1,11 +1,14 @@
-//! Recipe-driven Lab Scenario runner (issue #157 / ADR-0025).
+//! Recipe-driven Lab Scenario runner (issues #157, #173 / ADR-0025).
 //!
+//! When `workload.product_path` is set, the runner executes shared product-path
+//! steps from recipe data (prepare / apply / mutate / sync / assert). Scenario
+//! hooks supply Namespace seeds, rare escapes, and correctness asserts.
 //! Adapters return measured metrics + correctness; the runner evaluates
 //! `recipe.yaml` thresholds as equal-weight fail axes and builds the report.
 
 use crate::CliError;
 
-use super::recipe::{ScenarioRecipe, ScenarioRecipeThresholds};
+use super::recipe::{ProductPathStepKind, ScenarioRecipe, ScenarioRecipeThresholds};
 
 /// Measured metrics from a Scenario adapter (thresholds come from the recipe).
 #[derive(Debug, Clone)]
@@ -74,12 +77,26 @@ pub(crate) fn recipe_interface_summary(recipe: &ScenarioRecipe) -> String {
     } else {
         axes.join(",")
     };
+    let product_path = match &recipe.workload.product_path {
+        Some(pp) => format!("product_path.steps={}", pp.steps.len()),
+        None => "product_path=none".to_string(),
+    };
     format!(
-        "workload.concurrency={} workload.steps={} checks.correctness={} thresholds=[{axes}]",
+        "workload.concurrency={} workload.steps={} {product_path} \
+         checks.correctness={} thresholds=[{axes}]",
         recipe.workload.concurrency,
         recipe.workload.steps.len(),
         recipe.checks.correctness.len(),
     )
+}
+
+/// Ordered product-path plan from recipe data, when the Scenario opts in (#173).
+pub(crate) fn product_path_plan(recipe: &ScenarioRecipe) -> Option<&[ProductPathStepKind]> {
+    recipe
+        .workload
+        .product_path
+        .as_ref()
+        .map(|pp| pp.steps.as_slice())
 }
 
 /// Evaluate recipe.yaml thresholds against measured metrics (equal weight with correctness).
@@ -180,6 +197,30 @@ fn print_recipe_interface(recipe: &ScenarioRecipe) {
             println!("  {}. {step}", idx + 1);
         }
     }
+    if let Some(product_path) = &recipe.workload.product_path {
+        println!("Lab Scenario workload.product_path:");
+        for (idx, step) in product_path.steps.iter().enumerate() {
+            let label = match step {
+                ProductPathStepKind::PrepareNamespace => "prepare_namespace",
+                ProductPathStepKind::ProductApply => "product_apply",
+                ProductPathStepKind::Mutate => "mutate",
+                ProductPathStepKind::ProductSync => "product_sync",
+                ProductPathStepKind::Assert => "assert",
+            };
+            println!("  {}. {label}", idx + 1);
+        }
+        println!(
+            "Lab Scenario product_path.apply: require_initial_load={} \
+             require_delivery={} require_derived={}",
+            product_path.apply.require_initial_load,
+            product_path.apply.require_delivery,
+            product_path.apply.require_derived
+        );
+        println!(
+            "Lab Scenario product_path.sync: require_logminer={}",
+            product_path.sync.require_logminer
+        );
+    }
     if !recipe.checks.correctness.is_empty() {
         println!("Lab Scenario checks.correctness:");
         for check in &recipe.checks.correctness {
@@ -210,8 +251,8 @@ fn print_recipe_interface(recipe: &ScenarioRecipe) {
 }
 
 /// Run a Scenario through the recipe-driven path:
-/// 1. Print id / namespace / workload / checks / thresholds from the recipe
-/// 2. Call adapter
+/// 1. Print id / namespace / workload / product_path / checks / thresholds from the recipe
+/// 2. Call adapter (full adapt_* or shared product-path hooks)
 /// 3. Evaluate thresholds from recipe against adapter metrics
 /// 4. Build ScenarioReport
 pub(crate) async fn run_recipe_driven<F, Fut>(

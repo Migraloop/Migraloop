@@ -1,9 +1,11 @@
 //! Lab Scenario catalog, recipe-driven run orchestration, and Namespace cleanup
-//! (issues #60–#66, #63, #85, #86, #157 / ADR-0025).
+//! (issues #60–#66, #63, #85, #86, #157, #173 / ADR-0025).
 //!
-//! Recipe-driven runner (`runner.rs`): `recipe.yaml` workload / checks /
-//! thresholds are the live interface; Scenario `adapt_*` helpers supply
-//! Namespace seeds, Source workload escapes, and correctness asserts.
+//! Recipe-driven runner (`runner.rs`): `recipe.yaml` workload / optional
+//! `product_path` / checks / thresholds are the live interface. Scenarios with
+//! `workload.product_path` use shared prepare→apply→mutate→sync→assert steps;
+//! thin hooks supply Namespace seeds, rare escapes, and correctness asserts.
+//! Remaining Scenarios still use full `adapt_*` adapters until migrated.
 //! Lab-specific machinery: catalog listing from on-disk recipes, Scenario
 //! Namespace lifecycle (prepare / re-run wipe / manual remove / opt-in
 //! auto-remove), one-at-a-time lock, refusal of non-Lab / production engine
@@ -36,10 +38,13 @@ use crate::lab::{
 use crate::CliError;
 use migraloop_platform_store::PlatformStore;
 
-use self::recipe::{load_selectable_catalog, load_selectable_recipes, ScenarioRecipe};
+use self::recipe::{
+    load_selectable_catalog, load_selectable_recipes, ProductPathApplyOpts, ProductPathStepKind,
+    ProductPathSyncOpts, ScenarioRecipe,
+};
 use self::runner::{
-    report_from_adapter_outcome, run_recipe_driven, AdapterOutcome, ScenarioMetrics,
-    ScenarioReport,
+    product_path_plan, report_from_adapter_outcome, run_recipe_driven, AdapterOutcome,
+    ScenarioMetrics, ScenarioReport,
 };
 
 
@@ -563,12 +568,15 @@ async fn scenario_run(
 
     let lock = ScenarioLock::acquire(&lock_path, scenario)?;
     let started = Instant::now();
-    // Recipe-driven path: print recipe interface, run Scenario adapter, evaluate thresholds.
+    // Recipe-driven path: print recipe interface, run product-path or full adapter,
+    // evaluate thresholds.
     let result = run_recipe_driven(&recipe, || async {
+        if recipe.workload.product_path.is_some() {
+            return run_product_path_scenario(lab_dir, &recipe).await;
+        }
         match scenario {
-            DIRECT_PIPELINE_ID => adapt_direct_pipeline(lab_dir, &recipe).await,
+            // direct-pipeline / rt-project / poison-quarantine require workload.product_path (#173).
             TRANSFORM_PIPELINE_ID => adapt_transform_pipeline(lab_dir, &recipe).await,
-            RT_PROJECT_ID => adapt_rt_project(lab_dir, &recipe).await,
             RT_FILTER_ID => adapt_rt_filter(lab_dir, &recipe).await,
             RT_FIELD_OPS_ID => adapt_rt_field_ops(lab_dir, &recipe).await,
             RT_EQUILOOKUP_ID => adapt_rt_equilookup(lab_dir, &recipe).await,
@@ -583,7 +591,6 @@ async fn scenario_run(
             PAUSE_RESUME_ID => adapt_pause_resume(lab_dir, &recipe).await,
             REMOVE_PIPELINE_ID => adapt_remove_pipeline(lab_dir, &recipe).await,
             CHANGE_PIPELINE_ID => adapt_change_pipeline(lab_dir, &recipe).await,
-            POISON_QUARANTINE_ID => adapt_poison_quarantine(lab_dir, &recipe).await,
             SCHEMA_CHANGE_PAUSE_ID => adapt_schema_change_pause(lab_dir, &recipe).await,
             SOURCE_ALIGNMENT_ID => adapt_source_alignment(lab_dir, &recipe).await,
             DRIFT_CHECK_ID => adapt_drift_check(lab_dir, &recipe).await,
@@ -596,6 +603,12 @@ async fn scenario_run(
                 adapt_backward_compatible_upgrades(lab_dir, &recipe).await
             }
             INITIAL_LOAD_THROTTLED_ID => adapt_initial_load_throttled(lab_dir, &recipe).await,
+            DIRECT_PIPELINE_ID | RT_PROJECT_ID | POISON_QUARANTINE_ID => Err(CliError::Failed(
+                format!(
+                    "Lab Scenario `{scenario}` must declare workload.product_path in recipe.yaml \
+                     (shared product-path runner; issue #173)"
+                ),
+            )),
             _ => Err(CliError::Failed(format!(
                 "Lab Scenario `{scenario}` is listed but has no adapter"
             ))),
@@ -908,6 +921,24 @@ async fn product_apply_initial_load(
     lab_dir: &Path,
     scenario_id: &str,
 ) -> Result<String, CliError> {
+    product_apply(
+        lab_dir,
+        scenario_id,
+        &ProductPathApplyOpts {
+            require_initial_load: true,
+            require_delivery: false,
+            require_derived: false,
+        },
+    )
+    .await
+}
+
+/// Apply Scenario deployment via the real product CLI path with recipe apply gates.
+async fn product_apply(
+    lab_dir: &Path,
+    scenario_id: &str,
+    opts: &ProductPathApplyOpts,
+) -> Result<String, CliError> {
     let config_path = deployment_config_path(lab_dir, scenario_id)?;
     let bin = lab_migraloop_bin();
     println!("Lab Scenario: apply Deployment via real product path...");
@@ -924,108 +955,430 @@ async fn product_apply_initial_load(
         ],
     )
     .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
+    if opts.require_initial_load
+        && !(apply_out.contains("Initial Load")
+            || apply_out.to_ascii_lowercase().contains("initial_load"))
     {
         return Err(CliError::Failed(format!(
             "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
         )));
     }
+    if opts.require_delivery && !apply_out.to_ascii_lowercase().contains("delivery") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
+        )));
+    }
+    if opts.require_derived && !apply_out.to_ascii_lowercase().contains("derived") {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+        )));
+    }
     Ok(apply_out)
 }
 
-/// Incremental Capture + Delivery via real product path; require LogMiner.
-async fn product_sync_logminer() -> Result<(String, String), CliError> {
+/// Incremental Capture + Delivery via real product path, with optional sync env escapes.
+async fn product_sync(
+    opts: &ProductPathSyncOpts,
+    sync_env: &[(&str, &str)],
+) -> Result<(String, String), CliError> {
     let bin = lab_migraloop_bin();
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
+    if sync_env.is_empty() {
+        println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    }
+    let sync_out = run_product_cli_with_env(
         &bin,
         &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        sync_env,
     )
     .await?;
-    if sync_out.to_ascii_lowercase().contains("logminer") {
-        Ok((sync_out, "LogMiner".to_string()))
-    } else {
-        Err(CliError::Failed(format!(
+    let has_logminer = sync_out.to_ascii_lowercase().contains("logminer");
+    if opts.require_logminer && !has_logminer {
+        return Err(CliError::Failed(format!(
             "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )))
+        )));
+    }
+    let capture_note = if has_logminer {
+        "LogMiner".to_string()
+    } else {
+        "Incremental Sync".to_string()
+    };
+    Ok((sync_out, capture_note))
+}
+
+/// Context accumulated while the shared product-path runner executes recipe steps.
+struct ProductPathRunContext {
+    apply_out: String,
+    sync_out: String,
+    capture_path_note: String,
+}
+
+/// Thin Scenario hooks for seed SQL, rare escapes, and correctness (#173).
+enum ProductPathHooks {
+    DirectPipeline,
+    RtProject,
+    PoisonQuarantine,
+}
+
+impl ProductPathHooks {
+    fn for_recipe(recipe: &ScenarioRecipe) -> Result<Self, CliError> {
+        match recipe.id.as_str() {
+            DIRECT_PIPELINE_ID => Ok(Self::DirectPipeline),
+            RT_PROJECT_ID => Ok(Self::RtProject),
+            POISON_QUARANTINE_ID => Ok(Self::PoisonQuarantine),
+            other => Err(CliError::Failed(format!(
+                "Lab Scenario `{other}` declares workload.product_path but has no product-path hooks \
+                 (migrate the Scenario or remove product_path from recipe.yaml)"
+            ))),
+        }
+    }
+
+    async fn prepare(&self, lab_dir: &Path) -> Result<(), CliError> {
+        match self {
+            Self::DirectPipeline => prepare_direct_pipeline_namespace(lab_dir).await,
+            Self::RtProject => prepare_rt_project_namespace(lab_dir).await,
+            Self::PoisonQuarantine => prepare_poison_quarantine_namespace(lab_dir).await,
+        }
+    }
+
+    async fn after_apply(&self, _lab_dir: &Path, apply_out: &str) -> Result<(), CliError> {
+        let bin = lab_migraloop_bin();
+        match self {
+            Self::DirectPipeline => {
+                let base_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        DIRECT_PIPELINE_TABLE,
+                    ],
+                )
+                .await?;
+                if !(base_after_apply.contains("Alice") && base_after_apply.contains("Bob")) {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load Base check failed (expected Alice and Bob):\n{base_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::RtProject => {
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(RT_PROJECT_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_PROJECT_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+                    && managed_field_present(&derived_after_apply, "NAME", "Bob")
+                    && !inspect_mentions_email_field(&derived_after_apply))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load project Derived check failed \
+(expected Alice/Bob NAME, no EMAIL Managed field):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::PoisonQuarantine => Ok(()),
+        }
+    }
+
+    async fn mutate(&self, lab_dir: &Path) -> Result<(), CliError> {
+        match self {
+            Self::DirectPipeline => {
+                println!("Lab Scenario: driving Source insert/update/delete...");
+                mutate_direct_pipeline_source(lab_dir).await
+            }
+            Self::RtProject => {
+                println!("Lab Scenario: driving Source insert/update/delete...");
+                mutate_rt_project_source(lab_dir).await
+            }
+            Self::PoisonQuarantine => {
+                println!("Lab Scenario: driving Source mutations (update/insert/delete)...");
+                mutate_poison_quarantine_source(lab_dir).await
+            }
+        }
+    }
+
+    fn before_sync(&self) {
+        match self {
+            Self::DirectPipeline | Self::RtProject => {}
+            Self::PoisonQuarantine => {
+                println!(
+                    "Lab Scenario: sync Incremental Capture + Delivery with poison injection \
+                     for Output Identity {POISON_QUARANTINE_IDENTITY}..."
+                );
+            }
+        }
+    }
+
+    fn sync_env(&self) -> Vec<(&'static str, &'static str)> {
+        match self {
+            Self::DirectPipeline | Self::RtProject => vec![],
+            Self::PoisonQuarantine => vec![
+                (
+                    "MIGRALOOP_DELIVERY_POISON_IDENTITIES",
+                    POISON_QUARANTINE_IDENTITY,
+                ),
+                (
+                    "MIGRALOOP_POISON_MAX_ATTEMPTS",
+                    POISON_QUARANTINE_MAX_ATTEMPTS,
+                ),
+            ],
+        }
+    }
+
+    async fn after_sync(&self, sync_out: &str) -> Result<(), CliError> {
+        match self {
+            Self::DirectPipeline | Self::RtProject => Ok(()),
+            Self::PoisonQuarantine => {
+                let sync_lower = sync_out.to_ascii_lowercase();
+                if !(sync_lower.contains("quarantine") && sync_lower.contains("alert")) {
+                    return Err(CliError::Failed(format!(
+                        "sync must quarantine poison identity with an ALERT:\n{sync_out}"
+                    )));
+                }
+                if sync_lower
+                    .lines()
+                    .any(|line| line.contains("paused") && line.contains(POISON_QUARANTINE_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "poison quarantine must not pause the Pipeline:\n{sync_out}"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn assert_correctness(
+        &self,
+        ctx: &ProductPathRunContext,
+    ) -> Result<AdapterOutcome, CliError> {
+        let bin = lab_migraloop_bin();
+        let rows_applied =
+            count_delivery_ops(&ctx.apply_out) + count_delivery_ops(&ctx.sync_out);
+        match self {
+            Self::DirectPipeline => {
+                let base_after = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        DIRECT_PIPELINE_TABLE,
+                    ],
+                )
+                .await?;
+                let target_after = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        DIRECT_PIPELINE_COLLECTION,
+                    ],
+                )
+                .await?;
+                let base_ok = managed_name_present(&base_after, "Alicia")
+                    && managed_name_present(&base_after, "Carol")
+                    && !managed_name_present(&base_after, "Bob");
+                let target_ok = managed_name_present(&target_after, "Alicia")
+                    && managed_name_present(&target_after, "Carol")
+                    && !managed_name_present(&target_after, "Bob");
+                if !(base_ok && target_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after insert/update/delete.\nBase:\n{base_after}\nTarget:\n{target_after}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (Base + Target Managed outcomes)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::RtProject => {
+                let derived_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_PROJECT_PIPELINE,
+                    ],
+                )
+                .await?;
+                let target_after = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        RT_PROJECT_COLLECTION,
+                    ],
+                )
+                .await?;
+                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+                    && managed_field_present(&derived_after, "NAME", "Carol")
+                    && !managed_field_present(&derived_after, "NAME", "Bob")
+                    && !inspect_mentions_email_field(&derived_after);
+                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+                    && managed_field_present(&target_after, "NAME", "Carol")
+                    && !managed_field_present(&target_after, "NAME", "Bob")
+                    && !inspect_mentions_email_field(&target_after);
+                if !(derived_ok && target_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after project insert/update/delete.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (projected Derived + Target Managed outcomes)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::PoisonQuarantine => {
+                let target_out = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        POISON_QUARANTINE_COLLECTION,
+                    ],
+                )
+                .await?;
+                if !(managed_name_present(&target_out, "Alice")
+                    && !managed_name_present(&target_out, "Alicia")
+                    && managed_name_present(&target_out, "Carol")
+                    && !managed_name_present(&target_out, "Bob"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Target must keep Alice for quarantined identity 1, Deliver Carol, delete Bob:\n{target_out}"
+                    )));
+                }
+                let status_out = run_product_cli(
+                    &bin,
+                    &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                )
+                .await?;
+                let status_lower = status_out.to_ascii_lowercase();
+                if !(status_out.contains("Delivery Health: unhealthy")
+                    && status_out.contains(POISON_QUARANTINE_PIPELINE)
+                    && status_lower.contains("quarantine")
+                    && (status_out.contains("identity=1") || status_lower.contains("identity=1")))
+                {
+                    return Err(CliError::Failed(format!(
+                        "status must show Delivery Health unhealthy with quarantined identity=1:\n{status_out}"
+                    )));
+                }
+                if !(status_lower.contains("unhealthy") || status_lower.contains("not aligned")) {
+                    return Err(CliError::Failed(format!(
+                        "quarantined keys must be marked unhealthy/not aligned:\n{status_out}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed \
+                     (poison identity quarantined; Pipeline continued; status unhealthy)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+        }
     }
 }
 
-async fn adapt_direct_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    // Runner already printed recipe id / namespace / workload / checks.
-    prepare_direct_pipeline_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+/// Execute shared product-path steps from recipe data with Scenario-specific hooks.
+async fn run_product_path_scenario(
+    lab_dir: &Path,
+    recipe: &ScenarioRecipe,
+) -> Result<AdapterOutcome, CliError> {
+    let product_path = recipe.workload.product_path.as_ref().ok_or_else(|| {
+        CliError::Failed(
+            "internal: run_product_path_scenario called without workload.product_path".to_string(),
+        )
+    })?;
+    let steps = product_path_plan(recipe).ok_or_else(|| {
+        CliError::Failed(
+            "internal: product_path_plan missing despite workload.product_path".to_string(),
+        )
+    })?;
+    let hooks = ProductPathHooks::for_recipe(recipe)?;
+    let mut ctx = ProductPathRunContext {
+        apply_out: String::new(),
+        sync_out: String::new(),
+        capture_path_note: String::new(),
+    };
 
-    let apply_out = product_apply_initial_load(lab_dir, DIRECT_PIPELINE_ID).await?;
-    let bin = lab_migraloop_bin();
-
-    let base_after_apply = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            DIRECT_PIPELINE_TABLE,
-        ],
-    )
-    .await?;
-    if !(base_after_apply.contains("Alice") && base_after_apply.contains("Bob")) {
-        return Err(CliError::Failed(format!(
-            "Initial Load Base check failed (expected Alice and Bob):\n{base_after_apply}"
-        )));
+    for step in steps {
+        match step {
+            ProductPathStepKind::PrepareNamespace => {
+                hooks.prepare(lab_dir).await?;
+                println!(
+                    "Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)"
+                );
+            }
+            ProductPathStepKind::ProductApply => {
+                ctx.apply_out =
+                    product_apply(lab_dir, &recipe.id, &product_path.apply).await?;
+                hooks.after_apply(lab_dir, &ctx.apply_out).await?;
+            }
+            ProductPathStepKind::Mutate => {
+                hooks.mutate(lab_dir).await?;
+            }
+            ProductPathStepKind::ProductSync => {
+                hooks.before_sync();
+                let env = hooks.sync_env();
+                let (sync_out, capture_note) =
+                    product_sync(&product_path.sync, &env).await?;
+                hooks.after_sync(&sync_out).await?;
+                ctx.sync_out = sync_out;
+                ctx.capture_path_note = capture_note;
+            }
+            ProductPathStepKind::Assert => {
+                return hooks.assert_correctness(&ctx).await;
+            }
+        }
     }
 
-    println!("Lab Scenario: driving Source insert/update/delete...");
-    mutate_direct_pipeline_source(lab_dir).await?;
-
-    let (sync_out, capture_note) = product_sync_logminer().await?;
-
-    let base_after = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            DIRECT_PIPELINE_TABLE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            DIRECT_PIPELINE_COLLECTION,
-        ],
-    )
-    .await?;
-
-    let base_ok = managed_name_present(&base_after, "Alicia")
-        && managed_name_present(&base_after, "Carol")
-        && !managed_name_present(&base_after, "Bob");
-    let target_ok = managed_name_present(&target_after, "Alicia")
-        && managed_name_present(&target_after, "Carol")
-        && !managed_name_present(&target_after, "Bob");
-
-    // Throughput signal from product apply/sync Delivery lines (not a hand-counted recipe).
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(base_ok && target_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after insert/update/delete.\nBase:\n{base_after}\nTarget:\n{target_after}"
-        )));
-    }
-
-    println!("Lab Scenario: correctness checks passed (Base + Target Managed outcomes)");
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(adapter_ok(rows_applied, capture_note))
+    Err(CliError::Failed(format!(
+        "Lab Scenario `{}` product_path completed without an `assert` step",
+        recipe.id
+    )))
 }
 
 /// Managed NAME field presence in Base/Target JSON inspect output.
@@ -1599,148 +1952,6 @@ EXIT;\n"
                 "Failed to drive multi-table Source insert/update/delete for Lab Scenario:\n{err}"
             ))
         })
-}
-
-async fn adapt_rt_project(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {RT_PROJECT_ID}");
-    println!(
-        "Scenario Namespace: table={RT_PROJECT_TABLE} \
-collection={RT_PROJECT_COLLECTION} deployment={RT_PROJECT_DEPLOYMENT}"
-    );
-
-    prepare_rt_project_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, RT_PROJECT_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.to_ascii_lowercase().contains("derived")
-        || apply_out.contains(RT_PROJECT_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-        )));
-    }
-
-    let derived_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_PROJECT_PIPELINE,
-        ],
-    )
-    .await?;
-    // project keeps ID/NAME only — EMAIL must not appear as Managed Derived field.
-    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
-        && managed_field_present(&derived_after_apply, "NAME", "Bob")
-        && !inspect_mentions_email_field(&derived_after_apply))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load project Derived check failed \
-(expected Alice/Bob NAME, no EMAIL Managed field):\n{derived_after_apply}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source insert/update/delete...");
-    mutate_rt_project_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let derived_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_PROJECT_PIPELINE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            RT_PROJECT_COLLECTION,
-        ],
-    )
-    .await?;
-
-    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-        && managed_field_present(&derived_after, "NAME", "Carol")
-        && !managed_field_present(&derived_after, "NAME", "Bob")
-        && !inspect_mentions_email_field(&derived_after);
-    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-        && managed_field_present(&target_after, "NAME", "Carol")
-        && !managed_field_present(&target_after, "NAME", "Bob")
-        && !inspect_mentions_email_field(&target_after);
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(derived_ok && target_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after project insert/update/delete.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed (projected Derived + Target Managed outcomes)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
 }
 
 /// True when inspect output exposes an EMAIL Managed field key (not merely the substring).
@@ -4778,156 +4989,6 @@ EXIT;\n"
                 "Failed to drive Source mutations for pause-resume:\n{err}"
             ))
         })
-}
-
-async fn adapt_poison_quarantine(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {POISON_QUARANTINE_ID}");
-    println!(
-        "Scenario Namespace: table={POISON_QUARANTINE_TABLE} \
-collection={POISON_QUARANTINE_COLLECTION} deployment={POISON_QUARANTINE_DEPLOYMENT}"
-    );
-
-    prepare_poison_quarantine_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, POISON_QUARANTINE_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !apply_out.to_ascii_lowercase().contains("delivery") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source mutations (update/insert/delete)...");
-    mutate_poison_quarantine_source(lab_dir).await?;
-
-    println!(
-        "Lab Scenario: sync Incremental Capture + Delivery with poison injection \
-         for Output Identity {POISON_QUARANTINE_IDENTITY}..."
-    );
-    let sync_out = run_product_cli_with_env(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        &[
-            (
-                "MIGRALOOP_DELIVERY_POISON_IDENTITIES",
-                POISON_QUARANTINE_IDENTITY,
-            ),
-            (
-                "MIGRALOOP_POISON_MAX_ATTEMPTS",
-                POISON_QUARANTINE_MAX_ATTEMPTS,
-            ),
-        ],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-    let sync_lower = sync_out.to_ascii_lowercase();
-    if !(sync_lower.contains("quarantine") && sync_lower.contains("alert")) {
-        return Err(CliError::Failed(format!(
-            "sync must quarantine poison identity with an ALERT:\n{sync_out}"
-        )));
-    }
-    if sync_lower
-        .lines()
-        .any(|line| line.contains("paused") && line.contains(POISON_QUARANTINE_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "poison quarantine must not pause the Pipeline:\n{sync_out}"
-        )));
-    }
-
-    let target_out = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            POISON_QUARANTINE_COLLECTION,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&target_out, "Alice")
-        && !managed_name_present(&target_out, "Alicia")
-        && managed_name_present(&target_out, "Carol")
-        && !managed_name_present(&target_out, "Bob"))
-    {
-        return Err(CliError::Failed(format!(
-            "Target must keep Alice for quarantined identity 1, Deliver Carol, delete Bob:\n{target_out}"
-        )));
-    }
-
-    let status_out = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let status_lower = status_out.to_ascii_lowercase();
-    if !(status_out.contains("Delivery Health: unhealthy")
-        && status_out.contains(POISON_QUARANTINE_PIPELINE)
-        && status_lower.contains("quarantine")
-        && (status_out.contains("identity=1") || status_lower.contains("identity=1")))
-    {
-        return Err(CliError::Failed(format!(
-            "status must show Delivery Health unhealthy with quarantined identity=1:\n{status_out}"
-        )));
-    }
-    if !(status_lower.contains("unhealthy") || status_lower.contains("not aligned")) {
-        return Err(CliError::Failed(format!(
-            "quarantined keys must be marked unhealthy/not aligned:\n{status_out}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (poison identity quarantined; Pipeline continued; status unhealthy)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
 }
 
 async fn remove_poison_quarantine_namespace(lab_dir: &Path) -> Result<(), CliError> {
@@ -8389,11 +8450,28 @@ EXIT;\n"
 mod tests {
     use super::*;
     use crate::lab_scenario::recipe::{
-        load_recipe, ScenarioRecipeChecks, ScenarioRecipeNamespace, ScenarioRecipeThresholds,
+        load_recipe, validate_product_path, ProductPathStepKind, ScenarioRecipeChecks,
+        ScenarioRecipeNamespace, ScenarioRecipeProductPath, ScenarioRecipeThresholds,
         ScenarioRecipeWorkload,
     };
-    use crate::lab_scenario::runner::{evaluate_recipe_thresholds, recipe_interface_summary};
+    use crate::lab_scenario::runner::{
+        evaluate_recipe_thresholds, product_path_plan, recipe_interface_summary,
+    };
     use std::time::Duration;
+
+    trait ProductPathStepSink {
+        fn on_step(&mut self, step: ProductPathStepKind) -> Result<(), String>;
+    }
+
+    fn dispatch_product_path_steps<S: ProductPathStepSink>(
+        steps: &[ProductPathStepKind],
+        sink: &mut S,
+    ) -> Result<(), String> {
+        for step in steps {
+            sink.on_step(*step)?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn selectable_catalog_loads_bulk_load_recipe_from_repo_lab() {
@@ -8629,6 +8707,7 @@ mod tests {
             workload: ScenarioRecipeWorkload {
                 concurrency: "serial".to_string(),
                 steps: vec!["prepare".to_string()],
+                product_path: None,
             },
             checks: ScenarioRecipeChecks {
                 correctness: vec!["rows".to_string()],
@@ -8694,6 +8773,7 @@ mod tests {
             workload: ScenarioRecipeWorkload {
                 concurrency: "serial".to_string(),
                 steps: vec!["prepare".to_string()],
+                product_path: None,
             },
             checks: ScenarioRecipeChecks {
                 correctness: vec!["rows".to_string()],
@@ -8817,6 +8897,10 @@ mod tests {
             "summary={summary}"
         );
         assert!(
+            summary.contains("product_path=none"),
+            "bulk-load stays on full adapter until later migration; summary={summary}"
+        );
+        assert!(
             summary.contains(&format!(
                 "checks.correctness={}",
                 recipe.checks.correctness.len()
@@ -8833,6 +8917,111 @@ mod tests {
         assert!(
             !recipe.namespace.pipelines.is_empty(),
             "bulk-load recipe declares pipelines"
+        );
+    }
+
+    #[test]
+    fn product_path_recipes_drive_shared_steps_for_first_batch() {
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab/scenarios");
+        for (id, require_delivery, require_derived) in [
+            (DIRECT_PIPELINE_ID, false, false),
+            (RT_PROJECT_ID, false, true),
+            (POISON_QUARANTINE_ID, true, false),
+        ] {
+            let recipe = load_recipe(&lab.join(id).join("recipe.yaml"))
+                .unwrap_or_else(|err| panic!("load {id}: {err}"));
+            let plan = product_path_plan(&recipe)
+                .unwrap_or_else(|| panic!("{id} must declare workload.product_path"));
+            assert_eq!(
+                plan,
+                &[
+                    ProductPathStepKind::PrepareNamespace,
+                    ProductPathStepKind::ProductApply,
+                    ProductPathStepKind::Mutate,
+                    ProductPathStepKind::ProductSync,
+                    ProductPathStepKind::Assert,
+                ],
+                "{id} product_path.steps"
+            );
+            let pp = recipe.workload.product_path.as_ref().expect("product_path");
+            assert!(pp.apply.require_initial_load, "{id}");
+            assert_eq!(pp.apply.require_delivery, require_delivery, "{id}");
+            assert_eq!(pp.apply.require_derived, require_derived, "{id}");
+            assert!(pp.sync.require_logminer, "{id}");
+            let summary = recipe_interface_summary(&recipe);
+            assert!(
+                summary.contains("product_path.steps=5"),
+                "{id} summary={summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn product_path_step_dispatch_follows_recipe_order() {
+        struct Recorder(Vec<ProductPathStepKind>);
+        impl ProductPathStepSink for Recorder {
+            fn on_step(&mut self, step: ProductPathStepKind) -> Result<(), String> {
+                self.0.push(step);
+                Ok(())
+            }
+        }
+        let steps = [
+            ProductPathStepKind::PrepareNamespace,
+            ProductPathStepKind::ProductApply,
+            ProductPathStepKind::Mutate,
+            ProductPathStepKind::ProductSync,
+            ProductPathStepKind::Assert,
+        ];
+        let mut recorder = Recorder(Vec::new());
+        dispatch_product_path_steps(&steps, &mut recorder).expect("dispatch");
+        assert_eq!(recorder.0, steps);
+    }
+
+    #[test]
+    fn product_path_validation_rejects_incomplete_plans() {
+        let incomplete = ScenarioRecipeProductPath {
+            steps: vec![ProductPathStepKind::PrepareNamespace],
+            apply: Default::default(),
+            sync: Default::default(),
+        };
+        let err = validate_product_path("demo.yaml", &incomplete).expect_err("need assert");
+        assert!(
+            err.to_string().contains("prepare_namespace")
+                && err.to_string().contains("assert"),
+            "err={err}"
+        );
+
+        let no_product = ScenarioRecipeProductPath {
+            steps: vec![
+                ProductPathStepKind::PrepareNamespace,
+                ProductPathStepKind::Mutate,
+                ProductPathStepKind::Assert,
+            ],
+            apply: Default::default(),
+            sync: Default::default(),
+        };
+        let err = validate_product_path("demo.yaml", &no_product).expect_err("need apply/sync");
+        assert!(
+            err.to_string().contains("product_apply")
+                || err.to_string().contains("product_sync"),
+            "err={err}"
+        );
+
+        let mock_sync = ScenarioRecipeProductPath {
+            steps: vec![
+                ProductPathStepKind::PrepareNamespace,
+                ProductPathStepKind::ProductSync,
+                ProductPathStepKind::Assert,
+            ],
+            apply: Default::default(),
+            sync: ProductPathSyncOpts {
+                require_logminer: false,
+            },
+        };
+        let err = validate_product_path("demo.yaml", &mock_sync).expect_err("logminer required");
+        assert!(
+            err.to_string().contains("require_logminer"),
+            "err={err}"
         );
     }
 

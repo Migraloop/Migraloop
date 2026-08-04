@@ -96,6 +96,15 @@ fn write_scenario_package_with_deployment(lab: &Path, id: &str, summary: &str, d
     } else {
         ""
     };
+    // First-batch Scenarios require typed product_path (issue #173).
+    let product_path = if matches!(
+        id,
+        "direct-pipeline" | "rt-project" | "poison-quarantine"
+    ) {
+        "  product_path:\n    steps:\n      - prepare_namespace\n      - product_apply\n      - mutate\n      - product_sync\n      - assert\n    apply:\n      require_initial_load: true\n    sync:\n      require_logminer: true\n"
+    } else {
+        ""
+    };
     fs::write(
         scenario_dir.join("recipe.yaml"),
         format!(
@@ -112,7 +121,7 @@ workload:
   steps:
     - prepare Namespace
     - apply via real product path
-checks:
+{product_path}checks:
   correctness:
     - Managed outcomes match recipe expectations
 {thresholds}"#
