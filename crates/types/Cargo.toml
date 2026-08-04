@@ -3,7 +3,7 @@ name = "migraloop-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared TLS, Managed-field mapping, secret-reference, and Output Identity key types"
+description = "Shared TLS, Managed-field mapping, column shape, secret-reference, and Output Identity key types"
 
 [dependencies]
 serde = { workspace = true }

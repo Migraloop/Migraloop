@@ -57,6 +57,7 @@ pub use engine::{
 
 use std::collections::BTreeMap;
 
+use migraloop_types::ColumnShape;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -169,6 +170,19 @@ impl SourceColumn {
 
     pub fn is_number(&self) -> bool {
         normalize_oracle_type(&self.oracle_type) == "NUMBER"
+    }
+
+    /// Map this Source-discovered column into the shared Managed/Base column shape.
+    ///
+    /// Engine-specific fields (`oracle_type`, allow-list `supported`, size caps) stay
+    /// on [`SourceColumn`]; callers that need the shared shape use this path (issue #171).
+    pub fn column_shape(&self) -> ColumnShape {
+        ColumnShape {
+            name: self.name.clone(),
+            data_type: self.oracle_type.clone(),
+            precision: self.precision,
+            scale: self.scale,
+        }
     }
 }
 
@@ -603,5 +617,30 @@ mod tests {
         let changes = incremental_changes_stub("CUSTOMERS", CUSTOMERS_LOW_WATERMARK)
             .expect("empty incremental ok");
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn source_column_populates_shared_column_shape() {
+        let column = SourceColumn {
+            name: "BALANCE_CENTS".into(),
+            oracle_type: "NUMBER".into(),
+            supported: true,
+            precision: Some(18),
+            scale: Some(0),
+            size: None,
+        };
+        let shape = column.column_shape();
+        assert_eq!(
+            shape,
+            ColumnShape {
+                name: "BALANCE_CENTS".into(),
+                data_type: "NUMBER".into(),
+                precision: Some(18),
+                scale: Some(0),
+            }
+        );
+        // Engine brand / discovery extras stay on SourceColumn; shared shape omits them.
+        assert!(column.supported);
+        assert_eq!(column.size, None);
     }
 }
