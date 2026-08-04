@@ -51,6 +51,7 @@ mod lifecycle;
 mod poison;
 mod schema_impact;
 mod sync_options;
+mod verify_repair;
 
 pub use cutover::{
     cutover_facts_from_base, handoff_from_low_watermark, handoff_from_optional_low_watermark,
