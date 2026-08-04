@@ -63,6 +63,10 @@ fn base_change_kind(op: ChangeOp) -> BaseChangeKind {
 ///
 /// `changed_table` / `changed_base_rows` are the Base that just received the change
 /// (primary `source.table` or an `equiLookup.from` / `union.from` secondary).
+///
+/// Returns the next opaque Maintenance State blob when the transform uses one. Callers
+/// persist it only after durable Base/checkpoint progress so a Sync retry cannot
+/// analyze/bump the same change twice.
 async fn maintain_transform_pipeline_for_change(
     store: &PlatformStore,
     pipeline: &Pipeline,
@@ -71,7 +75,7 @@ async fn maintain_transform_pipeline_for_change(
     changed_base_rows: &[serde_json::Map<String, serde_json::Value>],
     change: &ChangeEvent,
     pre_apply: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> Result<(), RuntimeError> {
+) -> Result<Option<MaintenanceStateBlob>, RuntimeError> {
     let ops = transform_ops_from_pipeline(pipeline)?;
     let after = match change.op {
         ChangeOp::Insert | ChangeOp::Update => {
@@ -143,24 +147,16 @@ async fn maintain_transform_pipeline_for_change(
 
     match analysis.outcome {
         AffectOutcome::SkipUnusedFields => {
-            if let Some(next) = &analysis.next_maintenance_state {
-                persist_maintenance_state_blob(store, pipeline, next).await?;
-            }
             println!(
                 "Affect Analysis: Pipeline {} skipped (unused fields only)",
                 pipeline.name
             );
-            Ok(())
         }
         AffectOutcome::SkipValueUnchanged => {
-            if let Some(next) = &analysis.next_maintenance_state {
-                persist_maintenance_state_blob(store, pipeline, next).await?;
-            }
             println!(
                 "Affect Analysis: Pipeline {} skipped (value-level; no Derived change)",
                 pipeline.name
             );
-            Ok(())
         }
         AffectOutcome::Recompute { identities } => {
             println!(
@@ -180,14 +176,10 @@ async fn maintain_transform_pipeline_for_change(
                 &identities,
             )
             .await?;
-            // Persist next Maintenance State only after successful Derived/Delivery work
-            // so a Delivery retry cannot analyze/bump the same change twice.
-            if let Some(next) = &analysis.next_maintenance_state {
-                persist_maintenance_state_blob(store, pipeline, next).await?;
-            }
-            Ok(())
         }
     }
+    // Caller persists after durable Base/checkpoint — return next blob only.
+    Ok(analysis.next_maintenance_state)
 }
 
 async fn recompute_and_deliver_affected_identities(
@@ -1313,6 +1305,9 @@ pub async fn run_incremental_sync(
                             )?;
 
                             // Delivery before durable checkpoint so retries prefer duplicate applies.
+                            // Collect next Maintenance State blobs and persist only after Base/checkpoint.
+                            let mut pending_maintenance: Vec<(&Pipeline, MaintenanceStateBlob)> =
+                                Vec::new();
                             for pipeline in &deployment_pipelines {
                                 if pipeline.target_collection.is_empty()
                                     || !pipeline_references_table(pipeline, &table)
@@ -1458,6 +1453,7 @@ pub async fn run_incremental_sync(
                                     "transform" => {
                                         let mut last_error = String::new();
                                         let mut succeeded = false;
+                                        let mut next_ms = None;
                                         for attempt in 1..=max_poison_attempts {
                                             apply_delivery_delay().await;
                                             match maintain_transform_pipeline_for_change(
@@ -1471,7 +1467,8 @@ pub async fn run_incremental_sync(
                                             )
                                             .await
                                             {
-                                                Ok(()) => {
+                                                Ok(blob) => {
+                                                    next_ms = blob;
                                                     succeeded = true;
                                                     break;
                                                 }
@@ -1516,6 +1513,8 @@ pub async fn run_incremental_sync(
                                                 &last_error,
                                             )
                                             .await?;
+                                        } else if let Some(blob) = next_ms {
+                                            pending_maintenance.push((pipeline, blob));
                                         }
                                         store.update_pipeline_delivery_lag(
                                                                                                         &pipeline.deployment_name,
@@ -1555,6 +1554,11 @@ pub async fn run_incremental_sync(
                             )
                             .await
                             .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+                            // Durable Base/checkpoint first, then Maintenance State — matches
+                            // Delivery-before-checkpoint: Sync retries re-analyze with prior state.
+                            for (pipeline, blob) in &pending_maintenance {
+                                persist_maintenance_state_blob(store, pipeline, blob).await?;
+                            }
                             set_delivery_lag_for_table(
                                 store,
                                 &deployment_pipelines,

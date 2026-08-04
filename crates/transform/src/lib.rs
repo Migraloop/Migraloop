@@ -190,11 +190,6 @@ impl MaintenanceStateBlob {
         &self.json
     }
 
-    /// Consume into the opaque JSON string for Platform Store persistence.
-    pub fn into_string(self) -> String {
-        self.json
-    }
-
     fn from_state(state: &MaintenanceState) -> Result<Self, TransformError> {
         let json = serde_json::to_string(state).map_err(|err| {
             TransformError::Invalid(format!("failed to serialize Maintenance State: {err}"))
@@ -238,11 +233,13 @@ pub struct AffectAnalysis {
 
 /// Column metadata for Derived output schema inference (transform-owned).
 ///
-/// Mirrors Platform Store Base/Derived column shape without coupling transform to the store.
+/// Engine-agnostic at the transform seam: `data_type` / precision / scale are Source-driven
+/// metadata the runtime maps onto Platform Store column rows. Defaults for unresolved aliases
+/// use portable SQL-ish names (`NUMBER`, `VARCHAR2`) matching existing Base column conventions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputColumn {
     pub name: String,
-    pub oracle_type: String,
+    pub data_type: String,
     pub precision: Option<i32>,
     pub scale: Option<i32>,
 }
@@ -1577,7 +1574,7 @@ pub fn initial_maintenance_state(
 /// Infer Derived output columns from the Rich Transform definition and Base column metadata.
 ///
 /// Works for empty Derived results. Aggregate/`addFields`/`rename` aliases inherit the
-/// source field's Oracle type metadata. `equiLookup` `as` arrays and `addToSet` collections
+/// source field's type metadata. `equiLookup` `as` arrays and `addToSet` collections
 /// are nested documents (`JSON`). `unwind` of that path flattens object elements so the
 /// path is no longer nested — foreign Base column metadata in `secondary_columns` supplies
 /// types for those flattened / unioned fields.
@@ -1654,7 +1651,7 @@ pub fn infer_derived_columns(
             if nested_document_fields.contains(&name) {
                 OutputColumn {
                     name,
-                    oracle_type: "JSON".to_string(),
+                    data_type: "JSON".to_string(),
                     precision: None,
                     scale: None,
                 }
@@ -1664,14 +1661,14 @@ pub fn infer_derived_columns(
                 if let Some(col) = by_name.get(source.as_str()) {
                     OutputColumn {
                         name,
-                        oracle_type: col.oracle_type.clone(),
+                        data_type: col.data_type.clone(),
                         precision: col.precision,
                         scale: col.scale,
                     }
                 } else {
                     OutputColumn {
                         name,
-                        oracle_type: "NUMBER".to_string(),
+                        data_type: "NUMBER".to_string(),
                         precision: None,
                         scale: None,
                     }
@@ -1679,7 +1676,7 @@ pub fn infer_derived_columns(
             } else {
                 OutputColumn {
                     name,
-                    oracle_type: "VARCHAR2".to_string(),
+                    data_type: "VARCHAR2".to_string(),
                     precision: None,
                     scale: None,
                 }
@@ -4899,19 +4896,19 @@ mod tests {
         let primary = vec![
             OutputColumn {
                 name: "ID".into(),
-                oracle_type: "NUMBER".into(),
+                data_type: "NUMBER".into(),
                 precision: Some(10),
                 scale: Some(0),
             },
             OutputColumn {
                 name: "NAME".into(),
-                oracle_type: "VARCHAR2".into(),
+                data_type: "VARCHAR2".into(),
                 precision: Some(100),
                 scale: None,
             },
             OutputColumn {
                 name: "AMOUNT".into(),
-                oracle_type: "NUMBER".into(),
+                data_type: "NUMBER".into(),
                 precision: Some(12),
                 scale: Some(2),
             },
@@ -4919,8 +4916,8 @@ mod tests {
         // Empty Derived rows — schema must still come from the transform definition.
         let cols = infer_derived_columns(&ops, &primary, &[], &[]);
         let by_name: BTreeMap<_, _> = cols.into_iter().map(|c| (c.name.clone(), c)).collect();
-        assert_eq!(by_name["NAME"].oracle_type, "VARCHAR2");
-        assert_eq!(by_name["TOTAL"].oracle_type, "NUMBER");
+        assert_eq!(by_name["NAME"].data_type, "VARCHAR2");
+        assert_eq!(by_name["TOTAL"].data_type, "NUMBER");
         assert_eq!(by_name["TOTAL"].precision, Some(12));
         assert_eq!(by_name["TOTAL"].scale, Some(2));
         assert!(!by_name.contains_key("ID"));
@@ -4948,21 +4945,21 @@ mod tests {
         let primary = vec![
             OutputColumn {
                 name: "ID".into(),
-                oracle_type: "NUMBER".into(),
+                data_type: "NUMBER".into(),
                 precision: None,
                 scale: None,
             },
             OutputColumn {
                 name: "NAME".into(),
-                oracle_type: "VARCHAR2".into(),
+                data_type: "VARCHAR2".into(),
                 precision: None,
                 scale: None,
             },
         ];
         let lookup_cols = infer_derived_columns(&lookup_ops, &primary, &[], &[]);
-        assert!(lookup_cols.iter().any(|c| c.name == "orders" && c.oracle_type == "JSON"));
+        assert!(lookup_cols.iter().any(|c| c.name == "orders" && c.data_type == "JSON"));
         let add_cols = infer_derived_columns(&add_ops, &primary, &[], &[]);
-        assert!(add_cols.iter().any(|c| c.name == "NAMES" && c.oracle_type == "JSON"));
+        assert!(add_cols.iter().any(|c| c.name == "NAMES" && c.data_type == "JSON"));
     }
 
     #[test]

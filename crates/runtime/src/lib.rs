@@ -1333,7 +1333,7 @@ fn to_output_columns(columns: &[BaseColumn]) -> Vec<OutputColumn> {
         .iter()
         .map(|c| OutputColumn {
             name: c.name.clone(),
-            oracle_type: c.oracle_type.clone(),
+            data_type: c.oracle_type.clone(),
             precision: c.precision,
             scale: c.scale,
         })
@@ -1345,7 +1345,7 @@ fn from_output_columns(columns: Vec<OutputColumn>) -> Vec<BaseColumn> {
         .into_iter()
         .map(|c| BaseColumn {
             name: c.name,
-            oracle_type: c.oracle_type,
+            oracle_type: c.data_type,
             precision: c.precision,
             scale: c.scale,
         })
