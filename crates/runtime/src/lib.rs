@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use migraloop_capture::{
-    classify_number, is_allow_listed_oracle_type, CapturePosition, IncrementalCapture,
+    classify_number, is_allow_listed_oracle_type, CapturePosition, IncrementalCaptureSession,
     InitialLoadChunkOptions, NumberMongoMapping, OracleLogMinerSource, OracleSourceConnect,
     SourceColumn, SourceEngine, TypeError,
 };
@@ -37,8 +37,8 @@ pub use observability::{emit_event, EventValue};
 
 pub use incremental::{
     apply_change_events_to_base_rows, format_output_identity, run_incremental_sync,
-    run_continuous_incremental_sync, supervise_continuous_incremental_sync, sync_incremental,
-    SyncCycleOutcome, SyncInvocation,
+    run_incremental_sync_with_engines, run_continuous_incremental_sync,
+    supervise_continuous_incremental_sync, sync_incremental, SyncCycleOutcome, SyncInvocation,
 };
 pub use lifecycle::{
     drift_check, inspect_base_rows, inspect_derived_rows, inspect_target_documents, pause_pipeline,
@@ -169,10 +169,11 @@ pub async fn load_secondary_bases_and_columns_for_pipeline(
 
 /// Open the v1 Target engine adapter for a Deployment (MongoDB document Delivery).
 ///
-/// Runtime Delivery / Drift paths depend on [`TargetEngine`], not Mongo free functions.
+/// Returns the [`TargetEngine`] interface so production wiring and Sync/Delivery
+/// call sites do not name the concrete Mongo adapter type.
 pub fn target_engine_from_deployment(
     deployment: &Deployment,
-) -> Result<MongoTargetConnection, RuntimeError> {
+) -> Result<impl TargetEngine, RuntimeError> {
     if !deployment.target.kind.eq_ignore_ascii_case("mongodb") {
         return Err(RuntimeError::Failed(format!(
             "unsupported Target System kind {:?} (v1 ships MongoDB only)",
@@ -197,10 +198,12 @@ pub fn target_engine_from_deployment(
 
 /// Open the v1 Source engine adapter for a Deployment Source System connection.
 ///
-/// Oracle LogMiner contract harness and OCI are selected inside the adapter (ADR-0003).
+/// Returns the [`SourceEngine`] interface so production wiring and Sync call sites
+/// do not name the concrete Oracle LogMiner adapter type. Contract harness vs OCI
+/// selection stays inside the adapter (ADR-0003).
 pub fn source_engine_from_connection(
     source: &SystemConnection,
-) -> Result<OracleLogMinerSource, RuntimeError> {
+) -> Result<impl SourceEngine, RuntimeError> {
     if !source.kind.eq_ignore_ascii_case("oracle") {
         return Err(RuntimeError::Failed(format!(
             "unsupported Source System kind {:?} (v1 ships Oracle LogMiner only)",
@@ -891,7 +894,7 @@ pub fn oracle_source_connect(
 /// Open Incremental Capture via the Source engine interface.
 pub fn open_deployment_incremental_capture(
     source: &SystemConnection,
-) -> Result<IncrementalCapture, RuntimeError> {
+) -> Result<impl IncrementalCaptureSession, RuntimeError> {
     let engine = source_engine_from_connection(source)?;
     engine
         .open_incremental_capture()

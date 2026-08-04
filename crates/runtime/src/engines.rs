@@ -86,8 +86,71 @@ mod tests {
         CapturePosition,
     };
     use migraloop_delivery::FakeTarget;
+    use migraloop_platform_store::{
+        Deployment, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
+    };
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn production_factories_expose_source_and_target_engine_interfaces() {
+        std::env::set_var("ORACLE_PASSWORD", "oracle-secret-value");
+        std::env::set_var("MONGO_PASSWORD", "mongo-secret-value");
+
+        let source = crate::source_engine_from_connection(&SystemConnection {
+            kind: "oracle".into(),
+            host: "stub".into(),
+            port: 1521,
+            database: "STUB".into(),
+            username: "sync_user".into(),
+            password_ref: SecretRef {
+                kind: SecretRefKind::Env,
+                value: "ORACLE_PASSWORD".into(),
+            },
+            timezone: String::new(),
+            tls: TlsSettings::default(),
+        })
+        .expect("Source factory");
+        fn accept_source<S: SourceEngine>(engine: &S) -> &'static str {
+            engine.kind_label()
+        }
+        assert!(accept_source(&source).starts_with("oracle-logminer"));
+
+        let target = crate::target_engine_from_deployment(&Deployment {
+            name: "factory-seam".into(),
+            source: SystemConnection {
+                kind: "oracle".into(),
+                host: "stub".into(),
+                port: 1521,
+                database: "STUB".into(),
+                username: "sync_user".into(),
+                password_ref: SecretRef {
+                    kind: SecretRefKind::Env,
+                    value: "ORACLE_PASSWORD".into(),
+                },
+                timezone: String::new(),
+                tls: TlsSettings::default(),
+            },
+            target: SystemConnection {
+                kind: "mongodb".into(),
+                host: "127.0.0.1".into(),
+                port: 27017,
+                database: "factory_db".into(),
+                username: "deliver_user".into(),
+                password_ref: SecretRef {
+                    kind: SecretRefKind::Env,
+                    value: "MONGO_PASSWORD".into(),
+                },
+                timezone: String::new(),
+                tls: TlsSettings::default(),
+            },
+        })
+        .expect("Target factory");
+        fn accept_target<T: TargetEngine>(engine: &T) -> &'static str {
+            engine.kind_label()
+        }
+        assert_eq!(accept_target(&target), "mongodb");
+    }
 
     fn customers_fake_source() -> FakeSource {
         FakeSource::new().with_table(
