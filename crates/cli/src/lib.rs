@@ -769,7 +769,10 @@ async fn print_base(
     let columns = dataset
         .columns
         .iter()
-        .map(|c| format!("{}:{}", c.name, c.oracle_type))
+        .map(|c| {
+            let shape = c.column_shape();
+            format!("{}:{}", shape.name, shape.data_type)
+        })
         .collect::<Vec<_>>()
         .join(", ");
     println!("columns: [{columns}]");
@@ -806,7 +809,10 @@ async fn print_derived(
     let columns = dataset
         .columns
         .iter()
-        .map(|c| format!("{}:{}", c.name, c.oracle_type))
+        .map(|c| {
+            let shape = c.column_shape();
+            format!("{}:{}", shape.name, shape.data_type)
+        })
         .collect::<Vec<_>>()
         .join(", ");
     println!(

@@ -12,6 +12,7 @@ pub use guardrails::{
 use std::borrow::Cow;
 use std::time::Duration;
 
+use migraloop_types::ColumnShape;
 use serde::{Deserialize, Serialize};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
@@ -154,14 +155,48 @@ pub struct DerivedRow {
 }
 
 /// Supported column kept in a Base Dataset.
+///
+/// Domain metadata is the shared [`ColumnShape`]; `oracle_type` remains the
+/// persisted wire key during the expand–contract migrate (#181 → #182).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseColumn {
     pub name: String,
+    /// Wire name stays `oracle_type` until contract (#182); also accepts `data_type`.
+    #[serde(alias = "data_type")]
     pub oracle_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precision: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<i32>,
+}
+
+impl BaseColumn {
+    /// Shared Managed/Base column metadata (issue #181).
+    pub fn column_shape(&self) -> ColumnShape {
+        ColumnShape {
+            name: self.name.clone(),
+            data_type: self.oracle_type.clone(),
+            precision: self.precision,
+            scale: self.scale,
+        }
+    }
+}
+
+impl From<ColumnShape> for BaseColumn {
+    fn from(shape: ColumnShape) -> Self {
+        Self {
+            name: shape.name,
+            oracle_type: shape.data_type,
+            precision: shape.precision,
+            scale: shape.scale,
+        }
+    }
+}
+
+impl From<BaseColumn> for ColumnShape {
+    fn from(column: BaseColumn) -> Self {
+        column.column_shape()
+    }
 }
 
 /// Unsupported Source column omitted from the Base Dataset.
@@ -2304,6 +2339,20 @@ impl SchemaChangeImpactRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_column_round_trips_shared_column_shape() {
+        let shape = ColumnShape {
+            name: "ID".into(),
+            data_type: "NUMBER".into(),
+            precision: Some(10),
+            scale: Some(0),
+        };
+        let column = BaseColumn::from(shape.clone());
+        assert_eq!(column.oracle_type, "NUMBER");
+        assert_eq!(column.column_shape(), shape);
+        assert_eq!(ColumnShape::from(column), shape);
+    }
 
     #[test]
     fn platform_store_url_requires_tls_detects_explicit_modes() {

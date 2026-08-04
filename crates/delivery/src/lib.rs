@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bson::{doc, Bson, Document};
 use chrono::{DateTime, Utc};
-use migraloop_types::TlsSettings;
+use migraloop_types::{ColumnShape, TlsSettings};
 use mongodb::options::{ClientOptions, Tls, TlsOptions, UpdateOptions};
 use mongodb::{Client, Collection};
 use serde::{Deserialize, Serialize};
@@ -94,14 +94,49 @@ pub struct MongoTargetConnection {
 }
 
 /// Column schema used for schema-driven BSON conversion.
+///
+/// Domain metadata is the shared [`ColumnShape`]; `oracle_type` remains during
+/// the expand–contract migrate (#181 → #182). NUMBER mapping behaviour is
+/// unchanged (ADR-0018 / ADR-0023).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryColumn {
     pub name: String,
+    /// Wire name stays `oracle_type` until contract (#182); also accepts `data_type`.
+    #[serde(alias = "data_type")]
     pub oracle_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precision: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<i32>,
+}
+
+impl DeliveryColumn {
+    /// Shared Managed/Base column metadata (issue #181).
+    pub fn column_shape(&self) -> ColumnShape {
+        ColumnShape {
+            name: self.name.clone(),
+            data_type: self.oracle_type.clone(),
+            precision: self.precision,
+            scale: self.scale,
+        }
+    }
+}
+
+impl From<ColumnShape> for DeliveryColumn {
+    fn from(shape: ColumnShape) -> Self {
+        Self {
+            name: shape.name,
+            oracle_type: shape.data_type,
+            precision: shape.precision,
+            scale: shape.scale,
+        }
+    }
+}
+
+impl From<DeliveryColumn> for ColumnShape {
+    fn from(column: DeliveryColumn) -> Self {
+        column.column_shape()
+    }
 }
 
 /// One Output Identity plus the Managed fields Delivery will write.
@@ -240,12 +275,13 @@ pub fn value_to_bson(
         return json_fallback_to_bson(field, value);
     };
 
-    let oracle = normalize_oracle_type(&column.oracle_type);
+    let shape = column.column_shape();
+    let oracle = normalize_oracle_type(&shape.data_type);
     if oracle == "JSON" {
         return nested_json_to_bson(field, value);
     }
     match oracle.as_str() {
-        "NUMBER" => number_to_bson(field, value, column.precision, column.scale, mapping),
+        "NUMBER" => number_to_bson(field, value, shape.precision, shape.scale, mapping),
         "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" => float_to_bson(field, value),
         "DATE" | "TIMESTAMP" | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMP WITH LOCAL TIME ZONE" => {
             datetime_to_bson(field, value)
@@ -546,12 +582,13 @@ mod tests {
 
     #[test]
     fn number_long_not_double() {
-        let col = DeliveryColumn {
+        // Construct via shared ColumnShape; NUMBER→Long mapping unchanged (ADR-0023).
+        let col = DeliveryColumn::from(ColumnShape {
             name: "ID".into(),
-            oracle_type: "NUMBER".into(),
+            data_type: "NUMBER".into(),
             precision: Some(10),
             scale: Some(0),
-        };
+        });
         let bson = value_to_bson(
             "ID",
             &Value::from(1),
@@ -564,12 +601,12 @@ mod tests {
 
     #[test]
     fn number_decimal128_not_double() {
-        let col = DeliveryColumn {
+        let col = DeliveryColumn::from(ColumnShape {
             name: "AMOUNT".into(),
-            oracle_type: "NUMBER".into(),
+            data_type: "NUMBER".into(),
             precision: Some(12),
             scale: Some(2),
-        };
+        });
         let bson = value_to_bson(
             "AMOUNT",
             &Value::String("42.50".into()),
@@ -582,12 +619,12 @@ mod tests {
 
     #[test]
     fn unsafe_number_requires_string_map() {
-        let col = DeliveryColumn {
+        let col = DeliveryColumn::from(ColumnShape {
             name: "HUGE".into(),
-            oracle_type: "NUMBER".into(),
+            data_type: "NUMBER".into(),
             precision: Some(38),
             scale: Some(10),
-        };
+        });
         let err = value_to_bson(
             "HUGE",
             &Value::String("1".into()),
