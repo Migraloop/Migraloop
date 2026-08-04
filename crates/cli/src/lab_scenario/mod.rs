@@ -968,25 +968,25 @@ async fn product_apply(
 
 /// Incremental Capture + Delivery via real product path.
 ///
-/// Typed SyncOptions ride on `sync_args` (CLI flags; #180). Optional `sync_env`
-/// remains only for non-SyncOptions Lab bridges (e.g. Schema Change inject file).
+/// Typed SyncOptions ride on `sync_cli_args` (#180). Optional `extra_env` remains
+/// only for non-SyncOptions Lab bridges (e.g. Schema Change inject file).
 ///
 /// Returns `(sync_out, capture_note, sync_succeeded)`. When `opts.allow_fail` is set,
 /// a non-zero sync exit still returns output so hooks can observe mid-window stops.
-async fn product_sync_with_env(
+async fn product_sync(
     opts: &ProductPathSyncOpts,
-    sync_args: &[String],
-    sync_env: &[(String, String)],
+    sync_cli_args: &[String],
+    extra_env: &[(String, String)],
 ) -> Result<(String, String, bool), CliError> {
     let bin = lab_migraloop_bin();
-    if sync_args.is_empty() && sync_env.is_empty() && !opts.allow_fail {
+    if sync_cli_args.is_empty() && extra_env.is_empty() && !opts.allow_fail {
         println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
     }
     let mut args: Vec<&str> = vec!["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL];
-    for a in sync_args {
+    for a in sync_cli_args {
         args.push(a.as_str());
     }
-    let env_refs: Vec<(&str, &str)> = sync_env
+    let env_refs: Vec<(&str, &str)> = extra_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
@@ -1999,11 +1999,11 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
         Ok(())
     }
 
-    /// Typed SyncOptions CLI flags for product `sync` (#180).
+    /// Product `sync` invocation inputs (#180).
     ///
-    /// Schema Change Lab inject still uses `MIGRALOOP_INJECT_SCHEMA_CHANGES`
-    /// (file path bridge for LogMiner DDL gap — not a SyncOptions fault knob).
-    fn sync_args(&self, lab_dir: &Path) -> (Vec<String>, Vec<(String, String)>) {
+    /// `args` carry typed SyncOptions CLI flags. `env` is only for non-SyncOptions
+    /// Lab bridges (Schema Change inject file path for the LogMiner DDL gap).
+    fn sync_invocation(&self, lab_dir: &Path) -> (Vec<String>, Vec<(String, String)>) {
         match self {
             Self::PoisonQuarantine => (
                 vec![
@@ -4518,9 +4518,9 @@ async fn run_product_path_scenario(
             }
             ProductPathStepKind::ProductSync => {
                 hooks.before_sync(lab_dir).await?;
-                let (sync_args, sync_env) = hooks.sync_args(lab_dir);
+                let (sync_cli_args, extra_env) = hooks.sync_invocation(lab_dir);
                 let (sync_out, capture_note, sync_ok) =
-                    product_sync_with_env(&product_path.sync, &sync_args, &sync_env).await?;
+                    product_sync(&product_path.sync, &sync_cli_args, &extra_env).await?;
                 hooks.after_sync(lab_dir, &sync_out, sync_ok).await?;
                 ctx.sync_out = sync_out;
                 ctx.sync_ok = sync_ok;
