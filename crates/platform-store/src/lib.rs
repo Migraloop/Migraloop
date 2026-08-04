@@ -185,7 +185,8 @@ pub struct BaseDataset {
     pub row_count: i32,
     /// Count of Incremental Capture changes applied into this Base Dataset.
     pub sync_applied_changes: i32,
-    /// Operator-visible Sync Health for this Base: unknown | ok.
+    /// Operator-visible Sync Health for this Base: unknown | ok | lagging | failed.
+    /// Typed assembly lives in the Deployment runtime Observability Surface.
     pub sync_health: String,
     /// Low-watermark capture position established before Initial Load (ADR-0004).
     /// Required before Incremental Capture may start.

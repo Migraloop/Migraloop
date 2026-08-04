@@ -13,7 +13,7 @@ migraloop status
 - **Platform Store** 可达性 / 健康与 schema version（Platform Store Guardrails：过低的 Postgres 设置会被拒绝；可用磁盘低于 1 GiB 时打印 warn-only `WARN` — 绝不自动 pause Pipelines）
 - 每个 **Deployment**（Source/Target 标识、LogMiner 机制：contract 或 OCI）
 - 每条 **Pipeline**（mode、source 表、target collection、Delivery status）
-- 每个 **Base Dataset**（status、行数、列、省略的不支持类型、Initial Load / cutover watermarks、含 appliedChanges / lag / checkpoint 的 **Sync Health**、含 checked/mismatched 计数的 **Source Alignment**）
+- 每个 **Base Dataset**（status、行数、列、省略的不支持类型、Initial Load / cutover watermarks、**Sync Health** — `unknown` / `ok` / `lagging` / `failed` — 含 appliedChanges / lag / checkpoint、含 checked/mismatched 计数的 **Source Alignment**）
 - 每条 Pipeline 的 **Delivery Health**（已应用变更 / lag / status；有 Poison Change quarantine 时为 `unhealthy`；有 blocking Schema Change pause 时为 `paused`；Downstream backpressure 下 lag 会上升但不会 pause Pipeline）
 - 作用中的 **Quarantine** 行（Output Identity、change id、attempts、last error — unhealthy / not aligned）
 - Transform Pipelines 的 **Derived Datasets**（若有）
@@ -22,7 +22,7 @@ migraloop status
 
 - Platform Store：`healthy`
 - Base Dataset status 从 Initial Load 进入 incremental apply
-- Sync Health lag 趋向追上（不是长期单向增长）
+- Sync Health 为 `ok`（或由 `lagging` 趋向 `ok`）— lag 不是长期单向增长
 - 已配置 Target Binding 的 Delivery Health 显示成功应用（`ok`，不是 `unhealthy` quarantine）
 - Quarantine：`(none)`（除非刻意留下被 quarantine 的 poison identity）
 - Schema Change：`(none)`（除非刻意留下 blocking DDL pause）
@@ -39,7 +39,7 @@ migraloop status
 
 ## Sync Health vs Delivery Health
 
-- **Sync Health** — 从 Source capture 到 Base Dataset 是否跟上且成功应用。必要但不充分证明 Base 匹配 Source。
+- **Sync Health** — 从 Source capture 到 Base Dataset 是否跟上且成功应用（Incremental 进度后 lag 为 0 时为 `ok`；仍有 Source backlog 时为 `lagging`；耐久 capture/apply 失败为 `failed`；尚未有 Incremental 进度为 `unknown`）。必要但不充分证明 Base 匹配 Source。`status` 与 Prometheus 从同一个 Observability assembly 导出这些 labels。
 - **Source Alignment** — 该 Base 上次 Source Alignment Check 结果（`unknown` / `aligned` / `partial`）。在把 Base 当作 Drift baseline 前运行 `migraloop align`（resource-gated；用 Source reads 修复 Base；从不写入 Source）。`partial` 表示上次检查碰到 `--max-rows` budget。
 - **Delivery Health** — Pipeline 的 Target Binding change stream 是否跟上且成功应用。对 non-Managed 字段的编辑与此信号无关。Downstream backpressure 下，`lag=` 反映从 capture resume position 起算的剩余 pending Delivery 工作（ADR-0020）—不是整条 Pipeline pause。Capture 一次仍最多只 materialize 一个 bounded queue window。
 - **Drift** — 该 Pipeline 上次 Drift Check 结果（`unknown` / `ok` / `partial`）。在 Alignment 之后运行 `migraloop drift`（resource-gated；默认 Managed-field auto-repair；忽略 non-Managed fields）。`partial` 表示上次检查碰到 `--max-rows` budget。

@@ -823,7 +823,7 @@ fn base_with_sync_progress(
         omitted_columns: dataset.omitted_columns.clone(),
         row_count,
         sync_applied_changes,
-        sync_health: "ok".to_string(),
+        sync_health: crate::sync_health_label_for_progress(sync_lag).to_string(),
         capture_low_watermark: dataset.capture_low_watermark,
         capture_checkpoint,
         sync_lag,

@@ -5,7 +5,8 @@
 //! [`run_incremental_sync_with_engines`], [`run_continuous_incremental_sync`],
 //! [`supervise_continuous_incremental_sync`]), Pipeline lifecycle ([`pause_pipeline`],
 //! [`resume_pipeline`], [`remove_pipeline`]), [`source_alignment_check`], [`drift_check`],
-//! status inventory ([`status_inventory`], [`status_inventory_from_url`]), and inspect
+//! status inventory ([`status_inventory`], [`status_inventory_from_url`]), Observability
+//! Surface assembly ([`assemble_observability_surface`]), and inspect
 //! ([`inspect_base_rows`], [`inspect_derived_rows`], [`inspect_target_documents`]).
 //!
 //! **Session / factory entry points:** [`source_engine_from_connection`],
@@ -43,7 +44,11 @@ mod observability;
 mod incremental;
 mod lifecycle;
 
-pub use observability::{emit_event, EventValue};
+pub use observability::{
+    assemble_observability_surface, derive_delivery_health, derive_sync_health, emit_event,
+    render_prometheus_metrics, sync_health_label_for_progress, BaseSyncObservation, DeliveryHealth,
+    EventValue, ObservabilitySurface, PipelineDeliveryObservation, SyncHealth,
+};
 
 pub use incremental::{
     run_incremental_sync, run_incremental_sync_with_engines, run_continuous_incremental_sync,

@@ -42,7 +42,7 @@ migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployme
 
 ### `status`
 
-回報 Platform Store 健康、Deployments、Pipelines、Base Datasets、Sync Health、Source Alignment、Delivery Health、Quarantine 列、Schema Change impacts，與 Derived Datasets。Sync Health 與 Delivery Health 都暴露 `lag=`（從 capture resume position 起算的剩餘 pending 工作）。Downstream 變慢時，lag 會在 backpressure 下上升，但不會因此 pause Pipeline；capture 一次仍只填滿一個 bounded queue window（ADR-0020）。當 Poison Change quarantine 作用中時，Delivery Health 為 `unhealthy`，並把每個被 quarantine 的 Output Identity 標為 unhealthy / not aligned（ADR-0015）。當 blocking Schema Change pause 作用中時，Delivery Health 為 `paused`，且 `status` 會列出 Schema Change blocking 列（ADR-0009）—與 quarantine 不同。
+回報 Platform Store 健康、Deployments、Pipelines、Base Datasets、Sync Health（`unknown` / `ok` / `lagging` / `failed`）、Source Alignment、Delivery Health、Quarantine 列、Schema Change impacts，與 Derived Datasets。Sync Health 與 Delivery Health 都暴露 `lag=`（從 capture resume position 起算的剩餘 pending 工作）；labels 來自與 Prometheus 共用的同一個 runtime Observability assembly。Downstream 變慢時，lag 會在 backpressure 下上升，但不會因此 pause Pipeline；capture 一次仍只填滿一個 bounded queue window（ADR-0020）。當 Poison Change quarantine 作用中時，Delivery Health 為 `unhealthy`，並把每個被 quarantine 的 Output Identity 標為 unhealthy / not aligned（ADR-0015）。當 blocking Schema Change pause 作用中時，Delivery Health 為 `paused`，且 `status` 會列出 Schema Change blocking 列（ADR-0009）—與 quarantine 不同。
 
 ```bash
 migraloop status --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
