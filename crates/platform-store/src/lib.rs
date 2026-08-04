@@ -59,9 +59,8 @@ pub type FieldMappingAs = ManagedFieldAs;
 
 /// Parse a persisted secret-ref kind, mapping unknown values into store Load errors.
 pub fn parse_secret_ref_kind(value: &str) -> Result<SecretRefKind, PlatformStoreError> {
-    SecretRefKind::parse(value).map_err(|err| {
-        PlatformStoreError::Load(sqlx::Error::Protocol(err.to_string()))
-    })
+    SecretRefKind::parse(value)
+        .map_err(|err| PlatformStoreError::Load(sqlx::Error::Protocol(err.to_string())))
 }
 
 /// Non-secret connection configuration for a Source or Target System.
@@ -236,6 +235,1541 @@ pub(crate) async fn connect(database_url: &str) -> Result<PgPool, PlatformStoreE
         .map_err(|err| map_store_connect_error(database_url, err))
 }
 
+/// Opened Platform Store session: one pool reused across Deployment persistence verbs.
+///
+/// Postgres remains the only store engine (ADR-0001). Open once per process flow and
+/// call session verbs instead of reconnecting on every table-shaped CRUD call.
+pub struct PlatformStore {
+    pool: PgPool,
+}
+
+impl PlatformStore {
+    /// Open a Platform Store session against the given Postgres URL.
+    pub async fn open(database_url: &str) -> Result<Self, PlatformStoreError> {
+        Ok(Self {
+            pool: connect(database_url).await?,
+        })
+    }
+
+    /// Probe Platform Store Guardrails settings via this session's pool.
+    pub async fn probe_settings(&self) -> Result<PlatformStoreSettings, PlatformStoreError> {
+        guardrails::probe_store_settings_on_pool(&self.pool).await
+    }
+
+    /// Probe warn-only resource signals (disk; ADR-0010).
+    ///
+    /// Free-disk observation is process/env based (not a pool query); this method
+    /// exists so apply can keep one session handle for guardrails + persistence.
+    pub async fn probe_resources(&self) -> Result<PlatformStoreResourceStatus, PlatformStoreError> {
+        let _ = &self.pool;
+        probe_store_resources("unused").await
+    }
+
+    /// Acquire the Incremental Capture single-writer lock (blocks until available).
+    pub async fn acquire_incremental_sync_lock(
+        &self,
+    ) -> Result<IncrementalSyncLock, PlatformStoreError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(PlatformStoreError::Connect)?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(INCREMENTAL_SYNC_ADVISORY_LOCK_KEY)
+            .execute(&mut *conn)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        Ok(IncrementalSyncLock { _conn: conn })
+    }
+
+    /// Apply versioned Platform Store schema migrations.
+    pub async fn migrate(&self) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        store_migrator()
+            .run(pool)
+            .await
+            .map_err(PlatformStoreError::Migrate)?;
+        Ok(())
+    }
+
+    /// Apply only migrations with version `<= through_version` (inclusive).
+    ///
+    /// Upgrade-smoke / CI helper for seeding a prior-release Platform Store schema.
+    /// Production operators use [`migrate`] (or `migraloop run` / `migraloop migrate`),
+    /// which always applies every pending migration.
+    #[doc(hidden)]
+    pub async fn migrate_through(&self, through_version: i64) -> Result<(), PlatformStoreError> {
+        let full = store_migrator();
+        if !full.version_exists(through_version) {
+            return Err(PlatformStoreError::UnknownMigrationVersion(through_version));
+        }
+
+        let subset: Vec<_> = full
+            .iter()
+            .filter(|m| m.version <= through_version)
+            .cloned()
+            .collect();
+        let partial = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(subset),
+            ignore_missing: full.ignore_missing,
+            locking: full.locking,
+            no_tx: full.no_tx,
+        };
+
+        let pool = &self.pool;
+        partial
+            .run(pool)
+            .await
+            .map_err(PlatformStoreError::Migrate)?;
+        Ok(())
+    }
+
+    /// Check whether the Platform Store is reachable and migrated.
+    pub async fn health(&self) -> PlatformStoreHealth {
+        let pool = &self.pool;
+
+        if let Err(err) = sqlx::query("SELECT 1").execute(pool).await {
+            return PlatformStoreHealth::Unreachable {
+                reason: err.to_string(),
+            };
+        }
+
+        let version = sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM _sqlx_migrations WHERE success = true ORDER BY version DESC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await;
+
+        match version {
+            Ok(Some(schema_version)) => PlatformStoreHealth::Healthy { schema_version },
+            Ok(None) => PlatformStoreHealth::Unhealthy {
+                reason: "schema migrations have not been applied".to_string(),
+            },
+            Err(_) => PlatformStoreHealth::Unhealthy {
+                reason: "schema migrations have not been applied".to_string(),
+            },
+        }
+    }
+
+    /// Delete a Deployment and cascaded Platform Store state (Pipelines, Bases, Derived).
+    ///
+    /// Idempotent: missing Deployments are a no-op success so Lab Namespace cleanup
+    /// and re-run wipe can call this unconditionally.
+    pub async fn delete_deployment(&self, deployment_name: &str) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        sqlx::query("DELETE FROM deployments WHERE name = $1")
+            .bind(deployment_name)
+            .execute(pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Create or update a Deployment. Secrets are stored only as references.
+    pub async fn upsert_deployment(
+        &self,
+        deployment: &Deployment,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        sqlx::query(
+            r#"
+            INSERT INTO deployments (
+                name,
+                source_kind, source_host, source_port, source_database, source_username,
+                source_password_ref_kind, source_password_ref_value, source_timezone,
+                source_tls_json,
+                target_kind, target_host, target_port, target_database, target_username,
+                target_password_ref_kind, target_password_ref_value,
+                target_tls_json,
+                applied_at
+            ) VALUES (
+                $1,
+                $2, $3, $4, $5, $6,
+                $7, $8, $9,
+                $10,
+                $11, $12, $13, $14, $15,
+                $16, $17,
+                $18,
+                now()
+            )
+            ON CONFLICT (name) DO UPDATE SET
+                source_kind = EXCLUDED.source_kind,
+                source_host = EXCLUDED.source_host,
+                source_port = EXCLUDED.source_port,
+                source_database = EXCLUDED.source_database,
+                source_username = EXCLUDED.source_username,
+                source_password_ref_kind = EXCLUDED.source_password_ref_kind,
+                source_password_ref_value = EXCLUDED.source_password_ref_value,
+                source_timezone = EXCLUDED.source_timezone,
+                source_tls_json = EXCLUDED.source_tls_json,
+                target_kind = EXCLUDED.target_kind,
+                target_host = EXCLUDED.target_host,
+                target_port = EXCLUDED.target_port,
+                target_database = EXCLUDED.target_database,
+                target_username = EXCLUDED.target_username,
+                target_password_ref_kind = EXCLUDED.target_password_ref_kind,
+                target_password_ref_value = EXCLUDED.target_password_ref_value,
+                target_tls_json = EXCLUDED.target_tls_json,
+                applied_at = now()
+            "#,
+        )
+        .bind(&deployment.name)
+        .bind(&deployment.source.kind)
+        .bind(&deployment.source.host)
+        .bind(deployment.source.port)
+        .bind(&deployment.source.database)
+        .bind(&deployment.source.username)
+        .bind(deployment.source.password_ref.kind.as_str())
+        .bind(&deployment.source.password_ref.value)
+        .bind(&deployment.source.timezone)
+        .bind(tls_settings_to_json(&deployment.source.tls)?)
+        .bind(&deployment.target.kind)
+        .bind(&deployment.target.host)
+        .bind(deployment.target.port)
+        .bind(&deployment.target.database)
+        .bind(&deployment.target.username)
+        .bind(deployment.target.password_ref.kind.as_str())
+        .bind(&deployment.target.password_ref.value)
+        .bind(tls_settings_to_json(&deployment.target.tls)?)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Replace all Pipelines for a Deployment with the provided set.
+    pub async fn replace_pipelines(
+        &self,
+        deployment_name: &str,
+        pipelines: &[Pipeline],
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+
+        sqlx::query("DELETE FROM pipelines WHERE deployment_name = $1")
+            .bind(deployment_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+
+        for pipeline in pipelines {
+            let field_mappings_json = serde_json::to_string(&pipeline.field_mappings)
+                .map_err(PlatformStoreError::InvalidJson)?;
+            let output_identity_json = serde_json::to_string(&pipeline.output_identity)
+                .map_err(PlatformStoreError::InvalidJson)?;
+            let transform_json = match &pipeline.transform_json {
+                Some(value) => {
+                    serde_json::to_string(value).map_err(PlatformStoreError::InvalidJson)?
+                }
+                None => "null".to_string(),
+            };
+            sqlx::query(
+                r#"
+                INSERT INTO pipelines (
+                    deployment_name, name, mode, source_table, source_schema,
+                    target_collection, delivery_status, delivery_applied_changes, delivery_lag,
+                    paused, description, field_mappings_json, output_identity_json, transform_json,
+                    drift_status, drift_checked_rows, drift_mismatched_rows, applied_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now())
+                "#,
+            )
+            .bind(&pipeline.deployment_name)
+            .bind(&pipeline.name)
+            .bind(&pipeline.mode)
+            .bind(&pipeline.source_table)
+            .bind(&pipeline.source_schema)
+            .bind(&pipeline.target_collection)
+            .bind(&pipeline.delivery_status)
+            .bind(pipeline.delivery_applied_changes)
+            .bind(pipeline.delivery_lag)
+            .bind(pipeline.paused)
+            .bind(&pipeline.description)
+            .bind(&field_mappings_json)
+            .bind(&output_identity_json)
+            .bind(&transform_json)
+            .bind(&pipeline.drift_status)
+            .bind(pipeline.drift_checked_rows)
+            .bind(pipeline.drift_mismatched_rows)
+            .execute(&mut *tx)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        }
+
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Persist a Base Dataset snapshot (metadata + full supported-type rows).
+    pub async fn replace_base_dataset(
+        &self,
+        dataset: &BaseDataset,
+        rows: &[serde_json::Map<String, serde_json::Value>],
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM base_rows
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.source_schema)
+        .bind(&dataset.source_table)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        let columns_json =
+            serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+        let omitted_json = serde_json::to_string(&dataset.omitted_columns)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        let primary_key_json =
+            serde_json::to_string(&dataset.primary_key).map_err(PlatformStoreError::InvalidJson)?;
+        let cursor_json = match &dataset.initial_load_cursor {
+            Some(cursor) => {
+                Some(serde_json::to_string(cursor).map_err(PlatformStoreError::InvalidJson)?)
+            }
+            None => None,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO base_datasets (
+                deployment_name, source_table, source_schema, status,
+                primary_key_json, columns_json, omitted_columns_json, row_count,
+                sync_applied_changes, sync_health,
+                capture_low_watermark, capture_checkpoint, sync_lag,
+                source_alignment, source_alignment_checked_rows,
+                source_alignment_mismatched_rows, initial_load_cursor_json, loaded_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now()
+            )
+            ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
+                status = EXCLUDED.status,
+                primary_key_json = EXCLUDED.primary_key_json,
+                columns_json = EXCLUDED.columns_json,
+                omitted_columns_json = EXCLUDED.omitted_columns_json,
+                row_count = EXCLUDED.row_count,
+                sync_applied_changes = EXCLUDED.sync_applied_changes,
+                sync_health = EXCLUDED.sync_health,
+                capture_low_watermark = EXCLUDED.capture_low_watermark,
+                capture_checkpoint = EXCLUDED.capture_checkpoint,
+                sync_lag = EXCLUDED.sync_lag,
+                source_alignment = EXCLUDED.source_alignment,
+                source_alignment_checked_rows = EXCLUDED.source_alignment_checked_rows,
+                source_alignment_mismatched_rows = EXCLUDED.source_alignment_mismatched_rows,
+                initial_load_cursor_json = EXCLUDED.initial_load_cursor_json,
+                loaded_at = now()
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.source_table)
+        .bind(&dataset.source_schema)
+        .bind(&dataset.status)
+        .bind(&primary_key_json)
+        .bind(&columns_json)
+        .bind(&omitted_json)
+        .bind(dataset.row_count)
+        .bind(dataset.sync_applied_changes)
+        .bind(&dataset.sync_health)
+        .bind(dataset.capture_low_watermark)
+        .bind(dataset.capture_checkpoint)
+        .bind(dataset.sync_lag)
+        .bind(&dataset.source_alignment)
+        .bind(dataset.source_alignment_checked_rows)
+        .bind(dataset.source_alignment_mismatched_rows)
+        .bind(&cursor_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        for (ordinal, row) in rows.iter().enumerate() {
+            let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
+            sqlx::query(
+                r#"
+                INSERT INTO base_rows (
+                    deployment_name, source_schema, source_table, row_ordinal, row_json
+                ) VALUES ($1, $2, $3, $4, $5)
+                "#,
+            )
+            .bind(&dataset.deployment_name)
+            .bind(&dataset.source_schema)
+            .bind(&dataset.source_table)
+            .bind(ordinal as i32)
+            .bind(&row_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        }
+
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Append one Initial Load chunk into an existing (or new) Base Dataset.
+    ///
+    /// Does **not** delete prior rows — used for chunked / pausable Initial Load
+    /// (issue #124). `dataset.row_count` must be the new total after this chunk.
+    /// `start_ordinal` is the first `row_ordinal` for the appended rows.
+    pub async fn append_base_dataset_chunk(
+        &self,
+        dataset: &BaseDataset,
+        rows: &[serde_json::Map<String, serde_json::Value>],
+        start_ordinal: i32,
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+
+        let columns_json =
+            serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+        let omitted_json = serde_json::to_string(&dataset.omitted_columns)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        let primary_key_json =
+            serde_json::to_string(&dataset.primary_key).map_err(PlatformStoreError::InvalidJson)?;
+        let cursor_json = match &dataset.initial_load_cursor {
+            Some(cursor) => {
+                Some(serde_json::to_string(cursor).map_err(PlatformStoreError::InvalidJson)?)
+            }
+            None => None,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO base_datasets (
+                deployment_name, source_table, source_schema, status,
+                primary_key_json, columns_json, omitted_columns_json, row_count,
+                sync_applied_changes, sync_health,
+                capture_low_watermark, capture_checkpoint, sync_lag,
+                source_alignment, source_alignment_checked_rows,
+                source_alignment_mismatched_rows, initial_load_cursor_json, loaded_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now()
+            )
+            ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
+                status = EXCLUDED.status,
+                primary_key_json = EXCLUDED.primary_key_json,
+                columns_json = EXCLUDED.columns_json,
+                omitted_columns_json = EXCLUDED.omitted_columns_json,
+                row_count = EXCLUDED.row_count,
+                sync_applied_changes = EXCLUDED.sync_applied_changes,
+                sync_health = EXCLUDED.sync_health,
+                capture_low_watermark = EXCLUDED.capture_low_watermark,
+                capture_checkpoint = EXCLUDED.capture_checkpoint,
+                sync_lag = EXCLUDED.sync_lag,
+                source_alignment = EXCLUDED.source_alignment,
+                source_alignment_checked_rows = EXCLUDED.source_alignment_checked_rows,
+                source_alignment_mismatched_rows = EXCLUDED.source_alignment_mismatched_rows,
+                initial_load_cursor_json = EXCLUDED.initial_load_cursor_json,
+                loaded_at = now()
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.source_table)
+        .bind(&dataset.source_schema)
+        .bind(&dataset.status)
+        .bind(&primary_key_json)
+        .bind(&columns_json)
+        .bind(&omitted_json)
+        .bind(dataset.row_count)
+        .bind(dataset.sync_applied_changes)
+        .bind(&dataset.sync_health)
+        .bind(dataset.capture_low_watermark)
+        .bind(dataset.capture_checkpoint)
+        .bind(dataset.sync_lag)
+        .bind(&dataset.source_alignment)
+        .bind(dataset.source_alignment_checked_rows)
+        .bind(dataset.source_alignment_mismatched_rows)
+        .bind(&cursor_json)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        for (offset, row) in rows.iter().enumerate() {
+            let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
+            sqlx::query(
+                r#"
+                INSERT INTO base_rows (
+                    deployment_name, source_schema, source_table, row_ordinal, row_json
+                ) VALUES ($1, $2, $3, $4, $5)
+                "#,
+            )
+            .bind(&dataset.deployment_name)
+            .bind(&dataset.source_schema)
+            .bind(&dataset.source_table)
+            .bind(start_ordinal + offset as i32)
+            .bind(&row_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        }
+
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// List applied Deployments ordered by name.
+    pub async fn list_deployments(&self) -> Result<Vec<Deployment>, PlatformStoreError> {
+        let pool = &self.pool;
+        let rows = sqlx::query_as::<_, DeploymentRow>(
+            r#"
+            SELECT
+                name,
+                source_kind, source_host, source_port, source_database, source_username,
+                source_password_ref_kind, source_password_ref_value, source_timezone,
+                source_tls_json,
+                target_kind, target_host, target_port, target_database, target_username,
+                target_password_ref_kind, target_password_ref_value,
+                target_tls_json
+            FROM deployments
+            ORDER BY name
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        rows.into_iter()
+            .map(DeploymentRow::into_deployment)
+            .collect()
+    }
+
+    /// List Pipelines for all Deployments, ordered by deployment then name.
+    pub async fn list_pipelines(&self) -> Result<Vec<Pipeline>, PlatformStoreError> {
+        let pool = &self.pool;
+        let rows = sqlx::query_as::<_, PipelineRow>(
+            r#"
+            SELECT deployment_name, name, mode, source_table, source_schema,
+                   target_collection, delivery_status, delivery_applied_changes, delivery_lag,
+                   paused, description, field_mappings_json, output_identity_json, transform_json,
+                   drift_status, drift_checked_rows, drift_mismatched_rows
+            FROM pipelines
+            ORDER BY deployment_name, name
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        rows.into_iter().map(PipelineRow::into_pipeline).collect()
+    }
+
+    /// Set durable Operator pause for one Pipeline (ADR-0007 / issue #19).
+    pub async fn set_pipeline_paused(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+        paused: bool,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let result = sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET paused = $3
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .bind(paused)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        if result.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete one Pipeline (Derived Dataset CASCADE). Deployment and shared Bases stay
+    /// until callers prune unreferenced Bases (ADR-0007 / issue #20).
+    pub async fn delete_pipeline(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let result = sqlx::query(
+            r#"
+            DELETE FROM pipelines
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        if result.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Update Delivery status for one Pipeline.
+    pub async fn update_pipeline_delivery_status(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+        delivery_status: &str,
+    ) -> Result<(), PlatformStoreError> {
+        self.update_pipeline_delivery_progress(
+            deployment_name,
+            pipeline_name,
+            delivery_status,
+            None,
+        )
+        .await
+    }
+
+    /// Persist Drift Check status for one Pipeline (issue #25).
+    pub async fn update_pipeline_drift_status(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+        drift_status: &str,
+        drift_checked_rows: i32,
+        drift_mismatched_rows: i32,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let result = sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET drift_status = $3,
+                drift_checked_rows = $4,
+                drift_mismatched_rows = $5
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .bind(drift_status)
+        .bind(drift_checked_rows)
+        .bind(drift_mismatched_rows)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        if result.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Update Delivery status and optionally accumulate applied Output Identity changes.
+    pub async fn update_pipeline_delivery_progress(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+        delivery_status: &str,
+        additional_applied_changes: Option<i32>,
+    ) -> Result<(), PlatformStoreError> {
+        self.update_pipeline_delivery_progress_with_lag(
+            deployment_name,
+            pipeline_name,
+            delivery_status,
+            additional_applied_changes,
+            None,
+        )
+        .await
+    }
+
+    /// Persist Delivery Health lag (remaining pending Delivery work; ADR-0020 / issue #26).
+    pub async fn update_pipeline_delivery_lag(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+        delivery_lag: i32,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let result = sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET delivery_lag = $3
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .bind(delivery_lag)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        if result.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Update Delivery status, optional applied-count delta, and optional Delivery lag.
+    pub async fn update_pipeline_delivery_progress_with_lag(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+        delivery_status: &str,
+        additional_applied_changes: Option<i32>,
+        delivery_lag: Option<i32>,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let result = match (additional_applied_changes, delivery_lag) {
+            (Some(additional), Some(lag)) => sqlx::query(
+                r#"
+                    UPDATE pipelines
+                    SET delivery_status = $3,
+                        delivery_applied_changes = delivery_applied_changes + $4,
+                        delivery_lag = $5
+                    WHERE deployment_name = $1 AND name = $2
+                    "#,
+            )
+            .bind(deployment_name)
+            .bind(pipeline_name)
+            .bind(delivery_status)
+            .bind(additional)
+            .bind(lag)
+            .execute(pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?,
+            (Some(additional), None) => sqlx::query(
+                r#"
+                    UPDATE pipelines
+                    SET delivery_status = $3,
+                        delivery_applied_changes = delivery_applied_changes + $4
+                    WHERE deployment_name = $1 AND name = $2
+                    "#,
+            )
+            .bind(deployment_name)
+            .bind(pipeline_name)
+            .bind(delivery_status)
+            .bind(additional)
+            .execute(pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?,
+            (None, Some(lag)) => sqlx::query(
+                r#"
+                    UPDATE pipelines
+                    SET delivery_status = $3,
+                        delivery_lag = $4
+                    WHERE deployment_name = $1 AND name = $2
+                    "#,
+            )
+            .bind(deployment_name)
+            .bind(pipeline_name)
+            .bind(delivery_status)
+            .bind(lag)
+            .execute(pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?,
+            (None, None) => sqlx::query(
+                r#"
+                    UPDATE pipelines
+                    SET delivery_status = $3
+                    WHERE deployment_name = $1 AND name = $2
+                    "#,
+            )
+            .bind(deployment_name)
+            .bind(pipeline_name)
+            .bind(delivery_status)
+            .execute(pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?,
+        };
+
+        if result.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// List Base Datasets for all Deployments.
+    pub async fn list_base_datasets(&self) -> Result<Vec<BaseDataset>, PlatformStoreError> {
+        let pool = &self.pool;
+        let rows = sqlx::query_as::<_, BaseDatasetRow>(
+            r#"
+            SELECT
+                deployment_name, source_table, source_schema, status,
+                primary_key_json, columns_json, omitted_columns_json, row_count,
+                sync_applied_changes, sync_health,
+                capture_low_watermark, capture_checkpoint, sync_lag,
+                source_alignment, source_alignment_checked_rows,
+                source_alignment_mismatched_rows,
+                initial_load_cursor_json
+            FROM base_datasets
+            ORDER BY deployment_name, source_schema, source_table
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        rows.into_iter()
+            .map(BaseDatasetRow::into_base_dataset)
+            .collect()
+    }
+
+    /// Load Base Dataset rows for a Source table (operator-facing inspect).
+    ///
+    /// When `deployment_name` is `None`, exactly one matching Base Dataset must exist.
+    pub async fn get_base_rows(
+        &self,
+        table: &str,
+        deployment_name: Option<&str>,
+    ) -> Result<(BaseDataset, Vec<BaseRow>), PlatformStoreError> {
+        let pool = &self.pool;
+        let dataset_rows = if let Some(deployment_name) = deployment_name {
+            sqlx::query_as::<_, BaseDatasetRow>(
+                r#"
+                SELECT
+                    deployment_name, source_table, source_schema, status,
+                    primary_key_json, columns_json, omitted_columns_json, row_count,
+                    sync_applied_changes, sync_health,
+                    capture_low_watermark, capture_checkpoint, sync_lag,
+                    source_alignment, source_alignment_checked_rows,
+                    source_alignment_mismatched_rows,
+                    initial_load_cursor_json
+                FROM base_datasets
+                WHERE source_table = $1 AND deployment_name = $2
+                ORDER BY source_schema
+                "#,
+            )
+            .bind(table)
+            .bind(deployment_name)
+            .fetch_all(pool)
+            .await
+            .map_err(PlatformStoreError::Load)?
+        } else {
+            sqlx::query_as::<_, BaseDatasetRow>(
+                r#"
+                SELECT
+                    deployment_name, source_table, source_schema, status,
+                    primary_key_json, columns_json, omitted_columns_json, row_count,
+                    sync_applied_changes, sync_health,
+                    capture_low_watermark, capture_checkpoint, sync_lag,
+                    source_alignment, source_alignment_checked_rows,
+                    source_alignment_mismatched_rows,
+                    initial_load_cursor_json
+                FROM base_datasets
+                WHERE source_table = $1
+                ORDER BY deployment_name, source_schema
+                "#,
+            )
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .map_err(PlatformStoreError::Load)?
+        };
+
+        let dataset_row = match dataset_rows.as_slice() {
+            [] => {
+                return Err(PlatformStoreError::NotFound(format!(
+                    "no Base Dataset found for table {table}"
+                )));
+            }
+            [only] => only.clone(),
+            many => {
+                return Err(PlatformStoreError::NotFound(format!(
+                    "multiple Base Datasets found for table {table} across Deployments {}; \
+                     pass --deployment to disambiguate",
+                    many.iter()
+                        .map(|row| row.deployment_name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        };
+        let dataset = dataset_row.into_base_dataset()?;
+
+        let rows = sqlx::query_as::<_, BaseRowDb>(
+            r#"
+            SELECT row_ordinal, row_json
+            FROM base_rows
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            ORDER BY row_ordinal
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.source_schema)
+        .bind(&dataset.source_table)
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        let base_rows = rows
+            .into_iter()
+            .map(BaseRowDb::into_base_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((dataset, base_rows))
+    }
+
+    /// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
+    pub async fn delete_base_datasets_not_in(
+        &self,
+        deployment_name: &str,
+        keep_tables: &[(String, String)],
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let existing = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT source_schema, source_table
+            FROM base_datasets
+            WHERE deployment_name = $1
+            "#,
+        )
+        .bind(deployment_name)
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        for (schema, table) in existing {
+            let keep = keep_tables.iter().any(|(s, t)| s == &schema && t == &table);
+            if keep {
+                continue;
+            }
+            sqlx::query(
+                r#"
+                DELETE FROM base_rows
+                WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+                "#,
+            )
+            .bind(deployment_name)
+            .bind(&schema)
+            .bind(&table)
+            .execute(pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+            sqlx::query(
+                r#"
+                DELETE FROM base_datasets
+                WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+                "#,
+            )
+            .bind(deployment_name)
+            .bind(&schema)
+            .bind(&table)
+            .execute(pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a Base Dataset already exists for the given Deployment table.
+    pub async fn base_dataset_exists(
+        &self,
+        deployment_name: &str,
+        source_schema: &str,
+        source_table: &str,
+    ) -> Result<bool, PlatformStoreError> {
+        let pool = &self.pool;
+        let found = sqlx::query_scalar::<_, i32>(
+            r#"
+            SELECT 1
+            FROM base_datasets
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            LIMIT 1
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(source_schema)
+        .bind(source_table)
+        .fetch_optional(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+        Ok(found.is_some())
+    }
+
+    /// Backfill Output Identity source primary-key metadata without reloading Base rows.
+    pub async fn update_base_primary_key(
+        &self,
+        deployment_name: &str,
+        source_schema: &str,
+        source_table: &str,
+        primary_key: &[String],
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let primary_key_json =
+            serde_json::to_string(primary_key).map_err(PlatformStoreError::InvalidJson)?;
+        let result = sqlx::query(
+            r#"
+            UPDATE base_datasets
+            SET primary_key_json = $4
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(source_schema)
+        .bind(source_table)
+        .bind(&primary_key_json)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        if result.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "no Base Dataset found for table {source_table}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// List applied source change ids at or after `from_position` for resume-safe
+    /// same-SCN Incremental windows (issue #143).
+    pub async fn list_applied_change_ids_from_position(
+        &self,
+        deployment_name: &str,
+        source_schema: &str,
+        source_table: &str,
+        from_position: i64,
+    ) -> Result<Vec<String>, PlatformStoreError> {
+        let pool = &self.pool;
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT change_id
+            FROM applied_source_changes
+            WHERE deployment_name = $1
+              AND source_schema = $2
+              AND source_table = $3
+              AND position >= $4
+            ORDER BY position ASC, change_id ASC
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(source_schema)
+        .bind(source_table)
+        .bind(from_position)
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)
+    }
+
+    /// Filter `change_ids` down to those not yet applied into this Base Dataset.
+    pub async fn filter_unapplied_change_ids(
+        &self,
+        deployment_name: &str,
+        source_schema: &str,
+        source_table: &str,
+        change_ids: &[String],
+    ) -> Result<Vec<String>, PlatformStoreError> {
+        if change_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = &self.pool;
+        let existing = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT change_id
+            FROM applied_source_changes
+            WHERE deployment_name = $1
+              AND source_schema = $2
+              AND source_table = $3
+              AND change_id = ANY($4)
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(source_schema)
+        .bind(source_table)
+        .bind(change_ids)
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        let existing_set: std::collections::BTreeSet<_> = existing.into_iter().collect();
+        Ok(change_ids
+            .iter()
+            .filter(|id| !existing_set.contains(*id))
+            .cloned()
+            .collect())
+    }
+
+    /// Record applied source change ids for cutover/replay dedupe.
+    pub async fn record_applied_source_changes(
+        &self,
+        deployment_name: &str,
+        source_schema: &str,
+        source_table: &str,
+        changes: &[(String, i64)],
+    ) -> Result<(), PlatformStoreError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        for (change_id, position) in changes {
+            sqlx::query(
+                r#"
+                INSERT INTO applied_source_changes (
+                    deployment_name, source_schema, source_table, change_id, position
+                ) VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (deployment_name, source_schema, source_table, change_id) DO NOTHING
+                "#,
+            )
+            .bind(deployment_name)
+            .bind(source_schema)
+            .bind(source_table)
+            .bind(change_id)
+            .bind(position)
+            .execute(&mut *tx)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        }
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Persist a Derived Dataset snapshot (metadata + rows) for a Transform Pipeline.
+    pub async fn replace_derived_dataset(
+        &self,
+        dataset: &DerivedDataset,
+        rows: &[serde_json::Map<String, serde_json::Value>],
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM derived_rows
+            WHERE deployment_name = $1 AND pipeline_name = $2
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.pipeline_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        let output_identity_json = serde_json::to_string(&dataset.output_identity)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        let columns_json =
+            serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO derived_datasets (
+                deployment_name, pipeline_name, status,
+                output_identity_json, columns_json, row_count, materialized_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, now())
+            ON CONFLICT (deployment_name, pipeline_name) DO UPDATE SET
+                status = EXCLUDED.status,
+                output_identity_json = EXCLUDED.output_identity_json,
+                columns_json = EXCLUDED.columns_json,
+                row_count = EXCLUDED.row_count,
+                materialized_at = now()
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.pipeline_name)
+        .bind(&dataset.status)
+        .bind(&output_identity_json)
+        .bind(&columns_json)
+        .bind(dataset.row_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        for (ordinal, row) in rows.iter().enumerate() {
+            let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
+            sqlx::query(
+                r#"
+                INSERT INTO derived_rows (
+                    deployment_name, pipeline_name, row_ordinal, row_json
+                ) VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(&dataset.deployment_name)
+            .bind(&dataset.pipeline_name)
+            .bind(ordinal as i32)
+            .bind(&row_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        }
+
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// List Derived Datasets ordered by deployment then Pipeline name.
+    pub async fn list_derived_datasets(&self) -> Result<Vec<DerivedDataset>, PlatformStoreError> {
+        let pool = &self.pool;
+        let rows = sqlx::query_as::<_, DerivedDatasetRow>(
+            r#"
+            SELECT deployment_name, pipeline_name, status,
+                   output_identity_json, columns_json, row_count
+            FROM derived_datasets
+            ORDER BY deployment_name, pipeline_name
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        rows.into_iter()
+            .map(DerivedDatasetRow::into_derived_dataset)
+            .collect()
+    }
+
+    /// Load Derived Dataset rows for one Pipeline.
+    pub async fn get_derived_rows(
+        &self,
+        pipeline_name: &str,
+        deployment_name: Option<&str>,
+    ) -> Result<(DerivedDataset, Vec<DerivedRow>), PlatformStoreError> {
+        let pool = &self.pool;
+
+        let dataset_row = if let Some(deployment) = deployment_name {
+            sqlx::query_as::<_, DerivedDatasetRow>(
+                r#"
+                SELECT deployment_name, pipeline_name, status,
+                       output_identity_json, columns_json, row_count
+                FROM derived_datasets
+                WHERE deployment_name = $1 AND pipeline_name = $2
+                "#,
+            )
+            .bind(deployment)
+            .bind(pipeline_name)
+            .fetch_optional(pool)
+            .await
+            .map_err(PlatformStoreError::Load)?
+        } else {
+            let matches = sqlx::query_as::<_, DerivedDatasetRow>(
+                r#"
+                SELECT deployment_name, pipeline_name, status,
+                       output_identity_json, columns_json, row_count
+                FROM derived_datasets
+                WHERE pipeline_name = $1
+                ORDER BY deployment_name
+                "#,
+            )
+            .bind(pipeline_name)
+            .fetch_all(pool)
+            .await
+            .map_err(PlatformStoreError::Load)?;
+            match matches.len() {
+                0 => None,
+                1 => matches.into_iter().next(),
+                _ => {
+                    return Err(PlatformStoreError::NotFound(format!(
+                        "multiple Derived Datasets named {pipeline_name}; pass deployment to disambiguate"
+                    )));
+                }
+            }
+        };
+
+        let dataset_row = dataset_row.ok_or_else(|| {
+            PlatformStoreError::NotFound(format!(
+                "no Derived Dataset found for Pipeline {pipeline_name}"
+            ))
+        })?;
+        let dataset = dataset_row.into_derived_dataset()?;
+
+        let row_dbs = sqlx::query_as::<_, DerivedRowDb>(
+            r#"
+            SELECT row_ordinal, row_json
+            FROM derived_rows
+            WHERE deployment_name = $1 AND pipeline_name = $2
+            ORDER BY row_ordinal
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.pipeline_name)
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        let rows = row_dbs
+            .into_iter()
+            .map(DerivedRowDb::into_derived_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((dataset, rows))
+    }
+
+    /// Persist Maintenance State JSON for a Transform Pipeline (distinct/addToSet).
+    ///
+    /// Callers serialize the transform-crate `MaintenanceState`. Pipelines that do not
+    /// require Maintenance State should call [`delete_maintenance_state`] instead.
+    pub async fn replace_maintenance_state(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+        state_json: &str,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        sqlx::query(
+            r#"
+            INSERT INTO maintenance_states (
+                deployment_name, pipeline_name, state_json, updated_at
+            ) VALUES ($1, $2, $3, now())
+            ON CONFLICT (deployment_name, pipeline_name) DO UPDATE SET
+                state_json = EXCLUDED.state_json,
+                updated_at = now()
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .bind(state_json)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Load Maintenance State JSON for a Pipeline, if present.
+    pub async fn get_maintenance_state_json(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+    ) -> Result<Option<String>, PlatformStoreError> {
+        let pool = &self.pool;
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT state_json
+            FROM maintenance_states
+            WHERE deployment_name = $1 AND pipeline_name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+        Ok(row.map(|(json,)| json))
+    }
+
+    /// Remove Maintenance State for a Pipeline (no-op when absent).
+    pub async fn delete_maintenance_state(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        sqlx::query(
+            r#"
+            DELETE FROM maintenance_states
+            WHERE deployment_name = $1 AND pipeline_name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Persist or refresh a Poison Change quarantine (ADR-0015).
+    pub async fn upsert_quarantined_change(
+        &self,
+        record: &QuarantinedChange,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let identity_json = serde_json::to_string(&record.output_identity)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        sqlx::query(
+            r#"
+            INSERT INTO poison_quarantine (
+                deployment_name, pipeline_name, source_schema, source_table,
+                change_id, capture_position, output_identity_json, stage,
+                attempts, last_error, status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
+            ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
+                source_schema = EXCLUDED.source_schema,
+                source_table = EXCLUDED.source_table,
+                capture_position = EXCLUDED.capture_position,
+                output_identity_json = EXCLUDED.output_identity_json,
+                stage = EXCLUDED.stage,
+                attempts = EXCLUDED.attempts,
+                last_error = EXCLUDED.last_error,
+                status = EXCLUDED.status,
+                quarantined_at = NOW()
+            "#,
+        )
+        .bind(&record.deployment_name)
+        .bind(&record.pipeline_name)
+        .bind(&record.source_schema)
+        .bind(&record.source_table)
+        .bind(&record.change_id)
+        .bind(record.capture_position)
+        .bind(identity_json)
+        .bind(&record.stage)
+        .bind(record.attempts)
+        .bind(&record.last_error)
+        .bind(&record.status)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// List active (status=quarantined) Poison Change records, optionally scoped.
+    pub async fn list_quarantined_changes(
+        &self,
+        deployment_name: Option<&str>,
+    ) -> Result<Vec<QuarantinedChange>, PlatformStoreError> {
+        let pool = &self.pool;
+        // Optional deployment filter: empty string means "all Deployments".
+        let deployment_filter = deployment_name.unwrap_or("");
+        let rows = sqlx::query_as::<_, QuarantinedChangeRow>(
+            r#"
+            SELECT deployment_name, pipeline_name, source_schema, source_table,
+                   change_id, capture_position, output_identity_json::text AS output_identity_json,
+                   stage, attempts, last_error, status
+            FROM poison_quarantine
+            WHERE status = 'quarantined'
+              AND ($1 = '' OR deployment_name = $1)
+            ORDER BY deployment_name, pipeline_name, quarantined_at, change_id
+            "#,
+        )
+        .bind(deployment_filter)
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        rows.into_iter()
+            .map(QuarantinedChangeRow::into_quarantined_change)
+            .collect()
+    }
+
+    /// Count active quarantines for one Pipeline (Operator-visible Delivery Health).
+    pub async fn count_active_quarantines(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+    ) -> Result<i64, PlatformStoreError> {
+        let pool = &self.pool;
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM poison_quarantine
+            WHERE deployment_name = $1
+              AND pipeline_name = $2
+              AND status = 'quarantined'
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .fetch_one(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+        Ok(count)
+    }
+
+    /// Persist or refresh a Schema Change impact (ADR-0009).
+    pub async fn upsert_schema_change_impact(
+        &self,
+        record: &SchemaChangeImpact,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        sqlx::query(
+            r#"
+            INSERT INTO schema_change_impacts (
+                deployment_name, pipeline_name, source_schema, source_table,
+                change_id, capture_position, ddl_summary, impact, status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
+                source_schema = EXCLUDED.source_schema,
+                source_table = EXCLUDED.source_table,
+                capture_position = EXCLUDED.capture_position,
+                ddl_summary = EXCLUDED.ddl_summary,
+                impact = EXCLUDED.impact,
+                status = EXCLUDED.status,
+                warned_at = NOW()
+            "#,
+        )
+        .bind(&record.deployment_name)
+        .bind(&record.pipeline_name)
+        .bind(&record.source_schema)
+        .bind(&record.source_table)
+        .bind(&record.change_id)
+        .bind(record.capture_position)
+        .bind(&record.ddl_summary)
+        .bind(&record.impact)
+        .bind(&record.status)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// List active Schema Change impacts, optionally scoped to one Deployment.
+    pub async fn list_schema_change_impacts(
+        &self,
+        deployment_name: Option<&str>,
+    ) -> Result<Vec<SchemaChangeImpact>, PlatformStoreError> {
+        let pool = &self.pool;
+        let deployment_filter = deployment_name.unwrap_or("");
+        let rows = sqlx::query_as::<_, SchemaChangeImpactRow>(
+            r#"
+            SELECT deployment_name, pipeline_name, source_schema, source_table,
+                   change_id, capture_position, ddl_summary, impact, status
+            FROM schema_change_impacts
+            WHERE status = 'active'
+              AND ($1 = '' OR deployment_name = $1)
+            ORDER BY deployment_name, pipeline_name, warned_at, change_id
+            "#,
+        )
+        .bind(deployment_filter)
+        .fetch_all(pool)
+        .await
+        .map_err(PlatformStoreError::Load)?;
+
+        Ok(rows
+            .into_iter()
+            .map(SchemaChangeImpactRow::into_impact)
+            .collect())
+    }
+
+    /// Clear active Schema Change impacts for one Pipeline (e.g. on Operator resume).
+    pub async fn clear_schema_change_impacts(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+    ) -> Result<u64, PlatformStoreError> {
+        let pool = &self.pool;
+        let result = sqlx::query(
+            r#"
+            UPDATE schema_change_impacts
+            SET status = 'cleared'
+            WHERE deployment_name = $1
+              AND pipeline_name = $2
+              AND status = 'active'
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        Ok(result.rows_affected())
+    }
+}
+
 /// Holds a Platform Store session advisory lock for one Incremental Capture cycle.
 ///
 /// Dropping the guard returns the connection to the pool; PostgreSQL releases the
@@ -248,14 +1782,8 @@ pub struct IncrementalSyncLock {
 pub async fn acquire_incremental_sync_lock(
     database_url: &str,
 ) -> Result<IncrementalSyncLock, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let mut conn = pool.acquire().await.map_err(PlatformStoreError::Connect)?;
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(INCREMENTAL_SYNC_ADVISORY_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-    Ok(IncrementalSyncLock { _conn: conn })
+    let store = PlatformStore::open(database_url).await?;
+    store.acquire_incremental_sync_lock().await
 }
 
 /// True when the Platform Store URL explicitly requests TLS (no cleartext fallback).
@@ -303,12 +1831,8 @@ pub fn latest_migration_version() -> i64 {
 
 /// Apply versioned Platform Store schema migrations.
 pub async fn migrate(database_url: &str) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    store_migrator()
-        .run(&pool)
-        .await
-        .map_err(PlatformStoreError::Migrate)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.migrate().await
 }
 
 /// Apply only migrations with version `<= through_version` (inclusive).
@@ -321,61 +1845,16 @@ pub async fn migrate_through(
     database_url: &str,
     through_version: i64,
 ) -> Result<(), PlatformStoreError> {
-    let full = store_migrator();
-    if !full.version_exists(through_version) {
-        return Err(PlatformStoreError::UnknownMigrationVersion(through_version));
-    }
-
-    let subset: Vec<_> = full
-        .iter()
-        .filter(|m| m.version <= through_version)
-        .cloned()
-        .collect();
-    let partial = sqlx::migrate::Migrator {
-        migrations: Cow::Owned(subset),
-        ignore_missing: full.ignore_missing,
-        locking: full.locking,
-        no_tx: full.no_tx,
-    };
-
-    let pool = connect(database_url).await?;
-    partial
-        .run(&pool)
-        .await
-        .map_err(PlatformStoreError::Migrate)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.migrate_through(through_version).await
 }
 
 /// Check whether the Platform Store is reachable and migrated.
 pub async fn health(database_url: &str) -> PlatformStoreHealth {
-    let pool = match connect(database_url).await {
-        Ok(pool) => pool,
-        Err(err) => {
-            return PlatformStoreHealth::Unreachable {
-                reason: err.to_string(),
-            };
-        }
-    };
-
-    if let Err(err) = sqlx::query("SELECT 1").execute(&pool).await {
-        return PlatformStoreHealth::Unreachable {
+    match PlatformStore::open(database_url).await {
+        Ok(store) => store.health().await,
+        Err(err) => PlatformStoreHealth::Unreachable {
             reason: err.to_string(),
-        };
-    }
-
-    let version = sqlx::query_scalar::<_, i64>(
-        "SELECT version FROM _sqlx_migrations WHERE success = true ORDER BY version DESC LIMIT 1",
-    )
-    .fetch_optional(&pool)
-    .await;
-
-    match version {
-        Ok(Some(schema_version)) => PlatformStoreHealth::Healthy { schema_version },
-        Ok(None) => PlatformStoreHealth::Unhealthy {
-            reason: "schema migrations have not been applied".to_string(),
-        },
-        Err(_) => PlatformStoreHealth::Unhealthy {
-            reason: "schema migrations have not been applied".to_string(),
         },
     }
 }
@@ -388,13 +1867,8 @@ pub async fn delete_deployment(
     database_url: &str,
     deployment_name: &str,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    sqlx::query("DELETE FROM deployments WHERE name = $1")
-        .bind(deployment_name)
-        .execute(&pool)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.delete_deployment(deployment_name).await
 }
 
 /// Create or update a Deployment. Secrets are stored only as references.
@@ -402,71 +1876,8 @@ pub async fn upsert_deployment(
     database_url: &str,
     deployment: &Deployment,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    sqlx::query(
-        r#"
-        INSERT INTO deployments (
-            name,
-            source_kind, source_host, source_port, source_database, source_username,
-            source_password_ref_kind, source_password_ref_value, source_timezone,
-            source_tls_json,
-            target_kind, target_host, target_port, target_database, target_username,
-            target_password_ref_kind, target_password_ref_value,
-            target_tls_json,
-            applied_at
-        ) VALUES (
-            $1,
-            $2, $3, $4, $5, $6,
-            $7, $8, $9,
-            $10,
-            $11, $12, $13, $14, $15,
-            $16, $17,
-            $18,
-            now()
-        )
-        ON CONFLICT (name) DO UPDATE SET
-            source_kind = EXCLUDED.source_kind,
-            source_host = EXCLUDED.source_host,
-            source_port = EXCLUDED.source_port,
-            source_database = EXCLUDED.source_database,
-            source_username = EXCLUDED.source_username,
-            source_password_ref_kind = EXCLUDED.source_password_ref_kind,
-            source_password_ref_value = EXCLUDED.source_password_ref_value,
-            source_timezone = EXCLUDED.source_timezone,
-            source_tls_json = EXCLUDED.source_tls_json,
-            target_kind = EXCLUDED.target_kind,
-            target_host = EXCLUDED.target_host,
-            target_port = EXCLUDED.target_port,
-            target_database = EXCLUDED.target_database,
-            target_username = EXCLUDED.target_username,
-            target_password_ref_kind = EXCLUDED.target_password_ref_kind,
-            target_password_ref_value = EXCLUDED.target_password_ref_value,
-            target_tls_json = EXCLUDED.target_tls_json,
-            applied_at = now()
-        "#,
-    )
-    .bind(&deployment.name)
-    .bind(&deployment.source.kind)
-    .bind(&deployment.source.host)
-    .bind(deployment.source.port)
-    .bind(&deployment.source.database)
-    .bind(&deployment.source.username)
-    .bind(deployment.source.password_ref.kind.as_str())
-    .bind(&deployment.source.password_ref.value)
-    .bind(&deployment.source.timezone)
-    .bind(tls_settings_to_json(&deployment.source.tls)?)
-    .bind(&deployment.target.kind)
-    .bind(&deployment.target.host)
-    .bind(deployment.target.port)
-    .bind(&deployment.target.database)
-    .bind(&deployment.target.username)
-    .bind(deployment.target.password_ref.kind.as_str())
-    .bind(&deployment.target.password_ref.value)
-    .bind(tls_settings_to_json(&deployment.target.tls)?)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.upsert_deployment(deployment).await
 }
 
 fn tls_settings_to_json(tls: &TlsSettings) -> Result<String, PlatformStoreError> {
@@ -486,60 +1897,8 @@ pub async fn replace_pipelines(
     deployment_name: &str,
     pipelines: &[Pipeline],
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
-
-    sqlx::query("DELETE FROM pipelines WHERE deployment_name = $1")
-        .bind(deployment_name)
-        .execute(&mut *tx)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-
-    for pipeline in pipelines {
-        let field_mappings_json = serde_json::to_string(&pipeline.field_mappings)
-            .map_err(PlatformStoreError::InvalidJson)?;
-        let output_identity_json = serde_json::to_string(&pipeline.output_identity)
-            .map_err(PlatformStoreError::InvalidJson)?;
-        let transform_json = match &pipeline.transform_json {
-            Some(value) => {
-                serde_json::to_string(value).map_err(PlatformStoreError::InvalidJson)?
-            }
-            None => "null".to_string(),
-        };
-        sqlx::query(
-            r#"
-            INSERT INTO pipelines (
-                deployment_name, name, mode, source_table, source_schema,
-                target_collection, delivery_status, delivery_applied_changes, delivery_lag,
-                paused, description, field_mappings_json, output_identity_json, transform_json,
-                drift_status, drift_checked_rows, drift_mismatched_rows, applied_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now())
-            "#,
-        )
-        .bind(&pipeline.deployment_name)
-        .bind(&pipeline.name)
-        .bind(&pipeline.mode)
-        .bind(&pipeline.source_table)
-        .bind(&pipeline.source_schema)
-        .bind(&pipeline.target_collection)
-        .bind(&pipeline.delivery_status)
-        .bind(pipeline.delivery_applied_changes)
-        .bind(pipeline.delivery_lag)
-        .bind(pipeline.paused)
-        .bind(&pipeline.description)
-        .bind(&field_mappings_json)
-        .bind(&output_identity_json)
-        .bind(&transform_json)
-        .bind(&pipeline.drift_status)
-        .bind(pipeline.drift_checked_rows)
-        .bind(pipeline.drift_mismatched_rows)
-        .execute(&mut *tx)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-    }
-
-    tx.commit().await.map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.replace_pipelines(deployment_name, pipelines).await
 }
 
 /// Persist a Base Dataset snapshot (metadata + full supported-type rows).
@@ -548,105 +1907,8 @@ pub async fn replace_base_dataset(
     dataset: &BaseDataset,
     rows: &[serde_json::Map<String, serde_json::Value>],
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM base_rows
-        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-        "#,
-    )
-    .bind(&dataset.deployment_name)
-    .bind(&dataset.source_schema)
-    .bind(&dataset.source_table)
-    .execute(&mut *tx)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    let columns_json =
-        serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
-    let omitted_json =
-        serde_json::to_string(&dataset.omitted_columns).map_err(PlatformStoreError::InvalidJson)?;
-    let primary_key_json =
-        serde_json::to_string(&dataset.primary_key).map_err(PlatformStoreError::InvalidJson)?;
-    let cursor_json = match &dataset.initial_load_cursor {
-        Some(cursor) => Some(serde_json::to_string(cursor).map_err(PlatformStoreError::InvalidJson)?),
-        None => None,
-    };
-
-    sqlx::query(
-        r#"
-        INSERT INTO base_datasets (
-            deployment_name, source_table, source_schema, status,
-            primary_key_json, columns_json, omitted_columns_json, row_count,
-            sync_applied_changes, sync_health,
-            capture_low_watermark, capture_checkpoint, sync_lag,
-            source_alignment, source_alignment_checked_rows,
-            source_alignment_mismatched_rows, initial_load_cursor_json, loaded_at
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now()
-        )
-        ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
-            status = EXCLUDED.status,
-            primary_key_json = EXCLUDED.primary_key_json,
-            columns_json = EXCLUDED.columns_json,
-            omitted_columns_json = EXCLUDED.omitted_columns_json,
-            row_count = EXCLUDED.row_count,
-            sync_applied_changes = EXCLUDED.sync_applied_changes,
-            sync_health = EXCLUDED.sync_health,
-            capture_low_watermark = EXCLUDED.capture_low_watermark,
-            capture_checkpoint = EXCLUDED.capture_checkpoint,
-            sync_lag = EXCLUDED.sync_lag,
-            source_alignment = EXCLUDED.source_alignment,
-            source_alignment_checked_rows = EXCLUDED.source_alignment_checked_rows,
-            source_alignment_mismatched_rows = EXCLUDED.source_alignment_mismatched_rows,
-            initial_load_cursor_json = EXCLUDED.initial_load_cursor_json,
-            loaded_at = now()
-        "#,
-    )
-    .bind(&dataset.deployment_name)
-    .bind(&dataset.source_table)
-    .bind(&dataset.source_schema)
-    .bind(&dataset.status)
-    .bind(&primary_key_json)
-    .bind(&columns_json)
-    .bind(&omitted_json)
-    .bind(dataset.row_count)
-    .bind(dataset.sync_applied_changes)
-    .bind(&dataset.sync_health)
-    .bind(dataset.capture_low_watermark)
-    .bind(dataset.capture_checkpoint)
-    .bind(dataset.sync_lag)
-    .bind(&dataset.source_alignment)
-    .bind(dataset.source_alignment_checked_rows)
-    .bind(dataset.source_alignment_mismatched_rows)
-    .bind(&cursor_json)
-    .execute(&mut *tx)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    for (ordinal, row) in rows.iter().enumerate() {
-        let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
-        sqlx::query(
-            r#"
-            INSERT INTO base_rows (
-                deployment_name, source_schema, source_table, row_ordinal, row_json
-            ) VALUES ($1, $2, $3, $4, $5)
-            "#,
-        )
-        .bind(&dataset.deployment_name)
-        .bind(&dataset.source_schema)
-        .bind(&dataset.source_table)
-        .bind(ordinal as i32)
-        .bind(&row_json)
-        .execute(&mut *tx)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-    }
-
-    tx.commit().await.map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.replace_base_dataset(dataset, rows).await
 }
 
 /// Append one Initial Load chunk into an existing (or new) Base Dataset.
@@ -660,138 +1922,22 @@ pub async fn append_base_dataset_chunk(
     rows: &[serde_json::Map<String, serde_json::Value>],
     start_ordinal: i32,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
-
-    let columns_json =
-        serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
-    let omitted_json =
-        serde_json::to_string(&dataset.omitted_columns).map_err(PlatformStoreError::InvalidJson)?;
-    let primary_key_json =
-        serde_json::to_string(&dataset.primary_key).map_err(PlatformStoreError::InvalidJson)?;
-    let cursor_json = match &dataset.initial_load_cursor {
-        Some(cursor) => Some(serde_json::to_string(cursor).map_err(PlatformStoreError::InvalidJson)?),
-        None => None,
-    };
-
-    sqlx::query(
-        r#"
-        INSERT INTO base_datasets (
-            deployment_name, source_table, source_schema, status,
-            primary_key_json, columns_json, omitted_columns_json, row_count,
-            sync_applied_changes, sync_health,
-            capture_low_watermark, capture_checkpoint, sync_lag,
-            source_alignment, source_alignment_checked_rows,
-            source_alignment_mismatched_rows, initial_load_cursor_json, loaded_at
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now()
-        )
-        ON CONFLICT (deployment_name, source_schema, source_table) DO UPDATE SET
-            status = EXCLUDED.status,
-            primary_key_json = EXCLUDED.primary_key_json,
-            columns_json = EXCLUDED.columns_json,
-            omitted_columns_json = EXCLUDED.omitted_columns_json,
-            row_count = EXCLUDED.row_count,
-            sync_applied_changes = EXCLUDED.sync_applied_changes,
-            sync_health = EXCLUDED.sync_health,
-            capture_low_watermark = EXCLUDED.capture_low_watermark,
-            capture_checkpoint = EXCLUDED.capture_checkpoint,
-            sync_lag = EXCLUDED.sync_lag,
-            source_alignment = EXCLUDED.source_alignment,
-            source_alignment_checked_rows = EXCLUDED.source_alignment_checked_rows,
-            source_alignment_mismatched_rows = EXCLUDED.source_alignment_mismatched_rows,
-            initial_load_cursor_json = EXCLUDED.initial_load_cursor_json,
-            loaded_at = now()
-        "#,
-    )
-    .bind(&dataset.deployment_name)
-    .bind(&dataset.source_table)
-    .bind(&dataset.source_schema)
-    .bind(&dataset.status)
-    .bind(&primary_key_json)
-    .bind(&columns_json)
-    .bind(&omitted_json)
-    .bind(dataset.row_count)
-    .bind(dataset.sync_applied_changes)
-    .bind(&dataset.sync_health)
-    .bind(dataset.capture_low_watermark)
-    .bind(dataset.capture_checkpoint)
-    .bind(dataset.sync_lag)
-    .bind(&dataset.source_alignment)
-    .bind(dataset.source_alignment_checked_rows)
-    .bind(dataset.source_alignment_mismatched_rows)
-    .bind(&cursor_json)
-    .execute(&mut *tx)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    for (offset, row) in rows.iter().enumerate() {
-        let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
-        sqlx::query(
-            r#"
-            INSERT INTO base_rows (
-                deployment_name, source_schema, source_table, row_ordinal, row_json
-            ) VALUES ($1, $2, $3, $4, $5)
-            "#,
-        )
-        .bind(&dataset.deployment_name)
-        .bind(&dataset.source_schema)
-        .bind(&dataset.source_table)
-        .bind(start_ordinal + offset as i32)
-        .bind(&row_json)
-        .execute(&mut *tx)
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .append_base_dataset_chunk(dataset, rows, start_ordinal)
         .await
-        .map_err(PlatformStoreError::Persist)?;
-    }
-
-    tx.commit().await.map_err(PlatformStoreError::Persist)?;
-    Ok(())
 }
 
 /// List applied Deployments ordered by name.
-pub async fn list_deployments(
-    database_url: &str,
-) -> Result<Vec<Deployment>, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let rows = sqlx::query_as::<_, DeploymentRow>(
-        r#"
-        SELECT
-            name,
-            source_kind, source_host, source_port, source_database, source_username,
-            source_password_ref_kind, source_password_ref_value, source_timezone,
-            source_tls_json,
-            target_kind, target_host, target_port, target_database, target_username,
-            target_password_ref_kind, target_password_ref_value,
-            target_tls_json
-        FROM deployments
-        ORDER BY name
-        "#,
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    rows.into_iter().map(DeploymentRow::into_deployment).collect()
+pub async fn list_deployments(database_url: &str) -> Result<Vec<Deployment>, PlatformStoreError> {
+    let store = PlatformStore::open(database_url).await?;
+    store.list_deployments().await
 }
 
 /// List Pipelines for all Deployments, ordered by deployment then name.
 pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let rows = sqlx::query_as::<_, PipelineRow>(
-        r#"
-        SELECT deployment_name, name, mode, source_table, source_schema,
-               target_collection, delivery_status, delivery_applied_changes, delivery_lag,
-               paused, description, field_mappings_json, output_identity_json, transform_json,
-               drift_status, drift_checked_rows, drift_mismatched_rows
-        FROM pipelines
-        ORDER BY deployment_name, name
-        "#,
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    rows.into_iter().map(PipelineRow::into_pipeline).collect()
+    let store = PlatformStore::open(database_url).await?;
+    store.list_pipelines().await
 }
 
 /// Set durable Operator pause for one Pipeline (ADR-0007 / issue #19).
@@ -801,27 +1947,10 @@ pub async fn set_pipeline_paused(
     pipeline_name: &str,
     paused: bool,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let result = sqlx::query(
-        r#"
-        UPDATE pipelines
-        SET paused = $3
-        WHERE deployment_name = $1 AND name = $2
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .bind(paused)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    if result.rows_affected() == 0 {
-        return Err(PlatformStoreError::NotFound(format!(
-            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
-        )));
-    }
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .set_pipeline_paused(deployment_name, pipeline_name, paused)
+        .await
 }
 
 /// Delete one Pipeline (Derived Dataset CASCADE). Deployment and shared Bases stay
@@ -831,25 +1960,8 @@ pub async fn delete_pipeline(
     deployment_name: &str,
     pipeline_name: &str,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let result = sqlx::query(
-        r#"
-        DELETE FROM pipelines
-        WHERE deployment_name = $1 AND name = $2
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    if result.rows_affected() == 0 {
-        return Err(PlatformStoreError::NotFound(format!(
-            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
-        )));
-    }
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.delete_pipeline(deployment_name, pipeline_name).await
 }
 
 /// Update Delivery status for one Pipeline.
@@ -859,14 +1971,10 @@ pub async fn update_pipeline_delivery_status(
     pipeline_name: &str,
     delivery_status: &str,
 ) -> Result<(), PlatformStoreError> {
-    update_pipeline_delivery_progress(
-        database_url,
-        deployment_name,
-        pipeline_name,
-        delivery_status,
-        None,
-    )
-    .await
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .update_pipeline_delivery_status(deployment_name, pipeline_name, delivery_status)
+        .await
 }
 
 /// Persist Drift Check status for one Pipeline (issue #25).
@@ -878,31 +1986,16 @@ pub async fn update_pipeline_drift_status(
     drift_checked_rows: i32,
     drift_mismatched_rows: i32,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let result = sqlx::query(
-        r#"
-        UPDATE pipelines
-        SET drift_status = $3,
-            drift_checked_rows = $4,
-            drift_mismatched_rows = $5
-        WHERE deployment_name = $1 AND name = $2
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .bind(drift_status)
-    .bind(drift_checked_rows)
-    .bind(drift_mismatched_rows)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    if result.rows_affected() == 0 {
-        return Err(PlatformStoreError::NotFound(format!(
-            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
-        )));
-    }
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .update_pipeline_drift_status(
+            deployment_name,
+            pipeline_name,
+            drift_status,
+            drift_checked_rows,
+            drift_mismatched_rows,
+        )
+        .await
 }
 
 /// Update Delivery status and optionally accumulate applied Output Identity changes.
@@ -913,15 +2006,15 @@ pub async fn update_pipeline_delivery_progress(
     delivery_status: &str,
     additional_applied_changes: Option<i32>,
 ) -> Result<(), PlatformStoreError> {
-    update_pipeline_delivery_progress_with_lag(
-        database_url,
-        deployment_name,
-        pipeline_name,
-        delivery_status,
-        additional_applied_changes,
-        None,
-    )
-    .await
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .update_pipeline_delivery_progress(
+            deployment_name,
+            pipeline_name,
+            delivery_status,
+            additional_applied_changes,
+        )
+        .await
 }
 
 /// Persist Delivery Health lag (remaining pending Delivery work; ADR-0020 / issue #26).
@@ -931,27 +2024,10 @@ pub async fn update_pipeline_delivery_lag(
     pipeline_name: &str,
     delivery_lag: i32,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let result = sqlx::query(
-        r#"
-        UPDATE pipelines
-        SET delivery_lag = $3
-        WHERE deployment_name = $1 AND name = $2
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .bind(delivery_lag)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    if result.rows_affected() == 0 {
-        return Err(PlatformStoreError::NotFound(format!(
-            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
-        )));
-    }
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .update_pipeline_delivery_lag(deployment_name, pipeline_name, delivery_lag)
+        .await
 }
 
 /// Update Delivery status, optional applied-count delta, and optional Delivery lag.
@@ -963,112 +2039,24 @@ pub async fn update_pipeline_delivery_progress_with_lag(
     additional_applied_changes: Option<i32>,
     delivery_lag: Option<i32>,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let result = match (additional_applied_changes, delivery_lag) {
-        (Some(additional), Some(lag)) => {
-            sqlx::query(
-                r#"
-                UPDATE pipelines
-                SET delivery_status = $3,
-                    delivery_applied_changes = delivery_applied_changes + $4,
-                    delivery_lag = $5
-                WHERE deployment_name = $1 AND name = $2
-                "#,
-            )
-            .bind(deployment_name)
-            .bind(pipeline_name)
-            .bind(delivery_status)
-            .bind(additional)
-            .bind(lag)
-            .execute(&pool)
-            .await
-            .map_err(PlatformStoreError::Persist)?
-        }
-        (Some(additional), None) => {
-            sqlx::query(
-                r#"
-                UPDATE pipelines
-                SET delivery_status = $3,
-                    delivery_applied_changes = delivery_applied_changes + $4
-                WHERE deployment_name = $1 AND name = $2
-                "#,
-            )
-            .bind(deployment_name)
-            .bind(pipeline_name)
-            .bind(delivery_status)
-            .bind(additional)
-            .execute(&pool)
-            .await
-            .map_err(PlatformStoreError::Persist)?
-        }
-        (None, Some(lag)) => {
-            sqlx::query(
-                r#"
-                UPDATE pipelines
-                SET delivery_status = $3,
-                    delivery_lag = $4
-                WHERE deployment_name = $1 AND name = $2
-                "#,
-            )
-            .bind(deployment_name)
-            .bind(pipeline_name)
-            .bind(delivery_status)
-            .bind(lag)
-            .execute(&pool)
-            .await
-            .map_err(PlatformStoreError::Persist)?
-        }
-        (None, None) => {
-            sqlx::query(
-                r#"
-                UPDATE pipelines
-                SET delivery_status = $3
-                WHERE deployment_name = $1 AND name = $2
-                "#,
-            )
-            .bind(deployment_name)
-            .bind(pipeline_name)
-            .bind(delivery_status)
-            .execute(&pool)
-            .await
-            .map_err(PlatformStoreError::Persist)?
-        }
-    };
-
-    if result.rows_affected() == 0 {
-        return Err(PlatformStoreError::NotFound(format!(
-            "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
-        )));
-    }
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .update_pipeline_delivery_progress_with_lag(
+            deployment_name,
+            pipeline_name,
+            delivery_status,
+            additional_applied_changes,
+            delivery_lag,
+        )
+        .await
 }
 
 /// List Base Datasets for all Deployments.
 pub async fn list_base_datasets(
     database_url: &str,
 ) -> Result<Vec<BaseDataset>, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let rows = sqlx::query_as::<_, BaseDatasetRow>(
-        r#"
-        SELECT
-            deployment_name, source_table, source_schema, status,
-            primary_key_json, columns_json, omitted_columns_json, row_count,
-            sync_applied_changes, sync_health,
-            capture_low_watermark, capture_checkpoint, sync_lag,
-            source_alignment, source_alignment_checked_rows,
-            source_alignment_mismatched_rows,
-            initial_load_cursor_json
-        FROM base_datasets
-        ORDER BY deployment_name, source_schema, source_table
-        "#,
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    rows.into_iter()
-        .map(BaseDatasetRow::into_base_dataset)
-        .collect()
+    let store = PlatformStore::open(database_url).await?;
+    store.list_base_datasets().await
 }
 
 /// Load Base Dataset rows for a Source table (operator-facing inspect).
@@ -1079,90 +2067,8 @@ pub async fn get_base_rows(
     table: &str,
     deployment_name: Option<&str>,
 ) -> Result<(BaseDataset, Vec<BaseRow>), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let dataset_rows = if let Some(deployment_name) = deployment_name {
-        sqlx::query_as::<_, BaseDatasetRow>(
-            r#"
-            SELECT
-                deployment_name, source_table, source_schema, status,
-                primary_key_json, columns_json, omitted_columns_json, row_count,
-                sync_applied_changes, sync_health,
-                capture_low_watermark, capture_checkpoint, sync_lag,
-                source_alignment, source_alignment_checked_rows,
-                source_alignment_mismatched_rows,
-                initial_load_cursor_json
-            FROM base_datasets
-            WHERE source_table = $1 AND deployment_name = $2
-            ORDER BY source_schema
-            "#,
-        )
-        .bind(table)
-        .bind(deployment_name)
-        .fetch_all(&pool)
-        .await
-        .map_err(PlatformStoreError::Load)?
-    } else {
-        sqlx::query_as::<_, BaseDatasetRow>(
-            r#"
-            SELECT
-                deployment_name, source_table, source_schema, status,
-                primary_key_json, columns_json, omitted_columns_json, row_count,
-                sync_applied_changes, sync_health,
-                capture_low_watermark, capture_checkpoint, sync_lag,
-                source_alignment, source_alignment_checked_rows,
-                source_alignment_mismatched_rows,
-                initial_load_cursor_json
-            FROM base_datasets
-            WHERE source_table = $1
-            ORDER BY deployment_name, source_schema
-            "#,
-        )
-        .bind(table)
-        .fetch_all(&pool)
-        .await
-        .map_err(PlatformStoreError::Load)?
-    };
-
-    let dataset_row = match dataset_rows.as_slice() {
-        [] => {
-            return Err(PlatformStoreError::NotFound(format!(
-                "no Base Dataset found for table {table}"
-            )));
-        }
-        [only] => only.clone(),
-        many => {
-            return Err(PlatformStoreError::NotFound(format!(
-                "multiple Base Datasets found for table {table} across Deployments {}; \
-                 pass --deployment to disambiguate",
-                many.iter()
-                    .map(|row| row.deployment_name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-    };
-    let dataset = dataset_row.into_base_dataset()?;
-
-    let rows = sqlx::query_as::<_, BaseRowDb>(
-        r#"
-        SELECT row_ordinal, row_json
-        FROM base_rows
-        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-        ORDER BY row_ordinal
-        "#,
-    )
-    .bind(&dataset.deployment_name)
-    .bind(&dataset.source_schema)
-    .bind(&dataset.source_table)
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    let base_rows = rows
-        .into_iter()
-        .map(BaseRowDb::into_base_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((dataset, base_rows))
+    let store = PlatformStore::open(database_url).await?;
+    store.get_base_rows(table, deployment_name).await
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1248,8 +2154,8 @@ impl PipelineRow {
             .map_err(PlatformStoreError::InvalidJson)?;
         let output_identity = serde_json::from_str(&self.output_identity_json)
             .map_err(PlatformStoreError::InvalidJson)?;
-        let transform_value: serde_json::Value = serde_json::from_str(&self.transform_json)
-            .map_err(PlatformStoreError::InvalidJson)?;
+        let transform_value: serde_json::Value =
+            serde_json::from_str(&self.transform_json).map_err(PlatformStoreError::InvalidJson)?;
         let transform_json = if transform_value.is_null() {
             None
         } else {
@@ -1304,52 +2210,10 @@ pub async fn delete_base_datasets_not_in(
     deployment_name: &str,
     keep_tables: &[(String, String)],
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let existing = sqlx::query_as::<_, (String, String)>(
-        r#"
-        SELECT source_schema, source_table
-        FROM base_datasets
-        WHERE deployment_name = $1
-        "#,
-    )
-    .bind(deployment_name)
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    for (schema, table) in existing {
-        let keep = keep_tables
-            .iter()
-            .any(|(s, t)| s == &schema && t == &table);
-        if keep {
-            continue;
-        }
-        sqlx::query(
-            r#"
-            DELETE FROM base_rows
-            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-            "#,
-        )
-        .bind(deployment_name)
-        .bind(&schema)
-        .bind(&table)
-        .execute(&pool)
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .delete_base_datasets_not_in(deployment_name, keep_tables)
         .await
-        .map_err(PlatformStoreError::Persist)?;
-        sqlx::query(
-            r#"
-            DELETE FROM base_datasets
-            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-            "#,
-        )
-        .bind(deployment_name)
-        .bind(&schema)
-        .bind(&table)
-        .execute(&pool)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-    }
-    Ok(())
 }
 
 /// Whether a Base Dataset already exists for the given Deployment table.
@@ -1359,22 +2223,10 @@ pub async fn base_dataset_exists(
     source_schema: &str,
     source_table: &str,
 ) -> Result<bool, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let found = sqlx::query_scalar::<_, i32>(
-        r#"
-        SELECT 1
-        FROM base_datasets
-        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-        LIMIT 1
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(source_schema)
-    .bind(source_table)
-    .fetch_optional(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-    Ok(found.is_some())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .base_dataset_exists(deployment_name, source_schema, source_table)
+        .await
 }
 
 /// Backfill Output Identity source primary-key metadata without reloading Base rows.
@@ -1385,30 +2237,10 @@ pub async fn update_base_primary_key(
     source_table: &str,
     primary_key: &[String],
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let primary_key_json =
-        serde_json::to_string(primary_key).map_err(PlatformStoreError::InvalidJson)?;
-    let result = sqlx::query(
-        r#"
-        UPDATE base_datasets
-        SET primary_key_json = $4
-        WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(source_schema)
-    .bind(source_table)
-    .bind(&primary_key_json)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    if result.rows_affected() == 0 {
-        return Err(PlatformStoreError::NotFound(format!(
-            "no Base Dataset found for table {source_table}"
-        )));
-    }
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .update_base_primary_key(deployment_name, source_schema, source_table, primary_key)
+        .await
 }
 
 impl BaseDatasetRow {
@@ -1435,9 +2267,9 @@ impl BaseDatasetRow {
             source_alignment_mismatched_rows: self.source_alignment_mismatched_rows,
             initial_load_cursor: match self.initial_load_cursor_json.as_deref() {
                 None | Some("") => None,
-                Some(raw) => Some(
-                    serde_json::from_str(raw).map_err(PlatformStoreError::InvalidJson)?,
-                ),
+                Some(raw) => {
+                    Some(serde_json::from_str(raw).map_err(PlatformStoreError::InvalidJson)?)
+                }
             },
         })
     }
@@ -1452,25 +2284,15 @@ pub async fn list_applied_change_ids_from_position(
     source_table: &str,
     from_position: i64,
 ) -> Result<Vec<String>, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT change_id
-        FROM applied_source_changes
-        WHERE deployment_name = $1
-          AND source_schema = $2
-          AND source_table = $3
-          AND position >= $4
-        ORDER BY position ASC, change_id ASC
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(source_schema)
-    .bind(source_table)
-    .bind(from_position)
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .list_applied_change_ids_from_position(
+            deployment_name,
+            source_schema,
+            source_table,
+            from_position,
+        )
+        .await
 }
 
 /// Filter `change_ids` down to those not yet applied into this Base Dataset.
@@ -1481,34 +2303,10 @@ pub async fn filter_unapplied_change_ids(
     source_table: &str,
     change_ids: &[String],
 ) -> Result<Vec<String>, PlatformStoreError> {
-    if change_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let pool = connect(database_url).await?;
-    let existing = sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT change_id
-        FROM applied_source_changes
-        WHERE deployment_name = $1
-          AND source_schema = $2
-          AND source_table = $3
-          AND change_id = ANY($4)
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(source_schema)
-    .bind(source_table)
-    .bind(change_ids)
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    let existing_set: std::collections::BTreeSet<_> = existing.into_iter().collect();
-    Ok(change_ids
-        .iter()
-        .filter(|id| !existing_set.contains(*id))
-        .cloned()
-        .collect())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .filter_unapplied_change_ids(deployment_name, source_schema, source_table, change_ids)
+        .await
 }
 
 /// Record applied source change ids for cutover/replay dedupe.
@@ -1519,31 +2317,10 @@ pub async fn record_applied_source_changes(
     source_table: &str,
     changes: &[(String, i64)],
 ) -> Result<(), PlatformStoreError> {
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let pool = connect(database_url).await?;
-    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
-    for (change_id, position) in changes {
-        sqlx::query(
-            r#"
-            INSERT INTO applied_source_changes (
-                deployment_name, source_schema, source_table, change_id, position
-            ) VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (deployment_name, source_schema, source_table, change_id) DO NOTHING
-            "#,
-        )
-        .bind(deployment_name)
-        .bind(source_schema)
-        .bind(source_table)
-        .bind(change_id)
-        .bind(position)
-        .execute(&mut *tx)
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .record_applied_source_changes(deployment_name, source_schema, source_table, changes)
         .await
-        .map_err(PlatformStoreError::Persist)?;
-    }
-    tx.commit().await.map_err(PlatformStoreError::Persist)?;
-    Ok(())
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1556,12 +2333,9 @@ impl BaseRowDb {
     fn into_base_row(self) -> Result<BaseRow, PlatformStoreError> {
         let value: serde_json::Value =
             serde_json::from_str(&self.row_json).map_err(PlatformStoreError::InvalidJson)?;
-        let data = value
-            .as_object()
-            .cloned()
-            .ok_or_else(|| {
-                PlatformStoreError::NotFound("stored Base row is not a JSON object".to_string())
-            })?;
+        let data = value.as_object().cloned().ok_or_else(|| {
+            PlatformStoreError::NotFound("stored Base row is not a JSON object".to_string())
+        })?;
         Ok(BaseRow {
             row_ordinal: self.row_ordinal,
             data,
@@ -1575,92 +2349,16 @@ pub async fn replace_derived_dataset(
     dataset: &DerivedDataset,
     rows: &[serde_json::Map<String, serde_json::Value>],
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let mut tx = pool.begin().await.map_err(PlatformStoreError::Persist)?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM derived_rows
-        WHERE deployment_name = $1 AND pipeline_name = $2
-        "#,
-    )
-    .bind(&dataset.deployment_name)
-    .bind(&dataset.pipeline_name)
-    .execute(&mut *tx)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    let output_identity_json = serde_json::to_string(&dataset.output_identity)
-        .map_err(PlatformStoreError::InvalidJson)?;
-    let columns_json =
-        serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO derived_datasets (
-            deployment_name, pipeline_name, status,
-            output_identity_json, columns_json, row_count, materialized_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, now())
-        ON CONFLICT (deployment_name, pipeline_name) DO UPDATE SET
-            status = EXCLUDED.status,
-            output_identity_json = EXCLUDED.output_identity_json,
-            columns_json = EXCLUDED.columns_json,
-            row_count = EXCLUDED.row_count,
-            materialized_at = now()
-        "#,
-    )
-    .bind(&dataset.deployment_name)
-    .bind(&dataset.pipeline_name)
-    .bind(&dataset.status)
-    .bind(&output_identity_json)
-    .bind(&columns_json)
-    .bind(dataset.row_count)
-    .execute(&mut *tx)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
-    for (ordinal, row) in rows.iter().enumerate() {
-        let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
-        sqlx::query(
-            r#"
-            INSERT INTO derived_rows (
-                deployment_name, pipeline_name, row_ordinal, row_json
-            ) VALUES ($1, $2, $3, $4)
-            "#,
-        )
-        .bind(&dataset.deployment_name)
-        .bind(&dataset.pipeline_name)
-        .bind(ordinal as i32)
-        .bind(&row_json)
-        .execute(&mut *tx)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-    }
-
-    tx.commit().await.map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.replace_derived_dataset(dataset, rows).await
 }
 
 /// List Derived Datasets ordered by deployment then Pipeline name.
 pub async fn list_derived_datasets(
     database_url: &str,
 ) -> Result<Vec<DerivedDataset>, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let rows = sqlx::query_as::<_, DerivedDatasetRow>(
-        r#"
-        SELECT deployment_name, pipeline_name, status,
-               output_identity_json, columns_json, row_count
-        FROM derived_datasets
-        ORDER BY deployment_name, pipeline_name
-        "#,
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    rows.into_iter()
-        .map(DerivedDatasetRow::into_derived_dataset)
-        .collect()
+    let store = PlatformStore::open(database_url).await?;
+    store.list_derived_datasets().await
 }
 
 /// Load Derived Dataset rows for one Pipeline.
@@ -1669,73 +2367,8 @@ pub async fn get_derived_rows(
     pipeline_name: &str,
     deployment_name: Option<&str>,
 ) -> Result<(DerivedDataset, Vec<DerivedRow>), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-
-    let dataset_row = if let Some(deployment) = deployment_name {
-        sqlx::query_as::<_, DerivedDatasetRow>(
-            r#"
-            SELECT deployment_name, pipeline_name, status,
-                   output_identity_json, columns_json, row_count
-            FROM derived_datasets
-            WHERE deployment_name = $1 AND pipeline_name = $2
-            "#,
-        )
-        .bind(deployment)
-        .bind(pipeline_name)
-        .fetch_optional(&pool)
-        .await
-        .map_err(PlatformStoreError::Load)?
-    } else {
-        let matches = sqlx::query_as::<_, DerivedDatasetRow>(
-            r#"
-            SELECT deployment_name, pipeline_name, status,
-                   output_identity_json, columns_json, row_count
-            FROM derived_datasets
-            WHERE pipeline_name = $1
-            ORDER BY deployment_name
-            "#,
-        )
-        .bind(pipeline_name)
-        .fetch_all(&pool)
-        .await
-        .map_err(PlatformStoreError::Load)?;
-        match matches.len() {
-            0 => None,
-            1 => matches.into_iter().next(),
-            _ => {
-                return Err(PlatformStoreError::NotFound(format!(
-                    "multiple Derived Datasets named {pipeline_name}; pass deployment to disambiguate"
-                )));
-            }
-        }
-    };
-
-    let dataset_row = dataset_row.ok_or_else(|| {
-        PlatformStoreError::NotFound(format!(
-            "no Derived Dataset found for Pipeline {pipeline_name}"
-        ))
-    })?;
-    let dataset = dataset_row.into_derived_dataset()?;
-
-    let row_dbs = sqlx::query_as::<_, DerivedRowDb>(
-        r#"
-        SELECT row_ordinal, row_json
-        FROM derived_rows
-        WHERE deployment_name = $1 AND pipeline_name = $2
-        ORDER BY row_ordinal
-        "#,
-    )
-    .bind(&dataset.deployment_name)
-    .bind(&dataset.pipeline_name)
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    let rows = row_dbs
-        .into_iter()
-        .map(DerivedRowDb::into_derived_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((dataset, rows))
+    let store = PlatformStore::open(database_url).await?;
+    store.get_derived_rows(pipeline_name, deployment_name).await
 }
 
 /// Persist Maintenance State JSON for a Transform Pipeline (distinct/addToSet).
@@ -1748,24 +2381,10 @@ pub async fn replace_maintenance_state(
     pipeline_name: &str,
     state_json: &str,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    sqlx::query(
-        r#"
-        INSERT INTO maintenance_states (
-            deployment_name, pipeline_name, state_json, updated_at
-        ) VALUES ($1, $2, $3, now())
-        ON CONFLICT (deployment_name, pipeline_name) DO UPDATE SET
-            state_json = EXCLUDED.state_json,
-            updated_at = now()
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .bind(state_json)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .replace_maintenance_state(deployment_name, pipeline_name, state_json)
+        .await
 }
 
 /// Load Maintenance State JSON for a Pipeline, if present.
@@ -1774,20 +2393,10 @@ pub async fn get_maintenance_state_json(
     deployment_name: &str,
     pipeline_name: &str,
 ) -> Result<Option<String>, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let row: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT state_json
-        FROM maintenance_states
-        WHERE deployment_name = $1 AND pipeline_name = $2
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .fetch_optional(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-    Ok(row.map(|(json,)| json))
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .get_maintenance_state_json(deployment_name, pipeline_name)
+        .await
 }
 
 /// Remove Maintenance State for a Pipeline (no-op when absent).
@@ -1796,19 +2405,10 @@ pub async fn delete_maintenance_state(
     deployment_name: &str,
     pipeline_name: &str,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    sqlx::query(
-        r#"
-        DELETE FROM maintenance_states
-        WHERE deployment_name = $1 AND pipeline_name = $2
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .delete_maintenance_state(deployment_name, pipeline_name)
+        .await
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1911,43 +2511,8 @@ pub async fn upsert_quarantined_change(
     database_url: &str,
     record: &QuarantinedChange,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let identity_json = serde_json::to_string(&record.output_identity)
-        .map_err(PlatformStoreError::InvalidJson)?;
-    sqlx::query(
-        r#"
-        INSERT INTO poison_quarantine (
-            deployment_name, pipeline_name, source_schema, source_table,
-            change_id, capture_position, output_identity_json, stage,
-            attempts, last_error, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11)
-        ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
-            source_schema = EXCLUDED.source_schema,
-            source_table = EXCLUDED.source_table,
-            capture_position = EXCLUDED.capture_position,
-            output_identity_json = EXCLUDED.output_identity_json,
-            stage = EXCLUDED.stage,
-            attempts = EXCLUDED.attempts,
-            last_error = EXCLUDED.last_error,
-            status = EXCLUDED.status,
-            quarantined_at = NOW()
-        "#,
-    )
-    .bind(&record.deployment_name)
-    .bind(&record.pipeline_name)
-    .bind(&record.source_schema)
-    .bind(&record.source_table)
-    .bind(&record.change_id)
-    .bind(record.capture_position)
-    .bind(identity_json)
-    .bind(&record.stage)
-    .bind(record.attempts)
-    .bind(&record.last_error)
-    .bind(&record.status)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.upsert_quarantined_change(record).await
 }
 
 /// List active (status=quarantined) Poison Change records, optionally scoped.
@@ -1955,28 +2520,8 @@ pub async fn list_quarantined_changes(
     database_url: &str,
     deployment_name: Option<&str>,
 ) -> Result<Vec<QuarantinedChange>, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    // Optional deployment filter: empty string means "all Deployments".
-    let deployment_filter = deployment_name.unwrap_or("");
-    let rows = sqlx::query_as::<_, QuarantinedChangeRow>(
-        r#"
-        SELECT deployment_name, pipeline_name, source_schema, source_table,
-               change_id, capture_position, output_identity_json::text AS output_identity_json,
-               stage, attempts, last_error, status
-        FROM poison_quarantine
-        WHERE status = 'quarantined'
-          AND ($1 = '' OR deployment_name = $1)
-        ORDER BY deployment_name, pipeline_name, quarantined_at, change_id
-        "#,
-    )
-    .bind(deployment_filter)
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    rows.into_iter()
-        .map(QuarantinedChangeRow::into_quarantined_change)
-        .collect()
+    let store = PlatformStore::open(database_url).await?;
+    store.list_quarantined_changes(deployment_name).await
 }
 
 /// Count active quarantines for one Pipeline (Operator-visible Delivery Health).
@@ -1985,22 +2530,10 @@ pub async fn count_active_quarantines(
     deployment_name: &str,
     pipeline_name: &str,
 ) -> Result<i64, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let count = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COUNT(*)::bigint
-        FROM poison_quarantine
-        WHERE deployment_name = $1
-          AND pipeline_name = $2
-          AND status = 'quarantined'
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .fetch_one(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-    Ok(count)
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .count_active_quarantines(deployment_name, pipeline_name)
+        .await
 }
 
 /// Durable Schema Change impact record (ADR-0009 / issue #23).
@@ -2054,36 +2587,8 @@ pub async fn upsert_schema_change_impact(
     database_url: &str,
     record: &SchemaChangeImpact,
 ) -> Result<(), PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    sqlx::query(
-        r#"
-        INSERT INTO schema_change_impacts (
-            deployment_name, pipeline_name, source_schema, source_table,
-            change_id, capture_position, ddl_summary, impact, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
-            source_schema = EXCLUDED.source_schema,
-            source_table = EXCLUDED.source_table,
-            capture_position = EXCLUDED.capture_position,
-            ddl_summary = EXCLUDED.ddl_summary,
-            impact = EXCLUDED.impact,
-            status = EXCLUDED.status,
-            warned_at = NOW()
-        "#,
-    )
-    .bind(&record.deployment_name)
-    .bind(&record.pipeline_name)
-    .bind(&record.source_schema)
-    .bind(&record.source_table)
-    .bind(&record.change_id)
-    .bind(record.capture_position)
-    .bind(&record.ddl_summary)
-    .bind(&record.impact)
-    .bind(&record.status)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-    Ok(())
+    let store = PlatformStore::open(database_url).await?;
+    store.upsert_schema_change_impact(record).await
 }
 
 /// List active Schema Change impacts, optionally scoped to one Deployment.
@@ -2091,24 +2596,8 @@ pub async fn list_schema_change_impacts(
     database_url: &str,
     deployment_name: Option<&str>,
 ) -> Result<Vec<SchemaChangeImpact>, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let deployment_filter = deployment_name.unwrap_or("");
-    let rows = sqlx::query_as::<_, SchemaChangeImpactRow>(
-        r#"
-        SELECT deployment_name, pipeline_name, source_schema, source_table,
-               change_id, capture_position, ddl_summary, impact, status
-        FROM schema_change_impacts
-        WHERE status = 'active'
-          AND ($1 = '' OR deployment_name = $1)
-        ORDER BY deployment_name, pipeline_name, warned_at, change_id
-        "#,
-    )
-    .bind(deployment_filter)
-    .fetch_all(&pool)
-    .await
-    .map_err(PlatformStoreError::Load)?;
-
-    Ok(rows.into_iter().map(SchemaChangeImpactRow::into_impact).collect())
+    let store = PlatformStore::open(database_url).await?;
+    store.list_schema_change_impacts(deployment_name).await
 }
 
 /// Clear active Schema Change impacts for one Pipeline (e.g. on Operator resume).
@@ -2117,22 +2606,10 @@ pub async fn clear_schema_change_impacts(
     deployment_name: &str,
     pipeline_name: &str,
 ) -> Result<u64, PlatformStoreError> {
-    let pool = connect(database_url).await?;
-    let result = sqlx::query(
-        r#"
-        UPDATE schema_change_impacts
-        SET status = 'cleared'
-        WHERE deployment_name = $1
-          AND pipeline_name = $2
-          AND status = 'active'
-        "#,
-    )
-    .bind(deployment_name)
-    .bind(pipeline_name)
-    .execute(&pool)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-    Ok(result.rows_affected())
+    let store = PlatformStore::open(database_url).await?;
+    store
+        .clear_schema_change_impacts(deployment_name, pipeline_name)
+        .await
 }
 
 #[cfg(test)]
@@ -2150,9 +2627,7 @@ mod tests {
         assert!(platform_store_url_requires_tls(
             "postgres://u:p@h:5432/db?connect_timeout=3&sslmode=verify-ca"
         ));
-        assert!(!platform_store_url_requires_tls(
-            "postgres://u:p@h:5432/db"
-        ));
+        assert!(!platform_store_url_requires_tls("postgres://u:p@h:5432/db"));
         assert!(!platform_store_url_requires_tls(
             "postgres://u:p@h:5432/db?sslmode=prefer"
         ));
