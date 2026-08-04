@@ -216,9 +216,6 @@ const SCHEMA_CHANGE_PAUSE_DEPLOYMENT: &str = "lab-schema-change-pause";
 const SOURCE_ALIGNMENT_ID: &str = "source-alignment";
 const SOURCE_ALIGNMENT_TABLE: &str = "LAB_SA_CUSTOMERS";
 const SOURCE_ALIGNMENT_COLLECTION: &str = "lab_sa_customers";
-// Pipeline id is declared on the recipe namespace; CLI align/status paths key by table.
-#[allow(dead_code)]
-const SOURCE_ALIGNMENT_PIPELINE: &str = "lab-sa-customers";
 const SOURCE_ALIGNMENT_DEPLOYMENT: &str = "lab-source-alignment";
 
 const DRIFT_CHECK_ID: &str = "drift-check";
@@ -576,7 +573,7 @@ async fn scenario_run(
 
     let lock = ScenarioLock::acquire(&lock_path, scenario)?;
     let started = Instant::now();
-    // Recipe-driven path: print recipe interface, run product-path or full adapter,
+    // Recipe-driven path: print recipe interface, run shared product-path hooks,
     // evaluate thresholds.
     let result = run_recipe_driven(&recipe, || async {
         if recipe.workload.product_path.is_some() {
