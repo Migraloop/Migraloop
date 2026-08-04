@@ -925,23 +925,13 @@ pub async fn run_incremental_sync(
         return Ok(SyncCycleOutcome::Idle);
     };
 
-    for deployment in &cycle.deployments {
-        let mut deployment_pipelines: Vec<_> = cycle
-            .pipelines
-            .iter()
-            .filter(|p| p.deployment_name == deployment.name)
-            .cloned()
-            .collect();
-        if deployment_pipelines.is_empty() {
+    for deployment_idx in 0..cycle.deployments.len() {
+        let deployment = cycle.deployments[deployment_idx].clone();
+        let Some((mut deployment_pipelines, tables)) =
+            pipelines_and_tables_for_deployment(&cycle, &deployment)
+        else {
             continue;
-        }
-
-        let mut tables = BTreeSet::new();
-        for pipeline in &deployment_pipelines {
-            for (schema, table) in pipeline_base_table_refs(pipeline) {
-                tables.insert((schema, table));
-            }
-        }
+        };
 
         // Factory path: Oracle-kind gate + v1 concrete adapters behind interfaces.
         let source_engine = if deployment.source.kind.eq_ignore_ascii_case("oracle") {
@@ -949,7 +939,7 @@ pub async fn run_incremental_sync(
         } else {
             None
         };
-        let target = target_engine_from_deployment(deployment)?;
+        let target = target_engine_from_deployment(&deployment)?;
         let Some(source) = source_engine.as_ref() else {
             if tables.is_empty() {
                 continue;
@@ -963,18 +953,12 @@ pub async fn run_incremental_sync(
 
         sync_deployment_incremental(
             store,
-            deployment,
+            &mut cycle,
+            &deployment,
             &mut deployment_pipelines,
             tables,
             source,
             &target,
-            cycle.fail_after,
-            cycle.max_poison_attempts,
-            cycle.queue_capacity,
-            cycle.downstream_delay,
-            cycle.quiet,
-            &mut cycle.applied_this_run,
-            &mut cycle.progressed,
         )
         .await?;
     }
@@ -999,38 +983,22 @@ pub async fn run_incremental_sync_with_engines<S: SourceEngine, T: TargetEngine>
         return Ok(SyncCycleOutcome::Idle);
     };
 
-    for deployment in &cycle.deployments {
-        let mut deployment_pipelines: Vec<_> = cycle
-            .pipelines
-            .iter()
-            .filter(|p| p.deployment_name == deployment.name)
-            .cloned()
-            .collect();
-        if deployment_pipelines.is_empty() {
+    for deployment_idx in 0..cycle.deployments.len() {
+        let deployment = cycle.deployments[deployment_idx].clone();
+        let Some((mut deployment_pipelines, tables)) =
+            pipelines_and_tables_for_deployment(&cycle, &deployment)
+        else {
             continue;
-        }
-
-        let mut tables = BTreeSet::new();
-        for pipeline in &deployment_pipelines {
-            for (schema, table) in pipeline_base_table_refs(pipeline) {
-                tables.insert((schema, table));
-            }
-        }
+        };
 
         sync_deployment_incremental(
             store,
-            deployment,
+            &mut cycle,
+            &deployment,
             &mut deployment_pipelines,
             tables,
             source,
             target,
-            cycle.fail_after,
-            cycle.max_poison_attempts,
-            cycle.queue_capacity,
-            cycle.downstream_delay,
-            cycle.quiet,
-            &mut cycle.applied_this_run,
-            &mut cycle.progressed,
         )
         .await?;
     }
@@ -1112,22 +1080,43 @@ fn finish_incremental_sync_cycle(
     })
 }
 
+fn pipelines_and_tables_for_deployment(
+    cycle: &IncrementalSyncCycle,
+    deployment: &migraloop_platform_store::Deployment,
+) -> Option<(Vec<Pipeline>, BTreeSet<(String, String)>)> {
+    let deployment_pipelines: Vec<_> = cycle
+        .pipelines
+        .iter()
+        .filter(|p| p.deployment_name == deployment.name)
+        .cloned()
+        .collect();
+    if deployment_pipelines.is_empty() {
+        return None;
+    }
+    let mut tables = BTreeSet::new();
+    for pipeline in &deployment_pipelines {
+        for (schema, table) in pipeline_base_table_refs(pipeline) {
+            tables.insert((schema, table));
+        }
+    }
+    Some((deployment_pipelines, tables))
+}
+
 /// One Deployment's Incremental Capture + Delivery against trait-bound engines.
 async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
     store: &PlatformStore,
+    cycle: &mut IncrementalSyncCycle,
     deployment: &migraloop_platform_store::Deployment,
     deployment_pipelines: &mut Vec<Pipeline>,
     tables: BTreeSet<(String, String)>,
     source: &S,
     target: &T,
-    fail_after: Option<u32>,
-    max_poison_attempts: u32,
-    queue_capacity: usize,
-    downstream_delay: bool,
-    quiet: bool,
-    applied_this_run: &mut u32,
-    progressed: &mut bool,
 ) -> Result<(), RuntimeError> {
+        let fail_after = cycle.fail_after;
+        let max_poison_attempts = cycle.max_poison_attempts;
+        let queue_capacity = cycle.queue_capacity;
+        let downstream_delay = cycle.downstream_delay;
+        let quiet = cycle.quiet;
         // ADR-0021: fail-fast Source Prerequisites before Incremental Capture.
         // Source engine is provided by factory wiring or injection (issue #169).
         let source_tables: Vec<String> = tables.iter().map(|(_, t)| t.clone()).collect();
@@ -1429,7 +1418,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                 lag,
                             )
                             .await?;
-                            *applied_this_run += 1;
+                            cycle.applied_this_run += 1;
                             println!(
                                 "Incremental Capture: Base Dataset {table} applied schema change_id={} \
                                  checkpoint={current_checkpoint} lag={lag}",
@@ -1714,7 +1703,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                             )
                             .await?;
 
-                            *applied_this_run += 1;
+                            cycle.applied_this_run += 1;
                             println!(
                                 "Incremental Capture: Base Dataset {table} applied change_id={} \
                                  checkpoint={current_checkpoint} lag={lag} rows={}",
@@ -1724,7 +1713,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                     }
 
                     if let Some(limit) = fail_after {
-                        if *applied_this_run >= limit {
+                        if cycle.applied_this_run >= limit {
                             let current_checkpoint = item.position().as_i64();
                             return Err(RuntimeError::Failed(format!(
                                 "simulated process kill after {limit} durable checkpoint(s) \
@@ -1745,7 +1734,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                     ))
                 })?;
                 windows_processed += 1;
-                *progressed = true;
+                cycle.progressed = true;
             }
         }
     Ok(())
