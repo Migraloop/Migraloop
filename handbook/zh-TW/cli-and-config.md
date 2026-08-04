@@ -10,7 +10,7 @@ migraloop <subcommand> [flags]
 
 由 `crates/app` 建置（`Dockerfile` release binary）。所有與 Platform Store 通訊的 Operator 子指令都接受 `--platform-store-url` 或下方環境變數。
 
-Operator 動詞（`apply`、`sync`、`run`、`status`、inspect、pause/resume/remove、align、drift）是薄的 clap/config/env adapter，接在 Deployment **runtime** 之上——Sync／Affect Analysis／Delivery orchestration 不由 CLI 模組擁有。要擴充 Source 或 Target engine 的 Developers，請依 [Developer 本機設定](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist) 的 checklist。
+Operator 動詞（`apply`、`sync`、`run`、`status`、inspect、pause/resume/remove、align、drift）是薄的 clap/config/env adapter，接在 Deployment **runtime** 之上——Sync／Affect Analysis／Delivery orchestration 不由 CLI 模組擁有。runtime 的 public surface 是這些 Operator verbs 加上 Source／Target factory entry points；Operator narrative formatting（例如 `status` labels）留在此 CLI adapter，continuous Sync／supervise 偏好於此開啟的 Platform Store session。要擴充 Source 或 Target engine 的 Developers，請依 [Developer 本機設定](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist) 的 checklist。
 
 ## Operator CLI 子指令
 

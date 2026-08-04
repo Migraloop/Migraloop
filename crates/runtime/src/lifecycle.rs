@@ -51,23 +51,6 @@ pub struct StatusInventory {
 ///
 /// Values: `paused` | `unhealthy` | `ok` | `pending` | `unknown`. Formatting of
 /// the full status line stays in the CLI adapter.
-pub fn pipeline_delivery_health(
-    pipeline: &Pipeline,
-    active_quarantines_for_pipeline: usize,
-) -> &'static str {
-    if pipeline.paused {
-        "paused"
-    } else if active_quarantines_for_pipeline > 0 {
-        "unhealthy"
-    } else {
-        match pipeline.delivery_status.as_str() {
-            "delivered" => "ok",
-            "pending" => "pending",
-            _ => "unknown",
-        }
-    }
-}
-
 /// Load Base Dataset rows for Operator `base` inspect (session verb).
 pub async fn inspect_base_rows(
     store: &PlatformStore,
@@ -1032,54 +1015,3 @@ fn normalize_json_for_drift(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::pipeline_delivery_health;
-    use migraloop_platform_store::Pipeline;
-
-    fn sample_pipeline(delivery_status: &str, paused: bool) -> Pipeline {
-        Pipeline {
-            deployment_name: "d".into(),
-            name: "p".into(),
-            mode: "direct".into(),
-            source_table: "T".into(),
-            source_schema: String::new(),
-            target_collection: "c".into(),
-            delivery_status: delivery_status.into(),
-            delivery_applied_changes: 0,
-            delivery_lag: 0,
-            paused,
-            description: String::new(),
-            field_mappings: std::collections::BTreeMap::new(),
-            output_identity: Vec::new(),
-            transform_json: None,
-            drift_status: "unknown".into(),
-            drift_checked_rows: 0,
-            drift_mismatched_rows: 0,
-        }
-    }
-
-    #[test]
-    fn delivery_health_labels_match_operator_status_contract() {
-        assert_eq!(
-            pipeline_delivery_health(&sample_pipeline("delivered", true), 0),
-            "paused"
-        );
-        assert_eq!(
-            pipeline_delivery_health(&sample_pipeline("delivered", false), 2),
-            "unhealthy"
-        );
-        assert_eq!(
-            pipeline_delivery_health(&sample_pipeline("delivered", false), 0),
-            "ok"
-        );
-        assert_eq!(
-            pipeline_delivery_health(&sample_pipeline("pending", false), 0),
-            "pending"
-        );
-        assert_eq!(
-            pipeline_delivery_health(&sample_pipeline("not_configured", false), 0),
-            "unknown"
-        );
-    }
-}

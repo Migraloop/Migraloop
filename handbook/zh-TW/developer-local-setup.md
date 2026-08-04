@@ -122,6 +122,7 @@ Recipe 慣例與短清單亦見 `lab/scenarios/README.md`。已出貨 capability
    - Source：`crates/capture` 的 `SourceEngine` / `IncrementalCaptureSession`（schema discovery、Initial Load chunks、Incremental Capture resume、prerequisites check、alignment reads、schema-change classification inputs）。
    - Target：`crates/delivery` 的 `TargetEngine`（依 Output Identity upsert Managed fields、依 identity delete、Drift Check／inspect 所需的 list/read helpers）。
    - 透過 Deployment runtime factory helpers（`source_engine_from_connection` / `target_engine_from_deployment`）接線。這些 factories 回傳 `SourceEngine`／`TargetEngine` interfaces（call site 不應出現具體 Oracle／Mongo types）。Runtime Sync／Delivery 必須繼續依賴 interfaces。
+   - Deployment runtime 的 public surface 僅限 Operator Deployment verbs（apply、Incremental Sync／supervise、Pipeline lifecycle、Source Alignment Check、Drift Check、status inventory、inspect）加上上述 factory entry points。不要從 `migraloop-runtime` 外部呼叫已 demote 的 internal helpers。Continuous Sync／supervise 偏好在 Operator edge 開啟的 Platform Store session。
    - 預設 Operator CLI `apply`／`run`／`sync` 仍經由上述 factories 建構 v1 Oracle LogMiner 與 MongoDB adapters。in-process seam 測試可用 injected engines（`run_incremental_sync_with_engines`）跑完整 Incremental Sync，讓 Fake adapters 走 production Sync path，且不依賴 Oracle-kind string gates。
    - Rich Transform／Affect Analysis 只讀 platform-managed Base/Derived data——絕不要把新 engine 當成 transform compute。
 2. **Prerequisites 與 handbook**

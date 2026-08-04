@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use lab::{run_lab, LabCommand};
+use migraloop_capture::OracleSourceConnect;
 use migraloop_delivery::ManagedFieldAs;
 use migraloop_platform_store::{
     check_store_settings, disk_warn_message, Deployment, Pipeline, PlatformStore,
     PlatformStoreHealth, SystemConnection,
 };
 use migraloop_runtime::{
-    format_output_identity, inspect_base_rows, inspect_derived_rows, inspect_target_documents,
-    oracle_source_connect, pipeline_delivery_health, status_inventory_from_url,
+    inspect_base_rows, inspect_derived_rows, inspect_target_documents, status_inventory_from_url,
 };
 use thiserror::Error;
 
@@ -361,6 +361,48 @@ fn format_system_line(label: &str, system: &SystemConnection) -> String {
         timezone,
         system.tls.display_summary()
     )
+}
+
+/// Operator-facing Output Identity label for `status` / quarantine narrative.
+fn format_output_identity(identity: &serde_json::Value) -> String {
+    match identity {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Operator-facing Delivery Health label for `status` narrative.
+fn pipeline_delivery_health(
+    pipeline: &Pipeline,
+    active_quarantines_for_pipeline: usize,
+) -> &'static str {
+    if pipeline.paused {
+        "paused"
+    } else if active_quarantines_for_pipeline > 0 {
+        "unhealthy"
+    } else {
+        match pipeline.delivery_status.as_str() {
+            "delivered" => "ok",
+            "pending" => "pending",
+            _ => "unknown",
+        }
+    }
+}
+
+fn oracle_source_connect(source: &SystemConnection) -> Result<OracleSourceConnect, CliError> {
+    if source.port <= 0 || source.port > u16::MAX as i32 {
+        return Err(CliError::Failed(
+            "source.port must be a valid TCP port".to_string(),
+        ));
+    }
+    Ok(OracleSourceConnect {
+        host: source.host.clone(),
+        port: source.port as u16,
+        database: source.database.clone(),
+        username: source.username.clone(),
+        tls: source.tls.clone(),
+    })
 }
 
 async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), CliError> {
@@ -899,9 +941,11 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             })?;
             // Continuous Incremental Capture + Delivery on the same single active
             // instance that serves Observability /metrics (issue #145 / ADR-0008).
-            let sync_url = platform_store_url.clone();
+            // Open the Platform Store session at the Operator edge; runtime supervise
+            // prefers that session handle over URL reopen (issue #172).
+            let sync_store = open_store(&platform_store_url).await?;
             tokio::spawn(async move {
-                migraloop_runtime::supervise_continuous_incremental_sync(sync_url).await;
+                migraloop_runtime::supervise_continuous_incremental_sync(sync_store).await;
             });
             observability::serve_prometheus_metrics(addr, platform_store_url).await
         }

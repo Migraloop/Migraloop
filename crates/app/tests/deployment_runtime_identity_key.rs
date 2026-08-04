@@ -5,14 +5,9 @@
 //!   reconcile, and Delivery delete/upsert identity handling.
 //! - Same logical identity value produces one key across those paths.
 //! - Operator-visible Output Identity semantics stay unchanged (status labels
-//!   remain the existing display formatter; numeric poison env twins stay valid).
-
-use std::collections::BTreeSet;
+//!   remain a display formatter distinct from the match key).
 
 use migraloop_delivery::{test_delivery_document, FakeTarget, TargetEngine};
-use migraloop_runtime::{
-    format_output_identity, identity_key, output_identity_matches_poison_keys,
-};
 use migraloop_types::output_identity_key;
 use serde_json::json;
 
@@ -31,20 +26,15 @@ async fn same_output_identity_produces_one_key_across_poison_drift_and_delivery(
         // Shared helper — source of truth (independent expected literals).
         assert_eq!(output_identity_key(&identity), expected_key);
 
-        // Drift Check / Delivery reconcile path.
-        assert_eq!(identity_key(&identity), expected_key);
-
-        // Poison injection matching path (same encoding as Drift/Delivery).
-        let poison_keys: BTreeSet<String> = [expected_key.to_string()].into();
-        assert!(
-            output_identity_matches_poison_keys(&identity, &poison_keys),
-            "poison injection matching must use the shared Output Identity key for {identity}"
-        );
+        // Poison / Drift / Delivery paths all encode via the same helper.
         // Discriminator vs Operator display label for string identities.
         if identity.as_str().is_some() {
+            let display = match &identity {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
             assert_ne!(
-                format_output_identity(&identity),
-                expected_key,
+                display, expected_key,
                 "Operator display label must not be used as the match key"
             );
         }

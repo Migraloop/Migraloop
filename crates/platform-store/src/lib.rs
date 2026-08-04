@@ -235,6 +235,10 @@ pub(crate) async fn connect(database_url: &str) -> Result<PgPool, PlatformStoreE
 ///
 /// Postgres remains the only store engine (ADR-0001). Open once per process flow and
 /// call session verbs instead of reconnecting on every table-shaped CRUD call.
+///
+/// [`Clone`] is cheap (shared [`PgPool`]) so Deployment runtime supervise can hand a
+/// session handle to panic-isolated continuous Sync workers without reopening by URL.
+#[derive(Clone)]
 pub struct PlatformStore {
     pool: PgPool,
 }
