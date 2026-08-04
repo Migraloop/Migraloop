@@ -10,6 +10,8 @@ migraloop <subcommand> [flags]
 
 由 `crates/app` 构建（`Dockerfile` release binary）。所有与 Platform Store 通信的 Operator 子命令都接受 `--platform-store-url` 或下方环境变量。
 
+Operator 动词（`apply`、`sync`、`run`、`status`、inspect、pause/resume/remove、align、drift）是薄的 clap/config/env adapter，接在 Deployment **runtime** 之上——Sync／Affect Analysis／Delivery orchestration 不由 CLI 模块拥有。要扩展 Source 或 Target engine 的 Developers，请依 [Developer 本地设置](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist) 的 checklist。
+
 ## Operator CLI 子命令
 
 `migraloop` Operator CLI 当前提供这些子命令：

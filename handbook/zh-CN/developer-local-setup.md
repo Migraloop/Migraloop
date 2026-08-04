@@ -18,7 +18,7 @@ cd Migraloop
 cargo build -p migraloop-app
 ```
 
-Workspace members：`crates/app`（binary `migraloop`）、`cli`、`capture`、`platform-store`、`transform`、`delivery`，以及 `ci/handbook`（Handbook guard）。
+Workspace members：`crates/app`（binary `migraloop`）、`cli`、`runtime`、`capture`、`platform-store`、`transform`、`delivery`、`types`，以及 `ci/handbook`（Handbook guard）。
 
 ## 以 compose 启动 Platform Store
 
@@ -113,6 +113,27 @@ Operator 面向细节见 [Deployment](deployment.md)。CLI-seam 覆盖：always-
 5. 在 `crates/app/tests` 新增**非 ignored** 的 contract-path CI twin（优先延伸既有 CLI／`migraloop-app` seams，走 contract/stub + Platform Store/Mongo）。更新 Lab↔CI 矩阵 `docs/rqg/CI_TWIN_COVERAGE.md`。**不要**为了「过 gate」而取消 ignore Lab Scenario／Fixture／live Oracle 测试，也**不要**新增会跑 Lab Scenario catalog 的 CI job。
 
 Recipe 惯例与短清单亦见 `lab/scenarios/README.md`。已出货 capability 的 Lab gaps：`lab/scenarios/COVERAGE.md`（亦由 `lab scenario list` 摘要）。同一批 capability 的 CI twin 行：`docs/rqg/CI_TWIN_COVERAGE.md`。
+
+### 新增 Source 或 Target engine（Developer checklist）
+
+新的 Source System 或 Target System kind 应接在稳定接口上。**不要**为了新 engine 重塑 Sync、Rich Transform、Delivery、Deployment runtime 或 Platform Store 概念——实现 seam、补齐 Operator prerequisites 文档，再完成 capability ladder（ADR-0024 / ADR-0025 / ADR-0028）。
+
+1. **实现 engine interface**
+   - Source：`crates/capture` 的 `SourceEngine` / `IncrementalCaptureSession`（schema discovery、Initial Load chunks、Incremental Capture resume、prerequisites check、alignment reads、schema-change classification inputs）。
+   - Target：`crates/delivery` 的 `TargetEngine`（按 Output Identity upsert Managed fields、按 identity delete、Drift Check／inspect 所需的 list/read helpers）。
+   - 通过 Deployment runtime factory helpers（`source_engine_from_connection` / `target_engine_from_deployment`）接线。Runtime 必须继续依赖 interfaces，而不是具体 engine types。
+   - Rich Transform／Affect Analysis 只读 platform-managed Base/Derived data——绝不要把新 engine 当成 transform compute。
+2. **Prerequisites 与 handbook**
+   - 在对应 Operator 章节（[Source System](source-system.md)／[Target System](target-system.md)）以**三个 locales**文档化 engine-specific Source Prerequisites／Required Privileges（或 Target Delivery grants）。
+   - prerequisites 未满足时在 apply/sync **fail fast**；默认不要自动改动客户 Source/Target 设置。
+3. **Lab Scenario**
+   - 在 `lab/scenarios/<id>/` 新增可选择的 Lab Scenario，在真实 product path 上演练新 engine（同上 recipe-driven runner checklist）。以 Lab-only bindings 做 Namespace isolation。
+4. **CI contract twin**
+   - 在 `crates/app/tests` 新增**非 ignored** 的 contract-path twin，并更新 `docs/rqg/CI_TWIN_COVERAGE.md`。优先 contract/stub + Platform Store/Mongo（或实现相同 interface 的 in-memory fake）——不要把 Lab catalog 当 CI。
+5. **Packaging guards**
+   - 保持 modular monorepo + 单一 `migraloop` binary（ADR-0024）。不要引入第二个 Platform Store engine（ADR-0001）。
+
+Seam 测试可用 in-memory `FakeSource`／`FakeTarget`；它们不是第二个 production engine。
 
 ## Release Quality Gate
 
@@ -228,3 +249,4 @@ cargo run -p handbook-guard -- check \
 - Operator 短路径：[从这里开始](start-here.md)
 - Compose 安装形态：[Deployment](deployment.md)
 - CLI surface：[CLI 与 Config 参考](cli-and-config.md)
+- Source／Target Operator contracts：[Source System](source-system.md)、[Target System](target-system.md)

@@ -100,5 +100,6 @@ Wire those accounts into Deployment config with secret references only (`fromEnv
 - Config shapes: [CLI & Config reference](cli-and-config.md)
 - Install defaults: [Deployment](deployment.md)
 - Local compose passwords: [Developer local setup](developer-local-setup.md)
+- Adding a Source/Target engine (Developer checklist): [Developer local setup](developer-local-setup.md#adding-a-source-or-target-engine-developer-checklist)
 - Oracle sync grants: [Source System](source-system.md#required-privileges)
 - MongoDB Delivery grants: [Target System](target-system.md#required-privileges-target)

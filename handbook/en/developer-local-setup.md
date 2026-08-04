@@ -18,7 +18,7 @@ cd Migraloop
 cargo build -p migraloop-app
 ```
 
-Workspace members: `crates/app` (binary `migraloop`), `cli`, `capture`, `platform-store`, `transform`, `delivery`, plus `ci/handbook` (Handbook guard).
+Workspace members: `crates/app` (binary `migraloop`), `cli`, `runtime`, `capture`, `platform-store`, `transform`, `delivery`, `types`, plus `ci/handbook` (Handbook guard).
 
 ## Platform Store via compose
 
@@ -113,6 +113,27 @@ Completeness ladder for a shipped first-class capability (ADR-0025 + ADR-0028): 
 5. Add a **non-ignored** contract-path CI twin under `crates/app/tests` (prefer extending existing CLI/`migraloop-app` seams on contract/stub + Platform Store/Mongo). Update the Lab↔CI matrix in `docs/rqg/CI_TWIN_COVERAGE.md`. Do **not** un-ignore Lab Scenario / Fixture / live Oracle tests to “satisfy” the gate, and do **not** add a CI job that runs the Lab Scenario catalog.
 
 Recipe conventions and a short checklist also live in `lab/scenarios/README.md`. Shipped-capability Lab gaps: `lab/scenarios/COVERAGE.md` (also summarized by `lab scenario list`). CI twin rows for the same capabilities: `docs/rqg/CI_TWIN_COVERAGE.md`.
+
+### Adding a Source or Target engine (Developer checklist)
+
+New Source System or Target System kinds plug in at stable interfaces. Do **not** reshape Sync, Rich Transform, Delivery, Deployment runtime, or Platform Store concepts for a new engine—implement the seam, document Operator prerequisites, then complete the capability ladder (ADR-0024 / ADR-0025 / ADR-0028).
+
+1. **Implement the engine interface**
+   - Source: `SourceEngine` / `IncrementalCaptureSession` in `crates/capture` (schema discovery, Initial Load chunks, Incremental Capture resume, prerequisites check, alignment reads, schema-change classification inputs).
+   - Target: `TargetEngine` in `crates/delivery` (upsert Managed fields by Output Identity, delete by identity, list/read helpers for Drift Check / inspect).
+   - Wire the adapter through Deployment runtime factory helpers (`source_engine_from_connection` / `target_engine_from_deployment`). Runtime must keep depending on the interfaces, not the concrete engine types.
+   - Keep Rich Transform / Affect Analysis on platform-managed Base/Derived data only—never use the new engine as transform compute.
+2. **Prerequisites and handbook**
+   - Document engine-specific Source Prerequisites / Required Privileges (or Target Delivery grants) in the matching Operator chapters ([Source System](source-system.md) / [Target System](target-system.md)) in **all three locales**.
+   - Fail fast at apply/sync when prerequisites are unmet; do not auto-mutate customer Source/Target settings by default.
+3. **Lab Scenario**
+   - Add a selectable Lab Scenario under `lab/scenarios/<id>/` that exercises the new engine on the real product path (same recipe-driven runner checklist above). Namespace-isolate Lab-only bindings.
+4. **CI contract twin**
+   - Add a **non-ignored** contract-path twin under `crates/app/tests` and update `docs/rqg/CI_TWIN_COVERAGE.md`. Prefer contract/stub + Platform Store/Mongo (or an in-memory fake that implements the same interface)—do not treat the Lab catalog as CI.
+5. **Packaging guards**
+   - Preserve the modular monorepo + single `migraloop` binary (ADR-0024). Do not introduce a second Platform Store engine (ADR-0001).
+
+In-memory `FakeSource` / `FakeTarget` adapters exist for seam tests; they are not a second production engine.
 
 ## Release Quality Gate
 
@@ -228,3 +249,4 @@ Locale trees under `handbook/en`, `handbook/zh-TW`, and `handbook/zh-CN` must st
 - Operator progressive path: [Start here](start-here.md)
 - Compose install shape: [Deployment](deployment.md)
 - CLI surface: [CLI & Config reference](cli-and-config.md)
+- Source / Target Operator contracts: [Source System](source-system.md), [Target System](target-system.md)

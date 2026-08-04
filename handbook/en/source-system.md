@@ -180,6 +180,10 @@ export ORACLE_PASSWORD=...
 cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocapture
 ```
 
+## Adding another Source engine (Developers)
+
+v1 ships Oracle LogMiner only. A new Source kind implements `SourceEngine` (plus prerequisites/docs, a Lab Scenario, and a CI contract twin) without reshaping Sync / Rich Transform / Delivery / runtime concepts—see [Developer local setup — Adding a Source or Target engine](developer-local-setup.md#adding-a-source-or-target-engine-developer-checklist).
+
 ## Related chapters
 
 - Pairing with Target: [Deployment](deployment.md)

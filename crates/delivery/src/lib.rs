@@ -27,10 +27,6 @@ pub use engine::{
     target_engine_delivery_roundtrip, test_delivery_document, FakeTarget, TargetEngine,
 };
 
-/// Expand-contract leftover alias — prefer [`TlsSettings`] on the apply path.
-#[deprecated(note = "use migraloop_types::TlsSettings — temporary expand-contract leftover")]
-pub type MongoTlsSettings = TlsSettings;
-
 /// Module seam marker retained by the single app binary.
 pub const SEAM: &str = "delivery";
 

@@ -123,6 +123,10 @@ v1 连接字符串以 `authSource=admin` 验证（见 Delivery URI 构建）。�
 
 Source allow-list 与 NUMBER/时间规则会影响 Managed 输出能出现什么—见 [Source System](source-system.md)。不安全的 NUMBER 字段必须先用 Pipeline `fields` 映射，`apply` 才会成功。
 
+## 新增另一个 Target engine（Developers）
+
+v1 仅出货 MongoDB document Delivery。新的 Target kind 实现 `TargetEngine`（外加 Delivery grants／文档、Lab Scenario，以及 CI contract twin），且不重塑 Sync／Rich Transform／Delivery／runtime 概念——见 [Developer 本地设置 — 新增 Source 或 Target engine](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist)。
+
 ## 相关章节
 
 - Deployment 配对：[Deployment](deployment.md)

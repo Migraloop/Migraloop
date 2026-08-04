@@ -53,10 +53,6 @@ pub enum PlatformStoreError {
 // a single import surface while enums stop drifting across crates.
 pub use migraloop_types::{ManagedFieldAs, SecretRef, SecretRefKind, TlsSettings};
 
-/// Expand-contract leftover alias — prefer [`ManagedFieldAs`] on the apply path.
-#[deprecated(note = "use ManagedFieldAs — temporary expand-contract leftover")]
-pub type FieldMappingAs = ManagedFieldAs;
-
 /// Parse a persisted secret-ref kind, mapping unknown values into store Load errors.
 pub fn parse_secret_ref_kind(value: &str) -> Result<SecretRefKind, PlatformStoreError> {
     SecretRefKind::parse(value)
@@ -1779,13 +1775,6 @@ pub struct IncrementalSyncLock {
     _conn: PoolConnection<Postgres>,
 }
 
-/// Acquire the Incremental Capture single-writer lock (blocks until available).
-pub async fn acquire_incremental_sync_lock(
-    database_url: &str,
-) -> Result<IncrementalSyncLock, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.acquire_incremental_sync_lock().await
-}
 
 /// True when the Platform Store URL explicitly requests TLS (no cleartext fallback).
 pub fn platform_store_url_requires_tls(database_url: &str) -> bool {
@@ -1830,16 +1819,11 @@ pub fn latest_migration_version() -> i64 {
         .unwrap_or(0)
 }
 
-/// Apply versioned Platform Store schema migrations.
-pub async fn migrate(database_url: &str) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.migrate().await
-}
 
 /// Apply only migrations with version `<= through_version` (inclusive).
 ///
 /// Upgrade-smoke / CI helper for seeding a prior-release Platform Store schema.
-/// Production operators use [`migrate`] (or `migraloop run` / `migraloop migrate`),
+/// Production operators use `PlatformStore::migrate` (or `migraloop run` / `migraloop migrate`),
 /// which always applies every pending migration.
 #[doc(hidden)]
 pub async fn migrate_through(
@@ -1850,36 +1834,8 @@ pub async fn migrate_through(
     store.migrate_through(through_version).await
 }
 
-/// Check whether the Platform Store is reachable and migrated.
-pub async fn health(database_url: &str) -> PlatformStoreHealth {
-    match PlatformStore::open(database_url).await {
-        Ok(store) => store.health().await,
-        Err(err) => PlatformStoreHealth::Unreachable {
-            reason: err.to_string(),
-        },
-    }
-}
 
-/// Delete a Deployment and cascaded Platform Store state (Pipelines, Bases, Derived).
-///
-/// Idempotent: missing Deployments are a no-op success so Lab Namespace cleanup
-/// and re-run wipe can call this unconditionally.
-pub async fn delete_deployment(
-    database_url: &str,
-    deployment_name: &str,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.delete_deployment(deployment_name).await
-}
 
-/// Create or update a Deployment. Secrets are stored only as references.
-pub async fn upsert_deployment(
-    database_url: &str,
-    deployment: &Deployment,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.upsert_deployment(deployment).await
-}
 
 fn tls_settings_to_json(tls: &TlsSettings) -> Result<String, PlatformStoreError> {
     serde_json::to_string(tls).map_err(PlatformStoreError::InvalidJson)
@@ -1892,185 +1848,19 @@ fn tls_settings_from_json(raw: &str) -> Result<TlsSettings, PlatformStoreError> 
     serde_json::from_str(raw).map_err(PlatformStoreError::InvalidJson)
 }
 
-/// Replace all Pipelines for a Deployment with the provided set.
-pub async fn replace_pipelines(
-    database_url: &str,
-    deployment_name: &str,
-    pipelines: &[Pipeline],
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.replace_pipelines(deployment_name, pipelines).await
-}
 
-/// Persist a Base Dataset snapshot (metadata + full supported-type rows).
-pub async fn replace_base_dataset(
-    database_url: &str,
-    dataset: &BaseDataset,
-    rows: &[serde_json::Map<String, serde_json::Value>],
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.replace_base_dataset(dataset, rows).await
-}
 
-/// Append one Initial Load chunk into an existing (or new) Base Dataset.
-///
-/// Does **not** delete prior rows — used for chunked / pausable Initial Load
-/// (issue #124). `dataset.row_count` must be the new total after this chunk.
-/// `start_ordinal` is the first `row_ordinal` for the appended rows.
-pub async fn append_base_dataset_chunk(
-    database_url: &str,
-    dataset: &BaseDataset,
-    rows: &[serde_json::Map<String, serde_json::Value>],
-    start_ordinal: i32,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .append_base_dataset_chunk(dataset, rows, start_ordinal)
-        .await
-}
 
-/// List applied Deployments ordered by name.
-pub async fn list_deployments(database_url: &str) -> Result<Vec<Deployment>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.list_deployments().await
-}
 
-/// List Pipelines for all Deployments, ordered by deployment then name.
-pub async fn list_pipelines(database_url: &str) -> Result<Vec<Pipeline>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.list_pipelines().await
-}
 
-/// Set durable Operator pause for one Pipeline (ADR-0007 / issue #19).
-pub async fn set_pipeline_paused(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-    paused: bool,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .set_pipeline_paused(deployment_name, pipeline_name, paused)
-        .await
-}
 
-/// Delete one Pipeline (Derived Dataset CASCADE). Deployment and shared Bases stay
-/// until callers prune unreferenced Bases (ADR-0007 / issue #20).
-pub async fn delete_pipeline(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.delete_pipeline(deployment_name, pipeline_name).await
-}
 
-/// Update Delivery status for one Pipeline.
-pub async fn update_pipeline_delivery_status(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-    delivery_status: &str,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .update_pipeline_delivery_status(deployment_name, pipeline_name, delivery_status)
-        .await
-}
 
-/// Persist Drift Check status for one Pipeline (issue #25).
-pub async fn update_pipeline_drift_status(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-    drift_status: &str,
-    drift_checked_rows: i32,
-    drift_mismatched_rows: i32,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .update_pipeline_drift_status(
-            deployment_name,
-            pipeline_name,
-            drift_status,
-            drift_checked_rows,
-            drift_mismatched_rows,
-        )
-        .await
-}
 
-/// Update Delivery status and optionally accumulate applied Output Identity changes.
-pub async fn update_pipeline_delivery_progress(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-    delivery_status: &str,
-    additional_applied_changes: Option<i32>,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .update_pipeline_delivery_progress(
-            deployment_name,
-            pipeline_name,
-            delivery_status,
-            additional_applied_changes,
-        )
-        .await
-}
 
-/// Persist Delivery Health lag (remaining pending Delivery work; ADR-0020 / issue #26).
-pub async fn update_pipeline_delivery_lag(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-    delivery_lag: i32,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .update_pipeline_delivery_lag(deployment_name, pipeline_name, delivery_lag)
-        .await
-}
 
-/// Update Delivery status, optional applied-count delta, and optional Delivery lag.
-pub async fn update_pipeline_delivery_progress_with_lag(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-    delivery_status: &str,
-    additional_applied_changes: Option<i32>,
-    delivery_lag: Option<i32>,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .update_pipeline_delivery_progress_with_lag(
-            deployment_name,
-            pipeline_name,
-            delivery_status,
-            additional_applied_changes,
-            delivery_lag,
-        )
-        .await
-}
 
-/// List Base Datasets for all Deployments.
-pub async fn list_base_datasets(
-    database_url: &str,
-) -> Result<Vec<BaseDataset>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.list_base_datasets().await
-}
 
-/// Load Base Dataset rows for a Source table (operator-facing inspect).
-///
-/// When `deployment_name` is `None`, exactly one matching Base Dataset must exist.
-pub async fn get_base_rows(
-    database_url: &str,
-    table: &str,
-    deployment_name: Option<&str>,
-) -> Result<(BaseDataset, Vec<BaseRow>), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.get_base_rows(table, deployment_name).await
-}
 
 #[derive(Debug, sqlx::FromRow)]
 struct DeploymentRow {
@@ -2205,44 +1995,8 @@ struct BaseDatasetRow {
     initial_load_cursor_json: Option<String>,
 }
 
-/// Delete Base Datasets (and rows) for a Deployment whose tables are not in `keep_tables`.
-pub async fn delete_base_datasets_not_in(
-    database_url: &str,
-    deployment_name: &str,
-    keep_tables: &[(String, String)],
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .delete_base_datasets_not_in(deployment_name, keep_tables)
-        .await
-}
 
-/// Whether a Base Dataset already exists for the given Deployment table.
-pub async fn base_dataset_exists(
-    database_url: &str,
-    deployment_name: &str,
-    source_schema: &str,
-    source_table: &str,
-) -> Result<bool, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .base_dataset_exists(deployment_name, source_schema, source_table)
-        .await
-}
 
-/// Backfill Output Identity source primary-key metadata without reloading Base rows.
-pub async fn update_base_primary_key(
-    database_url: &str,
-    deployment_name: &str,
-    source_schema: &str,
-    source_table: &str,
-    primary_key: &[String],
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .update_base_primary_key(deployment_name, source_schema, source_table, primary_key)
-        .await
-}
 
 impl BaseDatasetRow {
     fn into_base_dataset(self) -> Result<BaseDataset, PlatformStoreError> {
@@ -2276,53 +2030,8 @@ impl BaseDatasetRow {
     }
 }
 
-/// List applied source change ids at or after `from_position` for resume-safe
-/// same-SCN Incremental windows (issue #143).
-pub async fn list_applied_change_ids_from_position(
-    database_url: &str,
-    deployment_name: &str,
-    source_schema: &str,
-    source_table: &str,
-    from_position: i64,
-) -> Result<Vec<String>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .list_applied_change_ids_from_position(
-            deployment_name,
-            source_schema,
-            source_table,
-            from_position,
-        )
-        .await
-}
 
-/// Filter `change_ids` down to those not yet applied into this Base Dataset.
-pub async fn filter_unapplied_change_ids(
-    database_url: &str,
-    deployment_name: &str,
-    source_schema: &str,
-    source_table: &str,
-    change_ids: &[String],
-) -> Result<Vec<String>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .filter_unapplied_change_ids(deployment_name, source_schema, source_table, change_ids)
-        .await
-}
 
-/// Record applied source change ids for cutover/replay dedupe.
-pub async fn record_applied_source_changes(
-    database_url: &str,
-    deployment_name: &str,
-    source_schema: &str,
-    source_table: &str,
-    changes: &[(String, i64)],
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .record_applied_source_changes(deployment_name, source_schema, source_table, changes)
-        .await
-}
 
 #[derive(Debug, sqlx::FromRow)]
 struct BaseRowDb {
@@ -2344,74 +2053,11 @@ impl BaseRowDb {
     }
 }
 
-/// Persist a Derived Dataset snapshot (metadata + rows) for a Transform Pipeline.
-pub async fn replace_derived_dataset(
-    database_url: &str,
-    dataset: &DerivedDataset,
-    rows: &[serde_json::Map<String, serde_json::Value>],
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.replace_derived_dataset(dataset, rows).await
-}
 
-/// List Derived Datasets ordered by deployment then Pipeline name.
-pub async fn list_derived_datasets(
-    database_url: &str,
-) -> Result<Vec<DerivedDataset>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.list_derived_datasets().await
-}
 
-/// Load Derived Dataset rows for one Pipeline.
-pub async fn get_derived_rows(
-    database_url: &str,
-    pipeline_name: &str,
-    deployment_name: Option<&str>,
-) -> Result<(DerivedDataset, Vec<DerivedRow>), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.get_derived_rows(pipeline_name, deployment_name).await
-}
 
-/// Persist opaque Maintenance State JSON for a Transform Pipeline.
-///
-/// The blob is produced by the transform Affect Analysis interface; the store does
-/// not interpret its contents. Pipelines that do not require Maintenance State should
-/// call [`delete_maintenance_state`] instead.
-pub async fn replace_maintenance_state(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-    state_json: &str,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .replace_maintenance_state(deployment_name, pipeline_name, state_json)
-        .await
-}
 
-/// Load Maintenance State JSON for a Pipeline, if present.
-pub async fn get_maintenance_state_json(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-) -> Result<Option<String>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .get_maintenance_state_json(deployment_name, pipeline_name)
-        .await
-}
 
-/// Remove Maintenance State for a Pipeline (no-op when absent).
-pub async fn delete_maintenance_state(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .delete_maintenance_state(deployment_name, pipeline_name)
-        .await
-}
 
 #[derive(Debug, sqlx::FromRow)]
 struct DerivedDatasetRow {
@@ -2508,35 +2154,8 @@ impl QuarantinedChangeRow {
     }
 }
 
-/// Persist or refresh a Poison Change quarantine (ADR-0015).
-pub async fn upsert_quarantined_change(
-    database_url: &str,
-    record: &QuarantinedChange,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.upsert_quarantined_change(record).await
-}
 
-/// List active (status=quarantined) Poison Change records, optionally scoped.
-pub async fn list_quarantined_changes(
-    database_url: &str,
-    deployment_name: Option<&str>,
-) -> Result<Vec<QuarantinedChange>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.list_quarantined_changes(deployment_name).await
-}
 
-/// Count active quarantines for one Pipeline (Operator-visible Delivery Health).
-pub async fn count_active_quarantines(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-) -> Result<i64, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .count_active_quarantines(deployment_name, pipeline_name)
-        .await
-}
 
 /// Durable Schema Change impact record (ADR-0009 / issue #23).
 ///
@@ -2584,35 +2203,8 @@ impl SchemaChangeImpactRow {
     }
 }
 
-/// Persist or refresh a Schema Change impact (ADR-0009).
-pub async fn upsert_schema_change_impact(
-    database_url: &str,
-    record: &SchemaChangeImpact,
-) -> Result<(), PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.upsert_schema_change_impact(record).await
-}
 
-/// List active Schema Change impacts, optionally scoped to one Deployment.
-pub async fn list_schema_change_impacts(
-    database_url: &str,
-    deployment_name: Option<&str>,
-) -> Result<Vec<SchemaChangeImpact>, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store.list_schema_change_impacts(deployment_name).await
-}
 
-/// Clear active Schema Change impacts for one Pipeline (e.g. on Operator resume).
-pub async fn clear_schema_change_impacts(
-    database_url: &str,
-    deployment_name: &str,
-    pipeline_name: &str,
-) -> Result<u64, PlatformStoreError> {
-    let store = PlatformStore::open(database_url).await?;
-    store
-        .clear_schema_change_impacts(deployment_name, pipeline_name)
-        .await
-}
 
 #[cfg(test)]
 mod tests {

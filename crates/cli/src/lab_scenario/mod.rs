@@ -34,7 +34,7 @@ use crate::lab::{
     LAB_PLATFORM_STORE_URL,
 };
 use crate::CliError;
-use migraloop_platform_store::{delete_deployment, update_pipeline_delivery_status};
+use migraloop_platform_store::PlatformStore;
 
 use self::recipe::{load_selectable_catalog, load_selectable_recipes, ScenarioRecipe};
 use self::runner::{
@@ -44,6 +44,39 @@ use self::runner::{
 
 
 const LOCK_FILE_NAME: &str = ".migraloop-scenario.lock";
+
+/// Lab Namespace cleanup via Platform Store session (not the expand-era URL free fn).
+async fn lab_delete_deployment(deployment_name: &str) -> Result<(), PlatformStoreErrorMapped> {
+    let store = PlatformStore::open(LAB_PLATFORM_STORE_URL)
+        .await
+        .map_err(|err| PlatformStoreErrorMapped(err.to_string()))?;
+    store
+        .delete_deployment(deployment_name)
+        .await
+        .map_err(|err| PlatformStoreErrorMapped(err.to_string()))
+}
+
+async fn lab_update_pipeline_delivery_status(
+    deployment_name: &str,
+    pipeline_name: &str,
+    delivery_status: &str,
+) -> Result<(), PlatformStoreErrorMapped> {
+    let store = PlatformStore::open(LAB_PLATFORM_STORE_URL)
+        .await
+        .map_err(|err| PlatformStoreErrorMapped(err.to_string()))?;
+    store
+        .update_pipeline_delivery_status(deployment_name, pipeline_name, delivery_status)
+        .await
+        .map_err(|err| PlatformStoreErrorMapped(err.to_string()))
+}
+
+struct PlatformStoreErrorMapped(String);
+
+impl std::fmt::Display for PlatformStoreErrorMapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 const DIRECT_PIPELINE_ID: &str = "direct-pipeline";
 const DIRECT_PIPELINE_TABLE: &str = "LAB_DP_CUSTOMERS";
@@ -1489,7 +1522,7 @@ EXIT;\n"
         })?;
     }
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, TRANSFORM_PIPELINE_DEPLOYMENT)
+    lab_delete_deployment(TRANSFORM_PIPELINE_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -1753,7 +1786,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, RT_PROJECT_DEPLOYMENT)
+    lab_delete_deployment(RT_PROJECT_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -1990,7 +2023,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, RT_FILTER_DEPLOYMENT)
+    lab_delete_deployment(RT_FILTER_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -2239,7 +2272,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, RT_FIELD_OPS_DEPLOYMENT)
+    lab_delete_deployment(RT_FIELD_OPS_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -2497,7 +2530,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, RT_EQUILOOKUP_DEPLOYMENT)
+    lab_delete_deployment(RT_EQUILOOKUP_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -2757,7 +2790,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, RT_UNION_DEPLOYMENT)
+    lab_delete_deployment(RT_UNION_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -3021,7 +3054,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, RT_UNWIND_DEPLOYMENT)
+    lab_delete_deployment(RT_UNWIND_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -3317,7 +3350,7 @@ EXIT;\n"
         })?;
     }
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, RT_DISTINCT_ADDTOSET_DEPLOYMENT)
+    lab_delete_deployment(RT_DISTINCT_ADDTOSET_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -3691,7 +3724,7 @@ EXIT;\n"
         })?;
     }
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT)
+    lab_delete_deployment(CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -3996,7 +4029,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, BULK_LOAD_DEPLOYMENT)
+    lab_delete_deployment(BULK_LOAD_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -4137,7 +4170,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, DIRECT_PIPELINE_DEPLOYMENT)
+    lab_delete_deployment(DIRECT_PIPELINE_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -4295,9 +4328,7 @@ collection={IDEMPOTENT_REDELIVERY_COLLECTION} deployment={IDEMPOTENT_REDELIVERY_
     println!(
         "Lab Scenario: resetting Pipeline Delivery status to force duplicate-safe re-Delivery..."
     );
-    update_pipeline_delivery_status(
-        LAB_PLATFORM_STORE_URL,
-        IDEMPOTENT_REDELIVERY_DEPLOYMENT,
+    lab_update_pipeline_delivery_status(IDEMPOTENT_REDELIVERY_DEPLOYMENT,
         IDEMPOTENT_REDELIVERY_PIPELINE,
         "pending",
     )
@@ -4677,7 +4708,7 @@ db.getCollection('{PAUSE_RESUME_ORDERS_COLLECTION}').drop();"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, PAUSE_RESUME_DEPLOYMENT)
+    lab_delete_deployment(PAUSE_RESUME_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -4934,7 +4965,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, POISON_QUARANTINE_DEPLOYMENT)
+    lab_delete_deployment(POISON_QUARANTINE_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -5420,7 +5451,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, INITIAL_LOAD_THROTTLED_DEPLOYMENT)
+    lab_delete_deployment(INITIAL_LOAD_THROTTLED_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -5494,7 +5525,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, BOUNDED_BACKPRESSURE_DEPLOYMENT)
+    lab_delete_deployment(BOUNDED_BACKPRESSURE_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -5814,7 +5845,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, OBSERVABILITY_SURFACE_DEPLOYMENT)
+    lab_delete_deployment(OBSERVABILITY_SURFACE_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -6052,7 +6083,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, PLATFORM_STORE_GUARDRAILS_DEPLOYMENT)
+    lab_delete_deployment(PLATFORM_STORE_GUARDRAILS_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -6288,10 +6319,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(
-        LAB_PLATFORM_STORE_URL,
-        BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT,
-    )
+    lab_delete_deployment(BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT)
     .await
     .map_err(|err| {
         CliError::Failed(format!(
@@ -6669,7 +6697,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, SCHEMA_CHANGE_PAUSE_DEPLOYMENT)
+    lab_delete_deployment(SCHEMA_CHANGE_PAUSE_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -6965,7 +6993,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, SOURCE_ALIGNMENT_DEPLOYMENT)
+    lab_delete_deployment(SOURCE_ALIGNMENT_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -7229,7 +7257,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, DRIFT_CHECK_DEPLOYMENT)
+    lab_delete_deployment(DRIFT_CHECK_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -7623,7 +7651,7 @@ db.getCollection('{REMOVE_PIPELINE_REPORTING_COLLECTION}').drop();"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, REMOVE_PIPELINE_DEPLOYMENT)
+    lab_delete_deployment(REMOVE_PIPELINE_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -7720,7 +7748,7 @@ EXIT;\n"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, IDEMPOTENT_REDELIVERY_DEPLOYMENT)
+    lab_delete_deployment(IDEMPOTENT_REDELIVERY_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(
@@ -8315,7 +8343,7 @@ db.getCollection('{CHANGE_PIPELINE_REPORTING_COLLECTION}').drop();"
         ))
     })?;
 
-    delete_deployment(LAB_PLATFORM_STORE_URL, CHANGE_PIPELINE_DEPLOYMENT)
+    lab_delete_deployment(CHANGE_PIPELINE_DEPLOYMENT)
         .await
         .map_err(|err| {
             CliError::Failed(format!(

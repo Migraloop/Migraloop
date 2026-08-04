@@ -1,87 +1,16 @@
 //! Observability Surface (ADR-0008 / issue #27): structured operator logs and
 //! Prometheus metrics scraped from durable Platform Store health state.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use migraloop_platform_store::probe_store_resources;
 use migraloop_runtime::status_inventory_from_url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::CliError;
 
-/// Emit one structured JSON operator event line (stdout).
-///
-/// Human-readable companion lines stay elsewhere; this is the machine-parseable
-/// Observability Surface contract for key operator events.
-pub fn emit_event(event: &str, fields: &[(&str, EventValue)]) {
-    let mut map = BTreeMap::new();
-    map.insert("event".to_string(), EventValue::Str(event.to_string()));
-    for (k, v) in fields {
-        map.insert((*k).to_string(), v.clone());
-    }
-    match serde_json::to_string(&map) {
-        Ok(json) => println!("{json}"),
-        Err(err) => eprintln!("structured log encode failed for event={event}: {err}"),
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum EventValue {
-    Str(String),
-    Int(i64),
-    Bool(bool),
-}
-
-impl serde::Serialize for EventValue {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            EventValue::Str(s) => serializer.serialize_str(s),
-            EventValue::Int(n) => serializer.serialize_i64(*n),
-            EventValue::Bool(b) => serializer.serialize_bool(*b),
-        }
-    }
-}
-
-impl From<&str> for EventValue {
-    fn from(value: &str) -> Self {
-        EventValue::Str(value.to_string())
-    }
-}
-
-impl From<String> for EventValue {
-    fn from(value: String) -> Self {
-        EventValue::Str(value)
-    }
-}
-
-impl From<i64> for EventValue {
-    fn from(value: i64) -> Self {
-        EventValue::Int(value)
-    }
-}
-
-impl From<i32> for EventValue {
-    fn from(value: i32) -> Self {
-        EventValue::Int(i64::from(value))
-    }
-}
-
-impl From<usize> for EventValue {
-    fn from(value: usize) -> Self {
-        EventValue::Int(value as i64)
-    }
-}
-
-impl From<bool> for EventValue {
-    fn from(value: bool) -> Self {
-        EventValue::Bool(value)
-    }
-}
+// Re-export runtime Observability helpers so CLI adapters share one event shape.
+pub use migraloop_runtime::{emit_event, EventValue};
 
 /// Serve Prometheus text exposition at `GET /metrics` until the process ends.
 pub async fn serve_prometheus_metrics(
@@ -266,14 +195,11 @@ async fn render_prometheus_metrics(platform_store_url: &str) -> Result<String, S
     out.push_str(&format!("migraloop_failures {failures}\n"));
 
     // Platform Store resource signals (ADR-0010): warn-only disk threshold.
-    let resources = probe_store_resources(platform_store_url)
-        .await
-        .map_err(|err| err.to_string())?;
     out.push_str(
         "# HELP migraloop_platform_store_disk_free_bytes Free bytes on the Platform Store data volume when known (-1 if unknown).\n",
     );
     out.push_str("# TYPE migraloop_platform_store_disk_free_bytes gauge\n");
-    let free_metric = resources
+    let free_metric = inventory
         .free_disk_bytes
         .map(|b| b as i64)
         .unwrap_or(-1);
@@ -286,7 +212,7 @@ async fn render_prometheus_metrics(platform_store_url: &str) -> Result<String, S
     out.push_str("# TYPE migraloop_platform_store_disk_warn gauge\n");
     out.push_str(&format!(
         "migraloop_platform_store_disk_warn {}\n",
-        if resources.disk_warn { 1 } else { 0 }
+        if inventory.disk_warn { 1 } else { 0 }
     ));
 
     Ok(out)

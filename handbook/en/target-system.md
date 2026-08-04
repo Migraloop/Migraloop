@@ -123,6 +123,10 @@ Connection strings in v1 authenticate with `authSource=admin` (see Delivery URI 
 
 Source allow-list and NUMBER/temporal rules affect what can appear in Managed output—see [Source System](source-system.md). Unsafe NUMBER columns must be mapped with Pipeline `fields` before apply succeeds.
 
+## Adding another Target engine (Developers)
+
+v1 ships MongoDB document Delivery only. A new Target kind implements `TargetEngine` (plus Delivery grants/docs, a Lab Scenario, and a CI contract twin) without reshaping Sync / Rich Transform / Delivery / runtime concepts—see [Developer local setup — Adding a Source or Target engine](developer-local-setup.md#adding-a-source-or-target-engine-developer-checklist).
+
 ## Related chapters
 
 - Deployment pairing: [Deployment](deployment.md)

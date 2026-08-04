@@ -180,6 +180,10 @@ export ORACLE_PASSWORD=...
 cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocapture
 ```
 
+## 新增另一个 Source engine（Developers）
+
+v1 仅出货 Oracle LogMiner。新的 Source kind 实现 `SourceEngine`（外加 prerequisites／文档、Lab Scenario，以及 CI contract twin），且不重塑 Sync／Rich Transform／Delivery／runtime 概念——见 [Developer 本地设置 — 新增 Source 或 Target engine](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist)。
+
 ## 相关章节
 
 - 与 Target 配对：[Deployment](deployment.md)

@@ -10,15 +10,15 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use lab::{run_lab, LabCommand};
-use migraloop_delivery::{ManagedFieldAs, TargetEngine};
+use migraloop_delivery::ManagedFieldAs;
 use migraloop_platform_store::{
-    check_store_settings, disk_warn_message, get_base_rows, get_derived_rows, list_deployments,
-    list_pipelines, probe_store_resources, Deployment, Pipeline, PlatformStore,
+    check_store_settings, disk_warn_message, Deployment, Pipeline, PlatformStore,
     PlatformStoreHealth, SystemConnection,
 };
 use migraloop_runtime::{
-    ensure_store_session_healthy, format_output_identity, mongo_target_from_deployment,
-    oracle_source_connect, status_inventory_from_url,
+    format_output_identity, incremental_capture_mechanism_label, inspect_base_rows,
+    inspect_derived_rows, inspect_target_documents, pipeline_delivery_health,
+    status_inventory_from_url,
 };
 use thiserror::Error;
 
@@ -218,7 +218,9 @@ async fn apply_migrations(platform_store_url: &str) -> Result<(), CliError> {
 
 /// Surface free-disk warn threshold (warn only — never pauses Pipelines).
 async fn report_store_resource_warnings(platform_store_url: &str) -> Result<(), CliError> {
-    let resources = probe_store_resources(platform_store_url)
+    let store = open_store(platform_store_url).await?;
+    let resources = store
+        .probe_resources()
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     if let (true, Some(free)) = (resources.disk_warn, resources.free_disk_bytes) {
@@ -374,18 +376,8 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .map_err(|err| CliError::Failed(err.to_string()))
 }
 
-async fn ensure_store_healthy(platform_store_url: &str) -> Result<(), CliError> {
-    let store = PlatformStore::open(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    ensure_store_session_healthy(&store).await?;
-    Ok(())
-}
-
 async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
-    let store = PlatformStore::open(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let store = open_store(platform_store_url).await?;
     migraloop_runtime::sync_incremental(&store).await?;
     Ok(())
 }
@@ -471,13 +463,7 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             println!("Deployment: {}", deployment.name);
             println!("{}", format_system_line("Source", &deployment.source));
             println!("{}", format_system_line("Target", &deployment.target));
-            if deployment.source.kind.eq_ignore_ascii_case("oracle") {
-                let connect = oracle_source_connect(&deployment.source)?;
-                let mechanism = if connect.is_contract_harness() {
-                    "LogMiner (contract)"
-                } else {
-                    "LogMiner (OCI)"
-                };
+            if let Some(mechanism) = incremental_capture_mechanism_label(&deployment.source)? {
                 println!("  Incremental Capture: {mechanism}");
             }
         }
@@ -618,17 +604,8 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                     && s.impact == "blocking"
             })
             .collect();
-        let delivery_health = if pipeline.paused {
-            "paused"
-        } else if !pipeline_quarantines.is_empty() {
-            "unhealthy"
-        } else {
-            match pipeline.delivery_status.as_str() {
-                "delivered" => "ok",
-                "pending" => "pending",
-                _ => "unknown",
-            }
-        };
+        let delivery_health =
+            pipeline_delivery_health(pipeline, pipeline_quarantines.len());
         let status_label = if pipeline.paused {
             format!("{} (paused)", pipeline.delivery_status)
         } else {
@@ -702,11 +679,8 @@ async fn print_base(
     table: &str,
     deployment: Option<&str>,
 ) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
-
-    let (dataset, rows) = get_base_rows(platform_store_url, table, deployment)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let store = open_store(platform_store_url).await?;
+    let (dataset, rows) = inspect_base_rows(&store, table, deployment).await?;
 
     println!(
         "Base Dataset: {} status={} rows={}",
@@ -756,11 +730,8 @@ async fn print_derived(
     pipeline_name: &str,
     deployment_name: Option<&str>,
 ) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
-
-    let (dataset, rows) = get_derived_rows(platform_store_url, pipeline_name, deployment_name)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let store = open_store(platform_store_url).await?;
+    let (dataset, rows) = inspect_derived_rows(&store, pipeline_name, deployment_name).await?;
 
     let identity = dataset.output_identity.join(", ");
     let columns = dataset
@@ -789,58 +760,9 @@ async fn print_target(
     collection: &str,
     deployment_name: Option<&str>,
 ) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
-
-    let pipelines = list_pipelines(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    let matching: Vec<_> = pipelines
-        .into_iter()
-        .filter(|p| {
-            p.target_collection == collection
-                && deployment_name
-                    .map(|name| p.deployment_name == name)
-                    .unwrap_or(true)
-        })
-        .collect();
-
-    let pipeline = match matching.as_slice() {
-        [] => {
-            return Err(CliError::Failed(format!(
-                "no Pipeline Target Binding found for collection {collection}"
-            )));
-        }
-        [only] => only.clone(),
-        many => {
-            return Err(CliError::Failed(format!(
-                "multiple Pipelines bind collection {collection} across Deployments {}; \
-                 pass --deployment to disambiguate",
-                many.iter()
-                    .map(|p| p.deployment_name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-    };
-
-    let deployments = list_deployments(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    let deployment = deployments
-        .into_iter()
-        .find(|d| d.name == pipeline.deployment_name)
-        .ok_or_else(|| {
-            CliError::Failed(format!(
-                "Deployment {} not found for Target inspect",
-                pipeline.deployment_name
-            ))
-        })?;
-
-    let target = mongo_target_from_deployment(&deployment)?;
-    let documents = target
-        .list_documents(collection)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let store = open_store(platform_store_url).await?;
+    let (deployment, pipeline, documents) =
+        inspect_target_documents(&store, collection, deployment_name).await?;
 
     println!(
         "Target: {}.{} Deployment={} Pipeline={} Delivery={}",

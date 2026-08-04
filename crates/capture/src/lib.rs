@@ -24,10 +24,6 @@ pub use logminer::{
     INJECT_LOGMINER_CONTENTS_ENV, V_LOGMNR_CONTENTS_QUERY,
 };
 
-/// Expand-contract leftover — prefer `migraloop_types::TlsSettings` on the apply path.
-#[allow(deprecated)]
-pub use logminer::OracleTlsSettings;
-
 // Re-export session helper used by the OCI adapter surface.
 pub use logminer::oci_logminer_session_sql;
 pub use oracle_connect::{oracle_connect_string, resolve_oracle_schema};
