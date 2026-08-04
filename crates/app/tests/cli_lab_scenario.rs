@@ -88,6 +88,14 @@ fn write_scenario_package_with_deployment(lab: &Path, id: &str, summary: &str, d
     let scenario_dir = lab.join("scenarios").join(id);
     fs::create_dir_all(&scenario_dir).expect("scenario dir");
     fs::write(scenario_dir.join("deployment.yaml"), deployment).expect("deployment.yaml");
+    // bulk-load outcome probes evaluate recipe thresholds — keep aligned with
+    // lab/scenarios/bulk-load/recipe.yaml (live runner interface).
+    // Use \n + spaces (not `\` line-continuations) so YAML nesting is preserved.
+    let thresholds = if id == "bulk-load" {
+        "thresholds:\n  max_lag: 0\n  max_duration_ms: 600000\n  min_rows_per_s: 50.0\n"
+    } else {
+        ""
+    };
     fs::write(
         scenario_dir.join("recipe.yaml"),
         format!(
@@ -107,7 +115,7 @@ workload:
 checks:
   correctness:
     - Managed outcomes match recipe expectations
-"#
+{thresholds}"#
         ),
     )
     .expect("recipe.yaml");

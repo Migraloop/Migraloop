@@ -1,17 +1,20 @@
-//! Lab Scenario catalog, run orchestration, and Namespace cleanup
-//! (issues #60–#66, #63, #85, #86 / ADR-0025).
+//! Lab Scenario catalog, recipe-driven run orchestration, and Namespace cleanup
+//! (issues #60–#66, #63, #85, #86, #157 / ADR-0025).
 //!
-//! Lab-specific machinery: catalog listing from on-disk Scenario recipes
-//! (`lab/scenarios/<id>/recipe.yaml`), Scenario Namespace lifecycle
-//! (prepare / re-run wipe / manual remove / opt-in auto-remove), Source workload
-//! driving (including recipe-authored intra-Scenario concurrency and ~100k bulk
-//! Source inserts), one-at-a-time lock, refusal of non-Lab / production engine
-//! bindings before apply/sync (US44), result reporting with equal-weight
-//! correctness and operational metric thresholds (lag, throughput, duration),
-//! and shipped-capability coverage visibility (`lab/scenarios/COVERAGE.md`).
+//! Recipe-driven runner (`runner.rs`): `recipe.yaml` workload / checks /
+//! thresholds are the live interface; Scenario `adapt_*` helpers supply
+//! Namespace seeds, Source workload escapes, and correctness asserts.
+//! Lab-specific machinery: catalog listing from on-disk recipes, Scenario
+//! Namespace lifecycle (prepare / re-run wipe / manual remove / opt-in
+//! auto-remove), one-at-a-time lock, refusal of non-Lab / production engine
+//! bindings before apply/sync (US44), equal-weight correctness + metric
+//! thresholds, and shipped-capability coverage (`lab/scenarios/COVERAGE.md`).
 //! Apply / Sync / inspect use the real product CLI path. Idempotent re-delivery
 //! (#86) resets Pipeline Delivery status in Platform Store so a second real
 //! `apply` re-Delivers the same Output Identities (at-least-once / upsert).
+
+mod recipe;
+mod runner;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -32,6 +35,13 @@ use crate::lab::{
 };
 use crate::CliError;
 use migraloop_platform_store::{delete_deployment, update_pipeline_delivery_status};
+
+use self::recipe::{load_selectable_catalog, load_selectable_recipes, ScenarioRecipe};
+use self::runner::{
+    report_from_adapter_outcome, run_recipe_driven, AdapterOutcome, ScenarioMetrics,
+    ScenarioReport,
+};
+
 
 const LOCK_FILE_NAME: &str = ".migraloop-scenario.lock";
 
@@ -55,9 +65,6 @@ const CONCURRENT_CUSTOMERS_COLLECTION: &str = "lab_cw_customers";
 const CONCURRENT_ORDER_TOTALS_COLLECTION: &str = "lab_cw_order_totals";
 const CONCURRENT_ORDER_TOTALS_PIPELINE: &str = "lab-cw-order-totals";
 const CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT: &str = "lab-concurrent-source-workload";
-/// Fail-able settle threshold after concurrent Source changes (US21 / US47).
-/// Must stay aligned with `lab/scenarios/concurrent-source-workload/recipe.yaml`.
-const CONCURRENT_MAX_SETTLE_MS: u128 = 300_000;
 const CONCURRENT_SETTLE_POLL: Duration = Duration::from_secs(2);
 
 const BULK_LOAD_ID: &str = "bulk-load";
@@ -220,15 +227,10 @@ const INITIAL_LOAD_THROTTLED_RATE: &str = "200";
 const INITIAL_LOAD_THROTTLED_PAUSE_AFTER: &str = "2";
 const INITIAL_LOAD_THROTTLED_STORE_DELAY_MS: &str = "20";
 
-/// Bulk-load thresholds must stay aligned with `lab/scenarios/bulk-load/recipe.yaml`.
 /// Default bulk volume for the Lab Scenario (US17 — on the order of 100k).
+/// Thresholds (max_lag / max_duration_ms / min_rows_per_s) live in recipe.yaml — removed
+/// BULK_LOAD_MAX_LAG / BULK_LOAD_MAX_DURATION_MS / BULK_LOAD_MIN_ROWS_PER_S / CONCURRENT_MAX_SETTLE_MS.
 const BULK_LOAD_ROW_COUNT: u64 = 100_000;
-/// Fail-able Sync Health lag after Delivery catch-up (US21).
-const BULK_LOAD_MAX_LAG: i32 = 0;
-/// Fail-able end-to-end duration for bulk Initial Load + Delivery (US21 / US47).
-const BULK_LOAD_MAX_DURATION_MS: u128 = 600_000;
-/// Fail-able minimum throughput (rows/s) for the bulk load (US21).
-const BULK_LOAD_MIN_ROWS_PER_S: f64 = 50.0;
 /// Poll interval while waiting for Delivery/Health catch-up after bulk Initial Load (US47).
 const BULK_LOAD_SETTLE_POLL: Duration = Duration::from_secs(2);
 
@@ -287,7 +289,7 @@ pub async fn run_scenario_command(command: ScenarioCommand) -> Result<(), CliErr
     }
 }
 
-/// Registered Scenario runners (feature-time implementations in this module).
+/// Registered Scenario adapters (feature-time implementations in this module).
 /// Selectable catalog = these ids ∩ complete on-disk recipe packages.
 fn registered_scenario_ids() -> &'static [&'static str] {
     &[
@@ -410,154 +412,6 @@ fn shipped_capability_coverage_gaps(catalog_ids: &[String]) -> Vec<&'static str>
         .collect()
 }
 
-#[derive(Debug, Deserialize)]
-struct ScenarioRecipe {
-    id: String,
-    summary: String,
-    namespace: ScenarioRecipeNamespace,
-    #[serde(default = "default_deployment_config")]
-    deployment_config: String,
-    workload: ScenarioRecipeWorkload,
-    checks: ScenarioRecipeChecks,
-    /// Documented fail-able metric axes (equal weight with correctness). Kept on
-    /// the recipe seam for authoring; runners keep matching constants today.
-    #[serde(default)]
-    #[allow(dead_code)]
-    thresholds: ScenarioRecipeThresholds,
-}
-
-fn default_deployment_config() -> String {
-    "deployment.yaml".to_string()
-}
-
-#[derive(Debug, Deserialize)]
-struct ScenarioRecipeNamespace {
-    source_tables: Vec<String>,
-    target_collections: Vec<String>,
-    deployment: String,
-    /// Pipeline identities inside the Scenario Namespace (authoring metadata).
-    #[serde(default)]
-    #[allow(dead_code)]
-    pipelines: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScenarioRecipeWorkload {
-    concurrency: String,
-    #[serde(default)]
-    steps: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScenarioRecipeChecks {
-    #[serde(default)]
-    correctness: Vec<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[allow(dead_code)]
-struct ScenarioRecipeThresholds {
-    max_settle_ms: Option<u128>,
-    max_lag: Option<i32>,
-    max_duration_ms: Option<u128>,
-    min_rows_per_s: Option<f64>,
-}
-
-fn load_recipe(path: &Path) -> Result<ScenarioRecipe, CliError> {
-    let raw = fs::read_to_string(path).map_err(|err| {
-        CliError::Failed(format!(
-            "failed to read Lab Scenario recipe {}: {err}",
-            path.display()
-        ))
-    })?;
-    let recipe: ScenarioRecipe = serde_yaml::from_str(&raw).map_err(|err| {
-        CliError::Failed(format!(
-            "failed to parse Lab Scenario recipe {}: {err}",
-            path.display()
-        ))
-    })?;
-    if recipe.id.is_empty() || recipe.summary.is_empty() {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario recipe {} must set non-empty `id` and `summary`",
-            path.display()
-        )));
-    }
-    if recipe.namespace.source_tables.is_empty()
-        || recipe.namespace.target_collections.is_empty()
-        || recipe.namespace.deployment.is_empty()
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario recipe {} must declare namespace.source_tables, \
-             target_collections, and deployment",
-            path.display()
-        )));
-    }
-    match recipe.workload.concurrency.as_str() {
-        "serial" | "parallel" => {}
-        other => {
-            return Err(CliError::Failed(format!(
-                "Lab Scenario recipe {} workload.concurrency must be \
-                 `serial` or `parallel` (got `{other}`)",
-                path.display()
-            )));
-        }
-    }
-    if recipe.workload.steps.is_empty() {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario recipe {} must declare workload.steps",
-            path.display()
-        )));
-    }
-    if recipe.checks.correctness.is_empty() {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario recipe {} must declare checks.correctness",
-            path.display()
-        )));
-    }
-    Ok(recipe)
-}
-
-/// Selectable catalog: registered runners that have `recipe.yaml` + deployment
-/// config under `lab_dir/scenarios/<id>/`. Summaries come from the recipe file.
-fn load_selectable_catalog(lab_dir: &Path) -> Result<Vec<(String, String)>, CliError> {
-    Ok(load_selectable_recipes(lab_dir)?
-        .into_iter()
-        .map(|recipe| (recipe.id, recipe.summary))
-        .collect())
-}
-
-/// Load complete selectable Scenario recipes (id matches directory + deployment config present).
-fn load_selectable_recipes(lab_dir: &Path) -> Result<Vec<ScenarioRecipe>, CliError> {
-    let mut recipes = Vec::new();
-    for id in registered_scenario_ids() {
-        let scenario_dir = lab_dir.join("scenarios").join(id);
-        let recipe_path = scenario_dir.join("recipe.yaml");
-        if !recipe_path.is_file() {
-            // Not selectable yet — recipe package incomplete (feature-time authoring in progress).
-            continue;
-        }
-        let recipe = load_recipe(&recipe_path)?;
-        if recipe.id != *id {
-            return Err(CliError::Failed(format!(
-                "Lab Scenario recipe {} has id `{}` but lives under scenarios/{id}/ \
-                 (directory name must match recipe id)",
-                recipe_path.display(),
-                recipe.id
-            )));
-        }
-        let deployment_path = scenario_dir.join(&recipe.deployment_config);
-        if !deployment_path.is_file() {
-            return Err(CliError::Failed(format!(
-                "Lab Scenario `{id}` recipe references missing deployment config {} \
-                 (expected under lab/scenarios/{id}/)",
-                deployment_path.display()
-            )));
-        }
-        recipes.push(recipe);
-    }
-    Ok(recipes)
-}
-
 /// Active Lab Scenario id from the one-at-a-time lock (live PID only).
 pub(crate) fn active_scenario_run(lab_dir: &Path) -> Result<Option<String>, CliError> {
     let lock_path = lab_dir.join(LOCK_FILE_NAME);
@@ -646,11 +500,10 @@ async fn scenario_run(
     lab_dir: &Path,
     auto_remove: bool,
 ) -> Result<(), CliError> {
-    let catalog = load_selectable_catalog(lab_dir)?;
-    let entry = catalog
-        .iter()
-        .find(|(id, _)| id == scenario)
-        .cloned()
+    let recipes = load_selectable_recipes(lab_dir)?;
+    let recipe = recipes
+        .into_iter()
+        .find(|recipe| recipe.id == scenario)
         .ok_or_else(|| unknown_or_incomplete_scenario_error(scenario, lab_dir))?;
 
     // One-at-a-time check before Fixture probes so CI can assert rejection without Docker.
@@ -666,7 +519,7 @@ async fn scenario_run(
     // Lab-only outcome probe: exercise equal-weight fail axes through the real CLI
     // report/exit path without Docker (issue #63 / PRD #55 metrics tests).
     if let Ok(probe) = std::env::var("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE") {
-        return emit_scenario_outcome_probe(&entry.0, &probe);
+        return emit_scenario_outcome_probe(&recipe, &probe);
     }
 
     // US44 / issue #85: refuse non-Lab / production engine bindings before apply/sync.
@@ -677,36 +530,45 @@ async fn scenario_run(
 
     let lock = ScenarioLock::acquire(&lock_path, scenario)?;
     let started = Instant::now();
-    // Catalog membership already validated; dispatch by id.
-    let result = match scenario {
-        DIRECT_PIPELINE_ID => run_direct_pipeline(lab_dir).await,
-        TRANSFORM_PIPELINE_ID => run_transform_pipeline(lab_dir).await,
-        RT_PROJECT_ID => run_rt_project(lab_dir).await,
-        RT_FILTER_ID => run_rt_filter(lab_dir).await,
-        RT_FIELD_OPS_ID => run_rt_field_ops(lab_dir).await,
-        RT_EQUILOOKUP_ID => run_rt_equilookup(lab_dir).await,
-        RT_UNION_ID => run_rt_union(lab_dir).await,
-        RT_UNWIND_ID => run_rt_unwind(lab_dir).await,
-        RT_DISTINCT_ADDTOSET_ID => run_rt_distinct_addtoset(lab_dir).await,
-        CONCURRENT_SOURCE_WORKLOAD_ID => run_concurrent_source_workload(lab_dir).await,
-        BULK_LOAD_ID => run_bulk_load(lab_dir).await,
-        IDEMPOTENT_REDELIVERY_ID => run_idempotent_redelivery(lab_dir).await,
-        PAUSE_RESUME_ID => run_pause_resume(lab_dir).await,
-        REMOVE_PIPELINE_ID => run_remove_pipeline(lab_dir).await,
-        CHANGE_PIPELINE_ID => run_change_pipeline(lab_dir).await,
-        POISON_QUARANTINE_ID => run_poison_quarantine(lab_dir).await,
-        SCHEMA_CHANGE_PAUSE_ID => run_schema_change_pause(lab_dir).await,
-        SOURCE_ALIGNMENT_ID => run_source_alignment(lab_dir).await,
-        DRIFT_CHECK_ID => run_drift_check(lab_dir).await,
-        BOUNDED_BACKPRESSURE_ID => run_bounded_backpressure(lab_dir).await,
-        OBSERVABILITY_SURFACE_ID => run_observability_surface(lab_dir).await,
-        PLATFORM_STORE_GUARDRAILS_ID => run_platform_store_guardrails(lab_dir).await,
-        BACKWARD_COMPATIBLE_UPGRADES_ID => run_backward_compatible_upgrades(lab_dir).await,
-        INITIAL_LOAD_THROTTLED_ID => run_initial_load_throttled(lab_dir).await,
-        _ => Err(CliError::Failed(format!(
-            "Lab Scenario `{scenario}` is listed but has no runner"
-        ))),
-    };
+    // Recipe-driven path: print recipe interface, run Scenario adapter, evaluate thresholds.
+    let result = run_recipe_driven(&recipe, || async {
+        match scenario {
+            DIRECT_PIPELINE_ID => adapt_direct_pipeline(lab_dir, &recipe).await,
+            TRANSFORM_PIPELINE_ID => adapt_transform_pipeline(lab_dir, &recipe).await,
+            RT_PROJECT_ID => adapt_rt_project(lab_dir, &recipe).await,
+            RT_FILTER_ID => adapt_rt_filter(lab_dir, &recipe).await,
+            RT_FIELD_OPS_ID => adapt_rt_field_ops(lab_dir, &recipe).await,
+            RT_EQUILOOKUP_ID => adapt_rt_equilookup(lab_dir, &recipe).await,
+            RT_UNION_ID => adapt_rt_union(lab_dir, &recipe).await,
+            RT_UNWIND_ID => adapt_rt_unwind(lab_dir, &recipe).await,
+            RT_DISTINCT_ADDTOSET_ID => adapt_rt_distinct_addtoset(lab_dir, &recipe).await,
+            CONCURRENT_SOURCE_WORKLOAD_ID => {
+                adapt_concurrent_source_workload(lab_dir, &recipe).await
+            }
+            BULK_LOAD_ID => adapt_bulk_load(lab_dir, &recipe).await,
+            IDEMPOTENT_REDELIVERY_ID => adapt_idempotent_redelivery(lab_dir, &recipe).await,
+            PAUSE_RESUME_ID => adapt_pause_resume(lab_dir, &recipe).await,
+            REMOVE_PIPELINE_ID => adapt_remove_pipeline(lab_dir, &recipe).await,
+            CHANGE_PIPELINE_ID => adapt_change_pipeline(lab_dir, &recipe).await,
+            POISON_QUARANTINE_ID => adapt_poison_quarantine(lab_dir, &recipe).await,
+            SCHEMA_CHANGE_PAUSE_ID => adapt_schema_change_pause(lab_dir, &recipe).await,
+            SOURCE_ALIGNMENT_ID => adapt_source_alignment(lab_dir, &recipe).await,
+            DRIFT_CHECK_ID => adapt_drift_check(lab_dir, &recipe).await,
+            BOUNDED_BACKPRESSURE_ID => adapt_bounded_backpressure(lab_dir, &recipe).await,
+            OBSERVABILITY_SURFACE_ID => adapt_observability_surface(lab_dir, &recipe).await,
+            PLATFORM_STORE_GUARDRAILS_ID => {
+                adapt_platform_store_guardrails(lab_dir, &recipe).await
+            }
+            BACKWARD_COMPATIBLE_UPGRADES_ID => {
+                adapt_backward_compatible_upgrades(lab_dir, &recipe).await
+            }
+            INITIAL_LOAD_THROTTLED_ID => adapt_initial_load_throttled(lab_dir, &recipe).await,
+            _ => Err(CliError::Failed(format!(
+                "Lab Scenario `{scenario}` is listed but has no adapter"
+            ))),
+        }
+    })
+    .await;
     let duration = started.elapsed();
 
     match result {
@@ -719,7 +581,7 @@ async fn scenario_run(
                 namespace_removed = true;
             }
             drop(lock);
-            print_scenario_report(&entry.0, true, duration, &report, namespace_removed);
+            print_scenario_report(&recipe.id, true, duration, &report, namespace_removed);
             if passed {
                 Ok(())
             } else {
@@ -748,7 +610,7 @@ async fn scenario_run(
                 measured_duration_ms: None,
                 thresholds_ok: true,
             };
-            print_scenario_report(&entry.0, false, duration, &report, false);
+            print_scenario_report(&recipe.id, false, duration, &report, false);
             Err(err)
         }
     }
@@ -814,31 +676,6 @@ async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(),
     }
 }
 
-struct ScenarioReport {
-    correctness: bool,
-    rows_applied: u64,
-    detail: String,
-    capture_path_note: String,
-    /// Settle duration after concurrent Source changes (contention Scenario).
-    settle_ms: Option<u128>,
-    /// Scenario-defined max settle threshold that can fail the run (equal weight).
-    max_settle_ms: Option<u128>,
-    /// Observed Sync Health lag after catch-up (bulk-load).
-    lag: Option<i32>,
-    /// Scenario-defined max lag threshold (bulk-load).
-    max_lag: Option<i32>,
-    /// Scenario-defined minimum throughput threshold (bulk-load).
-    min_rows_per_s: Option<f64>,
-    /// Scenario-defined max duration threshold (bulk-load).
-    max_duration_ms: Option<u128>,
-    /// Measured throughput used for threshold comparison when set.
-    measured_rows_per_s: Option<f64>,
-    /// Measured duration used for threshold comparison when set.
-    measured_duration_ms: Option<u128>,
-    /// Operational threshold outcome; `true` when the Scenario defines none.
-    thresholds_ok: bool,
-}
-
 fn scenario_failure_kind(correctness: bool, thresholds_ok: bool) -> &'static str {
     match (correctness, thresholds_ok) {
         (false, false) => "correctness and threshold",
@@ -850,60 +687,63 @@ fn scenario_failure_kind(correctness: bool, thresholds_ok: bool) -> &'static str
 
 /// Emit a synthetic bulk-load Scenario outcome through the same report + exit
 /// contract as a real run (CLI-seam metrics/correctness fail-axis verification).
-fn emit_scenario_outcome_probe(scenario: &str, probe: &str) -> Result<(), CliError> {
-    if scenario != BULK_LOAD_ID {
+/// Thresholds come from the loaded bulk-load recipe (live interface).
+fn emit_scenario_outcome_probe(recipe: &ScenarioRecipe, probe: &str) -> Result<(), CliError> {
+    if recipe.id != BULK_LOAD_ID {
         return Err(CliError::Failed(format!(
             "MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE is only supported for `{BULK_LOAD_ID}` \
-             (got `{scenario}`)"
+             (got `{}`)",
+            recipe.id
         )));
     }
     let report = match probe {
         "threshold-fail" => {
-            let sample = BulkLoadMetricSample {
-                lag: 0,
-                max_lag: BULK_LOAD_MAX_LAG,
-                duration_ms: BULK_LOAD_MAX_DURATION_MS + 1,
-                max_duration_ms: BULK_LOAD_MAX_DURATION_MS,
-                rows_per_s: BULK_LOAD_MIN_ROWS_PER_S / 2.0,
-                min_rows_per_s: BULK_LOAD_MIN_ROWS_PER_S,
-            };
-            let (_, detail) = evaluate_bulk_load_thresholds(&sample);
-            ScenarioReport {
+            let max_duration_ms = recipe.thresholds.max_duration_ms.ok_or_else(|| {
+                CliError::Failed(
+                    "bulk-load recipe must declare thresholds.max_duration_ms for outcome probe"
+                        .to_string(),
+                )
+            })?;
+            let min_rows_per_s = recipe.thresholds.min_rows_per_s.ok_or_else(|| {
+                CliError::Failed(
+                    "bulk-load recipe must declare thresholds.min_rows_per_s for outcome probe"
+                        .to_string(),
+                )
+            })?;
+            let outcome = AdapterOutcome {
                 correctness: true,
-                rows_applied: BULK_LOAD_ROW_COUNT,
-                detail,
-                capture_path_note: "Initial Load".to_string(),
-                settle_ms: None,
-                max_settle_ms: None,
-                lag: Some(sample.lag),
-                max_lag: Some(sample.max_lag),
-                min_rows_per_s: Some(sample.min_rows_per_s),
-                max_duration_ms: Some(sample.max_duration_ms),
-                measured_rows_per_s: Some(sample.rows_per_s),
-                measured_duration_ms: Some(sample.duration_ms),
-                thresholds_ok: false,
-            }
+                detail: String::new(),
+                metrics: ScenarioMetrics {
+                    settle_ms: None,
+                    lag: Some(0),
+                    rows_per_s: Some(min_rows_per_s / 2.0),
+                    duration_ms: Some(max_duration_ms + 1),
+                    rows_applied: BULK_LOAD_ROW_COUNT,
+                    capture_path_note: "Initial Load".to_string(),
+                },
+            };
+            report_from_adapter_outcome(recipe, outcome)
         }
-        "correctness-fail" => ScenarioReport {
-            correctness: false,
-            rows_applied: BULK_LOAD_ROW_COUNT - 1,
-            detail: format!(
-                "correctness: expected rows={BULK_LOAD_ROW_COUNT} \
+        "correctness-fail" => {
+            let outcome = AdapterOutcome {
+                correctness: false,
+                detail: format!(
+                    "correctness: expected rows={BULK_LOAD_ROW_COUNT} \
 base_rows={} target_rows={}",
-                BULK_LOAD_ROW_COUNT - 1,
-                BULK_LOAD_ROW_COUNT - 1
-            ),
-            capture_path_note: "Initial Load".to_string(),
-            settle_ms: None,
-            max_settle_ms: None,
-            lag: Some(0),
-            max_lag: Some(BULK_LOAD_MAX_LAG),
-            min_rows_per_s: Some(BULK_LOAD_MIN_ROWS_PER_S),
-            max_duration_ms: Some(BULK_LOAD_MAX_DURATION_MS),
-            measured_rows_per_s: Some(800.0),
-            measured_duration_ms: Some(120_000),
-            thresholds_ok: true,
-        },
+                    BULK_LOAD_ROW_COUNT - 1,
+                    BULK_LOAD_ROW_COUNT - 1
+                ),
+                metrics: ScenarioMetrics {
+                    settle_ms: None,
+                    lag: Some(0),
+                    rows_per_s: Some(800.0),
+                    duration_ms: Some(120_000),
+                    rows_applied: BULK_LOAD_ROW_COUNT - 1,
+                    capture_path_note: "Initial Load".to_string(),
+                },
+            };
+            report_from_adapter_outcome(recipe, outcome)
+        }
         other => {
             return Err(CliError::Failed(format!(
                 "Unknown MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE `{other}` \
@@ -913,7 +753,7 @@ base_rows={} target_rows={}",
     };
 
     let duration = Duration::from_millis(report.measured_duration_ms.unwrap_or(0) as u64);
-    print_scenario_report(scenario, true, duration, &report, false);
+    print_scenario_report(&recipe.id, true, duration, &report, false);
     let kind = scenario_failure_kind(report.correctness, report.thresholds_ok);
     Err(CliError::Failed(format!(
         "Lab Scenario {kind} failed: {}",
@@ -926,46 +766,6 @@ fn report_defines_thresholds(report: &ScenarioReport) -> bool {
         || report.max_lag.is_some()
         || report.min_rows_per_s.is_some()
         || report.max_duration_ms.is_some()
-}
-
-/// Bulk-load metric sample for equal-weight threshold evaluation (US21 / US36).
-#[derive(Debug, Clone, PartialEq)]
-struct BulkLoadMetricSample {
-    lag: i32,
-    max_lag: i32,
-    duration_ms: u128,
-    max_duration_ms: u128,
-    rows_per_s: f64,
-    min_rows_per_s: f64,
-}
-
-/// Evaluate Scenario-defined lag / duration / throughput thresholds independently
-/// of row-level correctness.
-fn evaluate_bulk_load_thresholds(sample: &BulkLoadMetricSample) -> (bool, String) {
-    let mut failed = Vec::new();
-    if sample.lag > sample.max_lag {
-        failed.push(format!(
-            "lag={} exceeded max_lag={}",
-            sample.lag, sample.max_lag
-        ));
-    }
-    if sample.duration_ms > sample.max_duration_ms {
-        failed.push(format!(
-            "duration_ms={} exceeded max_duration_ms={}",
-            sample.duration_ms, sample.max_duration_ms
-        ));
-    }
-    if sample.rows_per_s < sample.min_rows_per_s {
-        failed.push(format!(
-            "rows_per_s={:.2} below min_rows_per_s={:.2}",
-            sample.rows_per_s, sample.min_rows_per_s
-        ));
-    }
-    if failed.is_empty() {
-        (true, String::new())
-    } else {
-        (false, format!("threshold: {}", failed.join("; ")))
-    }
 }
 
 fn print_scenario_report(
@@ -1054,17 +854,29 @@ fn format_scenario_report(
     out
 }
 
-async fn run_direct_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
-    println!("Lab Scenario: {DIRECT_PIPELINE_ID}");
-    println!("Scenario Namespace: table={DIRECT_PIPELINE_TABLE} \
-collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}");
+/// Successful adapter outcome with no measured threshold metrics.
+fn adapter_ok(rows_applied: u64, capture_path_note: impl Into<String>) -> AdapterOutcome {
+    AdapterOutcome {
+        correctness: true,
+        detail: String::new(),
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied,
+            capture_path_note: capture_path_note.into(),
+        },
+    }
+}
 
-    prepare_direct_pipeline_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, DIRECT_PIPELINE_ID)?;
+/// Apply Scenario deployment.yaml via the real product CLI path; require Initial Load.
+async fn product_apply_initial_load(
+    lab_dir: &Path,
+    scenario_id: &str,
+) -> Result<String, CliError> {
+    let config_path = deployment_config_path(lab_dir, scenario_id)?;
     let bin = lab_migraloop_bin();
-
     println!("Lab Scenario: apply Deployment via real product path...");
     let apply_out = run_product_cli(
         &bin,
@@ -1085,6 +897,34 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
             "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
         )));
     }
+    Ok(apply_out)
+}
+
+/// Incremental Capture + Delivery via real product path; require LogMiner.
+async fn product_sync_logminer() -> Result<(String, String), CliError> {
+    let bin = lab_migraloop_bin();
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if sync_out.to_ascii_lowercase().contains("logminer") {
+        Ok((sync_out, "LogMiner".to_string()))
+    } else {
+        Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )))
+    }
+}
+
+async fn adapt_direct_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
+    // Runner already printed recipe id / namespace / workload / checks.
+    prepare_direct_pipeline_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let apply_out = product_apply_initial_load(lab_dir, DIRECT_PIPELINE_ID).await?;
+    let bin = lab_migraloop_bin();
 
     let base_after_apply = run_product_cli(
         &bin,
@@ -1106,19 +946,7 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
     println!("Lab Scenario: driving Source insert/update/delete...");
     mutate_direct_pipeline_source(lab_dir).await?;
 
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
+    let (sync_out, capture_note) = product_sync_logminer().await?;
 
     let base_after = run_product_cli(
         &bin,
@@ -1164,21 +992,7 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
-        correctness: true,
-        rows_applied,
-        detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
-    })
+    Ok(adapter_ok(rows_applied, capture_note))
 }
 
 /// Managed NAME field presence in Base/Target JSON inspect output.
@@ -1352,7 +1166,7 @@ fn ensure_lab_fixture_engines_for_scenario(
     )))
 }
 
-async fn run_transform_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_transform_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {TRANSFORM_PIPELINE_ID}");
     println!(
         "Scenario Namespace: tables={TRANSFORM_CUSTOMERS_TABLE},{TRANSFORM_ORDERS_TABLE} \
@@ -1565,20 +1379,17 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -1757,7 +1568,7 @@ EXIT;\n"
         })
 }
 
-async fn run_rt_project(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_rt_project(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {RT_PROJECT_ID}");
     println!(
         "Scenario Namespace: table={RT_PROJECT_TABLE} \
@@ -1885,20 +1696,17 @@ Derived:\n{derived_after}\nTarget:\n{target_after}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -2006,7 +1814,7 @@ EXIT;\n"
         })
 }
 
-async fn run_rt_filter(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_rt_filter(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {RT_FILTER_ID}");
     println!(
         "Scenario Namespace: table={RT_FILTER_TABLE} \
@@ -2133,20 +1941,17 @@ Derived:\n{derived_after}\nTarget:\n{target_after}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -2251,7 +2056,7 @@ EXIT;\n"
 }
 
 
-async fn run_rt_field_ops(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_rt_field_ops(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {RT_FIELD_OPS_ID}");
     println!(
         "Scenario Namespace: table={RT_FIELD_OPS_TABLE} \
@@ -2385,20 +2190,17 @@ Derived:\n{derived_after}\nTarget:\n{target_after}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -2502,7 +2304,7 @@ EXIT;\n"
         })
 }
 
-async fn run_rt_equilookup(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_rt_equilookup(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {RT_EQUILOOKUP_ID}");
     println!(
         "Scenario Namespace: tables={RT_EQUILOOKUP_CUSTOMERS_TABLE},{RT_EQUILOOKUP_ORDERS_TABLE} \
@@ -2639,20 +2441,17 @@ Derived:\n{derived_after}\nTarget:\n{target_after}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -2768,7 +2567,7 @@ EXIT;\n"
         })
 }
 
-async fn run_rt_union(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_rt_union(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {RT_UNION_ID}");
     println!(
         "Scenario Namespace: tables={RT_UNION_EAST_TABLE},{RT_UNION_WEST_TABLE} \
@@ -2902,20 +2701,17 @@ Derived:\n{derived_after}\nTarget:\n{target_after}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -3030,7 +2826,7 @@ EXIT;\n"
         })
 }
 
-async fn run_rt_unwind(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_rt_unwind(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {RT_UNWIND_ID}");
     println!(
         "Scenario Namespace: tables={RT_UNWIND_CUSTOMERS_TABLE},{RT_UNWIND_ORDERS_TABLE} \
@@ -3169,20 +2965,17 @@ Derived:\n{derived_after}\nTarget:\n{target_after}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -3299,7 +3092,7 @@ EXIT;\n"
         })
 }
 
-async fn run_rt_distinct_addtoset(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_rt_distinct_addtoset(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {RT_DISTINCT_ADDTOSET_ID}");
     println!(
         "Scenario Namespace: table={RT_DISTINCT_ADDTOSET_TABLE} \
@@ -3469,20 +3262,17 @@ addToSet Derived:\n{add_after}\naddToSet Target:\n{add_target}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -3597,16 +3387,17 @@ EXIT;\n"
         })
 }
 
-async fn run_concurrent_source_workload(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
-    println!("Lab Scenario: {CONCURRENT_SOURCE_WORKLOAD_ID}");
-    println!(
-        "Scenario Namespace: tables={CONCURRENT_CUSTOMERS_TABLE},{CONCURRENT_ORDERS_TABLE} \
-collections={CONCURRENT_CUSTOMERS_COLLECTION},{CONCURRENT_ORDER_TOTALS_COLLECTION} \
-deployment={CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT}"
-    );
+async fn adapt_concurrent_source_workload(lab_dir: &Path, recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
+    // max_settle_ms is the live recipe interface (not a duplicated constant).
+    let max_settle_ms = recipe.thresholds.max_settle_ms.ok_or_else(|| {
+        CliError::Failed(
+            "Lab Scenario concurrent-source-workload recipe must declare thresholds.max_settle_ms"
+                .to_string(),
+        )
+    })?;
     println!(
         "Lab Scenario: recipe uses intra-Scenario parallel Source sessions \
-(not a second concurrent Scenario run); max_settle_ms={CONCURRENT_MAX_SETTLE_MS}"
+(not a second concurrent Scenario run); max_settle_ms={max_settle_ms}"
     );
 
     prepare_concurrent_source_namespace(lab_dir).await?;
@@ -3709,9 +3500,9 @@ deployment={CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT}"
     );
     mutate_concurrent_source_workload(lab_dir).await?;
 
-    // US47: wait until Delivery catches up within Scenario thresholds before final asserts.
+    // US47: wait until Delivery catches up within recipe thresholds before final asserts.
     println!(
-        "Lab Scenario: settling Incremental Capture + Delivery within max_settle_ms={CONCURRENT_MAX_SETTLE_MS}..."
+        "Lab Scenario: settling Incremental Capture + Delivery within max_settle_ms={max_settle_ms}..."
     );
     let settle_started = Instant::now();
     let mut sync_out = String::new();
@@ -3720,24 +3511,23 @@ deployment={CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT}"
 
     loop {
         let settle_ms = settle_started.elapsed().as_millis();
-        if settle_ms > CONCURRENT_MAX_SETTLE_MS {
-            return Ok(ScenarioReport {
+        if settle_ms > max_settle_ms {
+            // Outcomes never reached expected Managed state — correctness fails.
+            // Runner also fails recipe max_settle_ms (equal-weight threshold axis).
+            return Ok(AdapterOutcome {
                 correctness: false,
-                rows_applied: count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out),
                 detail: format!(
-                    "threshold: concurrent Source changes did not settle within \
-max_settle_ms={CONCURRENT_MAX_SETTLE_MS} (elapsed settle_ms={settle_ms}). {last_detail}"
+                    "correctness: concurrent Source Managed outcomes not settled \
+(elapsed settle_ms={settle_ms}). {last_detail}"
                 ),
-                capture_path_note: capture_note,
-                settle_ms: Some(settle_ms),
-                max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
-                lag: None,
-                max_lag: None,
-                min_rows_per_s: None,
-                max_duration_ms: None,
-                measured_rows_per_s: None,
-                measured_duration_ms: None,
-                thresholds_ok: false,
+                metrics: ScenarioMetrics {
+                    settle_ms: Some(settle_ms),
+                    lag: None,
+                    rows_per_s: None,
+                    duration_ms: None,
+                    rows_applied: count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out),
+                    capture_path_note: capture_note,
+                },
             });
         }
 
@@ -3836,42 +3626,18 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    // Threshold can fail even when Managed outcomes are already correct (US21 / US36).
-    if settle_ms > CONCURRENT_MAX_SETTLE_MS {
-        return Ok(ScenarioReport {
-            correctness: true,
-            rows_applied,
-            detail: format!(
-                "threshold: settle_ms={settle_ms} exceeded max_settle_ms={CONCURRENT_MAX_SETTLE_MS} \
-after concurrent Source changes reached correct Target/Derived outcomes"
-            ),
-            capture_path_note: capture_note,
-            settle_ms: Some(settle_ms),
-            max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
-            lag: None,
-            max_lag: None,
-            min_rows_per_s: None,
-            max_duration_ms: None,
-            measured_rows_per_s: None,
-            measured_duration_ms: None,
-            thresholds_ok: false,
-        });
-    }
-
-    Ok(ScenarioReport {
+    // Runner evaluates recipe max_settle_ms against measured settle_ms (US21 / US36).
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: Some(settle_ms),
-        max_settle_ms: Some(CONCURRENT_MAX_SETTLE_MS),
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: Some(settle_ms),
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -4038,16 +3804,20 @@ EXIT;\n"
     Ok(())
 }
 
-async fn run_bulk_load(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
-    println!("Lab Scenario: {BULK_LOAD_ID}");
+async fn adapt_bulk_load(lab_dir: &Path, recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
+    // Thresholds are the live recipe interface — runner evaluates them against metrics.
+    let max_lag = recipe.thresholds.max_lag.ok_or_else(|| {
+        CliError::Failed("Lab Scenario bulk-load recipe must declare thresholds.max_lag".to_string())
+    })?;
+    let max_duration_ms = recipe.thresholds.max_duration_ms.ok_or_else(|| {
+        CliError::Failed(
+            "Lab Scenario bulk-load recipe must declare thresholds.max_duration_ms".to_string(),
+        )
+    })?;
     println!(
-        "Scenario Namespace: table={BULK_LOAD_TABLE} collection={BULK_LOAD_COLLECTION} \
-deployment={BULK_LOAD_DEPLOYMENT}"
-    );
-    println!(
-        "Lab Scenario: bulk Source volume rows={BULK_LOAD_ROW_COUNT}; \
-thresholds max_lag={BULK_LOAD_MAX_LAG} max_duration_ms={BULK_LOAD_MAX_DURATION_MS} \
-min_rows_per_s={BULK_LOAD_MIN_ROWS_PER_S}"
+        "Lab Scenario: bulk Source volume rows={BULK_LOAD_ROW_COUNT} \
+(recipe namespace.deployment={}, thresholds from recipe)",
+        recipe.namespace.deployment
     );
 
     prepare_bulk_load_namespace(lab_dir).await?;
@@ -4056,35 +3826,14 @@ min_rows_per_s={BULK_LOAD_MIN_ROWS_PER_S}"
 (schema + ~{BULK_LOAD_ROW_COUNT} Source inserts + supplemental logging)"
     );
 
-    let config_path = deployment_config_path(lab_dir, BULK_LOAD_ID)?;
     let bin = lab_migraloop_bin();
     let load_started = Instant::now();
+    let apply_out = product_apply_initial_load(lab_dir, BULK_LOAD_ID).await?;
 
-    println!("Lab Scenario: apply Deployment via real product path (Initial Load of bulk volume)...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-
-    // US47: wait until Delivery/Health catch up within duration threshold before final asserts.
+    // US47: wait until Delivery/Health catch up within recipe duration before final asserts.
     println!(
         "Lab Scenario: settling bulk Delivery / Sync Health within \
-max_duration_ms={BULK_LOAD_MAX_DURATION_MS}..."
+max_duration_ms={max_duration_ms}..."
     );
     let mut last_detail = String::new();
     let mut settled = false;
@@ -4135,7 +3884,7 @@ max_duration_ms={BULK_LOAD_MAX_DURATION_MS}..."
         })?;
 
         let rows_ok = base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
-        let lag_ok = lag <= BULK_LOAD_MAX_LAG;
+        let lag_ok = lag <= max_lag;
         if rows_ok && lag_ok {
             settled = true;
             break (base_rows, target_rows, lag);
@@ -4146,7 +3895,7 @@ max_duration_ms={BULK_LOAD_MAX_DURATION_MS}..."
 (base_rows={base_rows} target_rows={target_rows} lag={lag}).\n\
 Base:\n{base_after}\nTarget:\n{target_after}\nStatus:\n{status_out}"
         );
-        if measured_duration_ms > BULK_LOAD_MAX_DURATION_MS {
+        if measured_duration_ms > max_duration_ms {
             break (base_rows, target_rows, lag);
         }
         tokio::time::sleep(BULK_LOAD_SETTLE_POLL).await;
@@ -4160,47 +3909,35 @@ Base:\n{base_after}\nTarget:\n{target_after}\nStatus:\n{status_out}"
     };
 
     let rows_applied = count_delivery_ops(&apply_out).max(base_rows);
-    // Correctness is row-level Managed outcomes; lag/duration/throughput are threshold axes.
+    // Correctness is row-level Managed outcomes; runner evaluates lag/duration/throughput.
     let correctness =
         base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
-    let sample = BulkLoadMetricSample {
-        lag,
-        max_lag: BULK_LOAD_MAX_LAG,
-        duration_ms: measured_duration_ms,
-        max_duration_ms: BULK_LOAD_MAX_DURATION_MS,
-        rows_per_s: measured_rows_per_s,
-        min_rows_per_s: BULK_LOAD_MIN_ROWS_PER_S,
-    };
-    let (thresholds_ok, mut threshold_detail) = evaluate_bulk_load_thresholds(&sample);
-    if !settled && !thresholds_ok && !last_detail.is_empty() {
-        threshold_detail = format!(
-            "{threshold_detail} (bulk Delivery/Health settle incomplete within \
-max_duration_ms={BULK_LOAD_MAX_DURATION_MS}). {last_detail}"
-        );
-    }
-
-    let mut detail_parts = Vec::new();
-    if !correctness {
-        detail_parts.push(format!(
+    let mut detail = if correctness {
+        String::new()
+    } else {
+        format!(
             "correctness: expected rows={BULK_LOAD_ROW_COUNT} \
 base_rows={base_rows} target_rows={target_rows}"
-        ));
-    }
-    if !thresholds_ok {
-        detail_parts.push(threshold_detail);
-    }
-    let detail = detail_parts.join("; ");
-
-    if correctness && thresholds_ok {
-        println!(
-            "Lab Scenario: correctness and metric thresholds passed \
-(base/target rows={BULK_LOAD_ROW_COUNT}, lag={lag}, \
-duration_ms={measured_duration_ms}, rows_per_s={measured_rows_per_s:.2})"
+        )
+    };
+    if !settled && !last_detail.is_empty() {
+        let settle_note = format!(
+            "bulk Delivery/Health settle incomplete within \
+max_duration_ms={max_duration_ms}. {last_detail}"
         );
-    } else if correctness {
+        if detail.is_empty() {
+            detail = settle_note;
+        } else {
+            detail = format!("{detail}; {settle_note}");
+        }
+    }
+
+    if correctness {
         println!(
-            "Lab Scenario: correctness passed; metric thresholds failed \
-(lag={lag}, duration_ms={measured_duration_ms}, rows_per_s={measured_rows_per_s:.2})"
+            "Lab Scenario: correctness passed \
+(base/target rows={BULK_LOAD_ROW_COUNT}, lag={lag}, \
+duration_ms={measured_duration_ms}, rows_per_s={measured_rows_per_s:.2}); \
+thresholds evaluated by recipe-driven runner"
         );
     } else {
         println!(
@@ -4209,20 +3946,17 @@ metrics lag={lag} duration_ms={measured_duration_ms} rows_per_s={measured_rows_p
         );
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness,
-        rows_applied,
         detail,
-        capture_path_note: "Initial Load".to_string(),
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: Some(lag),
-        max_lag: Some(BULK_LOAD_MAX_LAG),
-        min_rows_per_s: Some(BULK_LOAD_MIN_ROWS_PER_S),
-        max_duration_ms: Some(BULK_LOAD_MAX_DURATION_MS),
-        measured_rows_per_s: Some(measured_rows_per_s),
-        measured_duration_ms: Some(measured_duration_ms),
-        thresholds_ok,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: Some(lag),
+            rows_per_s: Some(measured_rows_per_s),
+            duration_ms: Some(measured_duration_ms),
+            rows_applied,
+            capture_path_note: "Initial Load".to_string(),
+        },
     })
 }
 
@@ -4468,7 +4202,7 @@ EXIT;\n"
 
 /// Issue #86 / PRD #55 US49: exercise at-least-once Delivery via duplicate-safe re-Delivery
 /// on the real product apply path inside a Scenario Namespace.
-async fn run_idempotent_redelivery(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_idempotent_redelivery(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {IDEMPOTENT_REDELIVERY_ID}");
     println!(
         "Scenario Namespace: table={IDEMPOTENT_REDELIVERY_TABLE} \
@@ -4666,26 +4400,23 @@ collection={IDEMPOTENT_REDELIVERY_COLLECTION} deployment={IDEMPOTENT_REDELIVERY_
     }
     println!("Lab Scenario: duplicate-safe re-Delivery complete on real product apply path");
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
 /// Issue #19 / ADR-0007: pause stops Delivery for one Pipeline; resume catch-up
 /// from durable Base; other Pipelines keep Delivering on the real product path.
-async fn run_pause_resume(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_pause_resume(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {PAUSE_RESUME_ID}");
     println!(
         "Scenario Namespace: tables={PAUSE_RESUME_CUSTOMERS_TABLE},{PAUSE_RESUME_ORDERS_TABLE} \
@@ -4886,20 +4617,17 @@ deployment={PAUSE_RESUME_DEPLOYMENT}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -5021,7 +4749,7 @@ EXIT;\n"
         })
 }
 
-async fn run_poison_quarantine(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_poison_quarantine(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {POISON_QUARANTINE_ID}");
     println!(
         "Scenario Namespace: table={POISON_QUARANTINE_TABLE} \
@@ -5157,20 +4885,17 @@ collection={POISON_QUARANTINE_COLLECTION} deployment={POISON_QUARANTINE_DEPLOYME
         println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -5272,7 +4997,7 @@ EXIT;\n"
 }
 
 
-async fn run_bounded_backpressure(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_bounded_backpressure(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {BOUNDED_BACKPRESSURE_ID}");
     println!(
         "Scenario Namespace: table={BOUNDED_BACKPRESSURE_TABLE} \
@@ -5483,24 +5208,21 @@ collection={BOUNDED_BACKPRESSURE_COLLECTION} deployment={BOUNDED_BACKPRESSURE_DE
          (bounded backpressure; visible lag; catch-up; Pipeline not paused)"
     );
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: Some(sync_lag_after),
-        max_lag: Some(0),
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: Some(sync_lag_after),
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
-async fn run_initial_load_throttled(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_initial_load_throttled(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {INITIAL_LOAD_THROTTLED_ID}");
     println!(
         "Scenario Namespace: table={INITIAL_LOAD_THROTTLED_TABLE} \
@@ -5649,20 +5371,17 @@ and store delay for backoff..."
          (chunked progress; pause/resume; rate_limit; backoff; watermark retained)"
     );
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied: INITIAL_LOAD_THROTTLED_ROW_COUNT as u64,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: Some(0),
-        max_lag: Some(0),
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: Some(0),
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: INITIAL_LOAD_THROTTLED_ROW_COUNT as u64,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -5843,7 +5562,7 @@ EXIT;\n"
         })
 }
 
-async fn run_observability_surface(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_observability_surface(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {OBSERVABILITY_SURFACE_ID}");
     println!(
         "Scenario Namespace: table={OBSERVABILITY_SURFACE_TABLE} \
@@ -6046,20 +5765,17 @@ collection={OBSERVABILITY_SURFACE_COLLECTION} deployment={OBSERVABILITY_SURFACE_
          (structured logs; Sync/Delivery Health; Prometheus lag/failures)"
     );
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: Some(sync_lag_after),
-        max_lag: Some(0),
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: Some(sync_lag_after),
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -6166,7 +5882,7 @@ EXIT;\n"
         })
 }
 
-async fn run_platform_store_guardrails(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_platform_store_guardrails(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {PLATFORM_STORE_GUARDRAILS_ID}");
     println!(
         "Scenario Namespace: table={PLATFORM_STORE_GUARDRAILS_TABLE} \
@@ -6287,20 +6003,17 @@ collection={PLATFORM_STORE_GUARDRAILS_COLLECTION} deployment={PLATFORM_STORE_GUA
          (Guardrails minimums ok; disk warn-only; Pipeline not paused)"
     );
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: "LogMiner".to_string(),
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: "LogMiner".to_string(),
+        },
     })
 }
 
@@ -6380,7 +6093,7 @@ EXIT;\n"
         })
 }
 
-async fn run_backward_compatible_upgrades(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_backward_compatible_upgrades(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {BACKWARD_COMPATIBLE_UPGRADES_ID}");
     println!(
         "Scenario Namespace: table={BACKWARD_COMPATIBLE_UPGRADES_TABLE} \
@@ -6525,20 +6238,17 @@ deployment={BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"
          (migrate preserved Deployment; older v1.0.0 config applies without rebuild)"
     );
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: "LogMiner".to_string(),
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: "LogMiner".to_string(),
+        },
     })
 }
 
@@ -6751,7 +6461,7 @@ fn parse_capture_checkpoint(status_out: &str) -> Option<i64> {
     None
 }
 
-async fn run_schema_change_pause(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_schema_change_pause(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {SCHEMA_CHANGE_PAUSE_ID}");
     println!(
         "Scenario Namespace: table={SCHEMA_CHANGE_PAUSE_TABLE} \
@@ -6910,20 +6620,17 @@ collection={SCHEMA_CHANGE_PAUSE_COLLECTION} deployment={SCHEMA_CHANGE_PAUSE_DEPL
         println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -7023,7 +6730,7 @@ EXIT;\n"
         })
 }
 
-async fn run_source_alignment(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_source_alignment(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {SOURCE_ALIGNMENT_ID}");
     println!(
         "Scenario Namespace: table={SOURCE_ALIGNMENT_TABLE} \
@@ -7209,20 +6916,17 @@ pipeline={SOURCE_ALIGNMENT_PIPELINE}"
          (detect + repair Base from Source; resource-gated max-rows; Source not written)"
     );
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: "Source Alignment Check (OCI reads)".to_string(),
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: "Source Alignment Check (OCI reads)".to_string(),
+        },
     })
 }
 
@@ -7273,7 +6977,7 @@ EXIT;\n"
     Ok(())
 }
 
-async fn run_drift_check(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_drift_check(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {DRIFT_CHECK_ID}");
     println!(
         "Scenario Namespace: table={DRIFT_CHECK_TABLE} \
@@ -7476,20 +7180,17 @@ pipeline={DRIFT_CHECK_PIPELINE}"
          (detect + Managed auto-repair; non-Managed preserved; resource-gated max-rows)"
     );
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: "Drift Check (Managed-field Target repair)".to_string(),
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: "Drift Check (Managed-field Target repair)".to_string(),
+        },
     })
 }
 
@@ -7676,7 +7377,7 @@ EXIT;\n"
     Ok(name)
 }
 
-async fn run_remove_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_remove_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {REMOVE_PIPELINE_ID}");
     println!(
         "Scenario Namespace: table={REMOVE_PIPELINE_CUSTOMERS_TABLE} \
@@ -7869,20 +7570,17 @@ deployment={REMOVE_PIPELINE_DEPLOYMENT}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
     }
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: capture_note,
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: capture_note,
+        },
     })
 }
 
@@ -8288,7 +7986,7 @@ impl Drop for ScenarioLock {
     }
 }
 
-async fn run_change_pipeline(lab_dir: &Path) -> Result<ScenarioReport, CliError> {
+async fn adapt_change_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
     println!("Lab Scenario: {CHANGE_PIPELINE_ID}");
     println!(
         "Scenario Namespace: table={CHANGE_PIPELINE_CUSTOMERS_TABLE} \
@@ -8564,20 +8262,17 @@ deployment={CHANGE_PIPELINE_DEPLOYMENT}"
 Shared Base kept; metadata-only skipped)"
     );
 
-    Ok(ScenarioReport {
+    Ok(AdapterOutcome {
         correctness: true,
-        rows_applied,
         detail: String::new(),
-        capture_path_note: String::new(),
-        settle_ms: None,
-        max_settle_ms: None,
-        lag: None,
-        max_lag: None,
-        min_rows_per_s: None,
-        max_duration_ms: None,
-        measured_rows_per_s: None,
-        measured_duration_ms: None,
-        thresholds_ok: true,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: rows_applied,
+            capture_path_note: String::new(),
+        },
     })
 }
 
@@ -8665,6 +8360,11 @@ EXIT;\n"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lab_scenario::recipe::{
+        load_recipe, ScenarioRecipeChecks, ScenarioRecipeNamespace, ScenarioRecipeThresholds,
+        ScenarioRecipeWorkload,
+    };
+    use crate::lab_scenario::runner::{evaluate_recipe_thresholds, recipe_interface_summary};
     use std::time::Duration;
 
     #[test]
@@ -8860,37 +8560,61 @@ mod tests {
         );
     }
 
+    fn bulk_load_recipe_thresholds() -> ScenarioRecipeThresholds {
+        // Values matching lab/scenarios/bulk-load/recipe.yaml (live interface).
+        ScenarioRecipeThresholds {
+            max_settle_ms: None,
+            max_lag: Some(0),
+            max_duration_ms: Some(600_000),
+            min_rows_per_s: Some(50.0),
+        }
+    }
+
     #[test]
     fn bulk_thresholds_fail_independently_of_correctness() {
         // Metrics miss the bar while row-level correctness would pass (US21 / US36).
-        let (ok, detail) = evaluate_bulk_load_thresholds(&BulkLoadMetricSample {
-            lag: 0,
-            max_lag: 0,
-            duration_ms: 900_000,
-            max_duration_ms: 600_000,
-            rows_per_s: 10.0,
-            min_rows_per_s: 50.0,
-        });
+        let thresholds = bulk_load_recipe_thresholds();
+        let metrics = ScenarioMetrics {
+            settle_ms: None,
+            lag: Some(0),
+            rows_per_s: Some(10.0),
+            duration_ms: Some(900_000),
+            rows_applied: BULK_LOAD_ROW_COUNT,
+            capture_path_note: "Initial Load".to_string(),
+        };
+        let (ok, detail) = evaluate_recipe_thresholds(&thresholds, &metrics);
         assert!(!ok, "threshold sample must fail");
         assert!(detail.contains("threshold:"), "detail={detail}");
         assert!(detail.contains("duration_ms"), "detail={detail}");
         assert!(detail.contains("rows_per_s"), "detail={detail}");
 
-        let report = ScenarioReport {
-            correctness: true,
-            rows_applied: BULK_LOAD_ROW_COUNT,
-            detail: detail.clone(),
-            capture_path_note: "Initial Load".to_string(),
-            settle_ms: None,
-            max_settle_ms: None,
-            lag: Some(0),
-            max_lag: Some(0),
-            min_rows_per_s: Some(50.0),
-            max_duration_ms: Some(600_000),
-            measured_rows_per_s: Some(10.0),
-            measured_duration_ms: Some(900_000),
-            thresholds_ok: false,
+        let recipe = ScenarioRecipe {
+            id: BULK_LOAD_ID.to_string(),
+            summary: "bulk".to_string(),
+            namespace: ScenarioRecipeNamespace {
+                source_tables: vec![BULK_LOAD_TABLE.to_string()],
+                target_collections: vec![BULK_LOAD_COLLECTION.to_string()],
+                deployment: BULK_LOAD_DEPLOYMENT.to_string(),
+                pipelines: vec![],
+            },
+            deployment_config: "deployment.yaml".to_string(),
+            workload: ScenarioRecipeWorkload {
+                concurrency: "serial".to_string(),
+                steps: vec!["prepare".to_string()],
+            },
+            checks: ScenarioRecipeChecks {
+                correctness: vec!["rows".to_string()],
+            },
+            thresholds,
         };
+        let report = report_from_adapter_outcome(
+            &recipe,
+            AdapterOutcome {
+                correctness: true,
+                detail: String::new(),
+                metrics,
+            },
+        );
         assert_eq!(
             scenario_failure_kind(report.correctness, report.thresholds_ok),
             "threshold"
@@ -8917,33 +8641,47 @@ mod tests {
     #[test]
     fn correctness_fail_even_when_metrics_pass() {
         // Row counts wrong, but lag/duration/throughput would pass (US36).
-        let (ok, detail) = evaluate_bulk_load_thresholds(&BulkLoadMetricSample {
-            lag: 0,
-            max_lag: 0,
-            duration_ms: 120_000,
-            max_duration_ms: 600_000,
-            rows_per_s: 800.0,
-            min_rows_per_s: 50.0,
-        });
+        let thresholds = bulk_load_recipe_thresholds();
+        let metrics = ScenarioMetrics {
+            settle_ms: None,
+            lag: Some(0),
+            rows_per_s: Some(800.0),
+            duration_ms: Some(120_000),
+            rows_applied: 99_000,
+            capture_path_note: "Initial Load".to_string(),
+        };
+        let (ok, detail) = evaluate_recipe_thresholds(&thresholds, &metrics);
         assert!(ok, "metrics should pass, detail={detail}");
 
-        let report = ScenarioReport {
-            correctness: false,
-            rows_applied: 99_000,
-            detail: format!(
-                "correctness: expected rows={BULK_LOAD_ROW_COUNT} base_rows=99000 target_rows=99000"
-            ),
-            capture_path_note: "Initial Load".to_string(),
-            settle_ms: None,
-            max_settle_ms: None,
-            lag: Some(0),
-            max_lag: Some(0),
-            min_rows_per_s: Some(50.0),
-            max_duration_ms: Some(600_000),
-            measured_rows_per_s: Some(800.0),
-            measured_duration_ms: Some(120_000),
-            thresholds_ok: true,
+        let recipe = ScenarioRecipe {
+            id: BULK_LOAD_ID.to_string(),
+            summary: "bulk".to_string(),
+            namespace: ScenarioRecipeNamespace {
+                source_tables: vec![BULK_LOAD_TABLE.to_string()],
+                target_collections: vec![BULK_LOAD_COLLECTION.to_string()],
+                deployment: BULK_LOAD_DEPLOYMENT.to_string(),
+                pipelines: vec![],
+            },
+            deployment_config: "deployment.yaml".to_string(),
+            workload: ScenarioRecipeWorkload {
+                concurrency: "serial".to_string(),
+                steps: vec!["prepare".to_string()],
+            },
+            checks: ScenarioRecipeChecks {
+                correctness: vec!["rows".to_string()],
+            },
+            thresholds,
         };
+        let report = report_from_adapter_outcome(
+            &recipe,
+            AdapterOutcome {
+                correctness: false,
+                detail: format!(
+                    "correctness: expected rows={BULK_LOAD_ROW_COUNT} base_rows=99000 target_rows=99000"
+                ),
+                metrics,
+            },
+        );
         assert_eq!(
             scenario_failure_kind(report.correctness, report.thresholds_ok),
             "correctness"
@@ -8963,6 +8701,110 @@ mod tests {
         assert!(
             rendered.contains("namespace=left in place"),
             "fail keeps Namespace for inspect; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn recipe_thresholds_are_live_interface_for_bulk_load() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lab/scenarios/bulk-load/recipe.yaml");
+        let recipe = load_recipe(&path).expect("load bulk-load recipe");
+        assert_eq!(recipe.thresholds.max_lag, Some(0));
+        assert_eq!(recipe.thresholds.max_duration_ms, Some(600_000));
+        assert_eq!(recipe.thresholds.min_rows_per_s, Some(50.0));
+
+        let metrics = ScenarioMetrics {
+            settle_ms: None,
+            lag: Some(1),
+            rows_per_s: Some(10.0),
+            duration_ms: Some(900_000),
+            rows_applied: BULK_LOAD_ROW_COUNT,
+            capture_path_note: "Initial Load".to_string(),
+        };
+        let (ok, detail) = evaluate_recipe_thresholds(&recipe.thresholds, &metrics);
+        assert!(!ok, "failing metrics must fail against recipe thresholds");
+        assert!(
+            detail.contains("max_lag=0"),
+            "detail must use recipe max_lag; got {detail}"
+        );
+        assert!(
+            detail.contains("max_duration_ms=600000"),
+            "detail must use recipe max_duration_ms; got {detail}"
+        );
+        assert!(
+            detail.contains("min_rows_per_s=50.00"),
+            "detail must use recipe min_rows_per_s; got {detail}"
+        );
+
+        let report = report_from_adapter_outcome(
+            &recipe,
+            AdapterOutcome {
+                correctness: true,
+                detail: String::new(),
+                metrics,
+            },
+        );
+        assert!(!report.thresholds_ok);
+        assert!(report.correctness);
+        assert!(report.detail.contains("threshold:"));
+    }
+
+    #[test]
+    fn recipe_thresholds_are_live_interface_for_concurrent_settle() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lab/scenarios/concurrent-source-workload/recipe.yaml");
+        let recipe = load_recipe(&path).expect("load concurrent-source-workload recipe");
+        assert_eq!(recipe.thresholds.max_settle_ms, Some(300_000));
+
+        let metrics = ScenarioMetrics {
+            settle_ms: Some(300_001),
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied: 10,
+            capture_path_note: "LogMiner".to_string(),
+        };
+        let (ok, detail) = evaluate_recipe_thresholds(&recipe.thresholds, &metrics);
+        assert!(!ok, "settle over recipe limit must fail");
+        assert!(
+            detail.contains("max_settle_ms=300000"),
+            "detail must use recipe max_settle_ms; got {detail}"
+        );
+    }
+
+    #[test]
+    fn recipe_driven_runner_surfaces_workload_and_checks() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lab/scenarios/bulk-load/recipe.yaml");
+        let recipe = load_recipe(&path).expect("load bulk-load recipe");
+        assert!(!recipe.workload.steps.is_empty());
+        assert!(!recipe.checks.correctness.is_empty());
+        let summary = recipe_interface_summary(&recipe);
+        assert!(
+            summary.contains("workload.concurrency=serial"),
+            "summary={summary}"
+        );
+        assert!(
+            summary.contains(&format!("workload.steps={}", recipe.workload.steps.len())),
+            "summary={summary}"
+        );
+        assert!(
+            summary.contains(&format!(
+                "checks.correctness={}",
+                recipe.checks.correctness.len()
+            )),
+            "summary={summary}"
+        );
+        assert!(
+            summary.contains("max_lag")
+                && summary.contains("max_duration_ms")
+                && summary.contains("min_rows_per_s"),
+            "summary must list threshold axes from recipe; got {summary}"
+        );
+        // pipelines is a live namespace field (no longer dead_code).
+        assert!(
+            !recipe.namespace.pipelines.is_empty(),
+            "bulk-load recipe declares pipelines"
         );
     }
 

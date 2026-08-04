@@ -29,7 +29,7 @@
       "paths": [
         "lab/**",
         "crates/cli/src/lab.rs",
-        "crates/cli/src/lab_scenario.rs"
+        "crates/cli/src/lab_scenario"
       ],
       "handbook_pages": [
         "start-here.md",
