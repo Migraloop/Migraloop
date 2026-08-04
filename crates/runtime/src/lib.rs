@@ -1,17 +1,27 @@
-//! Deployment runtime: apply, table-level Initial Load, Direct/Transform Pipeline
-//! Delivery, Incremental Sync orchestration (including Affect Analysis → Derived
-//! maintenance → Delivery via the single transform Affect interface), Pipeline
-//! lifecycle (pause / resume / remove / change-via-apply), Source Alignment Check,
-//! Drift Check, and status inventory reads.
+//! Deployment runtime public interface: Operator Deployment verbs plus necessary
+//! session / factory entry points (issue #172).
 //!
-//! The Operator CLI is a thin adapter over this interface.
+//! **Verbs:** [`apply`], Incremental Sync ([`sync_incremental`], [`run_incremental_sync`],
+//! [`run_incremental_sync_with_engines`], [`run_continuous_incremental_sync`],
+//! [`supervise_continuous_incremental_sync`]), Pipeline lifecycle ([`pause_pipeline`],
+//! [`resume_pipeline`], [`remove_pipeline`]), [`source_alignment_check`], [`drift_check`],
+//! status inventory ([`status_inventory`], [`status_inventory_from_url`]), and inspect
+//! ([`inspect_base_rows`], [`inspect_derived_rows`], [`inspect_target_documents`]).
+//!
+//! **Session / factory entry points:** [`source_engine_from_connection`],
+//! [`target_engine_from_deployment`], plus structured observability emit helpers
+//! used by the Operator edge.
+//!
+//! Internal helpers (Base apply crumbs, Delivery orchestration pieces, identity display)
+//! stay `pub(crate)` — they fail the deletion test as a public surface. The Operator CLI
+//! is a thin adapter (clap/config/env + narrative formatting) over this interface.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use migraloop_capture::{
-    classify_number, is_allow_listed_oracle_type, CapturePosition, IncrementalCaptureSession,
-    InitialLoadChunkOptions, NumberMongoMapping, OracleLogMinerSource, OracleSourceConnect,
-    SourceColumn, SourceEngine, TypeError,
+    classify_number, is_allow_listed_oracle_type, CapturePosition, InitialLoadChunkOptions,
+    NumberMongoMapping, OracleLogMinerSource, OracleSourceConnect, SourceColumn, SourceEngine,
+    TypeError,
 };
 use migraloop_delivery::{
     DeliveryColumn, DeliveryDocument, ManagedFieldAs, MongoTargetConnection, TargetEngine,
@@ -27,25 +37,22 @@ use migraloop_transform::{
 use migraloop_types::{output_identity_key, resolve_secret_ref};
 use thiserror::Error;
 
+#[cfg(test)]
 mod engines;
 mod observability;
 mod incremental;
 mod lifecycle;
 
-pub use engines::deliver_initial_load_chunk_via_engines;
 pub use observability::{emit_event, EventValue};
 
 pub use incremental::{
-    apply_change_events_to_base_rows, format_output_identity,
-    output_identity_matches_poison_keys, run_incremental_sync,
-    run_incremental_sync_with_engines, run_continuous_incremental_sync,
+    run_incremental_sync, run_incremental_sync_with_engines, run_continuous_incremental_sync,
     supervise_continuous_incremental_sync, sync_incremental, SyncCycleOutcome, SyncInvocation,
 };
 pub use lifecycle::{
     drift_check, inspect_base_rows, inspect_derived_rows, inspect_target_documents, pause_pipeline,
-    pipeline_delivery_health, remove_pipeline, resume_pipeline, source_alignment_check,
-    status_inventory, status_inventory_from_url, StatusInventory, DEFAULT_ALIGNMENT_MAX_ROWS,
-    DEFAULT_DRIFT_MAX_ROWS,
+    remove_pipeline, resume_pipeline, source_alignment_check, status_inventory,
+    status_inventory_from_url, StatusInventory, DEFAULT_ALIGNMENT_MAX_ROWS, DEFAULT_DRIFT_MAX_ROWS,
 };
 
 /// Dependency-graph seam marker (ADR-0024 modular monorepo).
@@ -57,11 +64,11 @@ pub enum RuntimeError {
     Failed(String),
 }
 
-pub fn resolve_secret_value(reference: &SecretRef, field: &str) -> Result<String, RuntimeError> {
+pub(crate) fn resolve_secret_value(reference: &SecretRef, field: &str) -> Result<String, RuntimeError> {
     resolve_secret_ref(reference, field).map_err(|err| RuntimeError::Failed(err.to_string()))
 }
 
-pub fn output_identity_from_row(
+pub(crate) fn output_identity_from_row(
     row: &serde_json::Map<String, serde_json::Value>,
     identity_fields: &[String],
 ) -> Result<serde_json::Value, RuntimeError> {
@@ -86,7 +93,7 @@ pub fn output_identity_from_row(
     Ok(serde_json::Value::Object(identity))
 }
 
-pub fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformOp>, RuntimeError> {
+pub(crate) fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformOp>, RuntimeError> {
     let Some(value) = &pipeline.transform_json else {
         return Err(RuntimeError::Failed(format!(
             "Transform Pipeline {} is missing transform definition",
@@ -105,7 +112,7 @@ pub fn transform_ops_from_pipeline(pipeline: &Pipeline) -> Result<Vec<TransformO
 
 /// Base Dataset (schema, table) pairs a Pipeline references — primary `source.table`
 /// plus every `equiLookup.from` / `union.from` secondary Base.
-pub fn pipeline_base_table_refs(pipeline: &Pipeline) -> Vec<(String, String)> {
+pub(crate) fn pipeline_base_table_refs(pipeline: &Pipeline) -> Vec<(String, String)> {
     let mut tables = BTreeSet::new();
     if !pipeline.source_table.is_empty() {
         tables.insert((
@@ -124,7 +131,7 @@ pub fn pipeline_base_table_refs(pipeline: &Pipeline) -> Vec<(String, String)> {
     tables.into_iter().collect()
 }
 
-pub fn pipeline_references_table(pipeline: &Pipeline, table: &str) -> bool {
+pub(crate) fn pipeline_references_table(pipeline: &Pipeline, table: &str) -> bool {
     pipeline_base_table_refs(pipeline)
         .iter()
         .any(|(_, t)| t.eq_ignore_ascii_case(table))
@@ -132,7 +139,7 @@ pub fn pipeline_references_table(pipeline: &Pipeline, table: &str) -> bool {
 
 /// Load secondary Base rows for all `equiLookup.from` / `union.from` tables on this Pipeline.
 /// Secondary Base rows plus column metadata (for unwind-flattened foreign fields).
-pub async fn load_secondary_bases_and_columns_for_pipeline(
+pub(crate) async fn load_secondary_bases_and_columns_for_pipeline(
     store: &PlatformStore,
     pipeline: &Pipeline,
     ops: &[TransformOp],
@@ -216,7 +223,7 @@ pub fn source_engine_from_connection(
     Ok(OracleLogMinerSource::new(connect, password))
 }
 
-pub fn source_timezone_opt(deployment: &Deployment) -> Option<&str> {
+pub(crate) fn source_timezone_opt(deployment: &Deployment) -> Option<&str> {
     let tz = deployment.source.timezone.trim();
     if tz.is_empty() {
         None
@@ -249,7 +256,7 @@ fn delivery_columns_from_base(columns: &[BaseColumn]) -> Vec<DeliveryColumn> {
         .collect()
 }
 
-pub fn apply_field_mappings_to_row(
+pub(crate) fn apply_field_mappings_to_row(
     row: &serde_json::Map<String, serde_json::Value>,
     pipeline: &Pipeline,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -274,7 +281,7 @@ pub fn apply_field_mappings_to_row(
 }
 
 /// Apply-time validation for Managed/transform inputs (ADR-0018 / ADR-0023).
-pub fn validate_pipeline_managed_fields(
+pub(crate) fn validate_pipeline_managed_fields(
     pipeline: &Pipeline,
     source_columns: &[SourceColumn],
     managed_column_names: &BTreeSet<String>,
@@ -334,7 +341,7 @@ pub fn validate_pipeline_managed_fields(
     Ok(())
 }
 
-pub fn delivery_document_for_row(
+pub(crate) fn delivery_document_for_row(
     row: &serde_json::Map<String, serde_json::Value>,
     identity_fields: &[String],
     columns: &[BaseColumn],
@@ -353,7 +360,7 @@ pub fn delivery_document_for_row(
     })
 }
 
-pub async fn ensure_store_session_healthy(store: &PlatformStore) -> Result<(), RuntimeError> {
+pub(crate) async fn ensure_store_session_healthy(store: &PlatformStore) -> Result<(), RuntimeError> {
     match store.health().await {
         PlatformStoreHealth::Healthy { .. } => {
             // Settings guardrails reject absurd under-provisioning; disk warn is
@@ -864,7 +871,7 @@ async fn ensure_base_primary_key(
 /// Load Source schema metadata for apply-time Managed field validation.
 ///
 /// Goes through the Source engine interface (contract catalog or OCI discovery).
-pub fn source_columns_for_pipeline(
+pub(crate) fn source_columns_for_pipeline(
     deployment: &Deployment,
     schema: &str,
     table: &str,
@@ -875,7 +882,7 @@ pub fn source_columns_for_pipeline(
         .map_err(|err| RuntimeError::Failed(err.to_string()))
 }
 
-pub fn oracle_source_connect(
+pub(crate) fn oracle_source_connect(
     source: &SystemConnection,
 ) -> Result<OracleSourceConnect, RuntimeError> {
     if source.port <= 0 || source.port > u16::MAX as i32 {
@@ -892,21 +899,11 @@ pub fn oracle_source_connect(
     })
 }
 
-/// Open Incremental Capture via the Source engine interface.
-pub fn open_deployment_incremental_capture(
-    source: &SystemConnection,
-) -> Result<impl IncrementalCaptureSession, RuntimeError> {
-    let engine = source_engine_from_connection(source)?;
-    engine
-        .open_incremental_capture()
-        .map_err(|err| RuntimeError::Failed(err.to_string()))
-}
-
 /// Fail-fast Source Prerequisites before capture runs (ADR-0021).
 ///
 /// Delegates to the Source engine adapter (contract or OCI). Read-only; never
 /// auto-alters customer Source configuration.
-pub fn ensure_source_prerequisites(
+pub(crate) fn ensure_source_prerequisites(
     source: &SystemConnection,
     source_tables: &[String],
 ) -> Result<(), RuntimeError> {
@@ -929,7 +926,7 @@ fn pipeline_source_tables(pipelines: &[Pipeline]) -> Vec<String> {
 }
 
 /// Whether a Pipeline has a Target Binding configured for Delivery.
-pub fn pipeline_has_target(pipeline: &Pipeline) -> bool {
+pub(crate) fn pipeline_has_target(pipeline: &Pipeline) -> bool {
     (pipeline.mode == "direct" || pipeline.mode == "transform")
         && !pipeline.target_collection.is_empty()
 }
@@ -1036,7 +1033,7 @@ fn pipelines_with_metadata_only_change<'a>(
         .collect()
 }
 
-pub async fn deliver_pipelines(
+pub(crate) async fn deliver_pipelines(
     store: &PlatformStore,
     deployment: &Deployment,
     pipelines: &[&Pipeline],
@@ -1047,7 +1044,7 @@ pub async fn deliver_pipelines(
 /// Deliver Pipelines. `reconcile_deletes` removes Target identities that disappeared
 /// (used for revision rebuild and resume catch-up). When `ignore_paused` is true,
 /// Delivery runs even if the Pipeline is still marked paused (revision transition).
-pub async fn deliver_pipelines_with_options(
+pub(crate) async fn deliver_pipelines_with_options(
     store: &PlatformStore,
     deployment: &Deployment,
     pipelines: &[&Pipeline],
@@ -1102,7 +1099,7 @@ pub async fn deliver_pipelines_with_options(
 
 /// Direct Pipeline Delivery. When `reconcile_deletes` is true (resume / revision),
 /// also remove Target documents whose Output Identity is no longer in Base.
-pub async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
+pub(crate) async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipeline: &Pipeline,
@@ -1201,11 +1198,11 @@ pub async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
     Ok(())
 }
 
-pub fn identity_key(identity: &serde_json::Value) -> String {
+pub(crate) fn identity_key(identity: &serde_json::Value) -> String {
     output_identity_key(identity)
 }
 
-pub fn target_document_identity_key(document: &serde_json::Value) -> Option<String> {
+pub(crate) fn target_document_identity_key(document: &serde_json::Value) -> Option<String> {
     document.get("_id").map(identity_key)
 }
 
@@ -1238,7 +1235,7 @@ async fn reconcile_target_deletes<T: TargetEngine>(
         .map_err(|err| RuntimeError::Failed(err.to_string()))
 }
 
-pub async fn deliver_transform_pipeline_with_options<T: TargetEngine>(
+pub(crate) async fn deliver_transform_pipeline_with_options<T: TargetEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipeline: &Pipeline,
@@ -1388,7 +1385,7 @@ fn from_output_columns(columns: Vec<OutputColumn>) -> Vec<BaseColumn> {
 }
 
 /// Derived columns via the transform schema-inference interface (no TransformOp walk here).
-pub fn derived_columns_for_ops(
+pub(crate) fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
     ops: &[TransformOp],
     derived_rows: &[serde_json::Map<String, serde_json::Value>],
@@ -1422,7 +1419,7 @@ async fn persist_initial_maintenance_state(
     }
 }
 
-pub async fn persist_maintenance_state_blob(
+pub(crate) async fn persist_maintenance_state_blob(
     store: &PlatformStore,
     pipeline: &Pipeline,
     state: &MaintenanceStateBlob,

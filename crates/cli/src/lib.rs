@@ -16,8 +16,7 @@ use migraloop_platform_store::{
     PlatformStoreHealth, SystemConnection,
 };
 use migraloop_runtime::{
-    format_output_identity, inspect_base_rows, inspect_derived_rows, inspect_target_documents,
-    oracle_source_connect, pipeline_delivery_health, status_inventory_from_url,
+    inspect_base_rows, inspect_derived_rows, inspect_target_documents, status_inventory_from_url,
 };
 use thiserror::Error;
 
@@ -363,6 +362,46 @@ fn format_system_line(label: &str, system: &SystemConnection) -> String {
     )
 }
 
+/// Operator-facing Output Identity label for `status` / quarantine narrative.
+fn format_output_identity(identity: &serde_json::Value) -> String {
+    match identity {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Operator-facing Delivery Health label for `status` narrative.
+fn pipeline_delivery_health(
+    pipeline: &Pipeline,
+    active_quarantines_for_pipeline: usize,
+) -> &'static str {
+    if pipeline.paused {
+        "paused"
+    } else if active_quarantines_for_pipeline > 0 {
+        "unhealthy"
+    } else {
+        match pipeline.delivery_status.as_str() {
+            "delivered" => "ok",
+            "pending" => "pending",
+            _ => "unknown",
+        }
+    }
+}
+
+/// Operator `status` Incremental Capture mechanism label for Oracle Sources.
+///
+/// Mirrors Source adapter harness selection (`host: contract|stub` → contract;
+/// otherwise OCI) without constructing a full capture connect object.
+fn oracle_incremental_capture_label(source: &SystemConnection) -> &'static str {
+    let host = source.host.trim();
+    if host.eq_ignore_ascii_case("contract") || host.eq_ignore_ascii_case("stub") {
+        "LogMiner (contract)"
+    } else {
+        "LogMiner (OCI)"
+    }
+}
+
 async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), CliError> {
     let store = PlatformStore::open(platform_store_url)
         .await
@@ -463,13 +502,10 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             println!("{}", format_system_line("Source", &deployment.source));
             println!("{}", format_system_line("Target", &deployment.target));
             if deployment.source.kind.eq_ignore_ascii_case("oracle") {
-                let connect = oracle_source_connect(&deployment.source)?;
-                let mechanism = if connect.is_contract_harness() {
-                    "LogMiner (contract)"
-                } else {
-                    "LogMiner (OCI)"
-                };
-                println!("  Incremental Capture: {mechanism}");
+                println!(
+                    "  Incremental Capture: {}",
+                    oracle_incremental_capture_label(&deployment.source)
+                );
             }
         }
     }
@@ -899,9 +935,11 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             })?;
             // Continuous Incremental Capture + Delivery on the same single active
             // instance that serves Observability /metrics (issue #145 / ADR-0008).
-            let sync_url = platform_store_url.clone();
+            // Open the Platform Store session at the Operator edge; runtime supervise
+            // prefers that session handle over URL reopen (issue #172).
+            let sync_store = open_store(&platform_store_url).await?;
             tokio::spawn(async move {
-                migraloop_runtime::supervise_continuous_incremental_sync(sync_url).await;
+                migraloop_runtime::supervise_continuous_incremental_sync(sync_store).await;
             });
             observability::serve_prometheus_metrics(addr, platform_store_url).await
         }

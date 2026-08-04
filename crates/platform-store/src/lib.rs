@@ -235,6 +235,10 @@ pub(crate) async fn connect(database_url: &str) -> Result<PgPool, PlatformStoreE
 ///
 /// Postgres remains the only store engine (ADR-0001). Open once per process flow and
 /// call session verbs instead of reconnecting on every table-shaped CRUD call.
+///
+/// [`Clone`] is cheap (shared [`PgPool`]) so Deployment runtime supervise can hand a
+/// session handle to panic-isolated continuous Sync workers without reopening by URL.
+#[derive(Clone)]
 pub struct PlatformStore {
     pool: PgPool,
 }
@@ -262,6 +266,10 @@ impl PlatformStore {
     }
 
     /// Acquire the Incremental Capture single-writer lock (blocks until available).
+    ///
+    /// The guard closes its backend session on drop (not pool-return) so the
+    /// session advisory lock is released even when the Platform Store pool is
+    /// reused across continuous Sync cycles.
     pub async fn acquire_incremental_sync_lock(
         &self,
     ) -> Result<IncrementalSyncLock, PlatformStoreError> {
@@ -275,6 +283,9 @@ impl PlatformStore {
             .execute(&mut *conn)
             .await
             .map_err(PlatformStoreError::Persist)?;
+        // Returning the connection to the pool would keep the PostgreSQL session
+        // (and this advisory lock) alive. Close-on-drop ends the session instead.
+        conn.close_on_drop();
         Ok(IncrementalSyncLock { _conn: conn })
     }
 
@@ -1769,8 +1780,9 @@ impl PlatformStore {
 
 /// Holds a Platform Store session advisory lock for one Incremental Capture cycle.
 ///
-/// Dropping the guard returns the connection to the pool; PostgreSQL releases the
-/// session advisory lock automatically when that backend session ends.
+/// Dropping the guard closes the backend connection (via [`PoolConnection::close_on_drop`])
+/// so PostgreSQL releases the session advisory lock. Do not return the locked
+/// connection to a shared pool — that would leave the lock held across cycles.
 pub struct IncrementalSyncLock {
     _conn: PoolConnection<Postgres>,
 }

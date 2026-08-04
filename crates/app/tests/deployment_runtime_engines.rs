@@ -7,17 +7,18 @@
 //! 3. Full Incremental Sync accepts injected Source/Target engines so Fake
 //!    adapters exercise the production Sync path without Oracle-kind gates.
 //!
-//! This file drives production Delivery and Incremental Sync verbs with
-//! in-memory Fake adapters (Mongo/Oracle contract twins cover the default
-//! factory path elsewhere).
+//! This file drives production Incremental Sync with in-memory Fake adapters
+//! (Mongo/Oracle contract twins cover the default factory path elsewhere).
+//! Direct Base→Target Delivery with Fake Target is covered in-crate by the
+//! runtime engine-seam unit tests (`deliver_initial_load_chunk_via_engines`);
+//! the public runtime surface no longer exposes Delivery helper verbs (#172).
 
 mod common;
 
 use std::collections::BTreeMap;
 
 use migraloop_capture::{
-    CapturePosition, ChangeEvent, ChangeOp, FakeSource, FakeSourceTable, SourceColumn,
-    SourceEngine, CONTRACT_SOURCE_CATALOG_ENV,
+    CapturePosition, ChangeEvent, ChangeOp, FakeSource, FakeSourceTable, SourceColumn, SourceEngine,
 };
 use migraloop_delivery::{FakeTarget, TargetEngine};
 use migraloop_platform_store::{
@@ -26,7 +27,6 @@ use migraloop_platform_store::{
 };
 use migraloop_runtime::{SyncCycleOutcome, SyncInvocation};
 use serde_json::json;
-use tempfile::TempDir;
 
 fn admin_url() -> String {
     std::env::var("MIGRALOOP_TEST_ADMIN_URL")
@@ -54,136 +54,6 @@ async fn ephemeral_database_url() -> String {
         .map(|(prefix, _)| prefix.to_string())
         .expect("admin url must include a database path");
     format!("{base}/{db_name}")
-}
-
-#[tokio::test]
-async fn production_delivery_orchestration_accepts_fake_target_adapter() {
-    let url = ephemeral_database_url().await;
-    let dir = TempDir::new().expect("tempdir");
-    let doubles = common::NamedScenarioDoubles::install(dir.path());
-
-    std::env::set_var("ORACLE_PASSWORD", "oracle-secret-value");
-    std::env::set_var(CONTRACT_SOURCE_CATALOG_ENV, &doubles.catalog_path);
-
-    let store = PlatformStore::open(&url)
-        .await
-        .expect("open Platform Store session");
-    store.migrate().await.expect("migrate via session");
-
-    let deployment = Deployment {
-        name: "engine-seam".into(),
-        source: SystemConnection {
-            kind: "oracle".into(),
-            host: "stub".into(),
-            port: 1521,
-            database: "STUB".into(),
-            username: "sync_user".into(),
-            password_ref: SecretRef {
-                kind: SecretRefKind::Env,
-                value: "ORACLE_PASSWORD".into(),
-            },
-            timezone: String::new(),
-            tls: TlsSettings::default(),
-        },
-        target: SystemConnection {
-            kind: "mongodb".into(),
-            host: "unused".into(),
-            port: 27017,
-            database: "unused".into(),
-            username: "unused".into(),
-            password_ref: SecretRef {
-                kind: SecretRefKind::Env,
-                value: "ORACLE_PASSWORD".into(),
-            },
-            timezone: String::new(),
-            tls: TlsSettings::default(),
-        },
-    };
-    store
-        .upsert_deployment(&deployment)
-        .await
-        .expect("upsert deployment");
-
-    let pipeline = Pipeline {
-        deployment_name: deployment.name.clone(),
-        name: "customers".into(),
-        mode: "direct".into(),
-        source_table: "CUSTOMERS".into(),
-        source_schema: String::new(),
-        target_collection: "customers".into(),
-        delivery_status: "pending".into(),
-        delivery_applied_changes: 0,
-        delivery_lag: 0,
-        paused: false,
-        description: String::new(),
-        field_mappings: Default::default(),
-        output_identity: vec![],
-        transform_json: None,
-        drift_status: "unknown".into(),
-        drift_checked_rows: 0,
-        drift_mismatched_rows: 0,
-    };
-    store
-        .replace_pipelines(&deployment.name, std::slice::from_ref(&pipeline))
-        .await
-        .expect("upsert pipeline");
-
-    let mut row = serde_json::Map::new();
-    row.insert("ID".into(), json!(1));
-    row.insert("NAME".into(), json!("Ada"));
-    let dataset = BaseDataset {
-        deployment_name: deployment.name.clone(),
-        source_schema: String::new(),
-        source_table: "CUSTOMERS".into(),
-        status: "initial_load_complete".into(),
-        primary_key: vec!["ID".into()],
-        columns: vec![
-            BaseColumn {
-                name: "ID".into(),
-                oracle_type: "NUMBER".into(),
-                precision: Some(10),
-                scale: Some(0),
-            },
-            BaseColumn {
-                name: "NAME".into(),
-                oracle_type: "VARCHAR2".into(),
-                precision: None,
-                scale: None,
-            },
-        ],
-        omitted_columns: vec![],
-        row_count: 1,
-        sync_applied_changes: 0,
-        sync_health: "ok".into(),
-        capture_low_watermark: Some(1000),
-        capture_checkpoint: Some(999),
-        sync_lag: 0,
-        source_alignment: "unknown".into(),
-        source_alignment_checked_rows: 0,
-        source_alignment_mismatched_rows: 0,
-        initial_load_cursor: None,
-    };
-    store
-        .replace_base_dataset(&dataset, std::slice::from_ref(&row))
-        .await
-        .expect("seed Base Dataset");
-
-    // Production Delivery verb — Fake Target adapter, no Mongo required.
-    let fake = FakeTarget::new();
-    assert_eq!(fake.kind_label(), "fake");
-    migraloop_runtime::deliver_direct_pipeline_with_options(
-        &store, &deployment, &pipeline, &fake, false,
-    )
-    .await
-    .expect("Delivery orchestration against FakeTarget");
-
-    let listed = fake
-        .list_documents("customers")
-        .await
-        .expect("list via TargetEngine");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0]["NAME"], json!("Ada"));
-    assert_eq!(listed[0]["_id"], json!(1));
 }
 
 /// Full production Incremental Sync with Fake Source + Fake Target (issue #169).

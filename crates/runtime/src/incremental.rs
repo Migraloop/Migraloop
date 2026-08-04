@@ -334,7 +334,7 @@ fn supported_row_from_change(
     Ok(as_btree.into_iter().collect())
 }
 
-pub fn apply_change_events_to_base_rows(
+pub(crate) fn apply_change_events_to_base_rows(
     rows: &mut Vec<serde_json::Map<String, serde_json::Value>>,
     changes: &[ChangeEvent],
     supported_names: &BTreeSet<String>,
@@ -460,11 +460,12 @@ async fn set_delivery_lag_for_table(
     Ok(())
 }
 
-/// Operator-facing label for an Output Identity (status / quarantine alerts).
+/// Internal label for an Output Identity (runtime quarantine / alert lines).
 ///
 /// Matching for poison injection, Drift reconcile, and Delivery delete/upsert uses
-/// [`migraloop_types::output_identity_key`] — not this formatter.
-pub fn format_output_identity(identity: &serde_json::Value) -> String {
+/// [`migraloop_types::output_identity_key`] — not this formatter. Operator `status`
+/// narrative formatting lives in the CLI adapter.
+pub(crate) fn format_output_identity(identity: &serde_json::Value) -> String {
     match identity {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => s.clone(),
@@ -476,7 +477,7 @@ pub fn format_output_identity(identity: &serde_json::Value) -> String {
 ///
 /// Encoding matches Drift reconcile and Delivery identity keys
 /// ([`migraloop_types::output_identity_key`]).
-pub fn output_identity_matches_poison_keys(
+pub(crate) fn output_identity_matches_poison_keys(
     identity: &serde_json::Value,
     poison_keys: &BTreeSet<String>,
 ) -> bool {
@@ -842,11 +843,12 @@ pub async fn sync_incremental(store: &PlatformStore) -> Result<(), RuntimeError>
 
 /// Continuous Incremental Capture → Affect Analysis → Delivery inside `migraloop run`.
 ///
-/// Idle-polls only when caught up or when no Deployments are applied yet so compose
-/// can start before `apply`. While there is pending Source work, cycles continue
-/// immediately (bounded windows still apply). Errors are logged and retried —
-/// Observability metrics keep serving on the same single active instance (issue #145).
-pub async fn run_continuous_incremental_sync(platform_store_url: String) {
+/// Prefers an open Platform Store session (issue #172). Idle-polls only when caught
+/// up or when no Deployments are applied yet so compose can start before `apply`.
+/// While there is pending Source work, cycles continue immediately (bounded windows
+/// still apply). Errors are logged and retried — Observability metrics keep serving
+/// on the same single active instance (issue #145).
+pub async fn run_continuous_incremental_sync(store: &PlatformStore) {
     let poll = sync_poll_interval();
     println!(
         "Continuous Incremental Capture: poll_interval_ms={}",
@@ -860,13 +862,7 @@ pub async fn run_continuous_incremental_sync(platform_store_url: String) {
         )],
     );
     loop {
-        let cycle = async {
-            let store = PlatformStore::open(&platform_store_url)
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-            run_incremental_sync(&store, SyncInvocation::ContinuousCycle).await
-        };
-        match cycle.await {
+        match run_incremental_sync(store, SyncInvocation::ContinuousCycle).await {
             Ok(SyncCycleOutcome::Progressed) => {
                 // Catch up backlog without waiting for the idle poll interval.
             }
@@ -885,11 +881,15 @@ pub async fn run_continuous_incremental_sync(platform_store_url: String) {
     }
 }
 
-/// Supervise continuous Sync so a panic does not leave `/metrics` up with Sync dead.
-pub async fn supervise_continuous_incremental_sync(platform_store_url: String) {
+/// Supervise continuous Sync on an open Platform Store session so a panic does not
+/// leave `/metrics` up with Sync dead.
+///
+/// Takes a session handle (cloned into each worker via shared pool) rather than a
+/// URL reopen loop — callers open the store once at the Operator edge.
+pub async fn supervise_continuous_incremental_sync(store: PlatformStore) {
     loop {
-        let url = platform_store_url.clone();
-        match tokio::spawn(async move { run_continuous_incremental_sync(url).await }).await {
+        let worker = store.clone();
+        match tokio::spawn(async move { run_continuous_incremental_sync(&worker).await }).await {
             Ok(()) => {
                 eprintln!("Continuous Incremental Capture task ended unexpectedly; restarting");
                 emit_event(

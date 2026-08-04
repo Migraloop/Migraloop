@@ -10,7 +10,7 @@ migraloop <subcommand> [flags]
 
 Built from `crates/app` (`Dockerfile` release binary). All Operator subcommands that talk to the Platform Store accept `--platform-store-url` or the env var below.
 
-Operator verbs (`apply`, `sync`, `run`, `status`, inspect, pause/resume/remove, align, drift) are thin clap/config/env adapters over the Deployment **runtime**—Sync / Affect Analysis / Delivery orchestration is not owned by the CLI module. Developers extending Source or Target engines should follow the checklist in [Developer local setup](developer-local-setup.md#adding-a-source-or-target-engine-developer-checklist).
+Operator verbs (`apply`, `sync`, `run`, `status`, inspect, pause/resume/remove, align, drift) are thin clap/config/env adapters over the Deployment **runtime**—Sync / Affect Analysis / Delivery orchestration is not owned by the CLI module. The runtime public surface is those Operator verbs plus Source/Target factory entry points; Operator narrative formatting (for example `status` labels) stays in this CLI adapter, and continuous Sync / supervise prefer an open Platform Store session opened here. Developers extending Source or Target engines should follow the checklist in [Developer local setup](developer-local-setup.md#adding-a-source-or-target-engine-developer-checklist).
 
 ## Operator CLI subcommands
 
