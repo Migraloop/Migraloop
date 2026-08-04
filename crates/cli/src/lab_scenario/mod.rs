@@ -1,14 +1,14 @@
-//! Lab Scenario catalog, run orchestration, and Namespace cleanup
-//! (issues #60–#66, #63, #85, #86 / ADR-0025).
+//! Lab Scenario catalog, recipe-driven run orchestration, and Namespace cleanup
+//! (issues #60–#66, #63, #85, #86, #157 / ADR-0025).
 //!
-//! Lab-specific machinery: catalog listing from on-disk Scenario recipes
-//! (`lab/scenarios/<id>/recipe.yaml`), Scenario Namespace lifecycle
-//! (prepare / re-run wipe / manual remove / opt-in auto-remove), Source workload
-//! driving (including recipe-authored intra-Scenario concurrency and ~100k bulk
-//! Source inserts), one-at-a-time lock, refusal of non-Lab / production engine
-//! bindings before apply/sync (US44), result reporting with equal-weight
-//! correctness and operational metric thresholds (lag, throughput, duration),
-//! and shipped-capability coverage visibility (`lab/scenarios/COVERAGE.md`).
+//! Recipe-driven runner (`runner.rs`): `recipe.yaml` workload / checks /
+//! thresholds are the live interface; Scenario `adapt_*` helpers supply
+//! Namespace seeds, Source workload escapes, and correctness asserts.
+//! Lab-specific machinery: catalog listing from on-disk recipes, Scenario
+//! Namespace lifecycle (prepare / re-run wipe / manual remove / opt-in
+//! auto-remove), one-at-a-time lock, refusal of non-Lab / production engine
+//! bindings before apply/sync (US44), equal-weight correctness + metric
+//! thresholds, and shipped-capability coverage (`lab/scenarios/COVERAGE.md`).
 //! Apply / Sync / inspect use the real product CLI path. Idempotent re-delivery
 //! (#86) resets Pipeline Delivery status in Platform Store so a second real
 //! `apply` re-Delivers the same Output Identities (at-least-once / upsert).
@@ -698,8 +698,18 @@ fn emit_scenario_outcome_probe(recipe: &ScenarioRecipe, probe: &str) -> Result<(
     }
     let report = match probe {
         "threshold-fail" => {
-            let max_duration_ms = recipe.thresholds.max_duration_ms.unwrap_or(600_000);
-            let min_rows_per_s = recipe.thresholds.min_rows_per_s.unwrap_or(50.0);
+            let max_duration_ms = recipe.thresholds.max_duration_ms.ok_or_else(|| {
+                CliError::Failed(
+                    "bulk-load recipe must declare thresholds.max_duration_ms for outcome probe"
+                        .to_string(),
+                )
+            })?;
+            let min_rows_per_s = recipe.thresholds.min_rows_per_s.ok_or_else(|| {
+                CliError::Failed(
+                    "bulk-load recipe must declare thresholds.min_rows_per_s for outcome probe"
+                        .to_string(),
+                )
+            })?;
             let outcome = AdapterOutcome {
                 correctness: true,
                 detail: String::new(),
@@ -844,17 +854,29 @@ fn format_scenario_report(
     out
 }
 
-async fn adapt_direct_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {DIRECT_PIPELINE_ID}");
-    println!("Scenario Namespace: table={DIRECT_PIPELINE_TABLE} \
-collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}");
+/// Successful adapter outcome with no measured threshold metrics.
+fn adapter_ok(rows_applied: u64, capture_path_note: impl Into<String>) -> AdapterOutcome {
+    AdapterOutcome {
+        correctness: true,
+        detail: String::new(),
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: None,
+            duration_ms: None,
+            rows_applied,
+            capture_path_note: capture_path_note.into(),
+        },
+    }
+}
 
-    prepare_direct_pipeline_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, DIRECT_PIPELINE_ID)?;
+/// Apply Scenario deployment.yaml via the real product CLI path; require Initial Load.
+async fn product_apply_initial_load(
+    lab_dir: &Path,
+    scenario_id: &str,
+) -> Result<String, CliError> {
+    let config_path = deployment_config_path(lab_dir, scenario_id)?;
     let bin = lab_migraloop_bin();
-
     println!("Lab Scenario: apply Deployment via real product path...");
     let apply_out = run_product_cli(
         &bin,
@@ -875,6 +897,34 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
             "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
         )));
     }
+    Ok(apply_out)
+}
+
+/// Incremental Capture + Delivery via real product path; require LogMiner.
+async fn product_sync_logminer() -> Result<(String, String), CliError> {
+    let bin = lab_migraloop_bin();
+    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
+    let sync_out = run_product_cli(
+        &bin,
+        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+    )
+    .await?;
+    if sync_out.to_ascii_lowercase().contains("logminer") {
+        Ok((sync_out, "LogMiner".to_string()))
+    } else {
+        Err(CliError::Failed(format!(
+            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+        )))
+    }
+}
+
+async fn adapt_direct_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
+    // Runner already printed recipe id / namespace / workload / checks.
+    prepare_direct_pipeline_namespace(lab_dir).await?;
+    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
+
+    let apply_out = product_apply_initial_load(lab_dir, DIRECT_PIPELINE_ID).await?;
+    let bin = lab_migraloop_bin();
 
     let base_after_apply = run_product_cli(
         &bin,
@@ -896,19 +946,7 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
     println!("Lab Scenario: driving Source insert/update/delete...");
     mutate_direct_pipeline_source(lab_dir).await?;
 
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
+    let (sync_out, capture_note) = product_sync_logminer().await?;
 
     let base_after = run_product_cli(
         &bin,
@@ -954,18 +992,7 @@ collection={DIRECT_PIPELINE_COLLECTION} deployment={DIRECT_PIPELINE_DEPLOYMENT}"
         println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
     }
 
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
+    Ok(adapter_ok(rows_applied, capture_note))
 }
 
 /// Managed NAME field presence in Base/Target JSON inspect output.
@@ -3485,13 +3512,13 @@ async fn adapt_concurrent_source_workload(lab_dir: &Path, recipe: &ScenarioRecip
     loop {
         let settle_ms = settle_started.elapsed().as_millis();
         if settle_ms > max_settle_ms {
-            // Outcomes never settled — correctness fails; runner also fails
-            // recipe max_settle_ms against the measured settle_ms (equal-weight axes).
+            // Outcomes never reached expected Managed state — correctness fails.
+            // Runner also fails recipe max_settle_ms (equal-weight threshold axis).
             return Ok(AdapterOutcome {
                 correctness: false,
                 detail: format!(
-                    "correctness: concurrent Source changes did not settle within \
-max_settle_ms={max_settle_ms} (elapsed settle_ms={settle_ms}). {last_detail}"
+                    "correctness: concurrent Source Managed outcomes not settled \
+(elapsed settle_ms={settle_ms}). {last_detail}"
                 ),
                 metrics: ScenarioMetrics {
                     settle_ms: Some(settle_ms),
@@ -3789,7 +3816,8 @@ async fn adapt_bulk_load(lab_dir: &Path, recipe: &ScenarioRecipe) -> Result<Adap
     })?;
     println!(
         "Lab Scenario: bulk Source volume rows={BULK_LOAD_ROW_COUNT} \
-(thresholds from recipe: max_lag={max_lag} max_duration_ms={max_duration_ms})"
+(recipe namespace.deployment={}, thresholds from recipe)",
+        recipe.namespace.deployment
     );
 
     prepare_bulk_load_namespace(lab_dir).await?;
@@ -3798,30 +3826,9 @@ async fn adapt_bulk_load(lab_dir: &Path, recipe: &ScenarioRecipe) -> Result<Adap
 (schema + ~{BULK_LOAD_ROW_COUNT} Source inserts + supplemental logging)"
     );
 
-    let config_path = deployment_config_path(lab_dir, BULK_LOAD_ID)?;
     let bin = lab_migraloop_bin();
     let load_started = Instant::now();
-
-    println!("Lab Scenario: apply Deployment via real product path (Initial Load of bulk volume)...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
+    let apply_out = product_apply_initial_load(lab_dir, BULK_LOAD_ID).await?;
 
     // US47: wait until Delivery/Health catch up within recipe duration before final asserts.
     println!(
