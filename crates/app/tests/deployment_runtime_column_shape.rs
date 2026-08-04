@@ -42,7 +42,7 @@ fn managed_base_metadata_round_trips_source_store_delivery_through_column_shape(
 }
 
 #[test]
-fn base_column_wire_keeps_oracle_type_and_accepts_column_shape_data_type() {
+fn store_and_delivery_wire_keep_oracle_type_and_accept_column_shape_data_type() {
     let legacy = r#"{"name":"ID","oracle_type":"NUMBER","precision":10,"scale":0}"#;
     let from_legacy: BaseColumn = serde_json::from_str(legacy).unwrap();
     assert_eq!(
@@ -59,6 +59,18 @@ fn base_column_wire_keeps_oracle_type_and_accepts_column_shape_data_type() {
     let from_shape: BaseColumn = serde_json::from_str(shaped).unwrap();
     assert_eq!(from_shape.oracle_type, "NUMBER");
     assert_eq!(ColumnShape::from(from_shape), ColumnShape::from(from_legacy));
+
+    let delivery_from_shape: DeliveryColumn = serde_json::from_str(shaped).unwrap();
+    assert_eq!(delivery_from_shape.oracle_type, "NUMBER");
+    assert_eq!(
+        ColumnShape::from(delivery_from_shape),
+        ColumnShape {
+            name: "ID".into(),
+            data_type: "NUMBER".into(),
+            precision: Some(10),
+            scale: Some(0),
+        }
+    );
 
     let written = serde_json::to_string(&BaseColumn::from(ColumnShape {
         name: "NAME".into(),
