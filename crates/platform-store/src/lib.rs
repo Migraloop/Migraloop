@@ -251,19 +251,18 @@ impl PlatformStore {
         })
     }
 
-    /// Borrow the underlying Postgres pool (for advanced / lock helpers).
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     /// Probe Platform Store Guardrails settings via this session's pool.
     pub async fn probe_settings(&self) -> Result<PlatformStoreSettings, PlatformStoreError> {
         guardrails::probe_store_settings_on_pool(&self.pool).await
     }
 
-    /// Probe warn-only resource signals (disk). Session-shaped; disk probe does not use the pool.
+    /// Probe warn-only resource signals (disk; ADR-0010).
+    ///
+    /// Free-disk observation is process/env based (not a pool query); this method
+    /// exists so apply can keep one session handle for guardrails + persistence.
     pub async fn probe_resources(&self) -> Result<PlatformStoreResourceStatus, PlatformStoreError> {
-        probe_store_resources("").await
+        let _ = &self.pool;
+        probe_store_resources("unused").await
     }
 
     /// Acquire the Incremental Capture single-writer lock (blocks until available).
