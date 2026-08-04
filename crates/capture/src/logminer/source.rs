@@ -8,10 +8,6 @@ use crate::{CaptureError, CapturePosition, ChangeEvent};
 use super::contract::ContractLogMiner;
 use super::oci::OciLogMiner;
 
-/// Expand-contract leftover alias — prefer [`TlsSettings`] on the apply path.
-#[deprecated(note = "use migraloop_types::TlsSettings — temporary expand-contract leftover")]
-pub type OracleTlsSettings = TlsSettings;
-
 /// Non-secret Oracle Source connection identity used to select a capture backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleSourceConnect {

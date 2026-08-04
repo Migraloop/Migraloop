@@ -125,6 +125,7 @@ impdp SYNC_USER/lab_oracle@//127.0.0.1:1521/FREEPDB1 \
 - v1 以 **一個 active app instance**（內部可並行）加上 Platform Store 執行。
 - 所有耐久 Deployment 狀態（Pipelines、Base/Derived Datasets、checkpoints）存在 Platform Store，替換 instance 才能續跑。
 - 自動 multi-instance failover 屬後續階段；active processing 維持 single-leader（非 multi-writer）。
+- Deployment **runtime** 擁有 apply／Sync／Delivery／lifecycle／checks；Operator CLI 是薄 adapter。新的 Source 或 Target engine 接在 `SourceEngine`／`TargetEngine`，不重塑這些概念——見 [Developer 本機設定](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist)。
 
 ## 宣告 Deployment
 

@@ -33,8 +33,7 @@ mod incremental;
 mod lifecycle;
 
 pub use engines::deliver_initial_load_chunk_via_engines;
-
-use crate::observability::{emit_event, EventValue};
+pub use observability::{emit_event, EventValue};
 
 pub use incremental::{
     apply_change_events_to_base_rows, format_output_identity, run_incremental_sync,
@@ -42,7 +41,8 @@ pub use incremental::{
     SyncCycleOutcome, SyncInvocation,
 };
 pub use lifecycle::{
-    drift_check, pause_pipeline, remove_pipeline, resume_pipeline, source_alignment_check,
+    drift_check, inspect_base_rows, inspect_derived_rows, inspect_target_documents, pause_pipeline,
+    pipeline_delivery_health, remove_pipeline, resume_pipeline, source_alignment_check,
     status_inventory, status_inventory_from_url, StatusInventory, DEFAULT_ALIGNMENT_MAX_ROWS,
     DEFAULT_DRIFT_MAX_ROWS,
 };
@@ -193,13 +193,6 @@ pub fn target_engine_from_deployment(
         password,
         tls: deployment.target.tls.clone(),
     })
-}
-
-/// Expand-contract alias — prefer [`target_engine_from_deployment`].
-pub fn mongo_target_from_deployment(
-    deployment: &Deployment,
-) -> Result<MongoTargetConnection, RuntimeError> {
-    target_engine_from_deployment(deployment)
 }
 
 /// Open the v1 Source engine adapter for a Deployment Source System connection.
@@ -917,14 +910,6 @@ pub fn ensure_source_prerequisites(
     engine
         .check_prerequisites(source_tables)
         .map_err(|err| RuntimeError::Failed(err.to_string()))
-}
-
-/// Expand-contract alias — prefer [`ensure_source_prerequisites`].
-pub fn ensure_oracle_source_prerequisites(
-    source: &SystemConnection,
-    source_tables: &[String],
-) -> Result<(), RuntimeError> {
-    ensure_source_prerequisites(source, source_tables)
 }
 
 fn pipeline_source_tables(pipelines: &[Pipeline]) -> Vec<String> {

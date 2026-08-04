@@ -35,14 +35,124 @@ pub struct StatusInventory {
     pub health: PlatformStoreHealth,
     /// When health is Healthy but Platform Store Guardrails fail (ADR-0010).
     pub guardrail_error: Option<String>,
-    /// Present when free-disk is under the warn threshold (ADR-0010 warn-only).
-    pub disk_warn_free_bytes: Option<u64>,
+    /// Observed free-disk bytes when known (metrics / status); `None` if unobserved.
+    pub free_disk_bytes: Option<u64>,
+    /// Whether free-disk is under the warn threshold (ADR-0010 warn-only).
+    pub disk_warn: bool,
     pub deployments: Vec<Deployment>,
     pub pipelines: Vec<Pipeline>,
     pub bases: Vec<BaseDataset>,
     pub derived: Vec<DerivedDataset>,
     pub quarantines: Vec<QuarantinedChange>,
     pub schema_impacts: Vec<SchemaChangeImpact>,
+}
+
+/// Operator-visible Delivery Health label derived from Pipeline + quarantine state.
+///
+/// Values: `paused` | `unhealthy` | `ok` | `pending` | `unknown`. Formatting of
+/// the full status line stays in the CLI adapter.
+pub fn pipeline_delivery_health(
+    pipeline: &Pipeline,
+    active_quarantines_for_pipeline: usize,
+) -> &'static str {
+    if pipeline.paused {
+        "paused"
+    } else if active_quarantines_for_pipeline > 0 {
+        "unhealthy"
+    } else {
+        match pipeline.delivery_status.as_str() {
+            "delivered" => "ok",
+            "pending" => "pending",
+            _ => "unknown",
+        }
+    }
+}
+
+/// Load Base Dataset rows for Operator `base` inspect (session verb).
+pub async fn inspect_base_rows(
+    store: &PlatformStore,
+    table: &str,
+    deployment_name: Option<&str>,
+) -> Result<(BaseDataset, Vec<migraloop_platform_store::BaseRow>), RuntimeError> {
+    ensure_store_session_healthy(store).await?;
+    store
+        .get_base_rows(table, deployment_name)
+        .await
+        .map_err(|err| RuntimeError::Failed(err.to_string()))
+}
+
+/// Load Derived Dataset rows for Operator `derived` inspect (session verb).
+pub async fn inspect_derived_rows(
+    store: &PlatformStore,
+    pipeline_name: &str,
+    deployment_name: Option<&str>,
+) -> Result<(DerivedDataset, Vec<migraloop_platform_store::DerivedRow>), RuntimeError> {
+    ensure_store_session_healthy(store).await?;
+    store
+        .get_derived_rows(pipeline_name, deployment_name)
+        .await
+        .map_err(|err| RuntimeError::Failed(err.to_string()))
+}
+
+/// Resolve a Target Binding and list Target documents for Operator `target` inspect.
+///
+/// Uses the Target engine interface — CLI formats only.
+pub async fn inspect_target_documents(
+    store: &PlatformStore,
+    collection: &str,
+    deployment_name: Option<&str>,
+) -> Result<(Deployment, Pipeline, Vec<serde_json::Value>), RuntimeError> {
+    ensure_store_session_healthy(store).await?;
+    let pipelines = store
+        .list_pipelines()
+        .await
+        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    let matching: Vec<_> = pipelines
+        .into_iter()
+        .filter(|p| {
+            p.target_collection == collection
+                && deployment_name
+                    .map(|name| p.deployment_name == name)
+                    .unwrap_or(true)
+        })
+        .collect();
+    let pipeline = match matching.as_slice() {
+        [] => {
+            return Err(RuntimeError::Failed(format!(
+                "no Pipeline Target Binding found for collection {collection}"
+            )));
+        }
+        [only] => only.clone(),
+        many => {
+            return Err(RuntimeError::Failed(format!(
+                "multiple Pipelines bind collection {collection} across Deployments {}; \
+                 pass --deployment to disambiguate",
+                many.iter()
+                    .map(|p| p.deployment_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    };
+    let deployments = store
+        .list_deployments()
+        .await
+        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    let deployment = deployments
+        .into_iter()
+        .find(|d| d.name == pipeline.deployment_name)
+        .ok_or_else(|| {
+            RuntimeError::Failed(format!(
+                "Deployment {} not found for Target inspect",
+                pipeline.deployment_name
+            ))
+        })?;
+    let target = target_engine_from_deployment(&deployment)?;
+    let documents = target
+        .list_documents(collection)
+        .await
+        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    Ok((deployment, pipeline, documents))
 }
 
 /// Load status inventory from a Platform Store URL.
@@ -60,7 +170,8 @@ pub async fn status_inventory_from_url(
                 reason: err.to_string(),
             },
             guardrail_error: None,
-            disk_warn_free_bytes: None,
+            free_disk_bytes: None,
+            disk_warn: false,
             deployments: Vec::new(),
             pipelines: Vec::new(),
             bases: Vec::new(),
@@ -78,7 +189,8 @@ pub async fn status_inventory_from_url(
 pub async fn status_inventory(store: &PlatformStore) -> Result<StatusInventory, RuntimeError> {
     let health = store.health().await;
     let mut guardrail_error = None;
-    let mut disk_warn_free_bytes = None;
+    let mut free_disk_bytes = None;
+    let mut disk_warn = false;
     let mut deployments = Vec::new();
     let mut pipelines = Vec::new();
     let mut bases = Vec::new();
@@ -104,9 +216,8 @@ pub async fn status_inventory(store: &PlatformStore) -> Result<StatusInventory, 
             .probe_resources()
             .await
             .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-        if let (true, Some(free)) = (resources.disk_warn, resources.free_disk_bytes) {
-            disk_warn_free_bytes = Some(free);
-        }
+        free_disk_bytes = resources.free_disk_bytes;
+        disk_warn = resources.disk_warn;
 
         deployments = store
             .list_deployments()
@@ -137,7 +248,8 @@ pub async fn status_inventory(store: &PlatformStore) -> Result<StatusInventory, 
     Ok(StatusInventory {
         health,
         guardrail_error,
-        disk_warn_free_bytes,
+        free_disk_bytes,
+        disk_warn,
         deployments,
         pipelines,
         bases,
@@ -917,5 +1029,57 @@ fn normalize_json_for_drift(value: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(items.iter().map(normalize_json_for_drift).collect())
         }
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pipeline_delivery_health;
+    use migraloop_platform_store::Pipeline;
+
+    fn sample_pipeline(delivery_status: &str, paused: bool) -> Pipeline {
+        Pipeline {
+            deployment_name: "d".into(),
+            name: "p".into(),
+            mode: "direct".into(),
+            source_table: "T".into(),
+            source_schema: String::new(),
+            target_collection: "c".into(),
+            delivery_status: delivery_status.into(),
+            delivery_applied_changes: 0,
+            delivery_lag: 0,
+            paused,
+            description: String::new(),
+            field_mappings: std::collections::BTreeMap::new(),
+            output_identity: Vec::new(),
+            transform_json: None,
+            drift_status: "unknown".into(),
+            drift_checked_rows: 0,
+            drift_mismatched_rows: 0,
+        }
+    }
+
+    #[test]
+    fn delivery_health_labels_match_operator_status_contract() {
+        assert_eq!(
+            pipeline_delivery_health(&sample_pipeline("delivered", true), 0),
+            "paused"
+        );
+        assert_eq!(
+            pipeline_delivery_health(&sample_pipeline("delivered", false), 2),
+            "unhealthy"
+        );
+        assert_eq!(
+            pipeline_delivery_health(&sample_pipeline("delivered", false), 0),
+            "ok"
+        );
+        assert_eq!(
+            pipeline_delivery_health(&sample_pipeline("pending", false), 0),
+            "pending"
+        );
+        assert_eq!(
+            pipeline_delivery_health(&sample_pipeline("not_configured", false), 0),
+            "unknown"
+        );
     }
 }

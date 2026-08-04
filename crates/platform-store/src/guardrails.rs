@@ -102,13 +102,6 @@ pub fn check_store_settings(settings: &PlatformStoreSettings) -> Result<(), Guar
 /// - `MIGRALOOP_INJECT_PLATFORM_STORE_WORK_MEM_BYTES`
 /// - `MIGRALOOP_INJECT_PLATFORM_STORE_MAINTENANCE_WORK_MEM_BYTES`
 /// - `MIGRALOOP_INJECT_PLATFORM_STORE_MAX_CONNECTIONS`
-pub async fn probe_store_settings(
-    database_url: &str,
-) -> Result<PlatformStoreSettings, PlatformStoreError> {
-    let pool = crate::connect(database_url).await?;
-    probe_store_settings_on_pool(&pool).await
-}
-
 pub(crate) async fn probe_store_settings_on_pool(
     pool: &PgPool,
 ) -> Result<PlatformStoreSettings, PlatformStoreError> {

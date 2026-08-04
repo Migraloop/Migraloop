@@ -178,13 +178,6 @@ impl ManagedFieldAs {
     }
 }
 
-/// Expand-contract leftover alias for persisted Managed-field overrides.
-///
-/// Prefer [`ManagedFieldAs`] on the apply → Direct Delivery path. This alias exists
-/// only so older call sites can migrate without a second source of truth.
-#[deprecated(note = "use ManagedFieldAs — temporary expand-contract leftover")]
-pub type FieldMappingAs = ManagedFieldAs;
-
 #[cfg(test)]
 mod tests {
     use super::*;

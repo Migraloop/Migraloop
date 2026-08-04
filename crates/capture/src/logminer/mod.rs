@@ -26,7 +26,3 @@ pub use oci::{
     V_LOGMNR_CONTENTS_QUERY,
 };
 pub use source::{open_oracle_incremental_capture, IncrementalCapture, OracleSourceConnect};
-
-/// Expand-contract leftover — prefer `migraloop_types::TlsSettings` on the apply path.
-#[allow(deprecated)]
-pub use source::OracleTlsSettings;

@@ -320,14 +320,15 @@ async fn duplicate_safe_redelivery_keeps_managed_outcomes_and_non_managed_fields
 
     // Test orchestration only (same idea as Lab Scenario): mark Delivery pending so the
     // next product `apply` re-Delivers current Base Output Identities.
-    migraloop_platform_store::update_pipeline_delivery_status(
-        &url,
-        "oracle-to-mongo",
-        "customers",
-        "pending",
-    )
-    .await
-    .expect("reset Pipeline Delivery status for re-Delivery exercise");
+    {
+        let store = migraloop_platform_store::PlatformStore::open(&url)
+            .await
+            .expect("open Platform Store for re-Delivery exercise");
+        store
+            .update_pipeline_delivery_status("oracle-to-mongo", "customers", "pending")
+            .await
+            .expect("reset Pipeline Delivery status for re-Delivery exercise");
+    }
 
     let reapply_out = apply_again(&url, &config, &doubles);
     assert!(

@@ -125,6 +125,7 @@ Keep loads on the disposable Fixture only—never point this escape hatch at cus
 - v1 runs **one active app instance** (internally concurrent) plus the Platform Store.
 - All durable Deployment state (Pipelines, Base/Derived Datasets, checkpoints) lives in the Platform Store so a replacement instance can resume.
 - Automatic multi-instance failover is later; active processing remains single-leader (not multi-writer).
+- Deployment **runtime** owns apply / Sync / Delivery / lifecycle / checks; the Operator CLI is a thin adapter. New Source or Target engines plug in at `SourceEngine` / `TargetEngine` without reshaping those concepts—see [Developer local setup](developer-local-setup.md#adding-a-source-or-target-engine-developer-checklist).
 
 ## Declaring a Deployment
 

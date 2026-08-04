@@ -5,7 +5,7 @@
 ## 读者
 
 - **Operator**：安装并运行 **Deployment**、编写 **Pipeline**、监视健康状态。
-- **Developer** 若要设置 monorepo，请直接看 [Developer 本地设置](developer-local-setup.md)。
+- **Developer** 若要设置 monorepo，请直接看 [Developer 本地设置](developer-local-setup.md)。新增 Source 或 Target engine 请用该页 checklist（interface + prerequisites／文档 + Lab Scenario + CI contract twin）——不要重写 Sync／Rich Transform／Delivery／runtime。
 
 v1 第一组引擎是 **Oracle → MongoDB**。一个 Deployment 恰好配对一个 Source System 与一个 Target System。
 

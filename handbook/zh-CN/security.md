@@ -100,5 +100,6 @@ ADR-0016：记载并偏好刚好足以运行的最小权限—不是默认就要
 - 配置形状：[CLI 与 Config 参考](cli-and-config.md)
 - 安装默认：[Deployment](deployment.md)
 - 本地 compose 密码：[Developer 本地设置](developer-local-setup.md)
+- 新增 Source／Target engine（Developer checklist）：[Developer 本地设置](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist)
 - Oracle sync grants：[Source System](source-system.md#required-privileges)
 - MongoDB Delivery grants：[Target System](target-system.md#required-privileges-target)

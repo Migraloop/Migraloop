@@ -5,7 +5,7 @@ Short progressive path from install to a first Pipeline and Sync Health / Delive
 ## Who this is for
 
 - **Operators** install and run a **Deployment**, author **Pipelines**, and monitor health.
-- **Developers** setting up the monorepo should jump to [Developer local setup](developer-local-setup.md).
+- **Developers** setting up the monorepo should jump to [Developer local setup](developer-local-setup.md). Adding a Source or Target engine uses the checklist there (interface + prerequisites/docs + Lab Scenario + CI contract twin)—not a rewrite of Sync / Rich Transform / Delivery / runtime.
 
 v1 ships the first engine pair **Oracle → MongoDB**. One Deployment pairs exactly one Source System with one Target System.
 
