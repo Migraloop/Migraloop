@@ -10,7 +10,9 @@
 use std::collections::BTreeSet;
 
 use migraloop_delivery::{test_delivery_document, FakeTarget, TargetEngine};
-use migraloop_runtime::identity_key;
+use migraloop_runtime::{
+    format_output_identity, identity_key, output_identity_matches_poison_keys,
+};
 use migraloop_types::output_identity_key;
 use serde_json::json;
 
@@ -32,12 +34,20 @@ async fn same_output_identity_produces_one_key_across_poison_drift_and_delivery(
         // Drift Check / Delivery reconcile path.
         assert_eq!(identity_key(&identity), expected_key);
 
-        // Poison injection matching compares env keys against the same encoding.
+        // Poison injection matching path (same encoding as Drift/Delivery).
         let poison_keys: BTreeSet<String> = [expected_key.to_string()].into();
         assert!(
-            poison_keys.contains(&output_identity_key(&identity)),
-            "poison injection keys must agree with the shared Output Identity key for {identity}"
+            output_identity_matches_poison_keys(&identity, &poison_keys),
+            "poison injection matching must use the shared Output Identity key for {identity}"
         );
+        // Discriminator vs Operator display label for string identities.
+        if identity.as_str().is_some() {
+            assert_ne!(
+                format_output_identity(&identity),
+                expected_key,
+                "Operator display label must not be used as the match key"
+            );
+        }
 
         // Delivery delete/upsert identity handling (FakeTarget map keys).
         let target = FakeTarget::new();

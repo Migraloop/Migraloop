@@ -36,7 +36,8 @@ pub use engines::deliver_initial_load_chunk_via_engines;
 pub use observability::{emit_event, EventValue};
 
 pub use incremental::{
-    apply_change_events_to_base_rows, format_output_identity, run_incremental_sync,
+    apply_change_events_to_base_rows, format_output_identity,
+    output_identity_matches_poison_keys, run_incremental_sync,
     run_incremental_sync_with_engines, run_continuous_incremental_sync,
     supervise_continuous_incremental_sync, sync_incremental, SyncCycleOutcome, SyncInvocation,
 };

@@ -472,11 +472,22 @@ pub fn format_output_identity(identity: &serde_json::Value) -> String {
     }
 }
 
-fn identity_is_poison(identity: &serde_json::Value, poison_keys: &BTreeSet<String>) -> bool {
+/// Whether an Output Identity matches a poison-injection key set.
+///
+/// Encoding matches Drift reconcile and Delivery identity keys
+/// ([`migraloop_types::output_identity_key`]).
+pub fn output_identity_matches_poison_keys(
+    identity: &serde_json::Value,
+    poison_keys: &BTreeSet<String>,
+) -> bool {
     if poison_keys.is_empty() {
         return false;
     }
     poison_keys.contains(&migraloop_types::output_identity_key(identity))
+}
+
+fn identity_is_poison(identity: &serde_json::Value, poison_keys: &BTreeSet<String>) -> bool {
+    output_identity_matches_poison_keys(identity, poison_keys)
 }
 
 fn identity_value_from_change(
@@ -1746,7 +1757,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
 
 #[cfg(test)]
 mod output_identity_key_tests {
-    use super::{format_output_identity, identity_is_poison};
+    use super::{format_output_identity, output_identity_matches_poison_keys};
     use migraloop_types::output_identity_key;
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -1757,8 +1768,8 @@ mod output_identity_key_tests {
         // poison formatter compared the bare string and would disagree with
         // Drift/Delivery keys for the same value.
         let poison = BTreeSet::from([r#""CUST-1""#.to_string()]);
-        assert!(identity_is_poison(&json!("CUST-1"), &poison));
-        assert!(!identity_is_poison(
+        assert!(output_identity_matches_poison_keys(&json!("CUST-1"), &poison));
+        assert!(!output_identity_matches_poison_keys(
             &json!("CUST-1"),
             &BTreeSet::from(["CUST-1".to_string()])
         ));
