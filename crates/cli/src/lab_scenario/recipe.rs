@@ -163,6 +163,13 @@ pub(crate) fn validate_product_path(
              at least one of `product_apply` or `product_sync` (real product path)"
         )));
     }
+    // Real product path only (ADR-0025 / ADR-0028): product_sync must require LogMiner.
+    if has_sync && !product_path.sync.require_logminer {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario recipe {path_display} workload.product_path.sync.require_logminer \
+             must be true when `product_sync` is present (no mock Sync path)"
+        )));
+    }
     Ok(())
 }
 

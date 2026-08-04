@@ -9006,6 +9006,23 @@ mod tests {
                 || err.to_string().contains("product_sync"),
             "err={err}"
         );
+
+        let mock_sync = ScenarioRecipeProductPath {
+            steps: vec![
+                ProductPathStepKind::PrepareNamespace,
+                ProductPathStepKind::ProductSync,
+                ProductPathStepKind::Assert,
+            ],
+            apply: Default::default(),
+            sync: ProductPathSyncOpts {
+                require_logminer: false,
+            },
+        };
+        let err = validate_product_path("demo.yaml", &mock_sync).expect_err("logminer required");
+        assert!(
+            err.to_string().contains("require_logminer"),
+            "err={err}"
+        );
     }
 
     #[test]
