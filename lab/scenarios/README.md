@@ -60,7 +60,7 @@ CLI path; Scenario hooks only supply Namespace seed SQL, rare escapes (e.g. pois
 and correctness asserts. On this path: `direct-pipeline`, all `rt-*` Rich Transform Scenarios (`rt-project`,
 `rt-filter`, `rt-field-ops`, `rt-equilookup`, `rt-union`, `rt-unwind`,
 `rt-distinct-addtoset`), and `poison-quarantine`. Other Scenarios may still use a
-full `adapt_*` until migrated (issue #179).
+full `adapt_*` until migrated (see issue #179 for remaining ops/lifecycle Scenarios).
 
 ## Adding a Scenario while building a feature
 
