@@ -581,14 +581,8 @@ async fn scenario_run(
             return run_product_path_scenario(lab_dir, &recipe).await;
         }
         match scenario {
-            // direct-pipeline / rt-project / poison-quarantine require workload.product_path (#173).
+            // product_path Scenarios (#173 / #178) are handled above; remaining use full adapters.
             TRANSFORM_PIPELINE_ID => adapt_transform_pipeline(lab_dir, &recipe).await,
-            RT_FILTER_ID => adapt_rt_filter(lab_dir, &recipe).await,
-            RT_FIELD_OPS_ID => adapt_rt_field_ops(lab_dir, &recipe).await,
-            RT_EQUILOOKUP_ID => adapt_rt_equilookup(lab_dir, &recipe).await,
-            RT_UNION_ID => adapt_rt_union(lab_dir, &recipe).await,
-            RT_UNWIND_ID => adapt_rt_unwind(lab_dir, &recipe).await,
-            RT_DISTINCT_ADDTOSET_ID => adapt_rt_distinct_addtoset(lab_dir, &recipe).await,
             CONCURRENT_SOURCE_WORKLOAD_ID => {
                 adapt_concurrent_source_workload(lab_dir, &recipe).await
             }
@@ -609,10 +603,18 @@ async fn scenario_run(
                 adapt_backward_compatible_upgrades(lab_dir, &recipe).await
             }
             INITIAL_LOAD_THROTTLED_ID => adapt_initial_load_throttled(lab_dir, &recipe).await,
-            DIRECT_PIPELINE_ID | RT_PROJECT_ID | POISON_QUARANTINE_ID => Err(CliError::Failed(
+            DIRECT_PIPELINE_ID
+            | RT_PROJECT_ID
+            | RT_FILTER_ID
+            | RT_FIELD_OPS_ID
+            | RT_EQUILOOKUP_ID
+            | RT_UNION_ID
+            | RT_UNWIND_ID
+            | RT_DISTINCT_ADDTOSET_ID
+            | POISON_QUARANTINE_ID => Err(CliError::Failed(
                 format!(
                     "Lab Scenario `{scenario}` must declare workload.product_path in recipe.yaml \
-                     (shared product-path runner; issue #173)"
+                     (shared product-path runner; issue #173 / #178)"
                 ),
             )),
             _ => Err(CliError::Failed(format!(
@@ -1018,10 +1020,16 @@ struct ProductPathRunContext {
     capture_path_note: String,
 }
 
-/// Thin Scenario hooks for seed SQL, rare escapes, and correctness (#173).
+/// Thin Scenario hooks for seed SQL, rare escapes, and correctness (#173 / #178).
 enum ProductPathHooks {
     DirectPipeline,
     RtProject,
+    RtFilter,
+    RtFieldOps,
+    RtEquilookup,
+    RtUnion,
+    RtUnwind,
+    RtDistinctAddtoset,
     PoisonQuarantine,
 }
 
@@ -1030,6 +1038,12 @@ impl ProductPathHooks {
         match recipe.id.as_str() {
             DIRECT_PIPELINE_ID => Ok(Self::DirectPipeline),
             RT_PROJECT_ID => Ok(Self::RtProject),
+            RT_FILTER_ID => Ok(Self::RtFilter),
+            RT_FIELD_OPS_ID => Ok(Self::RtFieldOps),
+            RT_EQUILOOKUP_ID => Ok(Self::RtEquilookup),
+            RT_UNION_ID => Ok(Self::RtUnion),
+            RT_UNWIND_ID => Ok(Self::RtUnwind),
+            RT_DISTINCT_ADDTOSET_ID => Ok(Self::RtDistinctAddtoset),
             POISON_QUARANTINE_ID => Ok(Self::PoisonQuarantine),
             other => Err(CliError::Failed(format!(
                 "Lab Scenario `{other}` declares workload.product_path but has no product-path hooks \
@@ -1042,6 +1056,12 @@ impl ProductPathHooks {
         match self {
             Self::DirectPipeline => prepare_direct_pipeline_namespace(lab_dir).await,
             Self::RtProject => prepare_rt_project_namespace(lab_dir).await,
+            Self::RtFilter => prepare_rt_filter_namespace(lab_dir).await,
+            Self::RtFieldOps => prepare_rt_field_ops_namespace(lab_dir).await,
+            Self::RtEquilookup => prepare_rt_equilookup_namespace(lab_dir).await,
+            Self::RtUnion => prepare_rt_union_namespace(lab_dir).await,
+            Self::RtUnwind => prepare_rt_unwind_namespace(lab_dir).await,
+            Self::RtDistinctAddtoset => prepare_rt_distinct_addtoset_namespace(lab_dir).await,
             Self::PoisonQuarantine => prepare_poison_quarantine_namespace(lab_dir).await,
         }
     }
@@ -1098,42 +1118,275 @@ impl ProductPathHooks {
                 }
                 Ok(())
             }
+            Self::RtFilter => {
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(RT_FILTER_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_FILTER_PIPELINE,
+                    ],
+                )
+                .await?;
+                // filter ACTIVE==1: Alice only (Bob ACTIVE=0 excluded).
+                if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+                    && !managed_field_present(&derived_after_apply, "NAME", "Bob"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load filter Derived check failed (expected Alice only):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::RtFieldOps => {
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(RT_FIELD_OPS_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_FIELD_OPS_PIPELINE,
+                    ],
+                )
+                .await?;
+                // project+remove+rename+addFields+filter: Alice only; EMAIL gone; customerName/displayName/source present.
+                if !(managed_field_present(&derived_after_apply, "customerName", "Alice")
+                    && managed_field_present(&derived_after_apply, "displayName", "Alice")
+                    && managed_field_present(&derived_after_apply, "source", "oracle")
+                    && !managed_field_present(&derived_after_apply, "customerName", "Bob")
+                    && !inspect_mentions_email_field(&derived_after_apply))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load field-ops Derived check failed \
+(expected Alice customerName/displayName/source, no EMAIL, no Bob):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::RtEquilookup => {
+                if !(apply_out.contains(RT_EQUILOOKUP_CUSTOMERS_TABLE)
+                    && apply_out.contains(RT_EQUILOOKUP_ORDERS_TABLE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply must Initial Load both equiLookup Bases:\n{apply_out}"
+                    )));
+                }
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(RT_EQUILOOKUP_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_EQUILOOKUP_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+                    && derived_after_apply.contains("orders")
+                    && (derived_after_apply.contains("42.50") || derived_after_apply.contains("42.5"))
+                    && managed_field_present(&derived_after_apply, "NAME", "Bob"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load equiLookup Derived check failed \
+(expected Alice/Bob with embedded orders):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::RtUnion => {
+                if !(apply_out.contains(RT_UNION_EAST_TABLE) && apply_out.contains(RT_UNION_WEST_TABLE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply must Initial Load both union Bases:\n{apply_out}"
+                    )));
+                }
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(RT_UNION_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_UNION_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+                    && managed_field_present(&derived_after_apply, "NAME", "Zoe")
+                    && managed_field_present(&derived_after_apply, "NAME", "Wade")
+                    && !derived_after_apply.contains("alice@example.com"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load union Derived check failed \
+(expected Alice/Zoe/Wade without EMAIL):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::RtUnwind => {
+                if !(apply_out.contains(RT_UNWIND_CUSTOMERS_TABLE)
+                    && apply_out.contains(RT_UNWIND_ORDERS_TABLE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply must Initial Load both equiLookup Bases for unwind:\n{apply_out}"
+                    )));
+                }
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(RT_UNWIND_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_UNWIND_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
+                    && derived_after_apply.contains("ORDER_ID")
+                    && (derived_after_apply.contains("42.50") || derived_after_apply.contains("42.5"))
+                    && derived_after_apply.contains("101")
+                    && managed_field_present(&derived_after_apply, "NAME", "Bob")
+                    && !derived_after_apply.contains("\"orders\""))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load unwind Derived check failed \
+(expected flattened ORDER_ID rows for Alice/Bob, no orders array):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::RtDistinctAddtoset => {
+                if !(apply_out.contains(RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE)
+                    && apply_out.contains(RT_DISTINCT_ADDTOSET_ADD_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply must materialize both distinct and addToSet Pipelines:\n{apply_out}"
+                    )));
+                }
+                let distinct_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE,
+                    ],
+                )
+                .await?;
+                let add_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_DISTINCT_ADDTOSET_ADD_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(distinct_after_apply.contains("\"CUSTOMER_ID\": 1")
+                    && distinct_after_apply.contains("\"CUSTOMER_ID\": 2")
+                    && add_after_apply.contains("42.50")
+                    && add_after_apply.contains("10.00")
+                    && add_after_apply.contains("5.00"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load distinct/addToSet Derived check failed.\n\
+distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
             Self::PoisonQuarantine => Ok(()),
         }
     }
 
     async fn mutate(&self, lab_dir: &Path) -> Result<(), CliError> {
         match self {
-            Self::DirectPipeline => {
+            Self::DirectPipeline | Self::RtProject | Self::RtFilter | Self::RtFieldOps => {
                 println!("Lab Scenario: driving Source insert/update/delete...");
-                mutate_direct_pipeline_source(lab_dir).await
             }
-            Self::RtProject => {
-                println!("Lab Scenario: driving Source insert/update/delete...");
-                mutate_rt_project_source(lab_dir).await
+            Self::RtEquilookup | Self::RtUnwind => {
+                println!("Lab Scenario: driving Source primary + foreign mutations...");
+            }
+            Self::RtUnion => {
+                println!("Lab Scenario: driving Source east + west mutations...");
+            }
+            Self::RtDistinctAddtoset => {
+                println!("Lab Scenario: driving Source mutations (unused/duplicate/new/key-move)...");
             }
             Self::PoisonQuarantine => {
                 println!("Lab Scenario: driving Source mutations (update/insert/delete)...");
-                mutate_poison_quarantine_source(lab_dir).await
             }
+        }
+        match self {
+            Self::DirectPipeline => mutate_direct_pipeline_source(lab_dir).await,
+            Self::RtProject => mutate_rt_project_source(lab_dir).await,
+            Self::RtFilter => mutate_rt_filter_source(lab_dir).await,
+            Self::RtFieldOps => mutate_rt_field_ops_source(lab_dir).await,
+            Self::RtEquilookup => mutate_rt_equilookup_source(lab_dir).await,
+            Self::RtUnion => mutate_rt_union_source(lab_dir).await,
+            Self::RtUnwind => mutate_rt_unwind_source(lab_dir).await,
+            Self::RtDistinctAddtoset => mutate_rt_distinct_addtoset_source(lab_dir).await,
+            Self::PoisonQuarantine => mutate_poison_quarantine_source(lab_dir).await,
         }
     }
 
     fn before_sync(&self) {
         match self {
-            Self::DirectPipeline | Self::RtProject => {}
             Self::PoisonQuarantine => {
                 println!(
                     "Lab Scenario: sync Incremental Capture + Delivery with poison injection \
                      for Output Identity {POISON_QUARANTINE_IDENTITY}..."
                 );
             }
+            _ => {}
         }
     }
 
     fn sync_env(&self) -> Vec<(&'static str, &'static str)> {
         match self {
-            Self::DirectPipeline | Self::RtProject => vec![],
             Self::PoisonQuarantine => vec![
                 (
                     "MIGRALOOP_DELIVERY_POISON_IDENTITIES",
@@ -1144,12 +1397,12 @@ impl ProductPathHooks {
                     POISON_QUARANTINE_MAX_ATTEMPTS,
                 ),
             ],
+            _ => vec![],
         }
     }
 
     async fn after_sync(&self, sync_out: &str) -> Result<(), CliError> {
         match self {
-            Self::DirectPipeline | Self::RtProject => Ok(()),
             Self::PoisonQuarantine => {
                 let sync_lower = sync_out.to_ascii_lowercase();
                 if !(sync_lower.contains("quarantine") && sync_lower.contains("alert")) {
@@ -1167,6 +1420,7 @@ impl ProductPathHooks {
                 }
                 Ok(())
             }
+            _ => Ok(()),
         }
     }
 
@@ -1262,6 +1516,330 @@ Derived:\n{derived_after}\nTarget:\n{target_after}"
                 }
                 println!(
                     "Lab Scenario: correctness checks passed (projected Derived + Target Managed outcomes)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::RtFilter => {
+                let derived_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_FILTER_PIPELINE,
+                    ],
+                )
+                .await?;
+                let target_after = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        RT_FILTER_COLLECTION,
+                    ],
+                )
+                .await?;
+                // After mutate: Alicia + flipped Bob + Carol ACTIVE=1; Dana ACTIVE=0 stays filtered out.
+                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+                    && managed_field_present(&derived_after, "NAME", "Bob")
+                    && managed_field_present(&derived_after, "NAME", "Carol")
+                    && !managed_field_present(&derived_after, "NAME", "Dana");
+                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+                    && managed_field_present(&target_after, "NAME", "Bob")
+                    && managed_field_present(&target_after, "NAME", "Carol")
+                    && !managed_field_present(&target_after, "NAME", "Dana");
+                if !(derived_ok && target_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after filter insert/update/delete.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (filtered Derived + Target Managed outcomes)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::RtFieldOps => {
+                let derived_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_FIELD_OPS_PIPELINE,
+                    ],
+                )
+                .await?;
+                let target_after = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        RT_FIELD_OPS_COLLECTION,
+                    ],
+                )
+                .await?;
+                let derived_ok = managed_field_present(&derived_after, "customerName", "Alicia")
+                    && managed_field_present(&derived_after, "displayName", "Alicia")
+                    && managed_field_present(&derived_after, "customerName", "Carol")
+                    && managed_field_present(&derived_after, "source", "oracle")
+                    && !managed_field_present(&derived_after, "customerName", "Bob")
+                    && !inspect_mentions_email_field(&derived_after);
+                let target_ok = managed_field_present(&target_after, "customerName", "Alicia")
+                    && managed_field_present(&target_after, "displayName", "Alicia")
+                    && managed_field_present(&target_after, "customerName", "Carol")
+                    && managed_field_present(&target_after, "source", "oracle")
+                    && !managed_field_present(&target_after, "customerName", "Bob")
+                    && !inspect_mentions_email_field(&target_after);
+                if !(derived_ok && target_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after field-ops insert/update/delete.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (addFields/rename/remove Derived + Target Managed outcomes)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::RtEquilookup => {
+                let derived_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_EQUILOOKUP_PIPELINE,
+                    ],
+                )
+                .await?;
+                let target_after = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        RT_EQUILOOKUP_COLLECTION,
+                    ],
+                )
+                .await?;
+                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+                    && derived_after.contains("orders")
+                    && (derived_after.contains("50.00") || derived_after.contains("50"))
+                    && !derived_after.contains("42.50")
+                    && managed_field_present(&derived_after, "NAME", "Bob");
+                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+                    && target_after.contains("orders")
+                    && (target_after.contains("50.00") || target_after.contains("50"))
+                    && managed_field_present(&target_after, "NAME", "Bob");
+                if !(derived_ok && target_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after equiLookup primary/foreign updates.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (equiLookup multi-Base Derived + Target Managed outcomes)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::RtUnion => {
+                let derived_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_UNION_PIPELINE,
+                    ],
+                )
+                .await?;
+                let target_after = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        RT_UNION_COLLECTION,
+                    ],
+                )
+                .await?;
+                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+                    && managed_field_present(&derived_after, "NAME", "Zora")
+                    && managed_field_present(&derived_after, "NAME", "Wade")
+                    && !derived_after.contains("Alice")
+                    && !derived_after.contains("Zoe");
+                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+                    && managed_field_present(&target_after, "NAME", "Zora")
+                    && managed_field_present(&target_after, "NAME", "Wade");
+                if !(derived_ok && target_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after union east/west updates.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (union multi-Base Derived + Target Managed outcomes)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::RtUnwind => {
+                let derived_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_UNWIND_PIPELINE,
+                    ],
+                )
+                .await?;
+                let target_after = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        RT_UNWIND_COLLECTION,
+                    ],
+                )
+                .await?;
+                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
+                    && (derived_after.contains("50.00") || derived_after.contains("50"))
+                    && !derived_after.contains("42.50")
+                    && !derived_after.contains("101")
+                    && managed_field_present(&derived_after, "NAME", "Bob");
+                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
+                    && (target_after.contains("50.00") || target_after.contains("50"))
+                    && !target_after.contains("101")
+                    && managed_field_present(&target_after, "NAME", "Bob");
+                if !(derived_ok && target_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after unwind primary/foreign updates + order delete.\n\
+Derived:\n{derived_after}\nTarget:\n{target_after}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (unwind Output Identities insert/update/delete)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::RtDistinctAddtoset => {
+                let distinct_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE,
+                    ],
+                )
+                .await?;
+                let add_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        RT_DISTINCT_ADDTOSET_ADD_PIPELINE,
+                    ],
+                )
+                .await?;
+                let distinct_target = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION,
+                    ],
+                )
+                .await?;
+                let add_target = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        RT_DISTINCT_ADDTOSET_ADD_COLLECTION,
+                    ],
+                )
+                .await?;
+                let distinct_ok = distinct_after.contains("\"CUSTOMER_ID\": 1")
+                    && distinct_after.contains("\"CUSTOMER_ID\": 3")
+                    && !distinct_after.contains("\"CUSTOMER_ID\": 2")
+                    && distinct_target.contains("\"CUSTOMER_ID\": 1")
+                    && distinct_target.contains("\"CUSTOMER_ID\": 3")
+                    && !distinct_target.contains("\"CUSTOMER_ID\": 2");
+                let add_ok = add_after.contains("7.00")
+                    && add_after.contains("42.50")
+                    && add_after.contains("10.00")
+                    && add_after.contains("\"CUSTOMER_ID\": 3")
+                    && add_after.contains("5.00")
+                    && !add_after.contains("\"CUSTOMER_ID\": 2")
+                    && add_target.contains("7.00")
+                    && add_target.contains("\"CUSTOMER_ID\": 3");
+                if !(distinct_ok && add_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after distinct/addToSet Source mutations.\n\
+distinct Derived:\n{distinct_after}\ndistinct Target:\n{distinct_target}\n\
+addToSet Derived:\n{add_after}\naddToSet Target:\n{add_target}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (distinct + addToSet Derived/Target outcomes)"
                 );
                 if !ctx.sync_out.trim().is_empty() {
                     println!(
@@ -2064,147 +2642,6 @@ EXIT;\n"
         })
 }
 
-async fn adapt_rt_filter(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {RT_FILTER_ID}");
-    println!(
-        "Scenario Namespace: table={RT_FILTER_TABLE} \
-collection={RT_FILTER_COLLECTION} deployment={RT_FILTER_DEPLOYMENT}"
-    );
-
-    prepare_rt_filter_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, RT_FILTER_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.to_ascii_lowercase().contains("derived")
-        || apply_out.contains(RT_FILTER_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-        )));
-    }
-
-    let derived_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_FILTER_PIPELINE,
-        ],
-    )
-    .await?;
-    // filter ACTIVE==1: Alice only (Bob ACTIVE=0 excluded).
-    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
-        && !managed_field_present(&derived_after_apply, "NAME", "Bob"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load filter Derived check failed (expected Alice only):\n{derived_after_apply}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source insert/update/delete...");
-    mutate_rt_filter_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let derived_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_FILTER_PIPELINE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            RT_FILTER_COLLECTION,
-        ],
-    )
-    .await?;
-
-    // After mutate: Alicia + flipped Bob + Carol ACTIVE=1; Dana ACTIVE=0 stays filtered out.
-    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-        && managed_field_present(&derived_after, "NAME", "Bob")
-        && managed_field_present(&derived_after, "NAME", "Carol")
-        && !managed_field_present(&derived_after, "NAME", "Dana");
-    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-        && managed_field_present(&target_after, "NAME", "Bob")
-        && managed_field_present(&target_after, "NAME", "Carol")
-        && !managed_field_present(&target_after, "NAME", "Dana");
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(derived_ok && target_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after filter insert/update/delete.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed (filtered Derived + Target Managed outcomes)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
-
 async fn remove_rt_filter_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
         "Lab Scenario: removing Namespace \
@@ -2306,154 +2743,6 @@ EXIT;\n"
 }
 
 
-async fn adapt_rt_field_ops(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {RT_FIELD_OPS_ID}");
-    println!(
-        "Scenario Namespace: table={RT_FIELD_OPS_TABLE} \
-collection={RT_FIELD_OPS_COLLECTION} deployment={RT_FIELD_OPS_DEPLOYMENT}"
-    );
-
-    prepare_rt_field_ops_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, RT_FIELD_OPS_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.to_ascii_lowercase().contains("derived")
-        || apply_out.contains(RT_FIELD_OPS_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-        )));
-    }
-
-    let derived_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_FIELD_OPS_PIPELINE,
-        ],
-    )
-    .await?;
-    // project+remove+rename+addFields+filter: Alice only; EMAIL gone; customerName/displayName/source present.
-    if !(managed_field_present(&derived_after_apply, "customerName", "Alice")
-        && managed_field_present(&derived_after_apply, "displayName", "Alice")
-        && managed_field_present(&derived_after_apply, "source", "oracle")
-        && !managed_field_present(&derived_after_apply, "customerName", "Bob")
-        && !inspect_mentions_email_field(&derived_after_apply))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load field-ops Derived check failed \
-(expected Alice customerName/displayName/source, no EMAIL, no Bob):\n{derived_after_apply}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source insert/update/delete...");
-    mutate_rt_field_ops_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let derived_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_FIELD_OPS_PIPELINE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            RT_FIELD_OPS_COLLECTION,
-        ],
-    )
-    .await?;
-
-    let derived_ok = managed_field_present(&derived_after, "customerName", "Alicia")
-        && managed_field_present(&derived_after, "displayName", "Alicia")
-        && managed_field_present(&derived_after, "customerName", "Carol")
-        && managed_field_present(&derived_after, "source", "oracle")
-        && !managed_field_present(&derived_after, "customerName", "Bob")
-        && !inspect_mentions_email_field(&derived_after);
-    let target_ok = managed_field_present(&target_after, "customerName", "Alicia")
-        && managed_field_present(&target_after, "displayName", "Alicia")
-        && managed_field_present(&target_after, "customerName", "Carol")
-        && managed_field_present(&target_after, "source", "oracle")
-        && !managed_field_present(&target_after, "customerName", "Bob")
-        && !inspect_mentions_email_field(&target_after);
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(derived_ok && target_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after field-ops insert/update/delete.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed (addFields/rename/remove Derived + Target Managed outcomes)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
-
 async fn remove_rt_field_ops_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
         "Lab Scenario: removing Namespace \
@@ -2552,157 +2841,6 @@ EXIT;\n"
                 "Failed to drive Source insert/update/delete for rt-field-ops Lab Scenario:\n{err}"
             ))
         })
-}
-
-async fn adapt_rt_equilookup(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {RT_EQUILOOKUP_ID}");
-    println!(
-        "Scenario Namespace: tables={RT_EQUILOOKUP_CUSTOMERS_TABLE},{RT_EQUILOOKUP_ORDERS_TABLE} \
-collection={RT_EQUILOOKUP_COLLECTION} deployment={RT_EQUILOOKUP_DEPLOYMENT}"
-    );
-
-    prepare_rt_equilookup_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, RT_EQUILOOKUP_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.contains(RT_EQUILOOKUP_CUSTOMERS_TABLE)
-        && apply_out.contains(RT_EQUILOOKUP_ORDERS_TABLE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply must Initial Load both equiLookup Bases:\n{apply_out}"
-        )));
-    }
-    if !(apply_out.to_ascii_lowercase().contains("derived")
-        || apply_out.contains(RT_EQUILOOKUP_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-        )));
-    }
-
-    let derived_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_EQUILOOKUP_PIPELINE,
-        ],
-    )
-    .await?;
-    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
-        && derived_after_apply.contains("orders")
-        && (derived_after_apply.contains("42.50") || derived_after_apply.contains("42.5"))
-        && managed_field_present(&derived_after_apply, "NAME", "Bob"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load equiLookup Derived check failed \
-(expected Alice/Bob with embedded orders):\n{derived_after_apply}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source primary + foreign mutations...");
-    mutate_rt_equilookup_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let derived_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_EQUILOOKUP_PIPELINE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            RT_EQUILOOKUP_COLLECTION,
-        ],
-    )
-    .await?;
-
-    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-        && derived_after.contains("orders")
-        && (derived_after.contains("50.00") || derived_after.contains("50"))
-        && !derived_after.contains("42.50")
-        && managed_field_present(&derived_after, "NAME", "Bob");
-    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-        && target_after.contains("orders")
-        && (target_after.contains("50.00") || target_after.contains("50"))
-        && managed_field_present(&target_after, "NAME", "Bob");
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(derived_ok && target_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after equiLookup primary/foreign updates.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed (equiLookup multi-Base Derived + Target Managed outcomes)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
 }
 
 async fn remove_rt_equilookup_namespace(lab_dir: &Path) -> Result<(), CliError> {
@@ -2817,154 +2955,6 @@ EXIT;\n"
         })
 }
 
-async fn adapt_rt_union(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {RT_UNION_ID}");
-    println!(
-        "Scenario Namespace: tables={RT_UNION_EAST_TABLE},{RT_UNION_WEST_TABLE} \
-collection={RT_UNION_COLLECTION} deployment={RT_UNION_DEPLOYMENT}"
-    );
-
-    prepare_rt_union_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, RT_UNION_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.contains(RT_UNION_EAST_TABLE) && apply_out.contains(RT_UNION_WEST_TABLE)) {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply must Initial Load both union Bases:\n{apply_out}"
-        )));
-    }
-    if !(apply_out.to_ascii_lowercase().contains("derived")
-        || apply_out.contains(RT_UNION_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-        )));
-    }
-
-    let derived_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_UNION_PIPELINE,
-        ],
-    )
-    .await?;
-    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
-        && managed_field_present(&derived_after_apply, "NAME", "Zoe")
-        && managed_field_present(&derived_after_apply, "NAME", "Wade")
-        && !derived_after_apply.contains("alice@example.com"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load union Derived check failed \
-(expected Alice/Zoe/Wade without EMAIL):\n{derived_after_apply}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source east + west mutations...");
-    mutate_rt_union_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let derived_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_UNION_PIPELINE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            RT_UNION_COLLECTION,
-        ],
-    )
-    .await?;
-
-    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-        && managed_field_present(&derived_after, "NAME", "Zora")
-        && managed_field_present(&derived_after, "NAME", "Wade")
-        && !derived_after.contains("Alice")
-        && !derived_after.contains("Zoe");
-    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-        && managed_field_present(&target_after, "NAME", "Zora")
-        && managed_field_present(&target_after, "NAME", "Wade");
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(derived_ok && target_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after union east/west updates.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed (union multi-Base Derived + Target Managed outcomes)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
-
 async fn remove_rt_union_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
         "Lab Scenario: removing Namespace \
@@ -3074,159 +3064,6 @@ EXIT;\n"
                 "Failed to drive Source mutations for rt-union Lab Scenario:\n{err}"
             ))
         })
-}
-
-async fn adapt_rt_unwind(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {RT_UNWIND_ID}");
-    println!(
-        "Scenario Namespace: tables={RT_UNWIND_CUSTOMERS_TABLE},{RT_UNWIND_ORDERS_TABLE} \
-collection={RT_UNWIND_COLLECTION} deployment={RT_UNWIND_DEPLOYMENT}"
-    );
-
-    prepare_rt_unwind_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, RT_UNWIND_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.contains(RT_UNWIND_CUSTOMERS_TABLE)
-        && apply_out.contains(RT_UNWIND_ORDERS_TABLE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply must Initial Load both equiLookup Bases for unwind:\n{apply_out}"
-        )));
-    }
-    if !(apply_out.to_ascii_lowercase().contains("derived")
-        || apply_out.contains(RT_UNWIND_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-        )));
-    }
-
-    let derived_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_UNWIND_PIPELINE,
-        ],
-    )
-    .await?;
-    if !(managed_field_present(&derived_after_apply, "NAME", "Alice")
-        && derived_after_apply.contains("ORDER_ID")
-        && (derived_after_apply.contains("42.50") || derived_after_apply.contains("42.5"))
-        && derived_after_apply.contains("101")
-        && managed_field_present(&derived_after_apply, "NAME", "Bob")
-        && !derived_after_apply.contains("\"orders\""))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load unwind Derived check failed \
-(expected flattened ORDER_ID rows for Alice/Bob, no orders array):\n{derived_after_apply}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source primary + foreign mutations...");
-    mutate_rt_unwind_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let derived_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_UNWIND_PIPELINE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            RT_UNWIND_COLLECTION,
-        ],
-    )
-    .await?;
-
-    let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-        && (derived_after.contains("50.00") || derived_after.contains("50"))
-        && !derived_after.contains("42.50")
-        && !derived_after.contains("101")
-        && managed_field_present(&derived_after, "NAME", "Bob");
-    let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-        && (target_after.contains("50.00") || target_after.contains("50"))
-        && !target_after.contains("101")
-        && managed_field_present(&target_after, "NAME", "Bob");
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(derived_ok && target_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after unwind primary/foreign updates + order delete.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed (unwind Output Identities insert/update/delete)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
 }
 
 async fn remove_rt_unwind_namespace(lab_dir: &Path) -> Result<(), CliError> {
@@ -3340,190 +3177,6 @@ EXIT;\n"
                 "Failed to drive Source mutations for rt-unwind Lab Scenario:\n{err}"
             ))
         })
-}
-
-async fn adapt_rt_distinct_addtoset(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {RT_DISTINCT_ADDTOSET_ID}");
-    println!(
-        "Scenario Namespace: table={RT_DISTINCT_ADDTOSET_TABLE} \
-collections={RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION},{RT_DISTINCT_ADDTOSET_ADD_COLLECTION} \
-deployment={RT_DISTINCT_ADDTOSET_DEPLOYMENT}"
-    );
-
-    prepare_rt_distinct_addtoset_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, RT_DISTINCT_ADDTOSET_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.contains(RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE)
-        && apply_out.contains(RT_DISTINCT_ADDTOSET_ADD_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply must materialize both distinct and addToSet Pipelines:\n{apply_out}"
-        )));
-    }
-
-    let distinct_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE,
-        ],
-    )
-    .await?;
-    let add_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_DISTINCT_ADDTOSET_ADD_PIPELINE,
-        ],
-    )
-    .await?;
-    if !(distinct_after_apply.contains("\"CUSTOMER_ID\": 1")
-        && distinct_after_apply.contains("\"CUSTOMER_ID\": 2")
-        && add_after_apply.contains("42.50")
-        && add_after_apply.contains("10.00")
-        && add_after_apply.contains("5.00"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load distinct/addToSet Derived check failed.\n\
-distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source mutations (unused/duplicate/new/key-move)...");
-    mutate_rt_distinct_addtoset_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let distinct_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE,
-        ],
-    )
-    .await?;
-    let add_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            RT_DISTINCT_ADDTOSET_ADD_PIPELINE,
-        ],
-    )
-    .await?;
-    let distinct_target = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION,
-        ],
-    )
-    .await?;
-    let add_target = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            RT_DISTINCT_ADDTOSET_ADD_COLLECTION,
-        ],
-    )
-    .await?;
-
-    let distinct_ok = distinct_after.contains("\"CUSTOMER_ID\": 1")
-        && distinct_after.contains("\"CUSTOMER_ID\": 3")
-        && !distinct_after.contains("\"CUSTOMER_ID\": 2")
-        && distinct_target.contains("\"CUSTOMER_ID\": 1")
-        && distinct_target.contains("\"CUSTOMER_ID\": 3")
-        && !distinct_target.contains("\"CUSTOMER_ID\": 2");
-    let add_ok = add_after.contains("7.00")
-        && add_after.contains("42.50")
-        && add_after.contains("10.00")
-        && add_after.contains("\"CUSTOMER_ID\": 3")
-        && add_after.contains("5.00")
-        && !add_after.contains("\"CUSTOMER_ID\": 2")
-        && add_target.contains("7.00")
-        && add_target.contains("\"CUSTOMER_ID\": 3");
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(distinct_ok && add_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after distinct/addToSet Source mutations.\n\
-distinct Derived:\n{distinct_after}\ndistinct Target:\n{distinct_target}\n\
-addToSet Derived:\n{add_after}\naddToSet Target:\n{add_target}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed (distinct + addToSet Derived/Target outcomes)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
 }
 
 async fn remove_rt_distinct_addtoset_namespace(lab_dir: &Path) -> Result<(), CliError> {
@@ -8927,11 +8580,17 @@ mod tests {
     }
 
     #[test]
-    fn product_path_recipes_drive_shared_steps_for_first_batch() {
+    fn product_path_recipes_drive_shared_steps_for_migrated_batch() {
         let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab/scenarios");
         for (id, require_delivery, require_derived) in [
             (DIRECT_PIPELINE_ID, false, false),
             (RT_PROJECT_ID, false, true),
+            (RT_FILTER_ID, false, true),
+            (RT_FIELD_OPS_ID, false, true),
+            (RT_EQUILOOKUP_ID, false, true),
+            (RT_UNION_ID, false, true),
+            (RT_UNWIND_ID, false, true),
+            (RT_DISTINCT_ADDTOSET_ID, false, true),
             (POISON_QUARANTINE_ID, true, false),
         ] {
             let recipe = load_recipe(&lab.join(id).join("recipe.yaml"))
@@ -8959,6 +8618,9 @@ mod tests {
                 summary.contains("product_path.steps=5"),
                 "{id} summary={summary}"
             );
+            ProductPathHooks::for_recipe(&recipe).unwrap_or_else(|err| {
+                panic!("{id} must have product-path hooks: {err}")
+            });
         }
     }
 

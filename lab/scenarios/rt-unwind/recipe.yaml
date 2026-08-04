@@ -1,4 +1,4 @@
-# Lab Scenario recipe (ADR-0025 / issue #129).
+# Lab Scenario recipe (ADR-0025 / issue #129 / #178).
 # Catalog listing (`migraloop lab scenario list`) reads this file.
 id: rt-unwind
 summary: "Rich Transform unwind: equiLookup array → unwound Output Identities → Delivery (real apply/sync)"
@@ -19,6 +19,18 @@ workload:
     - apply Deployment via real product path (Initial Load both Bases + equiLookup+unwind Derived)
     - mutate primary NAME + foreign AMOUNT + delete one order (identity insert/update/delete)
     - sync Incremental Capture + Delivery via real LogMiner path
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_derived: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "Derived/Target are one document per ORDER_ID after unwind flatten"

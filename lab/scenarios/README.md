@@ -57,8 +57,10 @@ thresholds:                     # optional; equal weight with correctness
 Typed `workload.product_path` steps (issue #173): `prepare_namespace`, `product_apply`,
 `mutate`, `product_sync`, `assert`. The shared runner owns apply/sync on the real product
 CLI path; Scenario hooks only supply Namespace seed SQL, rare escapes (e.g. poison env),
-and correctness asserts. First batch on this path: `direct-pipeline`, `rt-project`,
-`poison-quarantine`. Other Scenarios may still use a full `adapt_*` until migrated.
+and correctness asserts. On this path: `direct-pipeline`, all `rt-*` Rich Transform Scenarios (`rt-project`,
+`rt-filter`, `rt-field-ops`, `rt-equilookup`, `rt-union`, `rt-unwind`,
+`rt-distinct-addtoset`), and `poison-quarantine`. Other Scenarios may still use a
+full `adapt_*` until migrated (see issue #179 for remaining ops/lifecycle Scenarios).
 
 ## Adding a Scenario while building a feature
 
