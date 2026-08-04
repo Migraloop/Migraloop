@@ -47,10 +47,6 @@ pub struct StatusInventory {
     pub schema_impacts: Vec<SchemaChangeImpact>,
 }
 
-/// Operator-visible Delivery Health label derived from Pipeline + quarantine state.
-///
-/// Values: `paused` | `unhealthy` | `ok` | `pending` | `unknown`. Formatting of
-/// the full status line stays in the CLI adapter.
 /// Load Base Dataset rows for Operator `base` inspect (session verb).
 pub async fn inspect_base_rows(
     store: &PlatformStore,

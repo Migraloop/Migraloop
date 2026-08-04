@@ -16,7 +16,8 @@ use migraloop_platform_store::{
     PlatformStoreHealth, SystemConnection,
 };
 use migraloop_runtime::{
-    inspect_base_rows, inspect_derived_rows, inspect_target_documents, status_inventory_from_url,
+    assemble_observability_surface, inspect_base_rows, inspect_derived_rows,
+    inspect_target_documents, status_inventory_from_url,
 };
 use thiserror::Error;
 
@@ -371,24 +372,6 @@ fn format_output_identity(identity: &serde_json::Value) -> String {
     }
 }
 
-/// Operator-facing Delivery Health label for `status` narrative.
-fn pipeline_delivery_health(
-    pipeline: &Pipeline,
-    active_quarantines_for_pipeline: usize,
-) -> &'static str {
-    if pipeline.paused {
-        "paused"
-    } else if active_quarantines_for_pipeline > 0 {
-        "unhealthy"
-    } else {
-        match pipeline.delivery_status.as_str() {
-            "delivered" => "ok",
-            "pending" => "pending",
-            _ => "unknown",
-        }
-    }
-}
-
 /// Operator `status` Incremental Capture mechanism label for Oracle Sources.
 ///
 /// Mirrors Source adapter harness selection (`host: contract|stub` → contract;
@@ -450,10 +433,13 @@ async fn drift_check(
 
 async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     let inventory = status_inventory_from_url(platform_store_url).await?;
+    // Typed Sync/Delivery Health (+ lag / quarantine / schema-impact / disk-warn)
+    // come from one runtime assembly; CLI only formats Operator narrative (#174).
+    let surface = assemble_observability_surface(&inventory);
 
-    match &inventory.health {
+    match &surface.store_health {
         PlatformStoreHealth::Healthy { schema_version } => {
-            if let Some(err) = &inventory.guardrail_error {
+            if let Some(err) = &surface.guardrail_error {
                 println!("Platform Store: unhealthy");
                 eprintln!("{err}");
                 return Err(CliError::Failed(err.clone()));
@@ -461,7 +447,7 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             println!("Platform Store: healthy");
             println!("Schema version: {schema_version}");
             // Warn-only: free-disk pressure must not flip health or pause Pipelines.
-            if let (true, Some(free)) = (inventory.disk_warn, inventory.free_disk_bytes) {
+            if let (true, Some(free)) = (surface.disk_warn, surface.free_disk_bytes) {
                 let msg = disk_warn_message(free);
                 println!("{msg}");
                 emit_event(
@@ -586,13 +572,20 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                     println!("  Cutover: low-watermark=(missing)");
                 }
             }
-            // Sync Health stays unknown|ok; lag + checkpoint make resume state coherent after restart.
+            let sync_obs = surface
+                .sync
+                .iter()
+                .find(|s| {
+                    s.deployment_name == base.deployment_name && s.source_table == base.source_table
+                })
+                .expect("Observability assembly must cover every Base Dataset in inventory");
             println!(
                 "  Sync Health: {} appliedChanges={} lag={} checkpoint={}",
-                base.sync_health,
-                base.sync_applied_changes,
-                base.sync_lag,
-                base.capture_checkpoint
+                sync_obs.health.as_str(),
+                sync_obs.applied_changes,
+                sync_obs.lag,
+                sync_obs
+                    .checkpoint
                     .map(|cp| cp.to_string())
                     .unwrap_or_else(|| "(none)".to_string())
             );
@@ -631,45 +624,32 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         if pipeline.target_collection.is_empty() {
             continue;
         }
-        let pipeline_quarantines: Vec<_> = quarantines
+        let delivery_obs = surface
+            .delivery
             .iter()
-            .filter(|q| {
-                q.deployment_name == pipeline.deployment_name && q.pipeline_name == pipeline.name
+            .find(|d| {
+                d.deployment_name == pipeline.deployment_name && d.pipeline_name == pipeline.name
             })
-            .collect();
-        let pipeline_schema_blocks: Vec<_> = schema_impacts
-            .iter()
-            .filter(|s| {
-                s.deployment_name == pipeline.deployment_name
-                    && s.pipeline_name == pipeline.name
-                    && s.impact == "blocking"
-            })
-            .collect();
-        let delivery_health =
-            pipeline_delivery_health(pipeline, pipeline_quarantines.len());
+            .expect("Observability assembly must cover every Target-bound Pipeline");
+        let delivery_health = delivery_obs.health.as_str();
+        let applied = delivery_obs.applied_changes;
+        let lag = delivery_obs.lag;
+        let quarantined = delivery_obs.quarantined;
+        let schema_blocking = delivery_obs.schema_blocking;
         let status_label = if pipeline.paused {
             format!("{} (paused)", pipeline.delivery_status)
         } else {
             pipeline.delivery_status.clone()
         };
-        if pipeline_quarantines.is_empty() {
+        if quarantined == 0 {
             println!(
                 "  Delivery Health: {} Pipeline={} status={} appliedChanges={} lag={}",
-                delivery_health,
-                pipeline.name,
-                status_label,
-                pipeline.delivery_applied_changes,
-                pipeline.delivery_lag
+                delivery_health, pipeline.name, status_label, applied, lag
             );
         } else {
             println!(
                 "  Delivery Health: {} Pipeline={} status={} appliedChanges={} lag={} quarantined={}",
-                delivery_health,
-                pipeline.name,
-                status_label,
-                pipeline.delivery_applied_changes,
-                pipeline.delivery_lag,
-                pipeline_quarantines.len()
+                delivery_health, pipeline.name, status_label, applied, lag, quarantined
             );
         }
         println!(
@@ -679,11 +659,10 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
             pipeline.drift_checked_rows,
             pipeline.drift_mismatched_rows
         );
-        if !pipeline_schema_blocks.is_empty() {
+        if schema_blocking > 0 {
             println!(
                 "  Schema Change: Pipeline={} blocking={} paused (stream-wide DDL; not poison quarantine)",
-                pipeline.name,
-                pipeline_schema_blocks.len()
+                pipeline.name, schema_blocking
             );
         }
     }
