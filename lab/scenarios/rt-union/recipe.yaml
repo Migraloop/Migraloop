@@ -1,4 +1,4 @@
-# Lab Scenario recipe (ADR-0025 / issue #130).
+# Lab Scenario recipe (ADR-0025 / issue #130 / #178).
 # Catalog listing (`migraloop lab scenario list`) reads this file.
 id: rt-union
 summary: "Rich Transform union: multi-Base concatenate → Derived → Delivery (real apply/sync)"
@@ -19,6 +19,18 @@ workload:
     - apply Deployment via real product path (Initial Load both Bases + union Derived)
     - mutate east + west Source rows (NAME changes on each contributing Base)
     - sync Incremental Capture + Delivery via real LogMiner path
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_derived: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "Derived/Target concatenate both EAST and WEST rows by Output Identity"

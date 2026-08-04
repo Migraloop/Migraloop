@@ -1,4 +1,4 @@
-# Lab Scenario recipe (ADR-0025 / issue #66).
+# Lab Scenario recipe (ADR-0025 / issue #66 / #178).
 # Catalog listing (`migraloop lab scenario list`) reads this file.
 id: rt-filter
 summary: "Rich Transform filter: ACTIVE eq 1 → Derived → Delivery (real apply/sync)"
@@ -18,6 +18,18 @@ workload:
     - apply Deployment via real product path (Initial Load + filter Derived)
     - mutate Source (rename Alice, flip Bob ACTIVE 0→1, insert active Carol + inactive Dana)
     - sync Incremental Capture + Delivery via real LogMiner path
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_derived: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "After Initial Load: only ACTIVE=1 seed row (Alice) in Derived/Target"

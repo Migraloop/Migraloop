@@ -1,4 +1,4 @@
-# Lab Scenario recipe (ADR-0025 / issue #128).
+# Lab Scenario recipe (ADR-0025 / issue #128 / #178).
 # Catalog listing (`migraloop lab scenario list`) reads this file.
 id: rt-distinct-addtoset
 summary: "Rich Transform distinct/addToSet with Maintenance State → Derived → Delivery (real apply/sync)"
@@ -20,6 +20,18 @@ workload:
     - apply Deployment via real product path (Initial Load + distinct/addToSet Derived)
     - mutate Source (unused ADDRESS; duplicate CUSTOMER_ID; new AMOUNT; CUSTOMER_ID key move)
     - sync Incremental Capture + Delivery via real LogMiner path
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_derived: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "distinct Derived/Target lists customers 1 and 3 (not 2) after key move"
