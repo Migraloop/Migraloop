@@ -121,7 +121,8 @@ Recipe 惯例与短清单亦见 `lab/scenarios/README.md`。已出货 capability
 1. **实现 engine interface**
    - Source：`crates/capture` 的 `SourceEngine` / `IncrementalCaptureSession`（schema discovery、Initial Load chunks、Incremental Capture resume、prerequisites check、alignment reads、schema-change classification inputs）。
    - Target：`crates/delivery` 的 `TargetEngine`（按 Output Identity upsert Managed fields、按 identity delete、Drift Check／inspect 所需的 list/read helpers）。
-   - 通过 Deployment runtime factory helpers（`source_engine_from_connection` / `target_engine_from_deployment`）接线。Runtime 必须继续依赖 interfaces，而不是具体 engine types。
+   - 通过 Deployment runtime factory helpers（`source_engine_from_connection` / `target_engine_from_deployment`）接线。这些 factories 返回 `SourceEngine`／`TargetEngine` interfaces（call site 不应出现具体 Oracle／Mongo types）。Runtime Sync／Delivery 必须继续依赖 interfaces。
+   - 默认 Operator CLI `apply`／`run`／`sync` 仍经由上述 factories 构建 v1 Oracle LogMiner 与 MongoDB adapters。in-process seam 测试可用 injected engines（`run_incremental_sync_with_engines`）跑完整 Incremental Sync，让 Fake adapters 走 production Sync path，且不依赖 Oracle-kind string gates。
    - Rich Transform／Affect Analysis 只读 platform-managed Base/Derived data——绝不要把新 engine 当成 transform compute。
 2. **Prerequisites 与 handbook**
    - 在对应 Operator 章节（[Source System](source-system.md)／[Target System](target-system.md)）以**三个 locales**文档化 engine-specific Source Prerequisites／Required Privileges（或 Target Delivery grants）。
@@ -133,7 +134,7 @@ Recipe 惯例与短清单亦见 `lab/scenarios/README.md`。已出货 capability
 5. **Packaging guards**
    - 保持 modular monorepo + 单一 `migraloop` binary（ADR-0024）。不要引入第二个 Platform Store engine（ADR-0001）。
 
-Seam 测试可用 in-memory `FakeSource`／`FakeTarget`；它们不是第二个 production engine。
+Seam 测试可用 in-memory `FakeSource`／`FakeTarget`（含 injected 完整 Incremental Sync）；它们不是第二个 production engine。
 
 ## Release Quality Gate
 

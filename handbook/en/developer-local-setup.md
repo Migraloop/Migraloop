@@ -121,7 +121,8 @@ New Source System or Target System kinds plug in at stable interfaces. Do **not*
 1. **Implement the engine interface**
    - Source: `SourceEngine` / `IncrementalCaptureSession` in `crates/capture` (schema discovery, Initial Load chunks, Incremental Capture resume, prerequisites check, alignment reads, schema-change classification inputs).
    - Target: `TargetEngine` in `crates/delivery` (upsert Managed fields by Output Identity, delete by identity, list/read helpers for Drift Check / inspect).
-   - Wire the adapter through Deployment runtime factory helpers (`source_engine_from_connection` / `target_engine_from_deployment`). Runtime must keep depending on the interfaces, not the concrete engine types.
+   - Wire the adapter through Deployment runtime factory helpers (`source_engine_from_connection` / `target_engine_from_deployment`). Those factories return the `SourceEngine` / `TargetEngine` interfaces (not concrete Oracle/Mongo types at the call site). Runtime Sync/Delivery must keep depending on the interfaces.
+   - Default Operator CLI `apply` / `run` / `sync` still constructs the v1 Oracle LogMiner and MongoDB adapters via those factories. For in-process seam tests, full Incremental Sync also accepts injected engines (`run_incremental_sync_with_engines`) so Fake adapters can exercise the production Sync path without Oracle-kind string gates.
    - Keep Rich Transform / Affect Analysis on platform-managed Base/Derived data only—never use the new engine as transform compute.
 2. **Prerequisites and handbook**
    - Document engine-specific Source Prerequisites / Required Privileges (or Target Delivery grants) in the matching Operator chapters ([Source System](source-system.md) / [Target System](target-system.md)) in **all three locales**.
@@ -133,7 +134,7 @@ New Source System or Target System kinds plug in at stable interfaces. Do **not*
 5. **Packaging guards**
    - Preserve the modular monorepo + single `migraloop` binary (ADR-0024). Do not introduce a second Platform Store engine (ADR-0001).
 
-In-memory `FakeSource` / `FakeTarget` adapters exist for seam tests; they are not a second production engine.
+In-memory `FakeSource` / `FakeTarget` adapters exist for seam tests (including injected full Incremental Sync); they are not a second production engine.
 
 ## Release Quality Gate
 
