@@ -1,14 +1,25 @@
-//! Shared Connection Security and Managed-field types for the apply → Direct Delivery path.
+//! Shared Connection Security, Managed-field, and Output Identity key types for the
+//! apply → Direct Delivery path.
 //!
 //! Config wire shapes, Platform Store persistence, Source adapters, and Target adapters
 //! consume these types (or thin wire adapters from them) so TLS settings, Managed-field
-//! mapping, and secret-reference resolution do not drift as parallel enums.
+//! mapping, secret-reference resolution, and Output Identity key encoding do not drift
+//! as parallel enums.
 
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Canonical string key for one Output Identity value.
+///
+/// Poison injection matching, Drift Check reconcile, and Delivery delete/upsert
+/// identity handling must all use this helper so the same logical identity always
+/// serializes the same way (issue #170).
+pub fn output_identity_key(identity: &serde_json::Value) -> String {
+    serde_json::to_string(identity).unwrap_or_else(|_| identity.to_string())
+}
 
 /// How a secret is referenced (never stored as plaintext) — ADR-0006.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +308,17 @@ mod tests {
         assert_eq!(
             SecretRefKind::parse("docker").unwrap_err().to_string(),
             "unknown secret ref kind: docker"
+        );
+    }
+
+    #[test]
+    fn output_identity_key_uses_stable_json_encoding() {
+        // Independent literals — not recomputed via serde_json::to_string in the assert.
+        assert_eq!(output_identity_key(&serde_json::json!(1)), "1");
+        assert_eq!(output_identity_key(&serde_json::json!("CUST-1")), "\"CUST-1\"");
+        assert_eq!(
+            output_identity_key(&serde_json::json!({"ID": 1, "REGION": "APAC"})),
+            "{\"ID\":1,\"REGION\":\"APAC\"}"
         );
     }
 }

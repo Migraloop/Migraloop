@@ -24,7 +24,7 @@ use migraloop_transform::{
     evaluate_transform_with_bases, infer_derived_columns, initial_maintenance_state,
     parse_transform_steps, secondary_base_refs, MaintenanceStateBlob, OutputColumn, TransformOp,
 };
-use migraloop_types::resolve_secret_ref;
+use migraloop_types::{output_identity_key, resolve_secret_ref};
 use thiserror::Error;
 
 mod engines;
@@ -1201,7 +1201,7 @@ pub async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
 }
 
 pub fn identity_key(identity: &serde_json::Value) -> String {
-    serde_json::to_string(identity).unwrap_or_else(|_| identity.to_string())
+    output_identity_key(identity)
 }
 
 pub fn target_document_identity_key(document: &serde_json::Value) -> Option<String> {

@@ -460,6 +460,10 @@ async fn set_delivery_lag_for_table(
     Ok(())
 }
 
+/// Operator-facing label for an Output Identity (status / quarantine alerts).
+///
+/// Matching for poison injection, Drift reconcile, and Delivery delete/upsert uses
+/// [`migraloop_types::output_identity_key`] — not this formatter.
 pub fn format_output_identity(identity: &serde_json::Value) -> String {
     match identity {
         serde_json::Value::Number(n) => n.to_string(),
@@ -472,7 +476,7 @@ fn identity_is_poison(identity: &serde_json::Value, poison_keys: &BTreeSet<Strin
     if poison_keys.is_empty() {
         return false;
     }
-    poison_keys.contains(&format_output_identity(identity))
+    poison_keys.contains(&migraloop_types::output_identity_key(identity))
 }
 
 fn identity_value_from_change(
@@ -1738,4 +1742,33 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
             }
         }
     Ok(())
+}
+
+#[cfg(test)]
+mod output_identity_key_tests {
+    use super::{format_output_identity, identity_is_poison};
+    use migraloop_types::output_identity_key;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn poison_matching_uses_shared_output_identity_key() {
+        // Discriminator: string identities encode with JSON quotes. The former
+        // poison formatter compared the bare string and would disagree with
+        // Drift/Delivery keys for the same value.
+        let poison = BTreeSet::from([r#""CUST-1""#.to_string()]);
+        assert!(identity_is_poison(&json!("CUST-1"), &poison));
+        assert!(!identity_is_poison(
+            &json!("CUST-1"),
+            &BTreeSet::from(["CUST-1".to_string()])
+        ));
+        assert_eq!(output_identity_key(&json!("CUST-1")), r#""CUST-1""#);
+    }
+
+    #[test]
+    fn operator_display_label_stays_distinct_from_match_key_for_strings() {
+        let identity = json!("CUST-1");
+        assert_eq!(format_output_identity(&identity), "CUST-1");
+        assert_eq!(output_identity_key(&identity), r#""CUST-1""#);
+    }
 }
