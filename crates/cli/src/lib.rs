@@ -64,10 +64,6 @@ pub enum CliError {
     Failed(String),
 }
 
-fn runtime_err(err: migraloop_runtime::RuntimeError) -> CliError {
-    CliError::Failed(err.to_string())
-}
-
 impl From<migraloop_runtime::RuntimeError> for CliError {
     fn from(err: migraloop_runtime::RuntimeError) -> Self {
         CliError::Failed(err.to_string())
@@ -3163,12 +3159,11 @@ async fn resume_pipeline_command(
         let store = PlatformStore::open(platform_store_url)
             .await
             .map_err(|err| CliError::Failed(err.to_string()))?;
-        let mongo = mongo_target_from_deployment(&deployment).map_err(runtime_err)?;
+        let mongo = mongo_target_from_deployment(&deployment)?;
         match pipeline.mode.as_str() {
             "direct" => {
                 deliver_direct_pipeline_with_options(&store, &deployment, &pipeline, &mongo, true)
-                    .await
-                    .map_err(runtime_err)?;
+                    .await?;
             }
             "transform" => {
                 deliver_transform_pipeline_with_options(
@@ -3178,8 +3173,7 @@ async fn resume_pipeline_command(
                     &mongo,
                     true,
                 )
-                .await
-                .map_err(runtime_err)?;
+                .await?;
             }
             other => {
                 return Err(CliError::Failed(format!(

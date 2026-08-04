@@ -1469,6 +1469,11 @@ pub async fn persist_maintenance_state_json(
 
 /// Apply a Deployment: persist, table-level Initial Load, and Delivery start.
 ///
+/// This is the Deployment runtime's primary Operator verb for the apply path.
+/// Table-level Initial Load and Direct Pipeline Delivery (plus Transform first
+/// Delivery when a Pipeline revision needs rebuild) are sequenced here — not in
+/// the CLI clap adapter.
+///
 /// Callers (CLI adapter, in-process tests) supply an already-open Platform Store
 /// session and resolved Deployment / Pipeline values — config parsing stays outside.
 pub async fn apply(
