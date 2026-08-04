@@ -6,7 +6,9 @@
 //! [`supervise_continuous_incremental_sync`]), Pipeline lifecycle ([`pause_pipeline`],
 //! [`resume_pipeline`], [`remove_pipeline`]), [`source_alignment_check`], [`drift_check`],
 //! status inventory ([`status_inventory`], [`status_inventory_from_url`]), Observability
-//! Surface assembly ([`assemble_observability_surface`]), and inspect
+//! Surface assembly ([`assemble_observability_surface`]), cutover facts / hand-off
+//! ([`cutover_facts_from_base`], [`handoff_from_low_watermark`],
+//! [`resume_for_incremental`]), and inspect
 //! ([`inspect_base_rows`], [`inspect_derived_rows`], [`inspect_target_documents`]).
 //!
 //! **Session / factory entry points:** [`source_engine_from_connection`],
@@ -40,10 +42,15 @@ use thiserror::Error;
 
 #[cfg(test)]
 mod engines;
+mod cutover;
 mod observability;
 mod incremental;
 mod lifecycle;
 
+pub use cutover::{
+    cutover_facts_from_base, handoff_from_low_watermark, handoff_from_optional_low_watermark,
+    resume_for_incremental, CutoverFacts, CutoverHandoff, IncrementalResume,
+};
 pub use observability::{
     assemble_observability_surface, emit_event, render_prometheus_metrics, BaseSyncObservation,
     DeliveryHealth, EventValue, ObservabilitySurface, PipelineDeliveryObservation, SyncHealth,
@@ -613,6 +620,7 @@ async fn run_chunked_initial_load(
             chunk.cursor_pk.clone()
         };
         let wm = chunk.low_watermark;
+        let handoff = handoff_from_low_watermark(wm);
         let dataset = BaseDataset {
             deployment_name: deployment_name.to_string(),
             source_table: table.to_string(),
@@ -624,10 +632,8 @@ async fn run_chunked_initial_load(
             row_count: offset as i32,
             sync_applied_changes: 0,
             sync_health: "unknown".to_string(),
-            capture_low_watermark: Some(wm.as_i64()),
-            // Checkpoint starts at watermark-1 so first Incremental includes the overlap window
-            // via inclusive resume from checkpoint (== low-watermark-1) covering overlap.
-            capture_checkpoint: Some(wm.as_i64().saturating_sub(1)),
+            capture_low_watermark: Some(handoff.low_watermark),
+            capture_checkpoint: Some(handoff.checkpoint),
             sync_lag: 0,
             source_alignment: "unknown".to_string(),
             source_alignment_checked_rows: 0,
@@ -784,7 +790,7 @@ async fn persist_initial_load_pause(
     low_watermark: Option<CapturePosition>,
     cursor: Option<Vec<serde_json::Value>>,
 ) -> Result<(), RuntimeError> {
-    let wm = low_watermark.map(|w| w.as_i64());
+    let handoff = handoff_from_optional_low_watermark(low_watermark);
     let dataset = BaseDataset {
         deployment_name: deployment_name.to_string(),
         source_table: table.to_string(),
@@ -796,8 +802,8 @@ async fn persist_initial_load_pause(
         row_count: rows_loaded as i32,
         sync_applied_changes: 0,
         sync_health: "unknown".to_string(),
-        capture_low_watermark: wm,
-        capture_checkpoint: wm.map(|w| w.saturating_sub(1)),
+        capture_low_watermark: handoff.map(|h| h.low_watermark),
+        capture_checkpoint: handoff.map(|h| h.checkpoint),
         sync_lag: 0,
         source_alignment: "unknown".to_string(),
         source_alignment_checked_rows: 0,
@@ -818,7 +824,10 @@ async fn persist_initial_load_pause(
         &[
             ("table", EventValue::from(table)),
             ("rows", EventValue::from(rows_loaded as i64)),
-            ("low_watermark", EventValue::from(wm.unwrap_or(0))),
+            (
+                "low_watermark",
+                EventValue::from(handoff.map(|h| h.low_watermark).unwrap_or(0)),
+            ),
             ("deployment", EventValue::from(deployment_name)),
         ],
     );

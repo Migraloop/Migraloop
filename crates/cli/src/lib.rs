@@ -16,8 +16,8 @@ use migraloop_platform_store::{
     PlatformStoreHealth, SystemConnection,
 };
 use migraloop_runtime::{
-    assemble_observability_surface, inspect_base_rows, inspect_derived_rows,
-    inspect_target_documents, status_inventory_from_url,
+    assemble_observability_surface, cutover_facts_from_base, inspect_base_rows,
+    inspect_derived_rows, inspect_target_documents, status_inventory_from_url, CutoverFacts,
 };
 use thiserror::Error;
 
@@ -561,17 +561,7 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                 }
                 _ => {}
             }
-            match (base.capture_low_watermark, base.capture_checkpoint) {
-                (Some(wm), Some(cp)) => {
-                    println!("  Cutover: low-watermark={wm} checkpoint={cp}");
-                }
-                (Some(wm), None) => {
-                    println!("  Cutover: low-watermark={wm} checkpoint=(none)");
-                }
-                _ => {
-                    println!("  Cutover: low-watermark=(missing)");
-                }
-            }
+            print_cutover_line("  Cutover:", cutover_facts_from_base(base));
             let sync_obs = surface
                 .sync
                 .iter()
@@ -694,6 +684,23 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Format Operator cutover narrative from runtime [`CutoverFacts`] (issue #175).
+///
+/// `status` uses `"  Cutover:"`; `base` inspect uses `"cutover:"`.
+fn print_cutover_line(prefix: &str, facts: CutoverFacts) {
+    match (facts.low_watermark, facts.checkpoint) {
+        (Some(wm), Some(cp)) => {
+            println!("{prefix} low-watermark={wm} checkpoint={cp}");
+        }
+        (Some(wm), None) => {
+            println!("{prefix} low-watermark={wm} checkpoint=(none)");
+        }
+        _ => {
+            println!("{prefix} low-watermark=(missing)");
+        }
+    }
+}
+
 async fn print_base(
     platform_store_url: &str,
     table: &str,
@@ -706,17 +713,7 @@ async fn print_base(
         "Base Dataset: {} status={} rows={}",
         dataset.source_table, dataset.status, dataset.row_count
     );
-    match (dataset.capture_low_watermark, dataset.capture_checkpoint) {
-        (Some(wm), Some(cp)) => {
-            println!("cutover: low-watermark={wm} checkpoint={cp}");
-        }
-        (Some(wm), None) => {
-            println!("cutover: low-watermark={wm} checkpoint=(none)");
-        }
-        _ => {
-            println!("cutover: low-watermark=(missing)");
-        }
-    }
+    print_cutover_line("cutover:", cutover_facts_from_base(&dataset));
     let columns = dataset
         .columns
         .iter()
