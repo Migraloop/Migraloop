@@ -5,7 +5,6 @@
 //! OCI, plus [`FakeSource`] for in-process seam tests — no second production Source.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use serde_json::Value;
 
@@ -225,7 +224,6 @@ pub struct FakeSource {
     schema_changes: Vec<SchemaChangeEvent>,
     /// When set, [`SourceEngine::check_prerequisites`] fails with this summary.
     prerequisites_unmet: Option<String>,
-    incremental: Mutex<Option<FakeIncremental>>,
 }
 
 impl FakeSource {
@@ -234,7 +232,6 @@ impl FakeSource {
             tables: BTreeMap::new(),
             schema_changes: Vec::new(),
             prerequisites_unmet: None,
-            incremental: Mutex::new(None),
         }
     }
 
@@ -400,14 +397,7 @@ impl SourceEngine for FakeSource {
         for (name, table) in &self.tables {
             changes_by_table.insert(name.clone(), table.changes.clone());
         }
-        let session = FakeIncremental { changes_by_table };
-        *self
-            .incremental
-            .lock()
-            .map_err(|_| CaptureError::ContractCatalog {
-                detail: "FakeSource lock poisoned".to_string(),
-            })? = Some(session.clone());
-        Ok(session)
+        Ok(FakeIncremental { changes_by_table })
     }
 
     fn schema_change_inputs(&self) -> Result<Vec<SchemaChangeEvent>, CaptureError> {

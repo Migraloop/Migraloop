@@ -74,30 +74,8 @@ fn identity_from_primary_key(
     row: &std::collections::BTreeMap<String, Value>,
     primary_key: &[String],
 ) -> Result<Value, RuntimeError> {
-    if primary_key.is_empty() {
-        return Err(RuntimeError::Failed(
-            "Source table has no primary key for Output Identity".to_string(),
-        ));
-    }
-    if primary_key.len() == 1 {
-        return row
-            .get(&primary_key[0])
-            .cloned()
-            .ok_or_else(|| {
-                RuntimeError::Failed(format!(
-                    "missing primary key field {} in Source row",
-                    primary_key[0]
-                ))
-            });
-    }
-    let mut obj = Map::new();
-    for key in primary_key {
-        let value = row.get(key).cloned().ok_or_else(|| {
-            RuntimeError::Failed(format!("missing primary key field {key} in Source row"))
-        })?;
-        obj.insert(key.clone(), value);
-    }
-    Ok(Value::Object(obj))
+    let map: Map<String, Value> = row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    crate::output_identity_from_row(&map, primary_key)
 }
 
 #[cfg(test)]
