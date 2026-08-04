@@ -51,8 +51,8 @@ pub(crate) struct ScenarioRecipeWorkload {
     pub(crate) concurrency: String,
     #[serde(default)]
     pub(crate) steps: Vec<String>,
-    /// Optional typed product-path steps executed by the shared runner (#173).
-    /// When absent, the Scenario still uses a full `adapt_*` adapter.
+    /// Typed product-path steps executed by the shared runner (#173 / #178 / #179).
+    /// All shipped catalog Scenarios set this; absence is rejected at run time.
     #[serde(default)]
     pub(crate) product_path: Option<ScenarioRecipeProductPath>,
 }

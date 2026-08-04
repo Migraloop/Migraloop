@@ -216,6 +216,8 @@ const SCHEMA_CHANGE_PAUSE_DEPLOYMENT: &str = "lab-schema-change-pause";
 const SOURCE_ALIGNMENT_ID: &str = "source-alignment";
 const SOURCE_ALIGNMENT_TABLE: &str = "LAB_SA_CUSTOMERS";
 const SOURCE_ALIGNMENT_COLLECTION: &str = "lab_sa_customers";
+// Pipeline id is declared on the recipe namespace; CLI align/status paths key by table.
+#[allow(dead_code)]
 const SOURCE_ALIGNMENT_PIPELINE: &str = "lab-sa-customers";
 const SOURCE_ALIGNMENT_DEPLOYMENT: &str = "lab-source-alignment";
 
