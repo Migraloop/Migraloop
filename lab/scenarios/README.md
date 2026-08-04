@@ -26,11 +26,24 @@ namespace:
 deployment_config: deployment.yaml
 workload:
   concurrency: serial           # or parallel (intra-Scenario only)
-  steps:
+  steps:                        # human-readable narrative (always required)
     - prepare Namespace …
     - apply via real product path
     - mutate / drive Source workload
     - sync / settle and assert
+  product_path:                 # optional; when set, shared runner executes these
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_delivery: false     # set true when apply must report Delivery
+      require_derived: false      # set true for Transform Derived materialization
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - Expected Managed Base/Target/Derived outcomes
@@ -41,10 +54,16 @@ thresholds:                     # optional; equal weight with correctness
   min_rows_per_s: 50.0
 ```
 
+Typed `workload.product_path` steps (issue #173): `prepare_namespace`, `product_apply`,
+`mutate`, `product_sync`, `assert`. The shared runner owns apply/sync on the real product
+CLI path; Scenario hooks only supply Namespace seed SQL, rare escapes (e.g. poison env),
+and correctness asserts. First batch on this path: `direct-pipeline`, `rt-project`,
+`poison-quarantine`. Other Scenarios may still use a full `adapt_*` until migrated.
+
 ## Adding a Scenario while building a feature
 
-1. Create `lab/scenarios/<id>/recipe.yaml` + `deployment.yaml` (reuse the operator Deployment format).
-2. Implement a Scenario adapter (Namespace prepare/workload/correctness/remove) in `crates/cli/src/lab_scenario/` and register the Scenario id. Recipe `workload` / `checks` / `thresholds` are the recipe-driven runner interface — do not duplicate threshold values as Rust constants.
+1. Create `lab/scenarios/<id>/recipe.yaml` + `deployment.yaml` (reuse the operator Deployment format). Prefer `workload.product_path` for the common prepare→apply→mutate→sync→assert path.
+2. Register the Scenario id and implement thin hooks (Namespace prepare / mutate / assert / remove) — or a full `adapt_*` only when the Scenario cannot use `product_path` yet. Recipe `workload` / `checks` / `thresholds` are the recipe-driven runner interface — do not duplicate threshold values or the common product-path sequence as Rust constants.
 3. Confirm `migraloop lab scenario list` shows the new summary from the recipe.
 4. Manually verify with `migraloop lab scenario run <id>` on a Lab Fixture (`lab up`). Keep ignored CLI-seam coverage for the happy path; do **not** add a CI Release Quality Gate that runs the full catalog (ADR-0025 / ADR-0011).
 

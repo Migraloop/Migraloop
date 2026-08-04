@@ -1,4 +1,4 @@
-# Lab Scenario recipe (ADR-0025 / issue #22 / ADR-0015).
+# Lab Scenario recipe (ADR-0025 / issue #22 / ADR-0015 / #173).
 # Catalog listing (`migraloop lab scenario list`) reads this file.
 id: poison-quarantine
 summary: Quarantine poison Output Identity after bounded retries; Pipeline continues; status unhealthy
@@ -19,6 +19,18 @@ workload:
     - mutate Source (update identity 1, insert 3, delete 2)
     - sync Incremental Capture with Lab poison Delivery injection for identity 1
     - assert quarantine alert, other identities Deliver, status shows unhealthy quarantine
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_delivery: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "Poison identity 1 is quarantined after bounded retries (ALERT + Quarantine lines)"

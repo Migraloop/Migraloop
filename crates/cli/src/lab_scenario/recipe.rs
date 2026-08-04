@@ -1,8 +1,9 @@
-//! Lab Scenario recipe types and on-disk loaders (ADR-0025 / issue #157).
+//! Lab Scenario recipe types and on-disk loaders (ADR-0025 / issues #157, #173).
 //!
-//! `recipe.yaml` is the runner interface for workload steps, checks, and
-//! equal-weight metric thresholds. Adapters implement seeds/escapes; they must
-//! not duplicate threshold constants that already live on the recipe.
+//! `recipe.yaml` is the runner interface for workload steps, optional typed
+//! `product_path` steps, checks, and equal-weight metric thresholds. Adapters
+//! implement seeds/escapes/asserts; they must not duplicate threshold constants
+//! or the common prepare→apply→mutate→sync path when `product_path` is set.
 
 use std::fs;
 use std::path::Path;
@@ -31,6 +32,10 @@ pub(crate) fn default_deployment_config() -> String {
     "deployment.yaml".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScenarioRecipeNamespace {
     pub(crate) source_tables: Vec<String>,
@@ -46,6 +51,64 @@ pub(crate) struct ScenarioRecipeWorkload {
     pub(crate) concurrency: String,
     #[serde(default)]
     pub(crate) steps: Vec<String>,
+    /// Optional typed product-path steps executed by the shared runner (#173).
+    /// When absent, the Scenario still uses a full `adapt_*` adapter.
+    #[serde(default)]
+    pub(crate) product_path: Option<ScenarioRecipeProductPath>,
+}
+
+/// Shared product-path vocabulary driven from recipe data (not only prose `steps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProductPathStepKind {
+    PrepareNamespace,
+    ProductApply,
+    Mutate,
+    ProductSync,
+    Assert,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ScenarioRecipeProductPath {
+    pub(crate) steps: Vec<ProductPathStepKind>,
+    #[serde(default)]
+    pub(crate) apply: ProductPathApplyOpts,
+    #[serde(default)]
+    pub(crate) sync: ProductPathSyncOpts,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ProductPathApplyOpts {
+    #[serde(default = "default_true")]
+    pub(crate) require_initial_load: bool,
+    #[serde(default)]
+    pub(crate) require_delivery: bool,
+    #[serde(default)]
+    pub(crate) require_derived: bool,
+}
+
+impl Default for ProductPathApplyOpts {
+    fn default() -> Self {
+        Self {
+            require_initial_load: true,
+            require_delivery: false,
+            require_derived: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ProductPathSyncOpts {
+    #[serde(default = "default_true")]
+    pub(crate) require_logminer: bool,
+}
+
+impl Default for ProductPathSyncOpts {
+    fn default() -> Self {
+        Self {
+            require_logminer: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +123,47 @@ pub(crate) struct ScenarioRecipeThresholds {
     pub(crate) max_lag: Option<i32>,
     pub(crate) max_duration_ms: Option<u128>,
     pub(crate) min_rows_per_s: Option<f64>,
+}
+
+/// Validate optional `workload.product_path` when present (US18 / #173).
+pub(crate) fn validate_product_path(
+    path_display: &str,
+    product_path: &ScenarioRecipeProductPath,
+) -> Result<(), CliError> {
+    if product_path.steps.is_empty() {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario recipe {path_display} workload.product_path.steps must be non-empty"
+        )));
+    }
+    let has_prepare = product_path
+        .steps
+        .iter()
+        .any(|s| *s == ProductPathStepKind::PrepareNamespace);
+    let has_assert = product_path
+        .steps
+        .iter()
+        .any(|s| *s == ProductPathStepKind::Assert);
+    if !has_prepare || !has_assert {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario recipe {path_display} workload.product_path.steps must include \
+             `prepare_namespace` and `assert`"
+        )));
+    }
+    let has_apply = product_path
+        .steps
+        .iter()
+        .any(|s| *s == ProductPathStepKind::ProductApply);
+    let has_sync = product_path
+        .steps
+        .iter()
+        .any(|s| *s == ProductPathStepKind::ProductSync);
+    if !has_apply && !has_sync {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario recipe {path_display} workload.product_path.steps must include \
+             at least one of `product_apply` or `product_sync` (real product path)"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn load_recipe(path: &Path) -> Result<ScenarioRecipe, CliError> {
@@ -112,6 +216,9 @@ pub(crate) fn load_recipe(path: &Path) -> Result<ScenarioRecipe, CliError> {
             "Lab Scenario recipe {} must declare checks.correctness",
             path.display()
         )));
+    }
+    if let Some(product_path) = &recipe.workload.product_path {
+        validate_product_path(&path.display().to_string(), product_path)?;
     }
     Ok(recipe)
 }

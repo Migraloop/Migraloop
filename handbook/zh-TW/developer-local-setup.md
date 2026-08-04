@@ -105,9 +105,9 @@ Operator 面向細節見 [Deployment](deployment.md)。CLI-seam 覆蓋：always-
 已出貨第一級 capability 的完整度階梯（ADR-0025 + ADR-0028）：**capability → Lab Scenario → 非 ignored 的 contract-path CI twin**。在手動 Lab Scenario 與 Release Quality Gate twin 都齊之前，該 capability 視為未完成。開發 feature 時請走這條可重複路徑：
 
 1. 建立 `lab/scenarios/<id>/`，包含：
-   - `recipe.yaml` — recipe-driven runner 介面（亦為 catalog metadata）：`id`、`summary`、**Scenario Namespace**（`source_tables`、`target_collections`、`deployment`、`pipelines`）、`workload`（`concurrency`：`serial`|`parallel`、有序 `steps`）、`checks.correctness`、可選的等權 `thresholds`（`max_settle_ms`、`max_lag`、`max_duration_ms`、`min_rows_per_s`）
+   - `recipe.yaml` — recipe-driven runner 介面（亦為 catalog metadata）：`id`、`summary`、**Scenario Namespace**（`source_tables`、`target_collections`、`deployment`、`pipelines`）、`workload`（`concurrency`：`serial`|`parallel`、有序散文 `steps`、可選的 typed `product_path` 供共用 prepare→apply→mutate→sync→assert）、`checks.correctness`、可選的等權 `thresholds`（`max_settle_ms`、`max_lag`、`max_duration_ms`、`min_rows_per_s`）
    - `deployment.yaml` — 真實 product Deployment config（與 Operator `apply` 相同格式），且只能綁定 Lab Fixture engines（`migraloop lab status` 所示的 `127.0.0.1` / `localhost` Oracle + Mongo endpoints）。Scenario `run` 會在 apply/sync 前拒絕非 Lab／正式環境 engine targets。
-2. 在 `crates/cli/src/lab_scenario/` 模組實作 Scenario adapter（Namespace prepare／Source workload／correctness／remove），並註冊 Scenario id。Recipe 的 `workload`／`checks`／`thresholds` 是 recipe-driven runner 介面——不要把 threshold 數值再複製成 Rust constants。
+2. 註冊 Scenario id；若使用 `workload.product_path`，實作 thin hooks（Namespace prepare／Source mutate／correctness assert／remove）；僅在尚無法共用該 path 時才寫完整 adapter。Recipe 的 `workload`／`checks`／`thresholds` 是 recipe-driven runner 介面——不要把 threshold 數值或共用 product-path 序列再複製成 Rust constants。
 3. 確認 `migraloop lab scenario list` 顯示新 id，且 **summary 來自 `recipe.yaml`**。Selectable catalog = 已註冊 Scenario adapter，且在 `--lab-dir` 下同時有 recipe + deployment 檔。
 4. 在 Lab Fixture 上手動驗證 `migraloop lab scenario run <id>`。list／控制面行為維持 always-on CLI-seam 測試；完整 Fixture run 維持 `#[ignore]` — 不是 Release Quality Gate 證據。
 5. 在 `crates/app/tests` 新增**非 ignored** 的 contract-path CI twin（優先延伸既有 CLI／`migraloop-app` seams，走 contract/stub + Platform Store/Mongo）。更新 Lab↔CI 矩陣 `docs/rqg/CI_TWIN_COVERAGE.md`。**不要**為了「過 gate」而取消 ignore Lab Scenario／Fixture／live Oracle 測試，也**不要**新增會跑 Lab Scenario catalog 的 CI job。
