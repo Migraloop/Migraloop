@@ -1,37 +1,42 @@
-//! Incremental Sync orchestration for the Deployment runtime (#153).
+//! Incremental Sync orchestration for the Deployment runtime (#153 / #176).
 //!
 //! Owns Incremental Capture (including continuous supervise/resume), overlap
-//! apply ordering (Deliver-before-checkpoint + change-id dedupe), poison
-//! quarantine, schema-change pause, bounded backpressure, and ChangeEvent →
-//! Base Dataset apply. Cutover watermark / checkpoint / readiness live in
+//! apply ordering (Deliver-before-checkpoint + change-id dedupe), and
+//! ChangeEvent → Base Dataset apply. Poison quarantine, Schema Change pause,
+//! and bounded Backpressure sit behind small internal seams (`crate::poison`,
+//! `crate::schema_impact`, `crate::backpressure`) with typed [`SyncOptions`] on
+//! the sync invocation. Cutover watermark / checkpoint / readiness live in
 //! [`crate::cutover`] (ADR-0004 / #175). The Operator CLI is a thin adapter over
 //! [`sync_incremental`] / [`supervise_continuous_incremental_sync`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use migraloop_capture::{
-    classify_schema_impact, normalize_change_temporals, CapturePosition, ChangeEvent, ChangeOp,
-    IncrementalCaptureSession, PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn,
-    SourceEngine,
+    normalize_change_temporals, CapturePosition, ChangeEvent, ChangeOp,
+    IncrementalCaptureSession, SchemaChangeEvent, SourceColumn, SourceEngine,
 };
-use migraloop_delivery::{DeliveryDocument, ManagedFieldAs, TargetEngine};
-use migraloop_platform_store::{
-    BaseColumn, BaseDataset, Pipeline, PlatformStore, QuarantinedChange, SchemaChangeImpact,
-};
+use migraloop_delivery::TargetEngine;
+use migraloop_platform_store::{BaseColumn, BaseDataset, Pipeline, PlatformStore};
 use migraloop_transform::{
     analyze_base_change, evaluate_transform_for_identities_with_bases, identity_matches_row,
-    parse_transform_steps, secondary_base_refs, used_base_fields, AffectOutcome, BaseChangeContext,
-    BaseChangeKind, MaintenanceStateBlob, TransformOp,
+    secondary_base_refs, AffectOutcome, BaseChangeContext, BaseChangeKind, MaintenanceStateBlob,
+    TransformOp,
 };
 
+use crate::backpressure::{emit_backpressure, window_under_backpressure};
 use crate::cutover::resume_for_incremental;
 use crate::observability::{emit_event, EventValue};
+use crate::poison::{
+    delete_with_bounded_retries, quarantine_poison_change, upsert_with_bounded_retries,
+};
+use crate::schema_impact::apply_schema_change_impacts;
+use crate::sync_options::SyncOptions;
 use crate::{
     delivery_document_for_row, derived_columns_for_ops, ensure_store_session_healthy,
-    load_secondary_bases_and_columns_for_pipeline,
-    output_identity_from_row, persist_maintenance_state_blob, pipeline_base_table_refs,
-    pipeline_references_table, source_engine_from_connection, source_timezone_opt,
-    target_engine_from_deployment, transform_ops_from_pipeline, RuntimeError,
+    load_secondary_bases_and_columns_for_pipeline, output_identity_from_row,
+    persist_maintenance_state_blob, pipeline_base_table_refs, pipeline_references_table,
+    source_engine_from_connection, source_timezone_opt, target_engine_from_deployment,
+    transform_ops_from_pipeline, RuntimeError,
 };
 
 async fn load_maintenance_state_blob(
@@ -370,51 +375,6 @@ pub(crate) fn apply_change_events_to_base_rows(
     Ok(())
 }
 
-/// Test-only fault injection for restart-resume coverage (ADR-0011).
-/// When set, sync exits after N durable checkpoints to simulate mid-incremental process kill.
-fn sync_fail_after_changes() -> Option<u32> {
-    std::env::var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-}
-
-/// Bounded Delivery retries before Poison Change quarantine (ADR-0015 / issue #22).
-fn poison_max_attempts() -> u32 {
-    std::env::var("MIGRALOOP_POISON_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(3)
-}
-
-/// Test/Lab fault injection: comma-separated Output Identity keys that always fail Delivery.
-fn delivery_poison_identity_keys() -> BTreeSet<String> {
-    std::env::var("MIGRALOOP_DELIVERY_POISON_IDENTITIES")
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Bounded Incremental Capture / Delivery queue capacity (ADR-0020 / issue #26).
-///
-/// Stages never materialize more than this many pending changes at once; capture
-/// slows when Downstream cannot drain the window. Override via
-/// `MIGRALOOP_SYNC_QUEUE_CAPACITY` (must be > 0). Default 256.
-fn sync_queue_capacity() -> usize {
-    std::env::var("MIGRALOOP_SYNC_QUEUE_CAPACITY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &usize| *n > 0)
-        .unwrap_or(256)
-}
-
 /// Idle poll interval between continuous Incremental Capture cycles (`migraloop run`).
 ///
 /// Override via `MIGRALOOP_SYNC_POLL_INTERVAL_MS` (must be > 0). Default 1000ms.
@@ -425,20 +385,6 @@ fn sync_poll_interval() -> std::time::Duration {
         .filter(|n: &u64| *n > 0)
         .unwrap_or(1000);
     std::time::Duration::from_millis(ms)
-}
-
-/// Test/Lab fault injection: artificial Downstream Delivery slowness (milliseconds).
-fn delivery_delay_ms() -> Option<u64> {
-    std::env::var("MIGRALOOP_DELIVERY_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &u64| *n > 0)
-}
-
-async fn apply_delivery_delay() {
-    if let Some(ms) = delivery_delay_ms() {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-    }
 }
 
 async fn set_delivery_lag_for_table(
@@ -463,37 +409,6 @@ async fn set_delivery_lag_for_table(
     Ok(())
 }
 
-/// Internal label for an Output Identity (runtime quarantine / alert lines).
-///
-/// Matching for poison injection, Drift reconcile, and Delivery delete/upsert uses
-/// [`migraloop_types::output_identity_key`] — not this formatter. Operator `status`
-/// narrative formatting lives in the CLI adapter.
-pub(crate) fn format_output_identity(identity: &serde_json::Value) -> String {
-    match identity {
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// Whether an Output Identity matches a poison-injection key set.
-///
-/// Encoding matches Drift reconcile and Delivery identity keys
-/// ([`migraloop_types::output_identity_key`]).
-pub(crate) fn output_identity_matches_poison_keys(
-    identity: &serde_json::Value,
-    poison_keys: &BTreeSet<String>,
-) -> bool {
-    if poison_keys.is_empty() {
-        return false;
-    }
-    poison_keys.contains(&migraloop_types::output_identity_key(identity))
-}
-
-fn identity_is_poison(identity: &serde_json::Value, poison_keys: &BTreeSet<String>) -> bool {
-    output_identity_matches_poison_keys(identity, poison_keys)
-}
-
 fn identity_value_from_change(
     change: &ChangeEvent,
     identity_fields: &[String],
@@ -504,121 +419,6 @@ fn identity_value_from_change(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     Ok(output_identity_from_row(&identity_map, identity_fields)?)
-}
-
-async fn upsert_with_bounded_retries<T: TargetEngine>(
-    target: &T,
-    collection: &str,
-    document: &DeliveryDocument,
-    max_attempts: u32,
-) -> Result<usize, (u32, String)> {
-    let poison = delivery_poison_identity_keys();
-    let mut last_error = String::new();
-    for attempt in 1..=max_attempts {
-        apply_delivery_delay().await;
-        if identity_is_poison(&document.identity, &poison) {
-            last_error = format!(
-                "injected poison Delivery failure for Output Identity {}",
-                format_output_identity(&document.identity)
-            );
-        } else {
-            match target
-                .upsert_managed(collection, std::slice::from_ref(document))
-                .await
-            {
-                Ok(n) => return Ok(n),
-                Err(err) => last_error = err.to_string(),
-            }
-        }
-        if attempt < max_attempts {
-            eprintln!("Delivery retry {attempt}/{max_attempts} failed: {last_error}");
-        }
-    }
-    Err((max_attempts, last_error))
-}
-
-async fn delete_with_bounded_retries<T: TargetEngine>(
-    target: &T,
-    collection: &str,
-    identity: &serde_json::Value,
-    max_attempts: u32,
-) -> Result<usize, (u32, String)> {
-    let poison = delivery_poison_identity_keys();
-    let mut last_error = String::new();
-    for attempt in 1..=max_attempts {
-        apply_delivery_delay().await;
-        if identity_is_poison(identity, &poison) {
-            last_error = format!(
-                "injected poison Delivery failure for Output Identity {}",
-                format_output_identity(identity)
-            );
-        } else {
-            match target
-                .delete_by_identity(collection, std::slice::from_ref(identity))
-                .await
-            {
-                Ok(n) => return Ok(n),
-                Err(err) => last_error = err.to_string(),
-            }
-        }
-        if attempt < max_attempts {
-            eprintln!("Delivery retry {attempt}/{max_attempts} failed: {last_error}");
-        }
-    }
-    Err((max_attempts, last_error))
-}
-
-async fn quarantine_poison_change(
-    store: &PlatformStore,
-    pipeline: &Pipeline,
-    schema: &str,
-    table: &str,
-    change: &ChangeEvent,
-    output_identity: serde_json::Value,
-    stage: &str,
-    attempts: u32,
-    last_error: &str,
-) -> Result<(), RuntimeError> {
-    let record = QuarantinedChange {
-        deployment_name: pipeline.deployment_name.clone(),
-        pipeline_name: pipeline.name.clone(),
-        source_schema: schema.to_string(),
-        source_table: table.to_string(),
-        change_id: change.change_id.clone(),
-        capture_position: change.position.as_i64(),
-        output_identity,
-        stage: stage.to_string(),
-        attempts: attempts as i32,
-        last_error: last_error.to_string(),
-        status: "quarantined".to_string(),
-    };
-    let identity_label = format_output_identity(&record.output_identity);
-    store
-        .upsert_quarantined_change(&record)
-        .await
-        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-    eprintln!(
-        "ALERT: Poison Change quarantined Pipeline={} identity={} change_id={} \
-         stage={stage} attempts={attempts}: {last_error}",
-        pipeline.name, identity_label, change.change_id
-    );
-    println!(
-        "Quarantine: Pipeline={} identity={} change_id={} stage={stage} \
-         attempts={attempts} unhealthy / not aligned",
-        pipeline.name, identity_label, change.change_id
-    );
-    emit_event(
-        "poison_quarantine",
-        &[
-            ("level", EventValue::from("alert")),
-            ("pipeline", EventValue::from(pipeline.name.as_str())),
-            ("identity", EventValue::from(identity_label.as_str())),
-            ("change_id", EventValue::from(change.change_id.as_str())),
-            ("stage", EventValue::from(stage)),
-            ("attempts", EventValue::from(attempts as i64)),
-        ],
-    );
-    Ok(())
 }
 
 /// Row DML or Source Schema Change in the Incremental Capture stream (ADR-0009).
@@ -634,178 +434,6 @@ impl IncrementalItem {
             Self::Schema(c) => c.position,
         }
     }
-}
-
-/// Dependency columns for Schema Change impact classification.
-fn pipeline_schema_deps(pipeline: &Pipeline, dataset: &BaseDataset) -> PipelineSchemaDeps {
-    let mut dependency_columns: BTreeSet<String> = dataset.primary_key.iter().cloned().collect();
-    let is_primary = dataset
-        .source_table
-        .eq_ignore_ascii_case(&pipeline.source_table);
-    match pipeline.mode.as_str() {
-        "direct" => {
-            for col in &dataset.columns {
-                if pipeline.field_mappings.get(&col.name) == Some(&ManagedFieldAs::Omit) {
-                    continue;
-                }
-                dependency_columns.insert(col.name.clone());
-            }
-        }
-        "transform" => {
-            if is_primary {
-                if let Some(transform) = &pipeline.transform_json {
-                    if let Some(steps) = transform.as_array() {
-                        if let Ok(ops) = parse_transform_steps(steps) {
-                            dependency_columns.extend(used_base_fields(&ops));
-                        }
-                    }
-                }
-                for field in &pipeline.output_identity {
-                    dependency_columns.insert(field.clone());
-                }
-            } else if let Ok(ops) = transform_ops_from_pipeline(pipeline) {
-                if let Some(suffix) = union_suffix_ops_for_table(&ops, &dataset.source_table) {
-                    // union.from rows are shaped only by steps after the union —
-                    // Schema Change deps match Affect Analysis used fields.
-                    let used = used_base_fields(suffix);
-                    if used.is_empty() {
-                        for col in &dataset.columns {
-                            dependency_columns.insert(col.name.clone());
-                        }
-                    } else {
-                        dependency_columns.extend(used);
-                    }
-                    for field in &pipeline.output_identity {
-                        dependency_columns.insert(field.clone());
-                    }
-                } else {
-                    // equiLookup embeds full foreign rows — any column drop/type change blocks.
-                    for col in &dataset.columns {
-                        dependency_columns.insert(col.name.clone());
-                    }
-                }
-            } else {
-                for col in &dataset.columns {
-                    dependency_columns.insert(col.name.clone());
-                }
-            }
-        }
-        _ => {
-            for col in &dataset.columns {
-                dependency_columns.insert(col.name.clone());
-            }
-        }
-    }
-    PipelineSchemaDeps {
-        source_table: dataset.source_table.clone(),
-        source_schema: dataset.source_schema.clone(),
-        dependency_columns,
-    }
-}
-
-/// Operators after the `union.from` step for `table` (secondary contribution shape).
-fn union_suffix_ops_for_table<'a>(
-    ops: &'a [TransformOp],
-    table: &str,
-) -> Option<&'a [TransformOp]> {
-    let idx = ops.iter().position(|op| match op {
-        TransformOp::Union { from, .. } => from.eq_ignore_ascii_case(table),
-        _ => false,
-    })?;
-    Some(&ops[idx + 1..])
-}
-
-/// Classify Schema Change impact for Pipelines on this table; warn+pause on Blocking.
-async fn apply_schema_change_impacts(
-    store: &PlatformStore,
-    deployment_pipelines: &mut [Pipeline],
-    dataset: &BaseDataset,
-    schema: &str,
-    table: &str,
-    change: &SchemaChangeEvent,
-) -> Result<(), RuntimeError> {
-    for pipeline in deployment_pipelines.iter_mut() {
-        if !pipeline_references_table(pipeline, table) {
-            continue;
-        }
-        // Schema must match the referenced Base (primary schema or equiLookup/union fromSchema).
-        let refs = pipeline_base_table_refs(pipeline);
-        let schema_ok = refs.iter().any(|(ref_schema, ref_table)| {
-            ref_table.eq_ignore_ascii_case(table)
-                && (ref_schema.is_empty()
-                    || schema.is_empty()
-                    || ref_schema.eq_ignore_ascii_case(schema))
-        });
-        if !schema_ok {
-            continue;
-        }
-        let deps = pipeline_schema_deps(pipeline, dataset);
-        let impact = classify_schema_impact(&deps, change);
-        match impact {
-            SchemaImpact::Blocking => {
-                if !pipeline.paused {
-                    store
-                        .set_pipeline_paused(
-                            &pipeline.deployment_name,
-                            &pipeline.name,
-                            true,
-                        )
-                        .await
-                        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-                    pipeline.paused = true;
-                }
-                let record = SchemaChangeImpact {
-                    deployment_name: pipeline.deployment_name.clone(),
-                    pipeline_name: pipeline.name.clone(),
-                    source_schema: schema.to_string(),
-                    source_table: table.to_string(),
-                    change_id: change.change_id.clone(),
-                    capture_position: change.position.as_i64(),
-                    ddl_summary: change.summary.clone(),
-                    impact: impact.as_str().to_string(),
-                    status: "active".to_string(),
-                };
-                store
-                    .upsert_schema_change_impact(&record)
-                    .await
-                    .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-                eprintln!(
-                    "WARN: Schema Change blocked Pipeline={} change_id={} ddl={} — \
-                     pausing affected Pipeline (not poison quarantine)",
-                    pipeline.name, change.change_id, change.summary
-                );
-                println!(
-                    "Schema Change: Pipeline={} impact=blocking change_id={} ddl={} paused",
-                    pipeline.name, change.change_id, change.summary
-                );
-                emit_event(
-                    "schema_change_blocked",
-                    &[
-                        ("level", EventValue::from("warn")),
-                        ("pipeline", EventValue::from(pipeline.name.as_str())),
-                        ("change_id", EventValue::from(change.change_id.as_str())),
-                        ("ddl", EventValue::from(change.summary.as_str())),
-                        ("impact", EventValue::from("blocking")),
-                    ],
-                );
-            }
-            SchemaImpact::NonBlocking => {
-                println!(
-                    "Schema Change: Pipeline={} impact=non_blocking change_id={} ddl={} — \
-                     continue (safe apply)",
-                    pipeline.name, change.change_id, change.summary
-                );
-            }
-            SchemaImpact::Unaffecting => {
-                println!(
-                    "Schema Change: Pipeline={} impact=unaffecting change_id={} ddl={} — \
-                     continue",
-                    pipeline.name, change.change_id, change.summary
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 fn base_with_sync_progress(
@@ -933,12 +561,22 @@ pub enum SyncCycleOutcome {
 /// Run one Incremental Capture cycle through the Deployment runtime.
 ///
 /// Default Operator path: constructs v1 Oracle LogMiner + MongoDB adapters via
-/// factory helpers (Oracle-kind gate preserved for factory wiring).
+/// factory helpers (Oracle-kind gate preserved for factory wiring). Typed knobs
+/// come from [`SyncOptions::from_env_compat`] so existing RQG / Lab twins keep
+/// working while in-process tests prefer explicit [`SyncOptions`].
 pub async fn run_incremental_sync(
     store: &PlatformStore,
     invocation: SyncInvocation,
 ) -> Result<SyncCycleOutcome, RuntimeError> {
-    let prepared = prepare_incremental_sync_cycle(store, invocation).await?;
+    run_incremental_sync_with_options(store, invocation, SyncOptions::from_env_compat()).await
+}
+
+async fn run_incremental_sync_with_options(
+    store: &PlatformStore,
+    invocation: SyncInvocation,
+    options: SyncOptions,
+) -> Result<SyncCycleOutcome, RuntimeError> {
+    let prepared = prepare_incremental_sync_cycle(store, invocation, options).await?;
     let Some(mut cycle) = prepared else {
         return Ok(SyncCycleOutcome::Idle);
     };
@@ -984,19 +622,23 @@ pub async fn run_incremental_sync(
     finish_incremental_sync_cycle(cycle.quiet, cycle.progressed)
 }
 
-/// Run one Incremental Capture cycle with caller-injected Source/Target engines.
+/// Run one Incremental Capture cycle with caller-injected Source/Target engines
+/// and typed [`SyncOptions`].
 ///
 /// Seam for Fake Source/Target (and any pre-built adapters): skips Deployment
 /// `source.kind` / factory Oracle-kind gates — capture capability comes from the
-/// injected [`SourceEngine`]. Default CLI `apply`/`run`/`sync` keep using
-/// [`run_incremental_sync`] (factory path) with no Operator-visible change.
+/// injected [`SourceEngine`]. Fault injection and queue knobs come from
+/// `options` (not process env). Default CLI `apply`/`run`/`sync` keep using
+/// [`run_incremental_sync`] (factory + env compat shim) with no Operator-visible
+/// change.
 pub async fn run_incremental_sync_with_engines<S: SourceEngine, T: TargetEngine>(
     store: &PlatformStore,
     invocation: SyncInvocation,
     source: &S,
     target: &T,
+    options: SyncOptions,
 ) -> Result<SyncCycleOutcome, RuntimeError> {
-    let prepared = prepare_incremental_sync_cycle(store, invocation).await?;
+    let prepared = prepare_incremental_sync_cycle(store, invocation, options).await?;
     let Some(mut cycle) = prepared else {
         return Ok(SyncCycleOutcome::Idle);
     };
@@ -1027,10 +669,7 @@ pub async fn run_incremental_sync_with_engines<S: SourceEngine, T: TargetEngine>
 struct IncrementalSyncCycle {
     deployments: Vec<migraloop_platform_store::Deployment>,
     pipelines: Vec<Pipeline>,
-    fail_after: Option<u32>,
-    max_poison_attempts: u32,
-    queue_capacity: usize,
-    downstream_delay: bool,
+    options: SyncOptions,
     quiet: bool,
     applied_this_run: u32,
     progressed: bool,
@@ -1041,6 +680,7 @@ struct IncrementalSyncCycle {
 async fn prepare_incremental_sync_cycle(
     store: &PlatformStore,
     invocation: SyncInvocation,
+    options: SyncOptions,
 ) -> Result<Option<IncrementalSyncCycle>, RuntimeError> {
     ensure_store_session_healthy(store).await?;
 
@@ -1073,10 +713,7 @@ async fn prepare_incremental_sync_cycle(
     Ok(Some(IncrementalSyncCycle {
         deployments,
         pipelines,
-        fail_after: sync_fail_after_changes(),
-        max_poison_attempts: poison_max_attempts(),
-        queue_capacity: sync_queue_capacity(),
-        downstream_delay: delivery_delay_ms().is_some(),
+        options,
         quiet: matches!(invocation, SyncInvocation::ContinuousCycle),
         applied_this_run: 0,
         progressed: false,
@@ -1130,10 +767,11 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
     source: &S,
     target: &T,
 ) -> Result<(), RuntimeError> {
-        let fail_after = cycle.fail_after;
-        let max_poison_attempts = cycle.max_poison_attempts;
-        let queue_capacity = cycle.queue_capacity;
-        let downstream_delay = cycle.downstream_delay;
+        let fail_after = cycle.options.fail_after_changes;
+        let max_poison_attempts = cycle.options.poison.max_attempts;
+        let poison_identity_keys = cycle.options.poison.poison_identity_keys.clone();
+        let queue_capacity = cycle.options.backpressure.queue_capacity;
+        let delivery_delay_ms = cycle.options.backpressure.delivery_delay_ms;
         let quiet = cycle.quiet;
         // ADR-0021: fail-fast Source Prerequisites before Incremental Capture.
         // Source engine is provided by factory wiring or injection (issue #169).
@@ -1326,24 +964,16 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                 }
 
                 let queue_depth = items.len();
-                let fetched_full_window = queue_depth >= queue_capacity;
                 let reported_lag = pending_at_window_start as i32;
-                // Backpressure is the bounded window under Downstream delay or a
-                // full queue (capture cannot pull more until the window drains).
-                if (downstream_delay && fetched_full_window) || fetched_full_window {
-                    println!(
-                        "Backpressure: queue_depth={queue_depth} capacity={queue_capacity} \
-                         lag={reported_lag}"
-                    );
-                    emit_event(
-                        "backpressure",
-                        &[
-                            ("table", EventValue::from(table.as_str())),
-                            ("queue_depth", EventValue::from(queue_depth)),
-                            ("capacity", EventValue::from(queue_capacity)),
-                            ("lag", EventValue::from(reported_lag)),
-                            ("deployment", EventValue::from(deployment.name.as_str())),
-                        ],
+                // Backpressure seam (ADR-0020): full bounded window slows capture;
+                // Downstream delay alone does not pause Pipelines.
+                if window_under_backpressure(queue_depth, queue_capacity) {
+                    emit_backpressure(
+                        &table,
+                        &deployment.name,
+                        queue_depth,
+                        queue_capacity,
+                        reported_lag,
                     );
                 }
 
@@ -1500,6 +1130,8 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                                     &pipeline.target_collection,
                                                     &document,
                                                     max_poison_attempts,
+                                                    &poison_identity_keys,
+                                                    delivery_delay_ms,
                                                 )
                                                 .await
                                                 {
@@ -1556,6 +1188,8 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                                     &pipeline.target_collection,
                                                     &identity,
                                                     max_poison_attempts,
+                                                    &poison_identity_keys,
+                                                    delivery_delay_ms,
                                                 )
                                                 .await
                                                 {
@@ -1609,7 +1243,10 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                         let mut succeeded = false;
                                         let mut next_ms = None;
                                         for attempt in 1..=max_poison_attempts {
-                                            apply_delivery_delay().await;
+                                            crate::backpressure::apply_delivery_delay(
+                                                delivery_delay_ms,
+                                            )
+                                            .await;
                                             match maintain_transform_pipeline_for_change(
                                                 store,
                                                 pipeline,
@@ -1735,8 +1372,8 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                             let current_checkpoint = item.position().as_i64();
                             return Err(RuntimeError::Failed(format!(
                                 "simulated process kill after {limit} durable checkpoint(s) \
-                                 (MIGRALOOP_SYNC_FAIL_AFTER_CHANGES); resume from Platform Store \
-                                 checkpoint={current_checkpoint}"
+                                 (fail_after_changes / MIGRALOOP_SYNC_FAIL_AFTER_CHANGES); \
+                                 resume from Platform Store checkpoint={current_checkpoint}"
                             )));
                         }
                     }
@@ -1756,33 +1393,4 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
             }
         }
     Ok(())
-}
-
-#[cfg(test)]
-mod output_identity_key_tests {
-    use super::{format_output_identity, output_identity_matches_poison_keys};
-    use migraloop_types::output_identity_key;
-    use serde_json::json;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn poison_matching_uses_shared_output_identity_key() {
-        // Discriminator: string identities encode with JSON quotes. The former
-        // poison formatter compared the bare string and would disagree with
-        // Drift/Delivery keys for the same value.
-        let poison = BTreeSet::from([r#""CUST-1""#.to_string()]);
-        assert!(output_identity_matches_poison_keys(&json!("CUST-1"), &poison));
-        assert!(!output_identity_matches_poison_keys(
-            &json!("CUST-1"),
-            &BTreeSet::from(["CUST-1".to_string()])
-        ));
-        assert_eq!(output_identity_key(&json!("CUST-1")), r#""CUST-1""#);
-    }
-
-    #[test]
-    fn operator_display_label_stays_distinct_from_match_key_for_strings() {
-        let identity = json!("CUST-1");
-        assert_eq!(format_output_identity(&identity), "CUST-1");
-        assert_eq!(output_identity_key(&identity), r#""CUST-1""#);
-    }
 }

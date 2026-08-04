@@ -3,10 +3,11 @@
 //!
 //! **Verbs:** [`apply`], Incremental Sync ([`sync_incremental`], [`run_incremental_sync`],
 //! [`run_incremental_sync_with_engines`], [`run_continuous_incremental_sync`],
-//! [`supervise_continuous_incremental_sync`]), Pipeline lifecycle ([`pause_pipeline`],
-//! [`resume_pipeline`], [`remove_pipeline`]), [`source_alignment_check`], [`drift_check`],
-//! status inventory ([`status_inventory`], [`status_inventory_from_url`]), Observability
-//! Surface assembly ([`assemble_observability_surface`]), cutover facts / hand-off
+//! [`supervise_continuous_incremental_sync`] with typed [`SyncOptions`]), Pipeline
+//! lifecycle ([`pause_pipeline`], [`resume_pipeline`], [`remove_pipeline`]),
+//! [`source_alignment_check`], [`drift_check`], status inventory ([`status_inventory`],
+//! [`status_inventory_from_url`]), Observability Surface assembly
+//! ([`assemble_observability_surface`]), cutover facts / hand-off
 //! ([`cutover_facts_from_base`], [`handoff_from_low_watermark`],
 //! [`resume_for_incremental`]), and inspect
 //! ([`inspect_base_rows`], [`inspect_derived_rows`], [`inspect_target_documents`]).
@@ -42,10 +43,14 @@ use thiserror::Error;
 
 #[cfg(test)]
 mod engines;
+mod backpressure;
 mod cutover;
 mod observability;
 mod incremental;
 mod lifecycle;
+mod poison;
+mod schema_impact;
+mod sync_options;
 
 pub use cutover::{
     cutover_facts_from_base, handoff_from_low_watermark, handoff_from_optional_low_watermark,
@@ -61,6 +66,7 @@ pub use incremental::{
     run_incremental_sync, run_incremental_sync_with_engines, run_continuous_incremental_sync,
     supervise_continuous_incremental_sync, sync_incremental, SyncCycleOutcome, SyncInvocation,
 };
+pub use sync_options::{BackpressureOptions, PoisonOptions, SyncOptions};
 pub use lifecycle::{
     drift_check, inspect_base_rows, inspect_derived_rows, inspect_target_documents, pause_pipeline,
     remove_pipeline, resume_pipeline, source_alignment_check, status_inventory,
