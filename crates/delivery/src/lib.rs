@@ -6,6 +6,8 @@
 //! Conversion is schema-driven (ADR-0018 / ADR-0022 / ADR-0023): NUMBER → Long or
 //! Decimal128 (never default IEEE double); temporals → UTC DateTime.
 
+mod engine;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -21,6 +23,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub use migraloop_types::ManagedFieldAs;
+pub use engine::{
+    target_engine_delivery_roundtrip, test_delivery_document, FakeTarget, TargetEngine,
+};
 
 /// Expand-contract leftover alias — prefer [`TlsSettings`] on the apply path.
 #[deprecated(note = "use migraloop_types::TlsSettings — temporary expand-contract leftover")]

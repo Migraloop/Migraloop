@@ -8,6 +8,7 @@
 //! doubles, not a shipped product Source path (ADR-0026 / issue #120).
 
 mod contract_catalog;
+mod engine;
 mod logminer;
 mod oracle_connect;
 mod oracle_prerequisites;
@@ -53,6 +54,10 @@ pub use schema_change::{
     schema_change_id, PipelineSchemaDeps, SchemaChangeEvent, SchemaChangeInjectError,
     SchemaChangeKind, SchemaImpact, INJECT_SCHEMA_CHANGES_ENV,
 };
+pub use engine::{
+    source_engine_sync_probe, FakeIncremental, FakeSource, FakeSourceTable, IncrementalCaptureSession,
+    OracleLogMinerSource, SourceEngine,
+};
 
 use std::collections::BTreeMap;
 
@@ -96,6 +101,12 @@ pub enum CaptureError {
     OciUnavailable { host: String, detail: String },
     #[error("contract Source catalog error: {detail}")]
     ContractCatalog { detail: String },
+    #[error(
+        "Source Prerequisites not met: {summary}. \
+         The platform does not automatically alter Source System settings; \
+         fix these on the Source, then re-run. See handbook/en/source-system.md"
+    )]
+    PrerequisitesUnmet { summary: String },
     #[error(transparent)]
     Type(#[from] TypeError),
 }

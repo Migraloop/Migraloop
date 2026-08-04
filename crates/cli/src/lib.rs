@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use lab::{run_lab, LabCommand};
-use migraloop_delivery::{list_target_documents, ManagedFieldAs};
+use migraloop_delivery::{ManagedFieldAs, TargetEngine};
 use migraloop_platform_store::{
     check_store_settings, disk_warn_message, get_base_rows, get_derived_rows, list_deployments,
     list_pipelines, probe_store_resources, Deployment, Pipeline, PlatformStore,
@@ -836,8 +836,9 @@ async fn print_target(
             ))
         })?;
 
-    let mongo = mongo_target_from_deployment(&deployment)?;
-    let documents = list_target_documents(&mongo, collection)
+    let target = mongo_target_from_deployment(&deployment)?;
+    let documents = target
+        .list_documents(collection)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
 

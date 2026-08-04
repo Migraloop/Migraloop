@@ -8,14 +8,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use migraloop_capture::{
-    classify_schema_impact, load_injected_schema_changes, normalize_change_temporals,
-    CapturePosition, ChangeEvent, ChangeOp, PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact,
-    SourceColumn,
+    classify_schema_impact, normalize_change_temporals, CapturePosition, ChangeEvent, ChangeOp,
+    IncrementalCaptureSession, PipelineSchemaDeps, SchemaChangeEvent, SchemaImpact, SourceColumn,
+    SourceEngine,
 };
-use migraloop_delivery::{
-    delete_documents_by_identity, upsert_managed_documents, DeliveryDocument, ManagedFieldAs,
-    MongoTargetConnection,
-};
+use migraloop_delivery::{DeliveryDocument, ManagedFieldAs, TargetEngine};
 use migraloop_platform_store::{
     BaseColumn, BaseDataset, Pipeline, PlatformStore, QuarantinedChange, SchemaChangeImpact,
 };
@@ -27,11 +24,11 @@ use migraloop_transform::{
 
 use crate::observability::{emit_event, EventValue};
 use crate::{
-    delivery_document_for_row, derived_columns_for_ops, ensure_oracle_source_prerequisites,
-    ensure_store_session_healthy, load_secondary_bases_and_columns_for_pipeline,
-    mongo_target_from_deployment, open_deployment_incremental_capture, output_identity_from_row,
-    persist_maintenance_state_blob, pipeline_base_table_refs, pipeline_references_table,
-    source_columns_for_pipeline, source_timezone_opt, transform_ops_from_pipeline, RuntimeError,
+    delivery_document_for_row, derived_columns_for_ops, ensure_store_session_healthy,
+    load_secondary_bases_and_columns_for_pipeline,
+    output_identity_from_row, persist_maintenance_state_blob, pipeline_base_table_refs,
+    pipeline_references_table, source_columns_for_pipeline, source_engine_from_connection,
+    source_timezone_opt, target_engine_from_deployment, transform_ops_from_pipeline, RuntimeError,
 };
 
 async fn load_maintenance_state_blob(
@@ -67,10 +64,10 @@ fn base_change_kind(op: ChangeOp) -> BaseChangeKind {
 /// Returns the next opaque Maintenance State blob when the transform uses one. Callers
 /// persist it only after durable Base/checkpoint progress so a Sync retry cannot
 /// analyze/bump the same change twice.
-async fn maintain_transform_pipeline_for_change(
+async fn maintain_transform_pipeline_for_change<T: TargetEngine>(
     store: &PlatformStore,
     pipeline: &Pipeline,
-    mongo: &MongoTargetConnection,
+    target: &T,
     changed_table: &str,
     changed_base_rows: &[serde_json::Map<String, serde_json::Value>],
     change: &ChangeEvent,
@@ -167,7 +164,7 @@ async fn maintain_transform_pipeline_for_change(
             recompute_and_deliver_affected_identities(
                 store,
                 pipeline,
-                mongo,
+                target,
                 &primary_columns,
                 &secondary_columns,
                 &primary_rows,
@@ -182,10 +179,10 @@ async fn maintain_transform_pipeline_for_change(
     Ok(analysis.next_maintenance_state)
 }
 
-async fn recompute_and_deliver_affected_identities(
+async fn recompute_and_deliver_affected_identities<T: TargetEngine>(
     store: &PlatformStore,
     pipeline: &Pipeline,
-    mongo: &MongoTargetConnection,
+    target: &T,
     base_columns: &[BaseColumn],
     secondary_columns: &[BaseColumn],
     primary_rows: &[serde_json::Map<String, serde_json::Value>],
@@ -277,13 +274,11 @@ async fn recompute_and_deliver_affected_identities(
 
     let mut delivered = 0i32;
     if !upserts.is_empty() {
-        delivered += upsert_managed_documents(mongo, &pipeline.target_collection, &upserts)
-            .await
+        delivered += target.upsert_managed(&pipeline.target_collection, &upserts).await
             .map_err(|err| RuntimeError::Failed(err.to_string()))? as i32;
     }
     if !deletes.is_empty() {
-        delivered += delete_documents_by_identity(mongo, &pipeline.target_collection, &deletes)
-            .await
+        delivered += target.delete_by_identity(&pipeline.target_collection, &deletes).await
             .map_err(|err| RuntimeError::Failed(err.to_string()))? as i32;
     }
 
@@ -492,8 +487,8 @@ fn identity_value_from_change(
     Ok(output_identity_from_row(&identity_map, identity_fields)?)
 }
 
-async fn upsert_with_bounded_retries(
-    mongo: &MongoTargetConnection,
+async fn upsert_with_bounded_retries<T: TargetEngine>(
+    target: &T,
     collection: &str,
     document: &DeliveryDocument,
     max_attempts: u32,
@@ -508,7 +503,9 @@ async fn upsert_with_bounded_retries(
                 format_output_identity(&document.identity)
             );
         } else {
-            match upsert_managed_documents(mongo, collection, std::slice::from_ref(document)).await
+            match target
+                .upsert_managed(collection, std::slice::from_ref(document))
+                .await
             {
                 Ok(n) => return Ok(n),
                 Err(err) => last_error = err.to_string(),
@@ -521,8 +518,8 @@ async fn upsert_with_bounded_retries(
     Err((max_attempts, last_error))
 }
 
-async fn delete_with_bounded_retries(
-    mongo: &MongoTargetConnection,
+async fn delete_with_bounded_retries<T: TargetEngine>(
+    target: &T,
     collection: &str,
     identity: &serde_json::Value,
     max_attempts: u32,
@@ -537,7 +534,8 @@ async fn delete_with_bounded_retries(
                 format_output_identity(identity)
             );
         } else {
-            match delete_documents_by_identity(mongo, collection, std::slice::from_ref(identity))
+            match target
+                .delete_by_identity(collection, std::slice::from_ref(identity))
                 .await
             {
                 Ok(n) => return Ok(n),
@@ -951,8 +949,6 @@ pub async fn run_incremental_sync(
     let max_poison_attempts = poison_max_attempts();
     let queue_capacity = sync_queue_capacity();
     let downstream_delay = delivery_delay_ms().is_some();
-    let injected_schema_changes =
-        load_injected_schema_changes().map_err(|err| RuntimeError::Failed(err.to_string()))?;
     let mut applied_this_run: u32 = 0;
     let mut progressed = false;
     let quiet = matches!(invocation, SyncInvocation::ContinuousCycle);
@@ -975,19 +971,36 @@ pub async fn run_incremental_sync(
         }
 
         // ADR-0021: fail-fast Source Prerequisites before Incremental Capture.
-        // LogMiner-backed capture (contract or OCI) is opened once per Deployment.
-        let capture = if deployment.source.kind.eq_ignore_ascii_case("oracle") {
+        // Source engine adapter (contract or OCI) is opened once per Deployment.
+        let source_engine = if deployment.source.kind.eq_ignore_ascii_case("oracle") {
             let source_tables: Vec<String> = tables.iter().map(|(_, t)| t.clone()).collect();
-            ensure_oracle_source_prerequisites(&deployment.source, &source_tables)?;
-            Some(open_deployment_incremental_capture(&deployment.source)?)
+            let engine = source_engine_from_connection(&deployment.source)?;
+            engine.check_prerequisites(&source_tables).map_err(|err| {
+                RuntimeError::Failed(err.to_string())
+            })?;
+            Some(engine)
         } else {
             None
+        };
+        let injected_schema_changes = match &source_engine {
+            Some(engine) => engine
+                .schema_change_inputs()
+                .map_err(|err| RuntimeError::Failed(err.to_string()))?,
+            None => Vec::new(),
+        };
+        let capture = match &source_engine {
+            Some(engine) => Some(
+                engine
+                    .open_incremental_capture()
+                    .map_err(|err| RuntimeError::Failed(err.to_string()))?,
+            ),
+            None => None,
         };
         if let Some(ref capture) = capture {
             if !quiet {
                 println!(
                     "Incremental Capture: mechanism={}",
-                    capture.mechanism_label()
+                    IncrementalCaptureSession::mechanism_label(capture)
                 );
             }
         }
@@ -998,7 +1011,7 @@ pub async fn run_incremental_sync(
         // visible after a mid-SCN stop or bounded window (issue #143). Prefer duplicates
         // over gaps: Deliver each change before durable Base/checkpoint/change-id
         // persistence so a Delivery failure can retry.
-        let mongo = mongo_target_from_deployment(deployment)?;
+        let target = target_engine_from_deployment(deployment)?;
 
         for (schema, table) in tables {
             let (dataset, base_rows) = store
@@ -1342,7 +1355,7 @@ pub async fn run_incremental_sync(
                                                     pipeline,
                                                 )?;
                                                 match upsert_with_bounded_retries(
-                                                    &mongo,
+                                                    &target,
                                                     &pipeline.target_collection,
                                                     &document,
                                                     max_poison_attempts,
@@ -1398,7 +1411,7 @@ pub async fn run_incremental_sync(
                                                     &dataset.primary_key,
                                                 )?;
                                                 match delete_with_bounded_retries(
-                                                    &mongo,
+                                                    &target,
                                                     &pipeline.target_collection,
                                                     &identity,
                                                     max_poison_attempts,
@@ -1459,7 +1472,7 @@ pub async fn run_incremental_sync(
                                             match maintain_transform_pipeline_for_change(
                                                 store,
                                                 pipeline,
-                                                &mongo,
+                                                &target,
                                                 &table,
                                                 &rows,
                                                 change,

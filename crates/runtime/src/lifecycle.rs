@@ -6,10 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use migraloop_capture::{alignment_check_read_for_source, AlignmentCheckSample};
-use migraloop_delivery::{
-    list_target_documents, upsert_managed_documents, DeliveryDocument,
-};
+use migraloop_capture::{AlignmentCheckSample, SourceEngine};
+use migraloop_delivery::{DeliveryDocument, TargetEngine};
 use migraloop_platform_store::{
     BaseDataset, Deployment, DerivedDataset, Pipeline, PlatformStore, PlatformStoreHealth,
     QuarantinedChange, SchemaChangeImpact,
@@ -17,10 +15,9 @@ use migraloop_platform_store::{
 
 use crate::{
     deliver_direct_pipeline_with_options, deliver_transform_pipeline_with_options,
-    delivery_document_for_row, ensure_store_session_healthy, identity_key,
-    mongo_target_from_deployment, oracle_source_connect, pipeline_base_table_refs,
-    pipeline_has_target, resolve_secret_value, source_timezone_opt, target_document_identity_key,
-    RuntimeError,
+    delivery_document_for_row, ensure_store_session_healthy, identity_key, pipeline_base_table_refs,
+    pipeline_has_target, source_engine_from_connection, source_timezone_opt,
+    target_document_identity_key, target_engine_from_deployment, RuntimeError,
 };
 
 /// Default Source Alignment Check read budget (resource gate; not a full slam).
@@ -255,10 +252,10 @@ pub async fn resume_pipeline(
 
     // Catch up Delivery from durable Base/Derived state accumulated while paused.
     if pipeline_has_target(&pipeline) {
-        let mongo = mongo_target_from_deployment(&deployment)?;
+        let target = target_engine_from_deployment(&deployment)?;
         match pipeline.mode.as_str() {
             "direct" => {
-                deliver_direct_pipeline_with_options(store, &deployment, &pipeline, &mongo, true)
+                deliver_direct_pipeline_with_options(store, &deployment, &pipeline, &target, true)
                     .await?;
             }
             "transform" => {
@@ -266,7 +263,7 @@ pub async fn resume_pipeline(
                     store,
                     &deployment,
                     &pipeline,
-                    &mongo,
+                    &target,
                     true,
                 )
                 .await?;
@@ -445,18 +442,16 @@ async fn align_one_base(
         )));
     }
 
-    let connect = oracle_source_connect(&deployment.source)?;
-    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
+    let source = source_engine_from_connection(&deployment.source)?;
     let configured_tz = source_timezone_opt(deployment);
-    let sample: AlignmentCheckSample = alignment_check_read_for_source(
-        &connect,
-        &password,
-        &base.source_schema,
-        &base.source_table,
-        max_rows,
-        configured_tz,
-    )
-    .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    let sample: AlignmentCheckSample = source
+        .alignment_check_read(
+            &base.source_schema,
+            &base.source_table,
+            max_rows,
+            configured_tz,
+        )
+        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
     let (_, base_rows) = store
         .get_base_rows(&base.source_table, Some(&base.deployment_name))
@@ -660,11 +655,12 @@ async fn drift_one_pipeline(
 ) -> Result<(), RuntimeError> {
     ensure_drift_baseline_ready(store, pipeline).await?;
 
-    let mongo = mongo_target_from_deployment(deployment)?;
+    let target = target_engine_from_deployment(deployment)?;
     let (expected_docs, truncated) =
         expected_delivery_documents_for_drift(store, pipeline, max_rows).await?;
 
-    let target_docs = list_target_documents(&mongo, &pipeline.target_collection)
+    let target_docs = target
+        .list_documents(&pipeline.target_collection)
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
     let mut target_by_id: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -695,7 +691,8 @@ async fn drift_one_pipeline(
     }
 
     if !repair_docs.is_empty() {
-        upsert_managed_documents(&mongo, &pipeline.target_collection, &repair_docs)
+        target
+            .upsert_managed(&pipeline.target_collection, &repair_docs)
             .await
             .map_err(|err| RuntimeError::Failed(err.to_string()))?;
     }
