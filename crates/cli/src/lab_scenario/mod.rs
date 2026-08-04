@@ -966,36 +966,34 @@ async fn product_apply(
     Ok(apply_out)
 }
 
-/// Incremental Capture + Delivery via real product path, with optional sync env escapes.
+/// Incremental Capture + Delivery via real product path.
+///
+/// Typed SyncOptions ride on `sync_cli_args` (#180). Optional `extra_env` remains
+/// only for non-SyncOptions Lab bridges (e.g. Schema Change inject file).
 ///
 /// Returns `(sync_out, capture_note, sync_succeeded)`. When `opts.allow_fail` is set,
 /// a non-zero sync exit still returns output so hooks can observe mid-window stops.
 async fn product_sync(
     opts: &ProductPathSyncOpts,
-    sync_env: &[(String, String)],
+    sync_cli_args: &[String],
+    extra_env: &[(String, String)],
 ) -> Result<(String, String, bool), CliError> {
     let bin = lab_migraloop_bin();
-    if sync_env.is_empty() && !opts.allow_fail {
+    if sync_cli_args.is_empty() && extra_env.is_empty() && !opts.allow_fail {
         println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
     }
-    let env_refs: Vec<(&str, &str)> = sync_env
+    let mut args: Vec<&str> = vec!["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL];
+    for a in sync_cli_args {
+        args.push(a.as_str());
+    }
+    let env_refs: Vec<(&str, &str)> = extra_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let (sync_ok, sync_out) = if opts.allow_fail {
-        run_product_cli_allow_fail(
-            &bin,
-            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-            &env_refs,
-        )
-        .await?
+        run_product_cli_allow_fail(&bin, &args, &env_refs).await?
     } else {
-        let out = run_product_cli_with_env(
-            &bin,
-            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-            &env_refs,
-        )
-        .await?;
+        let out = run_product_cli_with_env(&bin, &args, &env_refs).await?;
         (true, out)
     };
     let has_logminer = sync_out.to_ascii_lowercase().contains("logminer");
@@ -2001,54 +1999,54 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
         Ok(())
     }
 
-    fn sync_env(&self, lab_dir: &Path) -> Vec<(String, String)> {
+    /// Product `sync` invocation inputs (#180).
+    ///
+    /// `args` carry typed SyncOptions CLI flags. `env` is only for non-SyncOptions
+    /// Lab bridges (Schema Change inject file path for the LogMiner DDL gap).
+    fn sync_invocation(&self, lab_dir: &Path) -> (Vec<String>, Vec<(String, String)>) {
         match self {
-            Self::PoisonQuarantine => vec![
-                (
-                    "MIGRALOOP_DELIVERY_POISON_IDENTITIES".to_string(),
+            Self::PoisonQuarantine => (
+                vec![
+                    "--sync-poison-identity".to_string(),
                     POISON_QUARANTINE_IDENTITY.to_string(),
-                ),
-                (
-                    "MIGRALOOP_POISON_MAX_ATTEMPTS".to_string(),
+                    "--sync-poison-max-attempts".to_string(),
                     POISON_QUARANTINE_MAX_ATTEMPTS.to_string(),
-                ),
-            ],
-            Self::BoundedBackpressure => vec![
-                (
-                    "MIGRALOOP_SYNC_QUEUE_CAPACITY".to_string(),
+                ],
+                vec![],
+            ),
+            Self::BoundedBackpressure => (
+                vec![
+                    "--sync-queue-capacity".to_string(),
                     BOUNDED_BACKPRESSURE_CAPACITY.to_string(),
-                ),
-                (
-                    "MIGRALOOP_DELIVERY_DELAY_MS".to_string(),
+                    "--sync-delivery-delay-ms".to_string(),
                     BOUNDED_BACKPRESSURE_DELAY_MS.to_string(),
-                ),
-                (
-                    "MIGRALOOP_SYNC_FAIL_AFTER_CHANGES".to_string(),
+                    "--sync-fail-after-changes".to_string(),
                     BOUNDED_BACKPRESSURE_FAIL_AFTER.to_string(),
-                ),
-            ],
-            Self::ObservabilitySurface => vec![
-                (
-                    "MIGRALOOP_SYNC_QUEUE_CAPACITY".to_string(),
+                ],
+                vec![],
+            ),
+            Self::ObservabilitySurface => (
+                vec![
+                    "--sync-queue-capacity".to_string(),
                     OBSERVABILITY_SURFACE_CAPACITY.to_string(),
-                ),
-                (
-                    "MIGRALOOP_DELIVERY_DELAY_MS".to_string(),
+                    "--sync-delivery-delay-ms".to_string(),
                     OBSERVABILITY_SURFACE_DELAY_MS.to_string(),
-                ),
-                (
-                    "MIGRALOOP_SYNC_FAIL_AFTER_CHANGES".to_string(),
+                    "--sync-fail-after-changes".to_string(),
                     OBSERVABILITY_SURFACE_FAIL_AFTER.to_string(),
-                ),
-            ],
+                ],
+                vec![],
+            ),
             Self::SchemaChangePause => {
                 let inject_path = lab_dir.join(".schema-change-pause-inject.json");
-                vec![(
-                    "MIGRALOOP_INJECT_SCHEMA_CHANGES".to_string(),
-                    inject_path.to_string_lossy().into_owned(),
-                )]
+                (
+                    vec![],
+                    vec![(
+                        "MIGRALOOP_INJECT_SCHEMA_CHANGES".to_string(),
+                        inject_path.to_string_lossy().into_owned(),
+                    )],
+                )
             }
-            _ => vec![],
+            _ => (vec![], vec![]),
         }
     }
 
@@ -3507,13 +3505,15 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
 
 
                     println!("Lab Scenario: catch-up sync without Downstream delay...");
-                    let catch_out = run_product_cli_with_env(
+                    let catch_out = run_product_cli(
                         &bin,
-                        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-                        &[(
-                            "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+                        &[
+                            "sync",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--sync-queue-capacity",
                             BOUNDED_BACKPRESSURE_CAPACITY,
-                        )],
+                        ],
                     )
                     .await?;
                     let capture_note = if catch_out.to_ascii_lowercase().contains("logminer") {
@@ -3680,13 +3680,15 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
 
             Self::ObservabilitySurface => {
                     println!("Lab Scenario: catch-up sync without Downstream delay...");
-                    let catch_out = run_product_cli_with_env(
+                    let catch_out = run_product_cli(
                         &bin,
-                        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-                        &[(
-                            "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+                        &[
+                            "sync",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--sync-queue-capacity",
                             OBSERVABILITY_SURFACE_CAPACITY,
-                        )],
+                        ],
                     )
                     .await?;
                     let capture_note = if catch_out.to_ascii_lowercase().contains("logminer") {
@@ -4516,9 +4518,9 @@ async fn run_product_path_scenario(
             }
             ProductPathStepKind::ProductSync => {
                 hooks.before_sync(lab_dir).await?;
-                let env = hooks.sync_env(lab_dir);
+                let (sync_cli_args, extra_env) = hooks.sync_invocation(lab_dir);
                 let (sync_out, capture_note, sync_ok) =
-                    product_sync(&product_path.sync, &env).await?;
+                    product_sync(&product_path.sync, &sync_cli_args, &extra_env).await?;
                 hooks.after_sync(lab_dir, &sync_out, sync_ok).await?;
                 ctx.sync_out = sync_out;
                 ctx.sync_ok = sync_ok;

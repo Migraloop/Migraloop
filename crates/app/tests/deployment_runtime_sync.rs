@@ -15,9 +15,12 @@ use std::process::Command;
 
 use migraloop_capture::CONTRACT_SOURCE_CATALOG_ENV;
 use migraloop_capture::INJECT_LOGMINER_CONTENTS_ENV;
+use std::collections::BTreeSet;
+
 use migraloop_platform_store::{
     Deployment, Pipeline, PlatformStore, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
 };
+use migraloop_runtime::{PoisonOptions, SyncOptions};
 use tempfile::TempDir;
 
 fn admin_url() -> String {
@@ -159,8 +162,9 @@ async fn runtime_sync_quarantines_poison_identity_and_continues_peers() {
     std::env::set_var("MONGO_PASSWORD", "mongo-secret-value");
     std::env::set_var(CONTRACT_SOURCE_CATALOG_ENV, &doubles.catalog_path);
     std::env::set_var(INJECT_LOGMINER_CONTENTS_ENV, &doubles.logminer_path);
-    std::env::set_var("MIGRALOOP_DELIVERY_POISON_IDENTITIES", "1");
-    std::env::set_var("MIGRALOOP_POISON_MAX_ATTEMPTS", "2");
+    // Typed SyncOptions — not process env fault injection (#180).
+    std::env::remove_var("MIGRALOOP_DELIVERY_POISON_IDENTITIES");
+    std::env::remove_var("MIGRALOOP_POISON_MAX_ATTEMPTS");
 
     let store = PlatformStore::open(&url)
         .await
@@ -174,7 +178,14 @@ async fn runtime_sync_quarantines_poison_identity_and_continues_peers() {
         .await
         .expect("runtime apply (Initial Load + first Delivery)");
 
-    migraloop_runtime::sync_incremental(&store)
+    let options = SyncOptions {
+        poison: PoisonOptions {
+            max_attempts: 2,
+            poison_identity_keys: BTreeSet::from(["1".into()]),
+        },
+        ..SyncOptions::default()
+    };
+    migraloop_runtime::sync_incremental_with_options(&store, options)
         .await
         .expect("runtime Incremental Sync should succeed after quarantine");
 

@@ -18,6 +18,7 @@ use migraloop_platform_store::{
 use migraloop_runtime::{
     assemble_observability_surface, cutover_facts_from_base, inspect_base_rows,
     inspect_derived_rows, inspect_target_documents, status_inventory_from_url, CutoverFacts,
+    SyncOptions, SyncOptionsOverrides,
 };
 use thiserror::Error;
 
@@ -110,6 +111,21 @@ pub enum Command {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
+        /// Test/Lab: Output Identity keys that always fail Delivery (typed SyncOptions; #180)
+        #[arg(long = "sync-poison-identity", value_name = "KEY", hide = true)]
+        sync_poison_identity: Vec<String>,
+        /// Test/Lab or override: Poison quarantine max Delivery attempts (typed SyncOptions)
+        #[arg(long = "sync-poison-max-attempts", hide = true)]
+        sync_poison_max_attempts: Option<u32>,
+        /// Override Incremental window capacity (typed SyncOptions; Operator env also applies)
+        #[arg(long = "sync-queue-capacity", hide = true)]
+        sync_queue_capacity: Option<usize>,
+        /// Test/Lab: artificial Downstream Delivery delay in ms (typed SyncOptions; #180)
+        #[arg(long = "sync-delivery-delay-ms", hide = true)]
+        sync_delivery_delay_ms: Option<u64>,
+        /// Test/Lab: stop after N durable checkpoints (typed SyncOptions; #180)
+        #[arg(long = "sync-fail-after-changes", hide = true)]
+        sync_fail_after_changes: Option<u32>,
     },
     /// Run Source Alignment Check: verify Base matches Source (resource-gated); repair Base only
     Align {
@@ -397,10 +413,46 @@ async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), C
         .map_err(|err| CliError::Failed(err.to_string()))
 }
 
-async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
+async fn sync_incremental(
+    platform_store_url: &str,
+    options: SyncOptions,
+) -> Result<(), CliError> {
     let store = open_store(platform_store_url).await?;
-    migraloop_runtime::sync_incremental(&store).await?;
+    migraloop_runtime::sync_incremental_with_options(&store, options).await?;
     Ok(())
+}
+
+/// Build typed [`SyncOptions`] for `migraloop sync` (#180).
+///
+/// Hidden CLI flags are the primary fault-injection path for RQG / Lab. Legacy
+/// fault-injection env vars remain a thin temporary shim when flags are unset.
+fn sync_options_from_cli_flags(
+    sync_poison_identity: Vec<String>,
+    sync_poison_max_attempts: Option<u32>,
+    sync_queue_capacity: Option<usize>,
+    sync_delivery_delay_ms: Option<u64>,
+    sync_fail_after_changes: Option<u32>,
+) -> SyncOptions {
+    let poison_identity_keys = if sync_poison_identity.is_empty() {
+        None
+    } else {
+        Some(sync_poison_identity.into_iter().collect())
+    };
+    // When any typed sync flag is present, omit the legacy fault-injection env
+    // shim so RQG / Lab cannot accidentally depend on leftover process env (#180).
+    let any_typed_override = poison_identity_keys.is_some()
+        || sync_poison_max_attempts.is_some()
+        || sync_queue_capacity.is_some()
+        || sync_delivery_delay_ms.is_some()
+        || sync_fail_after_changes.is_some();
+    SyncOptions::for_cli(SyncOptionsOverrides {
+        poison_identity_keys,
+        poison_max_attempts: sync_poison_max_attempts,
+        queue_capacity: sync_queue_capacity,
+        delivery_delay_ms: sync_delivery_delay_ms,
+        fail_after_changes: sync_fail_after_changes,
+        omit_env_fault_shim: any_typed_override,
+    })
 }
 
 async fn open_store(platform_store_url: &str) -> Result<PlatformStore, CliError> {
@@ -852,7 +904,23 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             pipeline,
             deployment,
         } => print_derived(&platform_store_url, &pipeline, deployment.as_deref()).await,
-        Command::Sync { platform_store_url } => sync_incremental(&platform_store_url).await,
+        Command::Sync {
+            platform_store_url,
+            sync_poison_identity,
+            sync_poison_max_attempts,
+            sync_queue_capacity,
+            sync_delivery_delay_ms,
+            sync_fail_after_changes,
+        } => {
+            let options = sync_options_from_cli_flags(
+                sync_poison_identity,
+                sync_poison_max_attempts,
+                sync_queue_capacity,
+                sync_delivery_delay_ms,
+                sync_fail_after_changes,
+            );
+            sync_incremental(&platform_store_url, options).await
+        }
         Command::Align {
             platform_store_url,
             table,
@@ -914,8 +982,12 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             // Open the Platform Store session at the Operator edge; runtime supervise
             // prefers that session handle over URL reopen (issue #172).
             let sync_store = open_store(&platform_store_url).await?;
+            // Continuous `run`: Operator env knobs via thin compat; fault injection
+            // for one-shot Lab/RQG paths uses typed `sync` flags (#180).
+            let sync_options = SyncOptions::from_env_compat();
             tokio::spawn(async move {
-                migraloop_runtime::supervise_continuous_incremental_sync(sync_store).await;
+                migraloop_runtime::supervise_continuous_incremental_sync(sync_store, sync_options)
+                    .await;
             });
             observability::serve_prometheus_metrics(addr, platform_store_url).await
         }

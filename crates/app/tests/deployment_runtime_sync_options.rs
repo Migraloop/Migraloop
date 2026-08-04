@@ -1,10 +1,10 @@
 //! Typed Sync options seam for Poison / Schema Change / Backpressure (issue #176).
 //!
-//! Agreed seams (#168 Testing Decisions / #176 AC):
+//! Agreed seams (#168 Testing Decisions / #176 / #180 AC):
 //! 1. Operator CLI / RQG contract-path twins remain the Release Quality Gate
-//!    (env compat shim keeps existing twins green).
+//!    (typed SyncOptions CLI flags are the primary fault path; env is a thin shim).
 //! 2. Deployment runtime interface — in-process tests exercise fault paths via
-//!    typed [`SyncOptions`], not only process env vars.
+//!    typed [`SyncOptions`], not process env vars.
 //!
 //! This file drives production Incremental Sync with Fake Source/Target and
 //! explicit poison identity options (ADR-0015). Schema Change pause (ADR-0009)

@@ -15,6 +15,7 @@ use std::time::Duration;
 use migraloop_platform_store::PlatformStore;
 use migraloop_runtime::{
     run_continuous_incremental_sync, status_inventory, SyncCycleOutcome, SyncInvocation,
+    SyncOptions,
 };
 
 fn admin_url() -> String {
@@ -55,9 +56,13 @@ async fn continuous_incremental_sync_prefers_open_store_session() {
     store.migrate().await.expect("migrate via session");
 
     // Empty store: ContinuousCycle idles — prove the session-shaped entry runs.
-    let outcome = migraloop_runtime::run_incremental_sync(&store, SyncInvocation::ContinuousCycle)
-        .await
-        .expect("one ContinuousCycle on open session");
+    let outcome = migraloop_runtime::run_incremental_sync(
+        &store,
+        SyncInvocation::ContinuousCycle,
+        SyncOptions::default(),
+    )
+    .await
+    .expect("one ContinuousCycle on open session");
     assert_eq!(outcome, SyncCycleOutcome::Idle);
 
     let inventory = status_inventory(&store)
@@ -68,7 +73,7 @@ async fn continuous_incremental_sync_prefers_open_store_session() {
     // Continuous loop uses the same open session (no URL reopen required).
     let ran = tokio::time::timeout(
         Duration::from_millis(250),
-        run_continuous_incremental_sync(&store),
+        run_continuous_incremental_sync(&store, SyncOptions::default()),
     )
     .await;
     assert!(

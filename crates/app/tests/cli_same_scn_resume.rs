@@ -228,16 +228,20 @@ fn run_sync_fail_after(
 ) -> std::process::Output {
     let mut cmd = Command::new(bin());
     cmd.env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", after.to_string());
-    if let Some(cap) = queue_capacity {
-        cmd.env("MIGRALOOP_SYNC_QUEUE_CAPACITY", cap.to_string());
-    }
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut cmd);
-    cmd.args(["sync", "--platform-store-url", url])
-        .output()
-        .expect("run sync with fail-after")
+    cmd.args(["sync", "--platform-store-url", url]);
+    common::SyncCliOptions {
+        poison_identities: vec![],
+        poison_max_attempts: None,
+        queue_capacity: queue_capacity.map(|c| c as usize),
+        delivery_delay_ms: None,
+        fail_after_changes: Some(after),
+    }
+    .append_to(&mut cmd);
+    cmd.output().expect("run sync with fail-after")
 }
+
 
 fn run_status(url: &str) -> String {
     let status = Command::new(bin())

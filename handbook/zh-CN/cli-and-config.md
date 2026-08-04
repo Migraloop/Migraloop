@@ -231,14 +231,14 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | `LD_LIBRARY_PATH` | 真实 Oracle host：Oracle Instant Client libraries 目录（apply/sync/`run` runtime 需要；`contract`/`stub` 不使用） |
 | `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | 仅 contract/stub host：harness catalog 表的 JSON 文件路径，供 schema discovery + Initial Load（CI／本地切片；未设置为空；不是 production Source 机制） |
 | `MIGRALOOP_POISON_MAX_ATTEMPTS` | Poison Change quarantine 前的有界 Delivery 重试次数（默认 `3`；必须 > 0） |
-| `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | 仅 Test/Lab fault injection：以逗号分隔、一律让 Delivery 失败的 Output Identity keys，用来演练 quarantine（不是 production Operator 控制） |
+| `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | 已弃用、仅薄临时 compat shim：以逗号分隔、一律让 Delivery 失败的 Output Identity keys。请改用 typed SyncOptions（`migraloop sync` 的 `--sync-poison-identity` 等隐藏 Test/Lab flags，或 in-process `SyncOptions`；不是 production Operator 控制） |
 | `MIGRALOOP_INJECT_SCHEMA_CHANGES` | 仅 Test/Lab injection：Schema Change events 的 JSON 文件路径（`scn`、`table`、`kind`、`columns` …），以便在没有 LogMiner DDL capture 时演练 blocking DDL warn+pause（不是 production Operator 控制） |
-| `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window 大小（默认 `256`；必须 > 0）。one-shot `sync` 或 continuous `run` 下各阶段一次 materialize 的 pending changes 都不超过此容量（ADR-0020） |
+| `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window 大小（默认 `256`；必须 > 0）。one-shot `sync` 或 continuous `run` 下各阶段一次 materialize 的 pending changes 都不超过此容量（ADR-0020）。Test/Lab 也可在 `migraloop sync` 上设 `--sync-queue-capacity` |
 | `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` | Bounded Initial Load Source read window（默认 `1000`；必须 > 0）。apply 的正常路径不会把 unbounded full-table slam 整表灌进内存 |
 | `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` | 可选的 Initial Load throttle（rows/second；`0`／未设置 = 除 chunking 外不再人工限速）。在 progress 行／`initial_load_progress` 以 `rate_limit` 可见 |
 | `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` | 仅供 Test/Lab inject：成功 N 个 chunks 后 pause Initial Load，以便演练 durable pause/resume（不是 production Operator 控制；Operators 请在 chunks 之间使用 `migraloop pause`） |
 | `MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS` | 仅供 Test/Lab inject：Initial Load 期间人工延迟 Platform Store／Downstream，以便演练 backoff（不是 production Operator 控制） |
-| `MIGRALOOP_DELIVERY_DELAY_MS` | 仅 Test/Lab fault injection：人工 Downstream Delivery 延迟（毫秒），用来演练 bounded backpressure 与可见 lag（不是 production Operator 控制） |
+| `MIGRALOOP_DELIVERY_DELAY_MS` | 已弃用、仅薄临时 compat shim：人工 Downstream Delivery 延迟（毫秒）。请改用 typed SyncOptions（`migraloop sync` 的 `--sync-delivery-delay-ms`、`--sync-fail-after-changes` 等隐藏 Test/Lab flags，或 in-process `SyncOptions`；不是 production Operator 控制） |
 | `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | 仅 Test/Lab injection：contract LogMiner contents 的 JSON 文件路径（`contents: [{scn, operation, table_name, identity, after_image, rs_id?, ssn?}, …]`），供 `contract`/`stub` hosts 的 Incremental Capture。可选的 `rs_id` / `ssn` 是 LogMiner ordering keys，让同一 SCN 的多行在 dedupe 与 resume-safe catch-up 时保持可区分（未设置时 harness Incremental 流为空；不是 production Operator 控制） |
 | Lab disposable defaults | `migraloop lab up` 之后：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`（仅本地 Lab） |
 

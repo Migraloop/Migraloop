@@ -155,17 +155,15 @@ fn run_sync(url: &str, doubles: &common::NamedScenarioDoubles) -> std::process::
 
 fn run_sync_fail_after(url: &str, after: u32, doubles: &common::NamedScenarioDoubles) -> std::process::Output {
     let mut cmd = Command::new(bin());
-    cmd
-        .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", after.to_string());
+    cmd.env("ORACLE_PASSWORD", "oracle-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut cmd);
-    cmd
-        .args(["sync", "--platform-store-url", url])
-        .output()
-        .expect("run sync with fail-after")
-
+    cmd.args(["sync", "--platform-store-url", url]);
+    common::SyncCliOptions::fail_after(after).append_to(&mut cmd);
+    let out = cmd.output().expect("run sync with fail-after");
+    out
 }
+
 
 fn run_status(url: &str) -> String {
     let status = Command::new(bin())
@@ -376,8 +374,7 @@ async fn resume_does_not_depend_on_ephemeral_local_state() {
     resumed
         .current_dir(cwd.path())
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env_remove("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES");
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut resumed);
     let resumed = resumed
         .args(["sync", "--platform-store-url", &url])

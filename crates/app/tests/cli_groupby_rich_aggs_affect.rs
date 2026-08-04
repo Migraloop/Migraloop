@@ -164,16 +164,15 @@ fn migrate_and_apply(url: &str, config: &Path, doubles: &common::NamedScenarioDo
 
 fn run_sync_fail_after(url: &str, after: u32, doubles: &common::NamedScenarioDoubles) -> std::process::Output {
     let mut cmd = Command::new(bin());
-    cmd
-        .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", after.to_string());
+    cmd.env("ORACLE_PASSWORD", "oracle-secret-value")
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut cmd);
-    cmd
-        .args(["sync", "--platform-store-url", url])
-        .output()
-        .expect("run sync with fail-after")
+    cmd.args(["sync", "--platform-store-url", url]);
+    common::SyncCliOptions::fail_after(after).append_to(&mut cmd);
+    let out = cmd.output().expect("run sync with fail-after");
+    out
 }
+
 
 fn delivery_applied_changes(status_out: &str, pipeline: &str) -> Option<i32> {
     for line in status_out.lines() {

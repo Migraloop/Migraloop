@@ -11,9 +11,8 @@
 //!
 //! Fault injection:
 //! - `MIGRALOOP_INJECT_LOGMINER_CONTENTS` — extra contract LogMiner contents
-//! - `MIGRALOOP_DELIVERY_DELAY_MS` — artificial Downstream Delivery slowness
-//! - `MIGRALOOP_SYNC_QUEUE_CAPACITY` — bound on in-flight Incremental window
-//! - `MIGRALOOP_SYNC_FAIL_AFTER_CHANGES` — mid-sync stop to observe lag
+//! - typed SyncOptions CLI flags (`--sync-queue-capacity`,
+//!   `--sync-delivery-delay-ms`, `--sync-fail-after-changes`; issue #180)
 
 mod common;
 
@@ -232,18 +231,23 @@ async fn downstream_slowness_applies_bounded_backpressure_with_visible_lag() {
     );
     migrate_and_apply(&url, &config, &doubles);
 
-    const CAPACITY: &str = "2";
+    const CAPACITY: usize = 2;
 
     let mut slow = Command::new(bin());
     slow
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_SYNC_QUEUE_CAPACITY", CAPACITY)
-        .env("MIGRALOOP_DELIVERY_DELAY_MS", "80")
-        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "1");
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut slow);
+    slow.args(["sync", "--platform-store-url", &url]);
+    common::SyncCliOptions {
+        poison_identities: vec![],
+        poison_max_attempts: None,
+        queue_capacity: Some(CAPACITY),
+        delivery_delay_ms: Some(80),
+        fail_after_changes: Some(1),
+    }
+    .append_to(&mut slow);
     let slow = slow
-        .args(["sync", "--platform-store-url", &url])
         .output()
         .expect("run sync under Downstream slowness");
     assert!(
@@ -306,13 +310,18 @@ async fn downstream_slowness_applies_bounded_backpressure_with_visible_lag() {
     let mut catch_up = Command::new(bin());
     catch_up
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_SYNC_QUEUE_CAPACITY", CAPACITY);
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut catch_up);
-    let catch_up = catch_up
-        .args(["sync", "--platform-store-url", &url])
-        .output()
-        .expect("run catch-up sync");
+    catch_up.args(["sync", "--platform-store-url", &url]);
+    common::SyncCliOptions {
+        poison_identities: vec![],
+        poison_max_attempts: None,
+        queue_capacity: Some(CAPACITY),
+        delivery_delay_ms: None,
+        fail_after_changes: None,
+    }
+    .append_to(&mut catch_up);
+    let catch_up = catch_up.output().expect("run catch-up sync");
     assert!(
         catch_up.status.success(),
         "catch-up sync failed: stdout={} stderr={}",

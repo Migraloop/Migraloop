@@ -88,3 +88,48 @@ impl NamedScenarioDoubles {
             .env(INJECT_LOGMINER_CONTENTS_ENV, &self.logminer_path)
     }
 }
+
+/// Typed SyncOptions CLI flags for `migraloop sync` (issue #180).
+///
+/// Prefer these over process env fault-injection knobs so RQG twins do not mutate
+/// global process state and Lab/CLI share one typed adapter.
+#[allow(dead_code)]
+pub struct SyncCliOptions {
+    pub poison_identities: Vec<&'static str>,
+    pub poison_max_attempts: Option<u32>,
+    pub queue_capacity: Option<usize>,
+    pub delivery_delay_ms: Option<u64>,
+    pub fail_after_changes: Option<u32>,
+}
+
+#[allow(dead_code)]
+impl SyncCliOptions {
+    pub fn fail_after(after: u32) -> Self {
+        Self {
+            poison_identities: vec![],
+            poison_max_attempts: None,
+            queue_capacity: None,
+            delivery_delay_ms: None,
+            fail_after_changes: Some(after),
+        }
+    }
+
+    pub fn append_to<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        for id in &self.poison_identities {
+            cmd.arg("--sync-poison-identity").arg(id);
+        }
+        if let Some(n) = self.poison_max_attempts {
+            cmd.arg("--sync-poison-max-attempts").arg(n.to_string());
+        }
+        if let Some(n) = self.queue_capacity {
+            cmd.arg("--sync-queue-capacity").arg(n.to_string());
+        }
+        if let Some(ms) = self.delivery_delay_ms {
+            cmd.arg("--sync-delivery-delay-ms").arg(ms.to_string());
+        }
+        if let Some(n) = self.fail_after_changes {
+            cmd.arg("--sync-fail-after-changes").arg(n.to_string());
+        }
+        cmd
+    }
+}

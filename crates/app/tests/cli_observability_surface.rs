@@ -294,20 +294,21 @@ async fn observability_surface_exposes_metrics_structured_logs_and_health() {
 
     // Structured logs on Initial Load / Delivery path (apply already ran).
     // Drive Incremental with Downstream delay + poison so lag + failure counters appear.
-    const CAPACITY: &str = "2";
-
     let mut slow = Command::new(bin());
     slow
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_SYNC_QUEUE_CAPACITY", CAPACITY)
-        .env("MIGRALOOP_DELIVERY_DELAY_MS", "80")
-        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "1")
-        .env("MIGRALOOP_DELIVERY_POISON_IDENTITIES", "100")
-        .env("MIGRALOOP_POISON_MAX_ATTEMPTS", "2");
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut slow);
+    slow.args(["sync", "--platform-store-url", &url]);
+    common::SyncCliOptions {
+        poison_identities: vec!["100"],
+        poison_max_attempts: Some(2),
+        queue_capacity: Some(2),
+        delivery_delay_ms: Some(80),
+        fail_after_changes: Some(1),
+    }
+    .append_to(&mut slow);
     let slow = slow
-        .args(["sync", "--platform-store-url", &url])
         .output()
         .expect("run sync under Observability Surface probes");
     let sync_out = format!(

@@ -1,4 +1,4 @@
-//! Incremental Sync orchestration for the Deployment runtime (#153 / #176).
+//! Incremental Sync orchestration for the Deployment runtime (#153 / #176 / #180).
 //!
 //! Owns Incremental Capture (including continuous supervise/resume), overlap
 //! apply ordering (Deliver-before-checkpoint + change-id dedupe), and
@@ -470,8 +470,19 @@ fn base_with_sync_progress(
 }
 
 /// One-shot Incremental Capture → Delivery (`migraloop sync`).
+///
+/// Uses [`SyncOptions::from_env_compat`] (thin temporary shim). Prefer
+/// [`sync_incremental_with_options`] with typed options (#180).
 pub async fn sync_incremental(store: &PlatformStore) -> Result<(), RuntimeError> {
-    run_incremental_sync(store, SyncInvocation::OneShot)
+    sync_incremental_with_options(store, SyncOptions::from_env_compat()).await
+}
+
+/// One-shot Incremental Capture → Delivery with typed [`SyncOptions`].
+pub async fn sync_incremental_with_options(
+    store: &PlatformStore,
+    options: SyncOptions,
+) -> Result<(), RuntimeError> {
+    run_incremental_sync(store, SyncInvocation::OneShot, options)
         .await
         .map(|_| ())
 }
@@ -483,7 +494,7 @@ pub async fn sync_incremental(store: &PlatformStore) -> Result<(), RuntimeError>
 /// While there is pending Source work, cycles continue immediately (bounded windows
 /// still apply). Errors are logged and retried — Observability metrics keep serving
 /// on the same single active instance (issue #145).
-pub async fn run_continuous_incremental_sync(store: &PlatformStore) {
+pub async fn run_continuous_incremental_sync(store: &PlatformStore, options: SyncOptions) {
     let poll = sync_poll_interval();
     println!(
         "Continuous Incremental Capture: poll_interval_ms={}",
@@ -497,7 +508,7 @@ pub async fn run_continuous_incremental_sync(store: &PlatformStore) {
         )],
     );
     loop {
-        match run_incremental_sync(store, SyncInvocation::ContinuousCycle).await {
+        match run_incremental_sync(store, SyncInvocation::ContinuousCycle, options.clone()).await {
             Ok(SyncCycleOutcome::Progressed) => {
                 // Catch up backlog without waiting for the idle poll interval.
             }
@@ -521,10 +532,13 @@ pub async fn run_continuous_incremental_sync(store: &PlatformStore) {
 ///
 /// Takes a session handle (cloned into each worker via shared pool) rather than a
 /// URL reopen loop — callers open the store once at the Operator edge.
-pub async fn supervise_continuous_incremental_sync(store: PlatformStore) {
+pub async fn supervise_continuous_incremental_sync(store: PlatformStore, options: SyncOptions) {
     loop {
         let worker = store.clone();
-        match tokio::spawn(async move { run_continuous_incremental_sync(&worker).await }).await {
+        let opts = options.clone();
+        match tokio::spawn(async move { run_continuous_incremental_sync(&worker, opts).await })
+            .await
+        {
             Ok(()) => {
                 eprintln!("Continuous Incremental Capture task ended unexpectedly; restarting");
                 emit_event(
@@ -566,16 +580,9 @@ pub enum SyncCycleOutcome {
 ///
 /// Default Operator path: constructs v1 Oracle LogMiner + MongoDB adapters via
 /// factory helpers (Oracle-kind gate preserved for factory wiring). Typed knobs
-/// come from [`SyncOptions::from_env_compat`] so existing RQG / Lab twins keep
-/// working while in-process tests prefer explicit [`SyncOptions`].
+/// come from `options` — CLI / Lab build them via [`SyncOptions::for_cli`];
+/// in-process tests pass explicit values (#180).
 pub async fn run_incremental_sync(
-    store: &PlatformStore,
-    invocation: SyncInvocation,
-) -> Result<SyncCycleOutcome, RuntimeError> {
-    run_incremental_sync_with_options(store, invocation, SyncOptions::from_env_compat()).await
-}
-
-async fn run_incremental_sync_with_options(
     store: &PlatformStore,
     invocation: SyncInvocation,
     options: SyncOptions,
@@ -634,8 +641,8 @@ async fn run_incremental_sync_with_options(
 /// `source.kind` / factory Oracle-kind gates — capture capability comes from the
 /// injected [`SourceEngine`]. Fault injection and queue knobs come from
 /// `options` (not process env). Default CLI `apply`/`run`/`sync` keep using
-/// [`run_incremental_sync`] (factory + env compat shim) with no Operator-visible
-/// change.
+/// [`run_incremental_sync`] with [`SyncOptions::for_cli`] (typed flags primary;
+/// env fault injection is a thin temporary shim) with no Operator-visible change.
 pub async fn run_incremental_sync_with_engines<S: SourceEngine, T: TargetEngine>(
     store: &PlatformStore,
     invocation: SyncInvocation,
@@ -1373,7 +1380,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                             let current_checkpoint = item.position().as_i64();
                             return Err(RuntimeError::Failed(format!(
                                 "simulated process kill after {limit} durable checkpoint(s) \
-                                 (fail_after_changes / MIGRALOOP_SYNC_FAIL_AFTER_CHANGES); \
+                                 (fail_after_changes / FAIL_AFTER); \
                                  resume from Platform Store checkpoint={current_checkpoint}"
                             )));
                         }
