@@ -101,40 +101,40 @@ pub async fn status_inventory(store: &PlatformStore) -> Result<StatusInventory, 
             }
         }
 
-        if guardrail_error.is_none() {
-            let resources = store
-                .probe_resources()
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-            if let (true, Some(free)) = (resources.disk_warn, resources.free_disk_bytes) {
-                disk_warn_free_bytes = Some(free);
-            }
-
-            deployments = store
-                .list_deployments()
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-            pipelines = store
-                .list_pipelines()
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-            bases = store
-                .list_base_datasets()
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-            derived = store
-                .list_derived_datasets()
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-            quarantines = store
-                .list_quarantined_changes(None)
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-            schema_impacts = store
-                .list_schema_change_impacts(None)
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        // Inventory lists stay available for metrics even when guardrails fail;
+        // `status` formatting returns early on `guardrail_error` (ADR-0010 hard path).
+        let resources = store
+            .probe_resources()
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        if let (true, Some(free)) = (resources.disk_warn, resources.free_disk_bytes) {
+            disk_warn_free_bytes = Some(free);
         }
+
+        deployments = store
+            .list_deployments()
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        pipelines = store
+            .list_pipelines()
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        bases = store
+            .list_base_datasets()
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        derived = store
+            .list_derived_datasets()
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        quarantines = store
+            .list_quarantined_changes(None)
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        schema_impacts = store
+            .list_schema_change_impacts(None)
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
     }
 
     Ok(StatusInventory {

@@ -290,4 +290,20 @@ async fn runtime_lifecycle_pause_align_drift_resume_and_status_inventory() {
             .any(|b| b.source_table.eq_ignore_ascii_case("CUSTOMERS")),
         "inventory should include Base Dataset"
     );
+
+    migraloop_runtime::remove_pipeline(&store, "customers", Some(deployment_name))
+        .await
+        .expect("runtime remove");
+    let remaining = store.list_pipelines().await.expect("list after remove");
+    assert!(
+        remaining.iter().all(|p| p.name != "customers"),
+        "removed Pipeline must not remain in inventory"
+    );
+    assert!(
+        !store
+            .base_dataset_exists(deployment_name, "", "CUSTOMERS")
+            .await
+            .expect("exists"),
+        "unreferenced Base Dataset should be pruned on remove"
+    );
 }

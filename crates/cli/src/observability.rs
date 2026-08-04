@@ -156,12 +156,13 @@ async fn render_prometheus_metrics(platform_store_url: &str) -> Result<String, S
     let inventory = status_inventory_from_url(platform_store_url)
         .await
         .map_err(|err| err.to_string())?;
-    if !matches!(
+    // Mirror prior metrics path: scrape durable lists when the store is reachable.
+    // Unreachable open failures yield empty lists via status_inventory_from_url.
+    if matches!(
         inventory.health,
-        migraloop_platform_store::PlatformStoreHealth::Healthy { .. }
-    ) || inventory.guardrail_error.is_some()
-    {
-        return Err("Platform Store is not healthy".to_string());
+        migraloop_platform_store::PlatformStoreHealth::Unreachable { .. }
+    ) {
+        return Err("Platform Store is unreachable".to_string());
     }
     let bases = inventory.bases;
     let pipelines = inventory.pipelines;
