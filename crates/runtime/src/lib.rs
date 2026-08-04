@@ -64,9 +64,12 @@ pub(crate) use observability::sync_health_label_for_progress;
 
 pub use incremental::{
     run_incremental_sync, run_incremental_sync_with_engines, run_continuous_incremental_sync,
-    supervise_continuous_incremental_sync, sync_incremental, SyncCycleOutcome, SyncInvocation,
+    supervise_continuous_incremental_sync, sync_incremental, sync_incremental_with_options,
+    SyncCycleOutcome, SyncInvocation,
 };
-pub use sync_options::{BackpressureOptions, PoisonOptions, SyncOptions};
+pub use sync_options::{
+    BackpressureOptions, PoisonOptions, SyncOptions, SyncOptionsOverrides,
+};
 pub use lifecycle::{
     drift_check, inspect_base_rows, inspect_derived_rows, inspect_target_documents, pause_pipeline,
     remove_pipeline, resume_pipeline, source_alignment_check, status_inventory,

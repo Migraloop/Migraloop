@@ -179,17 +179,16 @@ fn apply_expect_failure(url: &str, config: &Path, doubles: &common::NamedScenari
 fn run_sync_fail_after(url: &str, after: u32, doubles: &common::NamedScenarioDoubles) -> String {
     let mut cmd = Command::new(bin());
     cmd.env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", after.to_string());
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut cmd);
-    let out = cmd
-        .args(["sync", "--platform-store-url", url])
-        .output()
-        .expect("run sync with fail-after");
+    cmd.args(["sync", "--platform-store-url", url]);
+    common::SyncCliOptions::fail_after(after).append_to(&mut cmd);
+    let out = cmd.output().expect("run sync with fail-after");
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     text
 }
+
 
 fn delivery_applied_changes(status_out: &str, pipeline: &str) -> Option<i32> {
     for line in status_out.lines() {

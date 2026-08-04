@@ -9,9 +9,8 @@
 //! This is the non-ignored contract/stub CI twin of Lab Scenario
 //! `poison-quarantine`. It must not run Lab Fixture / live Oracle.
 //!
-//! Poison Delivery failures are injected via `MIGRALOOP_DELIVERY_POISON_IDENTITIES`
-//! (test/Lab fault injection for one Output Identity), matching the
-//! `MIGRALOOP_SYNC_FAIL_AFTER_CHANGES` pattern for fault seams.
+//! Poison Delivery failures are injected via typed SyncOptions CLI flags
+//! (`--sync-poison-identity` / `--sync-poison-max-attempts`; issue #180).
 
 mod common;
 
@@ -168,14 +167,18 @@ async fn poison_identity_is_quarantined_pipeline_continues_status_unhealthy() {
     let mut sync = Command::new(bin());
     sync
         .env("ORACLE_PASSWORD", "oracle-secret-value")
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .env("MIGRALOOP_DELIVERY_POISON_IDENTITIES", "1")
-        .env("MIGRALOOP_POISON_MAX_ATTEMPTS", "2");
+        .env("MONGO_PASSWORD", "mongo-secret-value");
     doubles.apply_env(&mut sync);
-    let sync = sync
-        .args(["sync", "--platform-store-url", &url])
-        .output()
-        .expect("run sync");
+    sync.args(["sync", "--platform-store-url", &url]);
+    common::SyncCliOptions {
+        poison_identities: vec!["1"],
+        poison_max_attempts: Some(2),
+        queue_capacity: None,
+        delivery_delay_ms: None,
+        fail_after_changes: None,
+    }
+    .append_to(&mut sync);
+    let sync = sync.output().expect("run sync");
 
     assert!(
         sync.status.success(),

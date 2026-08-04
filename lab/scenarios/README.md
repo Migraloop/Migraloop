@@ -58,7 +58,8 @@ thresholds:                     # optional; equal weight with correctness
 Typed `workload.product_path` steps (issues #173 / #178 / #179): `prepare_namespace`,
 `product_apply`, `mutate`, `product_sync`, `assert`. The shared runner owns apply/sync on
 the real product CLI path; Scenario hooks only supply Namespace seed SQL, rare escapes
-(e.g. poison / schema-change inject env, `sync.allow_fail` mid-window stops), and
+(e.g. typed SyncOptions CLI flags for poison / delay / fail-after / queue capacity,
+schema-change inject env for the DDL file bridge, `sync.allow_fail` mid-window stops), and
 correctness asserts. All selectable catalog Scenarios declare `product_path`.
 
 Optional `sync.allow_fail: true` keeps going after a non-zero sync exit so ops Scenarios

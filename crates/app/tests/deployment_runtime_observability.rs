@@ -19,8 +19,8 @@ use migraloop_platform_store::{
     Deployment, Pipeline, PlatformStore, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
 };
 use migraloop_runtime::{
-    assemble_observability_surface, render_prometheus_metrics, status_inventory, SyncHealth,
-    SyncInvocation,
+    assemble_observability_surface, render_prometheus_metrics, status_inventory, BackpressureOptions,
+    SyncHealth, SyncInvocation, SyncOptions,
 };
 use tempfile::TempDir;
 
@@ -163,9 +163,10 @@ async fn runtime_observability_assembly_sync_health_lags_and_matches_prometheus(
     std::env::set_var("MONGO_PASSWORD", "mongo-secret-value");
     std::env::set_var(CONTRACT_SOURCE_CATALOG_ENV, &doubles.catalog_path);
     std::env::set_var(INJECT_LOGMINER_CONTENTS_ENV, &doubles.logminer_path);
-    std::env::set_var("MIGRALOOP_SYNC_QUEUE_CAPACITY", "2");
-    std::env::set_var("MIGRALOOP_DELIVERY_DELAY_MS", "80");
-    std::env::set_var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "1");
+    // Typed SyncOptions — not process env fault injection (#180).
+    std::env::remove_var("MIGRALOOP_SYNC_QUEUE_CAPACITY");
+    std::env::remove_var("MIGRALOOP_DELIVERY_DELAY_MS");
+    std::env::remove_var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES");
 
     let store = PlatformStore::open(&url)
         .await
@@ -179,9 +180,17 @@ async fn runtime_observability_assembly_sync_health_lags_and_matches_prometheus(
         .await
         .expect("runtime apply");
 
+    let options = SyncOptions {
+        backpressure: BackpressureOptions {
+            queue_capacity: 2,
+            delivery_delay_ms: Some(80),
+        },
+        fail_after_changes: Some(1),
+        ..SyncOptions::default()
+    };
     let sync_result = tokio::time::timeout(
         Duration::from_secs(30),
-        migraloop_runtime::run_incremental_sync(&store, SyncInvocation::OneShot),
+        migraloop_runtime::run_incremental_sync(&store, SyncInvocation::OneShot, options),
     )
     .await
     .expect("sync should finish or fail within timeout");
