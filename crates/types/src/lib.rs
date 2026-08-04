@@ -21,14 +21,13 @@ pub fn output_identity_key(identity: &serde_json::Value) -> String {
     serde_json::to_string(identity).unwrap_or_else(|_| identity.to_string())
 }
 
-/// Shared Managed / Base column metadata (issue #171).
+/// Shared Managed / Base column metadata (issues #171 / #181).
 ///
 /// Source adapters map engine-specific type discovery into [`ColumnShape::data_type`].
-/// Existing Oracle-named column fields on store/delivery/source types remain during
-/// the expand–contract migration (#181 / #182); this shape is the domain default for
-/// Managed/Base column metadata. Table and column layouts still come from Source
-/// schema discovery for Pipeline-referenced tables — not a platform business schema
-/// catalog (ADR-0026).
+/// Runtime, Platform Store, Delivery, and transform consume this shape for Managed/Base
+/// column metadata; Oracle-named fields remain on store/delivery wire types until
+/// contract (#182). Table and column layouts still come from Source schema discovery
+/// for Pipeline-referenced tables — not a platform business schema catalog (ADR-0026).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnShape {
     pub name: String,

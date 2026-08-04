@@ -231,18 +231,13 @@ pub struct AffectAnalysis {
     pub next_maintenance_state: Option<MaintenanceStateBlob>,
 }
 
-/// Column metadata for Derived output schema inference (transform-owned).
+/// Column metadata for Derived output schema inference.
 ///
-/// Engine-agnostic at the transform seam: `data_type` / precision / scale are Source-driven
-/// metadata the runtime maps onto Platform Store column rows. Defaults for unresolved aliases
-/// use portable SQL-ish names (`NUMBER`, `VARCHAR2`) matching existing Base column conventions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputColumn {
-    pub name: String,
-    pub data_type: String,
-    pub precision: Option<i32>,
-    pub scale: Option<i32>,
-}
+/// Shared [`migraloop_types::ColumnShape`] so runtime stops remapping a near-identical
+/// struct (issue #181). `data_type` / precision / scale remain Source-driven metadata
+/// mapped onto Platform Store column rows — not a platform business catalog (ADR-0026).
+/// Defaults for unresolved aliases use portable SQL-ish names (`NUMBER`, `VARCHAR2`).
+pub type OutputColumn = migraloop_types::ColumnShape;
 
 /// Parse one declarative transform step JSON object into an analyzable operator.
 ///

@@ -38,7 +38,7 @@ use migraloop_transform::{
     evaluate_transform_with_bases, infer_derived_columns, initial_maintenance_state,
     parse_transform_steps, secondary_base_refs, MaintenanceStateBlob, OutputColumn, TransformOp,
 };
-use migraloop_types::{output_identity_key, resolve_secret_ref};
+use migraloop_types::{output_identity_key, resolve_secret_ref, ColumnShape};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -256,24 +256,16 @@ pub(crate) fn source_timezone_opt(deployment: &Deployment) -> Option<&str> {
 fn base_columns_from_source(columns: &[&SourceColumn]) -> Vec<BaseColumn> {
     columns
         .iter()
-        .map(|c| BaseColumn {
-            name: c.name.clone(),
-            oracle_type: c.oracle_type.clone(),
-            precision: c.precision,
-            scale: c.scale,
-        })
+        .map(|c| BaseColumn::from(c.column_shape()))
         .collect()
 }
 
 fn delivery_columns_from_base(columns: &[BaseColumn]) -> Vec<DeliveryColumn> {
     columns
         .iter()
-        .map(|c| DeliveryColumn {
-            name: c.name.clone(),
-            oracle_type: c.oracle_type.clone(),
-            precision: c.precision,
-            scale: c.scale,
-        })
+        .cloned()
+        .map(ColumnShape::from)
+        .map(DeliveryColumn::from)
         .collect()
 }
 
@@ -593,9 +585,12 @@ async fn run_chunked_initial_load(
                 .columns
                 .iter()
                 .filter(|c| !c.supported)
-                .map(|c| OmittedColumn {
-                    name: c.name.clone(),
-                    oracle_type: c.oracle_type.clone(),
+                .map(|c| {
+                    let shape = c.column_shape();
+                    OmittedColumn {
+                        name: shape.name,
+                        oracle_type: shape.data_type,
+                    }
                 })
                 .collect();
             supported_names = columns.iter().map(|c| c.name.clone()).collect();
@@ -1386,27 +1381,11 @@ pub(crate) async fn deliver_transform_pipeline_with_options<T: TargetEngine>(
 }
 
 fn to_output_columns(columns: &[BaseColumn]) -> Vec<OutputColumn> {
-    columns
-        .iter()
-        .map(|c| OutputColumn {
-            name: c.name.clone(),
-            data_type: c.oracle_type.clone(),
-            precision: c.precision,
-            scale: c.scale,
-        })
-        .collect()
+    columns.iter().cloned().map(ColumnShape::from).collect()
 }
 
 fn from_output_columns(columns: Vec<OutputColumn>) -> Vec<BaseColumn> {
-    columns
-        .into_iter()
-        .map(|c| BaseColumn {
-            name: c.name,
-            oracle_type: c.data_type,
-            precision: c.precision,
-            scale: c.scale,
-        })
-        .collect()
+    columns.into_iter().map(BaseColumn::from).collect()
 }
 
 /// Derived columns via the transform schema-inference interface (no TransformOp walk here).
