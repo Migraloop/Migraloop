@@ -4,10 +4,8 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use migraloop_platform_store::{
-    list_base_datasets, list_pipelines, list_quarantined_changes, list_schema_change_impacts,
-    probe_store_resources,
-};
+use migraloop_platform_store::probe_store_resources;
+use migraloop_runtime::status_inventory_from_url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -155,18 +153,21 @@ pub async fn serve_prometheus_metrics(
 }
 
 async fn render_prometheus_metrics(platform_store_url: &str) -> Result<String, String> {
-    let bases = list_base_datasets(platform_store_url)
+    let inventory = status_inventory_from_url(platform_store_url)
         .await
         .map_err(|err| err.to_string())?;
-    let pipelines = list_pipelines(platform_store_url)
-        .await
-        .map_err(|err| err.to_string())?;
-    let quarantines = list_quarantined_changes(platform_store_url, None)
-        .await
-        .map_err(|err| err.to_string())?;
-    let schema_impacts = list_schema_change_impacts(platform_store_url, None)
-        .await
-        .map_err(|err| err.to_string())?;
+    // Mirror prior metrics path: scrape durable lists when the store is reachable.
+    // Unreachable open failures yield empty lists via status_inventory_from_url.
+    if matches!(
+        inventory.health,
+        migraloop_platform_store::PlatformStoreHealth::Unreachable { .. }
+    ) {
+        return Err("Platform Store is unreachable".to_string());
+    }
+    let bases = inventory.bases;
+    let pipelines = inventory.pipelines;
+    let quarantines = inventory.quarantines;
+    let schema_impacts = inventory.schema_impacts;
 
     let mut out = String::new();
     out.push_str("# HELP migraloop_sync_lag Sync Health lag (pending Source changes not yet applied to Base).\n");

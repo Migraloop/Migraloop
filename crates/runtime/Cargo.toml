@@ -3,7 +3,7 @@ name = "migraloop-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Deployment runtime: apply, Initial Load, Direct/Transform Delivery, Incremental Sync, and Affect maintenance"
+description = "Deployment runtime: apply, Initial Load, Delivery, Incremental Sync, Affect, lifecycle, Align, Drift"
 
 [dependencies]
 migraloop-capture = { workspace = true }

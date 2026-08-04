@@ -5,29 +5,20 @@ mod lab;
 mod lab_scenario;
 mod observability;
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use lab::{run_lab, LabCommand};
-use migraloop_capture::{alignment_check_read_for_source, AlignmentCheckSample};
-use migraloop_delivery::{
-    list_target_documents, upsert_managed_documents, DeliveryDocument, ManagedFieldAs,
-};
+use migraloop_delivery::{list_target_documents, ManagedFieldAs};
 use migraloop_platform_store::{
-    check_store_settings, clear_schema_change_impacts, delete_base_datasets_not_in, delete_pipeline,
-    disk_warn_message, get_base_rows, get_derived_rows, health, list_base_datasets,
-    list_deployments, list_derived_datasets, list_pipelines, list_quarantined_changes,
-    list_schema_change_impacts, probe_store_resources, probe_store_settings, replace_base_dataset,
-    set_pipeline_paused, update_pipeline_drift_status, BaseDataset, Deployment, Pipeline,
-    PlatformStore, PlatformStoreHealth, SystemConnection,
+    check_store_settings, disk_warn_message, get_base_rows, get_derived_rows, list_deployments,
+    list_pipelines, probe_store_resources, Deployment, Pipeline, PlatformStore,
+    PlatformStoreHealth, SystemConnection,
 };
 use migraloop_runtime::{
-    deliver_direct_pipeline_with_options, deliver_transform_pipeline_with_options,
-    delivery_document_for_row, ensure_store_session_healthy, format_output_identity, identity_key,
-    mongo_target_from_deployment, oracle_source_connect, pipeline_base_table_refs,
-    pipeline_has_target, resolve_secret_value, source_timezone_opt, target_document_identity_key,
+    ensure_store_session_healthy, format_output_identity, mongo_target_from_deployment,
+    oracle_source_connect, status_inventory_from_url,
 };
 use thiserror::Error;
 
@@ -225,15 +216,6 @@ async fn apply_migrations(platform_store_url: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Reject absurdly low Platform Store settings (ADR-0010). Warn-only disk
-/// thresholds are handled separately and must not fail this check.
-async fn enforce_store_guardrails(platform_store_url: &str) -> Result<(), CliError> {
-    let settings = probe_store_settings(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    check_store_settings(&settings).map_err(|err| CliError::Failed(err.to_string()))
-}
-
 /// Surface free-disk warn threshold (warn only — never pauses Pipelines).
 async fn report_store_resource_warnings(platform_store_url: &str) -> Result<(), CliError> {
     let resources = probe_store_resources(platform_store_url)
@@ -408,48 +390,10 @@ async fn sync_incremental(platform_store_url: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Default Source Alignment Check read budget (resource gate; not a full slam).
-const DEFAULT_ALIGNMENT_MAX_ROWS: u32 = 1000;
-
-/// Default Drift Check identity budget (resource gate; not a full slam).
-const DEFAULT_DRIFT_MAX_ROWS: u32 = 1000;
-
-fn supported_row_projection(
-    row: &serde_json::Map<String, serde_json::Value>,
-    supported: &BTreeSet<String>,
-) -> serde_json::Map<String, serde_json::Value> {
-    row.iter()
-        .filter(|(name, _)| supported.contains(name.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
-fn base_identity_key(
-    row: &serde_json::Map<String, serde_json::Value>,
-    primary_key: &[String],
-) -> Option<String> {
-    if primary_key.is_empty() {
-        return None;
-    }
-    let mut parts = Vec::with_capacity(primary_key.len());
-    for col in primary_key {
-        let value = row.get(col)?;
-        parts.push(identity_key(value));
-    }
-    Some(parts.join("|"))
-}
-
-fn rows_equal_supported(
-    left: &serde_json::Map<String, serde_json::Value>,
-    right: &serde_json::Map<String, serde_json::Value>,
-    supported: &BTreeSet<String>,
-) -> bool {
-    for name in supported {
-        if left.get(name) != right.get(name) {
-            return false;
-        }
-    }
-    true
+async fn open_store(platform_store_url: &str) -> Result<PlatformStore, CliError> {
+    PlatformStore::open(platform_store_url)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))
 }
 
 async fn source_alignment_check(
@@ -458,215 +402,8 @@ async fn source_alignment_check(
     deployment: Option<&str>,
     max_rows: u32,
 ) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
-    let max_rows = if max_rows == 0 {
-        DEFAULT_ALIGNMENT_MAX_ROWS
-    } else {
-        max_rows
-    };
-
-    let deployments = list_deployments(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    if deployments.is_empty() {
-        return Err(CliError::Failed(
-            "no Deployments applied; run `migraloop apply` first".to_string(),
-        ));
-    }
-
-    let bases = list_base_datasets(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    let targets: Vec<BaseDataset> = bases
-        .into_iter()
-        .filter(|base| {
-            table
-                .map(|t| base.source_table.eq_ignore_ascii_case(t))
-                .unwrap_or(true)
-                && deployment
-                    .map(|d| base.deployment_name == d)
-                    .unwrap_or(true)
-        })
-        .collect();
-    if targets.is_empty() {
-        return Err(CliError::Failed(match (table, deployment) {
-            (Some(t), Some(d)) => {
-                format!("no Base Dataset found for table {t} in Deployment {d}")
-            }
-            (Some(t), None) => format!("no Base Dataset found for table {t}"),
-            (None, Some(d)) => format!("no Base Datasets found for Deployment {d}"),
-            (None, None) => "no Base Datasets found; run `migraloop apply` first".to_string(),
-        }));
-    }
-
-    for base in targets {
-        let deployment = deployments
-            .iter()
-            .find(|d| d.name == base.deployment_name)
-            .ok_or_else(|| {
-                CliError::Failed(format!(
-                    "Deployment {} missing for Base Dataset {}",
-                    base.deployment_name, base.source_table
-                ))
-            })?;
-        align_one_base(platform_store_url, deployment, &base, max_rows).await?;
-    }
-    Ok(())
-}
-
-async fn align_one_base(
-    platform_store_url: &str,
-    deployment: &Deployment,
-    base: &BaseDataset,
-    max_rows: u32,
-) -> Result<(), CliError> {
-    if base.primary_key.is_empty() {
-        return Err(CliError::Failed(format!(
-            "Base Dataset {} has no primary key for Source Alignment Check",
-            base.source_table
-        )));
-    }
-
-    let connect = oracle_source_connect(&deployment.source)?;
-    let password = resolve_secret_value(&deployment.source.password_ref, "source.password")?;
-    let configured_tz = source_timezone_opt(deployment);
-    let sample: AlignmentCheckSample = alignment_check_read_for_source(
-        &connect,
-        &password,
-        &base.source_schema,
-        &base.source_table,
-        max_rows,
-        configured_tz,
-    )
-    .map_err(|err| CliError::Failed(err.to_string()))?;
-
-    let (_, base_rows) = get_base_rows(
-        platform_store_url,
-        &base.source_table,
-        Some(&base.deployment_name),
-    )
-    .await
-    .map_err(|err| CliError::Failed(err.to_string()))?;
-
-    let supported: BTreeSet<String> = if base.columns.is_empty() {
-        sample
-            .columns
-            .iter()
-            .filter(|c| c.supported)
-            .map(|c| c.name.clone())
-            .collect()
-    } else {
-        base.columns.iter().map(|c| c.name.clone()).collect()
-    };
-
-    let mut base_by_id: BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
-        BTreeMap::new();
-    for row in &base_rows {
-        let Some(key) = base_identity_key(&row.data, &base.primary_key) else {
-            continue;
-        };
-        base_by_id.insert(key, row.data.clone());
-    }
-
-    let mut repaired: BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
-        BTreeMap::new();
-    let mut mismatched = 0i32;
-    let mut repaired_count = 0i32;
-    let mut checked_ids: BTreeSet<String> = BTreeSet::new();
-
-    for source_row in &sample.rows {
-        let source_as_map: serde_json::Map<String, serde_json::Value> = source_row
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let source_map = supported_row_projection(&source_as_map, &supported);
-        let Some(key) = base_identity_key(&source_map, &base.primary_key) else {
-            continue;
-        };
-        checked_ids.insert(key.clone());
-        match base_by_id.get(&key) {
-            Some(existing) if rows_equal_supported(existing, &source_map, &supported) => {
-                repaired.insert(key, existing.clone());
-            }
-            Some(_) | None => {
-                mismatched += 1;
-                repaired_count += 1;
-                repaired.insert(key, source_map);
-            }
-        }
-    }
-
-    // Rows outside the gated Source window: keep when truncated; drop when full read.
-    for (key, row) in &base_by_id {
-        if checked_ids.contains(key) {
-            continue;
-        }
-        if sample.truncated {
-            repaired.insert(key.clone(), row.clone());
-        } else {
-            mismatched += 1;
-            repaired_count += 1;
-            // Source no longer has this identity — remove from Base (never write Source).
-        }
-    }
-
-    let mut rows: Vec<serde_json::Map<String, serde_json::Value>> =
-        repaired.into_values().collect();
-    // Stable ordinal order by primary key for inspectability.
-    rows.sort_by(|a, b| {
-        let ka = base_identity_key(a, &base.primary_key).unwrap_or_default();
-        let kb = base_identity_key(b, &base.primary_key).unwrap_or_default();
-        ka.cmp(&kb)
-    });
-
-    let alignment_status = if sample.truncated {
-        "partial"
-    } else {
-        "aligned"
-    };
-    let checked = sample.rows.len() as i32;
-    let updated = BaseDataset {
-        deployment_name: base.deployment_name.clone(),
-        source_table: base.source_table.clone(),
-        source_schema: base.source_schema.clone(),
-        status: base.status.clone(),
-        primary_key: base.primary_key.clone(),
-        columns: base.columns.clone(),
-        omitted_columns: base.omitted_columns.clone(),
-        row_count: rows.len() as i32,
-        sync_applied_changes: base.sync_applied_changes,
-        sync_health: base.sync_health.clone(),
-        capture_low_watermark: base.capture_low_watermark,
-        capture_checkpoint: base.capture_checkpoint,
-        sync_lag: base.sync_lag,
-        source_alignment: alignment_status.to_string(),
-        source_alignment_checked_rows: checked,
-        source_alignment_mismatched_rows: mismatched,
-        initial_load_cursor: None,
-    };
-
-    replace_base_dataset(platform_store_url, &updated, &rows)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-
-    let truncated_note = if sample.truncated {
-        " truncated=true"
-    } else {
-        ""
-    };
-    let detect_status = if mismatched > 0 {
-        "misaligned"
-    } else if sample.truncated {
-        "partial"
-    } else {
-        "aligned"
-    };
-    println!(
-        "Source Alignment Check: {} status={detect_status} checked={checked} \
-         mismatched={mismatched} repaired={repaired_count} maxRows={max_rows}{truncated_note} \
-         (Base repaired from Source reads; Source not written)",
-        base.source_table
-    );
+    let store = open_store(platform_store_url).await?;
+    migraloop_runtime::source_alignment_check(&store, table, deployment, max_rows).await?;
     Ok(())
 }
 
@@ -676,351 +413,39 @@ async fn drift_check(
     deployment: Option<&str>,
     max_rows: u32,
 ) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
-    let max_rows = if max_rows == 0 {
-        DEFAULT_DRIFT_MAX_ROWS
-    } else {
-        max_rows
-    };
-
-    let deployments = list_deployments(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    if deployments.is_empty() {
-        return Err(CliError::Failed(
-            "no Deployments applied; run `migraloop apply` first".to_string(),
-        ));
-    }
-
-    let pipelines = list_pipelines(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    let targets: Vec<Pipeline> = pipelines
-        .into_iter()
-        .filter(|p| {
-            pipeline_has_target(p)
-                && pipeline_name.map(|n| p.name == n).unwrap_or(true)
-                && deployment.map(|d| p.deployment_name == d).unwrap_or(true)
-        })
-        .collect();
-    if targets.is_empty() {
-        return Err(CliError::Failed(match (pipeline_name, deployment) {
-            (Some(n), Some(d)) => {
-                format!("no Pipeline with Target Binding named {n} in Deployment {d}")
-            }
-            (Some(n), None) => format!("no Pipeline with Target Binding named {n}"),
-            (None, Some(d)) => {
-                format!("no Pipelines with Target Binding found for Deployment {d}")
-            }
-            (None, None) => {
-                "no Pipelines with Target Binding found; run `migraloop apply` first".to_string()
-            }
-        }));
-    }
-
-    for pipeline in targets {
-        let deployment = deployments
-            .iter()
-            .find(|d| d.name == pipeline.deployment_name)
-            .ok_or_else(|| {
-                CliError::Failed(format!(
-                    "Deployment {} missing for Pipeline {}",
-                    pipeline.deployment_name, pipeline.name
-                ))
-            })?;
-        drift_one_pipeline(platform_store_url, deployment, &pipeline, max_rows).await?;
-    }
+    let store = open_store(platform_store_url).await?;
+    migraloop_runtime::drift_check(&store, pipeline_name, deployment, max_rows).await?;
     Ok(())
-}
-
-async fn drift_one_pipeline(
-    platform_store_url: &str,
-    deployment: &Deployment,
-    pipeline: &Pipeline,
-    max_rows: u32,
-) -> Result<(), CliError> {
-    ensure_drift_baseline_ready(platform_store_url, pipeline).await?;
-
-    let mongo = mongo_target_from_deployment(deployment)?;
-    let (expected_docs, truncated) =
-        expected_delivery_documents_for_drift(platform_store_url, pipeline, max_rows).await?;
-
-    let target_docs = list_target_documents(&mongo, &pipeline.target_collection)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    let mut target_by_id: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    for doc in target_docs {
-        if let Some(key) = target_document_identity_key(&doc) {
-            target_by_id.insert(key, doc);
-        }
-    }
-
-    let mut mismatched = 0i32;
-    let mut repaired_count = 0i32;
-    let mut repair_docs: Vec<DeliveryDocument> = Vec::new();
-
-    for expected in &expected_docs {
-        let key = identity_key(&expected.identity);
-        let managed_keys: Vec<&str> = expected.managed_fields.keys().map(|k| k.as_str()).collect();
-        let drifted = match target_by_id.get(&key) {
-            Some(target_doc) => {
-                !managed_fields_match_target(target_doc, &expected.managed_fields, &managed_keys)
-            }
-            None => true,
-        };
-        if drifted {
-            mismatched += 1;
-            repaired_count += 1;
-            repair_docs.push(expected.clone());
-        }
-    }
-
-    if !repair_docs.is_empty() {
-        upsert_managed_documents(&mongo, &pipeline.target_collection, &repair_docs)
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-    }
-
-    let checked = expected_docs.len() as i32;
-    let drift_status = if truncated { "partial" } else { "ok" };
-    update_pipeline_drift_status(
-        platform_store_url,
-        &pipeline.deployment_name,
-        &pipeline.name,
-        drift_status,
-        checked,
-        mismatched,
-    )
-    .await
-    .map_err(|err| CliError::Failed(err.to_string()))?;
-
-    let truncated_note = if truncated { " truncated=true" } else { "" };
-    let detect_status = if mismatched > 0 {
-        "drifted"
-    } else if truncated {
-        "partial"
-    } else {
-        "ok"
-    };
-    println!(
-        "Drift Check: Pipeline {} status={detect_status} checked={checked} \
-         mismatched={mismatched} repaired={repaired_count} maxRows={max_rows}{truncated_note} \
-         (Managed fields auto-repaired; non-Managed Target fields ignored)",
-        pipeline.name
-    );
-    Ok(())
-}
-
-async fn ensure_drift_baseline_ready(
-    platform_store_url: &str,
-    pipeline: &Pipeline,
-) -> Result<(), CliError> {
-    match pipeline.mode.as_str() {
-        "direct" => {
-            let bases = list_base_datasets(platform_store_url)
-                .await
-                .map_err(|err| CliError::Failed(err.to_string()))?;
-            let base = bases
-                .iter()
-                .find(|b| {
-                    b.deployment_name == pipeline.deployment_name
-                        && b.source_table.eq_ignore_ascii_case(&pipeline.source_table)
-                })
-                .ok_or_else(|| {
-                    CliError::Failed(format!(
-                        "no Base Dataset for Pipeline {} source table {}",
-                        pipeline.name, pipeline.source_table
-                    ))
-                })?;
-            if base.source_alignment == "unknown" {
-                return Err(CliError::Failed(format!(
-                    "Drift Check refuses Pipeline {}: Base {} Source Alignment is unknown; \
-                     run `migraloop align --table {}` first so Base is a trusted Drift baseline",
-                    pipeline.name, base.source_table, base.source_table
-                )));
-            }
-            Ok(())
-        }
-        "transform" => {
-            let derived = list_derived_datasets(platform_store_url)
-                .await
-                .map_err(|err| CliError::Failed(err.to_string()))?;
-            let dataset = derived.iter().find(|d| {
-                d.deployment_name == pipeline.deployment_name && d.pipeline_name == pipeline.name
-            });
-            match dataset {
-                Some(d) if !d.status.is_empty() => Ok(()),
-                _ => Err(CliError::Failed(format!(
-                    "Drift Check refuses Pipeline {}: Derived Dataset not materialized yet",
-                    pipeline.name
-                ))),
-            }
-        }
-        other => Err(CliError::Failed(format!(
-            "unsupported pipeline.mode {other:?} for Drift Check"
-        ))),
-    }
-}
-
-async fn expected_delivery_documents_for_drift(
-    platform_store_url: &str,
-    pipeline: &Pipeline,
-    max_rows: u32,
-) -> Result<(Vec<DeliveryDocument>, bool), CliError> {
-    let mut documents = match pipeline.mode.as_str() {
-        "direct" => {
-            let (dataset, rows) = get_base_rows(
-                platform_store_url,
-                &pipeline.source_table,
-                Some(&pipeline.deployment_name),
-            )
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-            if dataset.primary_key.is_empty() {
-                return Err(CliError::Failed(format!(
-                    "Base Dataset {} has no primary key for Drift Check Output Identity",
-                    pipeline.source_table
-                )));
-            }
-            // Drift reads the platform expected dataset only — no extra Source load
-            // (alignment already established the Base baseline).
-            let mut docs = Vec::with_capacity(rows.len());
-            for row in &rows {
-                docs.push(delivery_document_for_row(
-                    &row.data,
-                    &dataset.primary_key,
-                    &dataset.columns,
-                    pipeline,
-                )?);
-            }
-            docs
-        }
-        "transform" => {
-            if pipeline.output_identity.is_empty() {
-                return Err(CliError::Failed(format!(
-                    "Transform Pipeline {} requires outputIdentity for Drift Check",
-                    pipeline.name
-                )));
-            }
-            let (dataset, rows) = get_derived_rows(
-                platform_store_url,
-                &pipeline.name,
-                Some(&pipeline.deployment_name),
-            )
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-            let mut docs = Vec::with_capacity(rows.len());
-            for row in &rows {
-                docs.push(delivery_document_for_row(
-                    &row.data,
-                    &dataset.output_identity,
-                    &dataset.columns,
-                    pipeline,
-                )?);
-            }
-            docs
-        }
-        other => {
-            return Err(CliError::Failed(format!(
-                "unsupported pipeline.mode {other:?} for Drift Check"
-            )));
-        }
-    };
-
-    documents.sort_by(|a, b| identity_key(&a.identity).cmp(&identity_key(&b.identity)));
-    let truncated = documents.len() > max_rows as usize;
-    if truncated {
-        documents.truncate(max_rows as usize);
-    }
-    Ok((documents, truncated))
-}
-
-/// Compare Managed fields on a Target document to the platform expected map.
-/// Non-Managed Target keys are ignored.
-fn managed_fields_match_target(
-    target_doc: &serde_json::Value,
-    expected_managed: &serde_json::Map<String, serde_json::Value>,
-    managed_keys: &[&str],
-) -> bool {
-    for key in managed_keys {
-        let expected = expected_managed.get(*key);
-        let actual = target_doc.get(*key);
-        match (expected, actual) {
-            (Some(exp), Some(act)) if json_values_equal_for_drift(exp, act) => {}
-            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => return false,
-            (None, None) => {}
-        }
-    }
-    true
-}
-
-fn json_values_equal_for_drift(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    let left_n = normalize_json_for_drift(left);
-    let right_n = normalize_json_for_drift(right);
-    left_n == right_n
-}
-
-fn normalize_json_for_drift(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(n) = map.get("$numberLong").and_then(|v| v.as_str()) {
-                if let Ok(parsed) = n.parse::<i64>() {
-                    return serde_json::Value::Number(parsed.into());
-                }
-            }
-            if let Some(n) = map.get("$numberInt").and_then(|v| v.as_str()) {
-                if let Ok(parsed) = n.parse::<i64>() {
-                    return serde_json::Value::Number(parsed.into());
-                }
-            }
-            if let Some(n) = map.get("$numberDouble").and_then(|v| v.as_str()) {
-                if let Ok(parsed) = n.parse::<f64>() {
-                    if let Some(num) = serde_json::Number::from_f64(parsed) {
-                        return serde_json::Value::Number(num);
-                    }
-                }
-            }
-            if let Some(n) = map.get("$numberDecimal").and_then(|v| v.as_str()) {
-                return serde_json::Value::String(n.to_string());
-            }
-            if let Some(d) = map.get("$date") {
-                return normalize_json_for_drift(d);
-            }
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                out.insert(k.clone(), normalize_json_for_drift(v));
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_json::Value::Number(i.into())
-            } else if let Some(u) = n.as_u64() {
-                serde_json::Value::Number(u.into())
-            } else {
-                value.clone()
-            }
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(normalize_json_for_drift).collect())
-        }
-        other => other.clone(),
-    }
 }
 
 async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
-    match health(platform_store_url).await {
+    let inventory = status_inventory_from_url(platform_store_url).await?;
+
+    match &inventory.health {
         PlatformStoreHealth::Healthy { schema_version } => {
-            // Reject absurd settings even when migrations are present.
-            if let Err(err) = enforce_store_guardrails(platform_store_url).await {
+            if let Some(err) = &inventory.guardrail_error {
                 println!("Platform Store: unhealthy");
                 eprintln!("{err}");
-                return Err(err);
+                return Err(CliError::Failed(err.clone()));
             }
             println!("Platform Store: healthy");
             println!("Schema version: {schema_version}");
             // Warn-only: free-disk pressure must not flip health or pause Pipelines.
-            report_store_resource_warnings(platform_store_url).await?;
+            if let Some(free) = inventory.disk_warn_free_bytes {
+                let msg = disk_warn_message(free);
+                println!("{msg}");
+                emit_event(
+                    "platform_store_disk_warn",
+                    &[
+                        ("free_disk_bytes", EventValue::from(free as i64)),
+                        (
+                            "warn_threshold_bytes",
+                            EventValue::from(migraloop_platform_store::DISK_FREE_WARN_BYTES as i64),
+                        ),
+                        ("auto_pause", EventValue::from(false)),
+                    ],
+                );
+            }
         }
         PlatformStoreHealth::Unhealthy { reason } => {
             println!("Platform Store: unhealthy");
@@ -1038,14 +463,11 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
-    let deployments = list_deployments(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-
+    let deployments = &inventory.deployments;
     if deployments.is_empty() {
         println!("Deployment: (none)");
     } else {
-        for deployment in &deployments {
+        for deployment in deployments {
             println!("Deployment: {}", deployment.name);
             println!("{}", format_system_line("Source", &deployment.source));
             println!("{}", format_system_line("Target", &deployment.target));
@@ -1061,13 +483,11 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
-    let pipelines = list_pipelines(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let pipelines = &inventory.pipelines;
     if pipelines.is_empty() {
         println!("Pipeline: (none)");
     } else {
-        for pipeline in &pipelines {
+        for pipeline in pipelines {
             let pause_note = if pipeline.paused { " paused" } else { "" };
             if pipeline.target_collection.is_empty() {
                 println!(
@@ -1087,13 +507,11 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
-    let bases = list_base_datasets(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let bases = &inventory.bases;
     if bases.is_empty() {
         println!("Base Dataset: (none)");
     } else {
-        for base in &bases {
+        for base in bases {
             let columns = base
                 .columns
                 .iter()
@@ -1160,13 +578,11 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
-    let derived = list_derived_datasets(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let derived = &inventory.derived;
     if derived.is_empty() {
         println!("Derived Dataset: (none)");
     } else {
-        for dataset in &derived {
+        for dataset in derived {
             let columns = dataset
                 .columns
                 .iter()
@@ -1181,14 +597,10 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
-    let quarantines = list_quarantined_changes(platform_store_url, None)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    let schema_impacts = list_schema_change_impacts(platform_store_url, None)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let quarantines = &inventory.quarantines;
+    let schema_impacts = &inventory.schema_impacts;
 
-    for pipeline in &pipelines {
+    for pipeline in pipelines {
         if pipeline.target_collection.is_empty() {
             continue;
         }
@@ -1261,7 +673,7 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     if quarantines.is_empty() {
         println!("Quarantine: (none)");
     } else {
-        for q in &quarantines {
+        for q in quarantines {
             let identity = format_output_identity(&q.output_identity);
             println!(
                 "  Quarantine: Pipeline={} identity={} change_id={} stage={} attempts={} \
@@ -1274,7 +686,7 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     if schema_impacts.is_empty() {
         println!("Schema Change: (none)");
     } else {
-        for s in &schema_impacts {
+        for s in schema_impacts {
             println!(
                 "  Schema Change: Pipeline={} impact={} change_id={} table={} ddl={} status={}",
                 s.pipeline_name, s.impact, s.change_id, s.source_table, s.ddl_summary, s.status
@@ -1447,70 +859,13 @@ async fn print_target(
     Ok(())
 }
 
-async fn resolve_named_pipeline(
-    platform_store_url: &str,
-    pipeline_name: &str,
-    deployment_name: Option<&str>,
-) -> Result<Pipeline, CliError> {
-    let pipelines = list_pipelines(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    let matching: Vec<_> = pipelines
-        .into_iter()
-        .filter(|p| {
-            p.name == pipeline_name
-                && deployment_name
-                    .map(|name| p.deployment_name == name)
-                    .unwrap_or(true)
-        })
-        .collect();
-    match matching.as_slice() {
-        [] => Err(CliError::Failed(format!(
-            "Pipeline {pipeline_name} not found{}",
-            deployment_name
-                .map(|d| format!(" in Deployment {d}"))
-                .unwrap_or_default()
-        ))),
-        [only] => Ok(only.clone()),
-        many => Err(CliError::Failed(format!(
-            "multiple Pipelines named {pipeline_name} across Deployments {}; \
-             pass --deployment to disambiguate",
-            many.iter()
-                .map(|p| p.deployment_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
-    }
-}
-
 async fn pause_pipeline_command(
     platform_store_url: &str,
     pipeline_name: &str,
     deployment_name: Option<&str>,
 ) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
-    let pipeline =
-        resolve_named_pipeline(platform_store_url, pipeline_name, deployment_name).await?;
-    if pipeline.paused {
-        println!(
-            "Pipeline {} already paused (Deployment {})",
-            pipeline.name, pipeline.deployment_name
-        );
-        return Ok(());
-    }
-    set_pipeline_paused(
-        platform_store_url,
-        &pipeline.deployment_name,
-        &pipeline.name,
-        true,
-    )
-    .await
-    .map_err(|err| CliError::Failed(err.to_string()))?;
-    println!(
-        "Pipeline {} paused (Deployment {}) — Delivery/processing stopped; \
-         durable Base/checkpoint state retained",
-        pipeline.name, pipeline.deployment_name
-    );
+    let store = open_store(platform_store_url).await?;
+    migraloop_runtime::pause_pipeline(&store, pipeline_name, deployment_name).await?;
     Ok(())
 }
 
@@ -1519,79 +874,8 @@ async fn resume_pipeline_command(
     pipeline_name: &str,
     deployment_name: Option<&str>,
 ) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
-    let pipeline =
-        resolve_named_pipeline(platform_store_url, pipeline_name, deployment_name).await?;
-    if !pipeline.paused {
-        println!(
-            "Pipeline {} is not paused (Deployment {})",
-            pipeline.name, pipeline.deployment_name
-        );
-        return Ok(());
-    }
-
-    set_pipeline_paused(
-        platform_store_url,
-        &pipeline.deployment_name,
-        &pipeline.name,
-        false,
-    )
-    .await
-    .map_err(|err| CliError::Failed(err.to_string()))?;
-    clear_schema_change_impacts(
-        platform_store_url,
-        &pipeline.deployment_name,
-        &pipeline.name,
-    )
-    .await
-    .map_err(|err| CliError::Failed(err.to_string()))?;
-
-    let deployments = list_deployments(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-    let deployment = deployments
-        .into_iter()
-        .find(|d| d.name == pipeline.deployment_name)
-        .ok_or_else(|| {
-            CliError::Failed(format!(
-                "Deployment {} not found for Pipeline resume",
-                pipeline.deployment_name
-            ))
-        })?;
-
-    // Catch up Delivery from durable Base/Derived state accumulated while paused.
-    if pipeline_has_target(&pipeline) {
-        let store = PlatformStore::open(platform_store_url)
-            .await
-            .map_err(|err| CliError::Failed(err.to_string()))?;
-        let mongo = mongo_target_from_deployment(&deployment)?;
-        match pipeline.mode.as_str() {
-            "direct" => {
-                deliver_direct_pipeline_with_options(&store, &deployment, &pipeline, &mongo, true)
-                    .await?;
-            }
-            "transform" => {
-                deliver_transform_pipeline_with_options(
-                    &store,
-                    &deployment,
-                    &pipeline,
-                    &mongo,
-                    true,
-                )
-                .await?;
-            }
-            other => {
-                return Err(CliError::Failed(format!(
-                    "unsupported pipeline.mode {other:?} for resume catch-up Delivery"
-                )));
-            }
-        }
-    }
-
-    println!(
-        "Pipeline {} resumed (Deployment {}) — Delivery continues from durable state",
-        pipeline.name, pipeline.deployment_name
-    );
+    let store = open_store(platform_store_url).await?;
+    migraloop_runtime::resume_pipeline(&store, pipeline_name, deployment_name).await?;
     Ok(())
 }
 
@@ -1600,42 +884,8 @@ async fn remove_pipeline_command(
     pipeline_name: &str,
     deployment_name: Option<&str>,
 ) -> Result<(), CliError> {
-    ensure_store_healthy(platform_store_url).await?;
-    let pipeline =
-        resolve_named_pipeline(platform_store_url, pipeline_name, deployment_name).await?;
-
-    delete_pipeline(
-        platform_store_url,
-        &pipeline.deployment_name,
-        &pipeline.name,
-    )
-    .await
-    .map_err(|err| CliError::Failed(err.to_string()))?;
-
-    // Keep Shared Bases still referenced by remaining Pipelines; prune only tables
-    // no longer referenced (same capture-scope rule as apply — ADR-0019 / ADR-0007).
-    let remaining = list_pipelines(platform_store_url)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?
-        .into_iter()
-        .filter(|p| p.deployment_name == pipeline.deployment_name)
-        .collect::<Vec<_>>();
-    let mut keep = BTreeSet::new();
-    for remaining_pipeline in &remaining {
-        for (schema, table) in pipeline_base_table_refs(remaining_pipeline) {
-            keep.insert((schema, table));
-        }
-    }
-    let keep_tables: Vec<(String, String)> = keep.into_iter().collect();
-    delete_base_datasets_not_in(platform_store_url, &pipeline.deployment_name, &keep_tables)
-        .await
-        .map_err(|err| CliError::Failed(err.to_string()))?;
-
-    println!(
-        "Pipeline {} removed (Deployment {}) — Delivery/processing stopped; \
-         Shared Base Datasets kept when still referenced",
-        pipeline.name, pipeline.deployment_name
-    );
+    let store = open_store(platform_store_url).await?;
+    migraloop_runtime::remove_pipeline(&store, pipeline_name, deployment_name).await?;
     Ok(())
 }
 
