@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use migraloop_platform_store::{probe_store_resources, PlatformStore};
-use migraloop_runtime::status_inventory;
+use migraloop_platform_store::probe_store_resources;
+use migraloop_runtime::status_inventory_from_url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -153,12 +153,16 @@ pub async fn serve_prometheus_metrics(
 }
 
 async fn render_prometheus_metrics(platform_store_url: &str) -> Result<String, String> {
-    let store = PlatformStore::open(platform_store_url)
+    let inventory = status_inventory_from_url(platform_store_url)
         .await
         .map_err(|err| err.to_string())?;
-    let inventory = status_inventory(&store)
-        .await
-        .map_err(|err| err.to_string())?;
+    if !matches!(
+        inventory.health,
+        migraloop_platform_store::PlatformStoreHealth::Healthy { .. }
+    ) || inventory.guardrail_error.is_some()
+    {
+        return Err("Platform Store is not healthy".to_string());
+    }
     let bases = inventory.bases;
     let pipelines = inventory.pipelines;
     let quarantines = inventory.quarantines;

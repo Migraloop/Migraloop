@@ -48,6 +48,32 @@ pub struct StatusInventory {
     pub schema_impacts: Vec<SchemaChangeImpact>,
 }
 
+/// Load status inventory from a Platform Store URL.
+///
+/// Open failures map to [`PlatformStoreHealth::Unreachable`] (same Operator-visible
+/// contract as the former CLI `health` path) so `status` can print without the
+/// clap adapter owning store CRUD.
+pub async fn status_inventory_from_url(
+    database_url: &str,
+) -> Result<StatusInventory, RuntimeError> {
+    match PlatformStore::open(database_url).await {
+        Ok(store) => status_inventory(&store).await,
+        Err(err) => Ok(StatusInventory {
+            health: PlatformStoreHealth::Unreachable {
+                reason: err.to_string(),
+            },
+            guardrail_error: None,
+            disk_warn_free_bytes: None,
+            deployments: Vec::new(),
+            pipelines: Vec::new(),
+            bases: Vec::new(),
+            derived: Vec::new(),
+            quarantines: Vec::new(),
+            schema_impacts: Vec::new(),
+        }),
+    }
+}
+
 /// Load status inventory through one Platform Store session.
 ///
 /// When the store is healthy, settings guardrails are checked (recorded on the

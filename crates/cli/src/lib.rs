@@ -18,7 +18,7 @@ use migraloop_platform_store::{
 };
 use migraloop_runtime::{
     ensure_store_session_healthy, format_output_identity, mongo_target_from_deployment,
-    oracle_source_connect, status_inventory,
+    oracle_source_connect, status_inventory_from_url,
 };
 use thiserror::Error;
 
@@ -419,8 +419,7 @@ async fn drift_check(
 }
 
 async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
-    let store = open_store(platform_store_url).await?;
-    let inventory = status_inventory(&store).await?;
+    let inventory = status_inventory_from_url(platform_store_url).await?;
 
     match &inventory.health {
         PlatformStoreHealth::Healthy { schema_version } => {
