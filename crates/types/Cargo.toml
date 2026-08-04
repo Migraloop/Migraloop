@@ -3,11 +3,9 @@ name = "migraloop-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared TLS, Managed-field mapping, and secret-reference types for the apply path"
+description = "Shared TLS, Managed-field mapping, secret-reference, and Output Identity key types"
 
 [dependencies]
 serde = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
+thiserror = { workspace = true }

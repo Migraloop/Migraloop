@@ -24,7 +24,7 @@ use migraloop_transform::{
     evaluate_transform_with_bases, infer_derived_columns, initial_maintenance_state,
     parse_transform_steps, secondary_base_refs, MaintenanceStateBlob, OutputColumn, TransformOp,
 };
-use migraloop_types::resolve_secret_ref;
+use migraloop_types::{output_identity_key, resolve_secret_ref};
 use thiserror::Error;
 
 mod engines;
@@ -36,7 +36,8 @@ pub use engines::deliver_initial_load_chunk_via_engines;
 pub use observability::{emit_event, EventValue};
 
 pub use incremental::{
-    apply_change_events_to_base_rows, format_output_identity, run_incremental_sync,
+    apply_change_events_to_base_rows, format_output_identity,
+    output_identity_matches_poison_keys, run_incremental_sync,
     run_incremental_sync_with_engines, run_continuous_incremental_sync,
     supervise_continuous_incremental_sync, sync_incremental, SyncCycleOutcome, SyncInvocation,
 };
@@ -1201,7 +1202,7 @@ pub async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
 }
 
 pub fn identity_key(identity: &serde_json::Value) -> String {
-    serde_json::to_string(identity).unwrap_or_else(|_| identity.to_string())
+    output_identity_key(identity)
 }
 
 pub fn target_document_identity_key(document: &serde_json::Value) -> Option<String> {

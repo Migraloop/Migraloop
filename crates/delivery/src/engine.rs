@@ -85,8 +85,9 @@ impl FakeTarget {
         Self::default()
     }
 
-    fn identity_key(identity: &Value) -> Result<String, DeliveryError> {
-        serde_json::to_string(identity).map_err(|err| DeliveryError::Identity(err.to_string()))
+    fn identity_key(identity: &Value) -> String {
+        // Shared Output Identity key (issue #170) — same encoding as poison / Drift.
+        migraloop_types::output_identity_key(identity)
     }
 }
 
@@ -103,7 +104,7 @@ impl TargetEngine for FakeTarget {
         let coll = guard.entry(collection.to_string()).or_default();
         let mut delivered = 0usize;
         for doc_row in documents {
-            let key = Self::identity_key(&doc_row.identity)?;
+            let key = Self::identity_key(&doc_row.identity);
             let entry = coll.entry(key).or_insert_with(serde_json::Map::new);
             // Document semantics: never clear non-Managed keys; only write Managed.
             for (field, value) in &doc_row.managed_fields {
@@ -135,7 +136,7 @@ impl TargetEngine for FakeTarget {
         };
         let mut deleted = 0usize;
         for identity in identities {
-            let key = Self::identity_key(identity)?;
+            let key = Self::identity_key(identity);
             if coll.remove(&key).is_some() {
                 deleted += 1;
             }
