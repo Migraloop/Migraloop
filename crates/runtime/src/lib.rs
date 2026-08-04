@@ -45,10 +45,10 @@ mod incremental;
 mod lifecycle;
 
 pub use observability::{
-    assemble_observability_surface, derive_delivery_health, derive_sync_health, emit_event,
-    render_prometheus_metrics, sync_health_label_for_progress, BaseSyncObservation, DeliveryHealth,
-    EventValue, ObservabilitySurface, PipelineDeliveryObservation, SyncHealth,
+    assemble_observability_surface, emit_event, render_prometheus_metrics, BaseSyncObservation,
+    DeliveryHealth, EventValue, ObservabilitySurface, PipelineDeliveryObservation, SyncHealth,
 };
+pub(crate) use observability::sync_health_label_for_progress;
 
 pub use incremental::{
     run_incremental_sync, run_incremental_sync_with_engines, run_continuous_incremental_sync,

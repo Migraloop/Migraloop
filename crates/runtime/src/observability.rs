@@ -176,9 +176,9 @@ pub fn assemble_observability_surface(inventory: &StatusInventory) -> Observabil
 }
 
 /// Derive Sync Health from lag / progress / durable failure — beyond `unknown`/`ok`.
-pub fn derive_sync_health(base: &BaseDataset) -> SyncHealth {
+pub(crate) fn derive_sync_health(base: &BaseDataset) -> SyncHealth {
     let stored = base.sync_health.as_str();
-    if stored.eq_ignore_ascii_case("failed") || stored.eq_ignore_ascii_case("unhealthy") {
+    if stored.eq_ignore_ascii_case("failed") {
         return SyncHealth::Failed;
     }
     if base.sync_lag > 0 {
@@ -198,7 +198,7 @@ pub fn derive_sync_health(base: &BaseDataset) -> SyncHealth {
 }
 
 /// Derive Delivery Health from pause / quarantine / delivery_status.
-pub fn derive_delivery_health(
+pub(crate) fn derive_delivery_health(
     pipeline: &Pipeline,
     active_quarantines_for_pipeline: usize,
 ) -> DeliveryHealth {
@@ -216,12 +216,17 @@ pub fn derive_delivery_health(
 }
 
 /// Persistable Sync Health label for Incremental progress writes.
-pub fn sync_health_label_for_progress(sync_lag: i32) -> &'static str {
+pub(crate) fn sync_health_label_for_progress(sync_lag: i32) -> &'static str {
     if sync_lag > 0 {
         SyncHealth::Lagging.as_str()
     } else {
         SyncHealth::Ok.as_str()
     }
+}
+
+/// Persistable Sync Health label for durable capture/apply failure.
+pub(crate) fn sync_health_label_failed() -> &'static str {
+    SyncHealth::Failed.as_str()
 }
 
 /// Prometheus text exposition derived from the same Observability assembly as `status`.
@@ -511,6 +516,11 @@ mod tests {
     fn sync_health_failed_from_durable_failure_label() {
         assert_eq!(
             derive_sync_health(&empty_base("failed", 0, 2)),
+            SyncHealth::Failed
+        );
+        // Failure wins over lag so Operators see the durable apply fault.
+        assert_eq!(
+            derive_sync_health(&empty_base("failed", 9, 2)),
             SyncHealth::Failed
         );
     }

@@ -572,29 +572,20 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                     println!("  Cutover: low-watermark=(missing)");
                 }
             }
-            let sync_obs = surface.sync.iter().find(|s| {
-                s.deployment_name == base.deployment_name && s.source_table == base.source_table
-            });
-            let (health_label, applied, lag, checkpoint) = match sync_obs {
-                Some(obs) => (
-                    obs.health.as_str(),
-                    obs.applied_changes,
-                    obs.lag,
-                    obs.checkpoint,
-                ),
-                None => (
-                    base.sync_health.as_str(),
-                    base.sync_applied_changes,
-                    base.sync_lag,
-                    base.capture_checkpoint,
-                ),
-            };
+            let sync_obs = surface
+                .sync
+                .iter()
+                .find(|s| {
+                    s.deployment_name == base.deployment_name && s.source_table == base.source_table
+                })
+                .expect("Observability assembly must cover every Base Dataset in inventory");
             println!(
                 "  Sync Health: {} appliedChanges={} lag={} checkpoint={}",
-                health_label,
-                applied,
-                lag,
-                checkpoint
+                sync_obs.health.as_str(),
+                sync_obs.applied_changes,
+                sync_obs.lag,
+                sync_obs
+                    .checkpoint
                     .map(|cp| cp.to_string())
                     .unwrap_or_else(|| "(none)".to_string())
             );
@@ -633,19 +624,18 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         if pipeline.target_collection.is_empty() {
             continue;
         }
-        let delivery_obs = surface.delivery.iter().find(|d| {
-            d.deployment_name == pipeline.deployment_name && d.pipeline_name == pipeline.name
-        });
-        let (delivery_health, applied, lag, quarantined, schema_blocking) = match delivery_obs {
-            Some(obs) => (
-                obs.health.as_str(),
-                obs.applied_changes,
-                obs.lag,
-                obs.quarantined,
-                obs.schema_blocking,
-            ),
-            None => ("unknown", pipeline.delivery_applied_changes, pipeline.delivery_lag, 0, 0),
-        };
+        let delivery_obs = surface
+            .delivery
+            .iter()
+            .find(|d| {
+                d.deployment_name == pipeline.deployment_name && d.pipeline_name == pipeline.name
+            })
+            .expect("Observability assembly must cover every Target-bound Pipeline");
+        let delivery_health = delivery_obs.health.as_str();
+        let applied = delivery_obs.applied_changes;
+        let lag = delivery_obs.lag;
+        let quarantined = delivery_obs.quarantined;
+        let schema_blocking = delivery_obs.schema_blocking;
         let status_label = if pipeline.paused {
             format!("{} (paused)", pipeline.delivery_status)
         } else {

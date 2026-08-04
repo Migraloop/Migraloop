@@ -1447,13 +1447,28 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                 .find(|row| row_matches_identity(row, &change.identity))
                                 .cloned();
 
-                            apply_change_events_to_base_rows(
+                            if let Err(err) = apply_change_events_to_base_rows(
                                 &mut rows,
                                 std::slice::from_ref(change),
                                 &supported_names,
                                 &source_columns,
                                 configured_tz,
-                            )?;
+                            ) {
+                                // Durable failure signal for Observability Surface (#174).
+                                // Keep backlog lag visible; do not advance checkpoint.
+                                let mut failed = base_with_sync_progress(
+                                    &dataset,
+                                    dataset.status.clone(),
+                                    rows.len() as i32,
+                                    sync_applied,
+                                    dataset.capture_checkpoint,
+                                    lag.max(1),
+                                );
+                                failed.sync_health =
+                                    crate::observability::sync_health_label_failed().to_string();
+                                let _ = store.replace_base_dataset(&failed, &rows).await;
+                                return Err(err);
+                            }
 
                             // Delivery before durable checkpoint so retries prefer duplicate applies.
                             // Collect next Maintenance State blobs and persist only after Base/checkpoint.
