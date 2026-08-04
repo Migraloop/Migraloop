@@ -1,6 +1,10 @@
 //! Pipeline lifecycle (pause / resume / remove), Source Alignment Check, Drift Check,
 //! and status inventory reads (issue #155 / ADR-0007).
 //!
+//! Source Alignment Check and Drift Check stay distinct Operator verbs. Shared
+//! budget / field-subset equality / mismatch-collect helpers live in
+//! [`crate::verify_repair`] (issue #183) so isomorphic internals are fixed once.
+//!
 //! Change (Pipeline revision) remains inside [`crate::apply`]. These verbs use a
 //! Platform Store session — callers do not sequence URL-shaped store CRUD.
 
@@ -13,6 +17,10 @@ use migraloop_platform_store::{
     QuarantinedChange, SchemaChangeImpact,
 };
 
+use crate::verify_repair::{
+    collect_mismatched_repairs, detect_status, document_fields_match, effective_max_rows,
+    maps_equal_on_keys, persisted_status,
+};
 use crate::{
     deliver_direct_pipeline_with_options, deliver_transform_pipeline_with_options,
     delivery_document_for_row, ensure_store_session_healthy, identity_key, pipeline_base_table_refs,
@@ -442,19 +450,6 @@ fn base_identity_key(
     Some(parts.join("|"))
 }
 
-fn rows_equal_supported(
-    left: &serde_json::Map<String, serde_json::Value>,
-    right: &serde_json::Map<String, serde_json::Value>,
-    supported: &BTreeSet<String>,
-) -> bool {
-    for name in supported {
-        if left.get(name) != right.get(name) {
-            return false;
-        }
-    }
-    true
-}
-
 /// Source Alignment Check — repair Base from Source reads (never write Source).
 pub async fn source_alignment_check(
     store: &PlatformStore,
@@ -463,11 +458,7 @@ pub async fn source_alignment_check(
     max_rows: u32,
 ) -> Result<(), RuntimeError> {
     ensure_store_session_healthy(store).await?;
-    let max_rows = if max_rows == 0 {
-        DEFAULT_ALIGNMENT_MAX_ROWS
-    } else {
-        max_rows
-    };
+    let max_rows = effective_max_rows(max_rows, DEFAULT_ALIGNMENT_MAX_ROWS);
 
     let deployments = store
         .list_deployments()
@@ -586,7 +577,7 @@ async fn align_one_base(
         };
         checked_ids.insert(key.clone());
         match base_by_id.get(&key) {
-            Some(existing) if rows_equal_supported(existing, &source_map, &supported) => {
+            Some(existing) if maps_equal_on_keys(existing, &source_map, &supported) => {
                 repaired.insert(key, existing.clone());
             }
             Some(_) | None => {
@@ -620,11 +611,7 @@ async fn align_one_base(
         ka.cmp(&kb)
     });
 
-    let alignment_status = if sample.truncated {
-        "partial"
-    } else {
-        "aligned"
-    };
+    let alignment_status = persisted_status(sample.truncated, "aligned");
     let checked = sample.rows.len() as i32;
     let updated = BaseDataset {
         deployment_name: base.deployment_name.clone(),
@@ -656,15 +643,9 @@ async fn align_one_base(
     } else {
         ""
     };
-    let detect_status = if mismatched > 0 {
-        "misaligned"
-    } else if sample.truncated {
-        "partial"
-    } else {
-        "aligned"
-    };
+    let detect = detect_status(mismatched, sample.truncated, "aligned", "misaligned");
     println!(
-        "Source Alignment Check: {} status={detect_status} checked={checked} \
+        "Source Alignment Check: {} status={detect} checked={checked} \
          mismatched={mismatched} repaired={repaired_count} maxRows={max_rows}{truncated_note} \
          (Base repaired from Source reads; Source not written)",
         base.source_table
@@ -680,11 +661,7 @@ pub async fn drift_check(
     max_rows: u32,
 ) -> Result<(), RuntimeError> {
     ensure_store_session_healthy(store).await?;
-    let max_rows = if max_rows == 0 {
-        DEFAULT_DRIFT_MAX_ROWS
-    } else {
-        max_rows
-    };
+    let max_rows = effective_max_rows(max_rows, DEFAULT_DRIFT_MAX_ROWS);
 
     let deployments = store
         .list_deployments()
@@ -761,25 +738,23 @@ async fn drift_one_pipeline(
         }
     }
 
-    let mut mismatched = 0i32;
-    let mut repaired_count = 0i32;
-    let mut repair_docs: Vec<DeliveryDocument> = Vec::new();
-
-    for expected in &expected_docs {
+    let expected_items = expected_docs.iter().map(|expected| {
         let key = identity_key(&expected.identity);
-        let managed_keys: Vec<&str> = expected.managed_fields.keys().map(|k| k.as_str()).collect();
-        let drifted = match target_by_id.get(&key) {
-            Some(target_doc) => {
-                !managed_fields_match_target(target_doc, &expected.managed_fields, &managed_keys)
-            }
-            None => true,
-        };
-        if drifted {
-            mismatched += 1;
-            repaired_count += 1;
-            repair_docs.push(expected.clone());
-        }
-    }
+        (key, expected)
+    });
+    let outcome = collect_mismatched_repairs(
+        expected_items,
+        &target_by_id,
+        |expected, target_doc| {
+            let managed_keys: Vec<&str> =
+                expected.managed_fields.keys().map(|k| k.as_str()).collect();
+            document_fields_match(target_doc, &expected.managed_fields, &managed_keys)
+        },
+        |expected| expected.clone(),
+    );
+    let mismatched = outcome.mismatched;
+    let repaired_count = outcome.repaired;
+    let repair_docs = outcome.repairs;
 
     if !repair_docs.is_empty() {
         target
@@ -789,7 +764,7 @@ async fn drift_one_pipeline(
     }
 
     let checked = expected_docs.len() as i32;
-    let drift_status = if truncated { "partial" } else { "ok" };
+    let drift_status = persisted_status(truncated, "ok");
     store
         .update_pipeline_drift_status(
             &pipeline.deployment_name,
@@ -802,15 +777,9 @@ async fn drift_one_pipeline(
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
     let truncated_note = if truncated { " truncated=true" } else { "" };
-    let detect_status = if mismatched > 0 {
-        "drifted"
-    } else if truncated {
-        "partial"
-    } else {
-        "ok"
-    };
+    let detect = detect_status(mismatched, truncated, "ok", "drifted");
     println!(
-        "Drift Check: Pipeline {} status={detect_status} checked={checked} \
+        "Drift Check: Pipeline {} status={detect} checked={checked} \
          mismatched={mismatched} repaired={repaired_count} maxRows={max_rows}{truncated_note} \
          (Managed fields auto-repaired; non-Managed Target fields ignored)",
         pipeline.name
@@ -938,76 +907,4 @@ async fn expected_delivery_documents_for_drift(
     Ok((documents, truncated))
 }
 
-/// Compare Managed fields on a Target document to the platform expected map.
-/// Non-Managed Target keys are ignored.
-fn managed_fields_match_target(
-    target_doc: &serde_json::Value,
-    expected_managed: &serde_json::Map<String, serde_json::Value>,
-    managed_keys: &[&str],
-) -> bool {
-    for key in managed_keys {
-        let expected = expected_managed.get(*key);
-        let actual = target_doc.get(*key);
-        match (expected, actual) {
-            (Some(exp), Some(act)) if json_values_equal_for_drift(exp, act) => {}
-            (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => return false,
-            (None, None) => {}
-        }
-    }
-    true
-}
-
-fn json_values_equal_for_drift(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    let left_n = normalize_json_for_drift(left);
-    let right_n = normalize_json_for_drift(right);
-    left_n == right_n
-}
-
-fn normalize_json_for_drift(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(n) = map.get("$numberLong").and_then(|v| v.as_str()) {
-                if let Ok(parsed) = n.parse::<i64>() {
-                    return serde_json::Value::Number(parsed.into());
-                }
-            }
-            if let Some(n) = map.get("$numberInt").and_then(|v| v.as_str()) {
-                if let Ok(parsed) = n.parse::<i64>() {
-                    return serde_json::Value::Number(parsed.into());
-                }
-            }
-            if let Some(n) = map.get("$numberDouble").and_then(|v| v.as_str()) {
-                if let Ok(parsed) = n.parse::<f64>() {
-                    if let Some(num) = serde_json::Number::from_f64(parsed) {
-                        return serde_json::Value::Number(num);
-                    }
-                }
-            }
-            if let Some(n) = map.get("$numberDecimal").and_then(|v| v.as_str()) {
-                return serde_json::Value::String(n.to_string());
-            }
-            if let Some(d) = map.get("$date") {
-                return normalize_json_for_drift(d);
-            }
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                out.insert(k.clone(), normalize_json_for_drift(v));
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_json::Value::Number(i.into())
-            } else if let Some(u) = n.as_u64() {
-                serde_json::Value::Number(u.into())
-            } else {
-                value.clone()
-            }
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(normalize_json_for_drift).collect())
-        }
-        other => other.clone(),
-    }
-}
 
