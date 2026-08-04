@@ -1,20 +1,17 @@
 [package]
-name = "migraloop-cli"
+name = "migraloop-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Operator CLI for the DB Sync Platform"
+description = "Deployment runtime: apply, Initial Load, and Direct Pipeline Delivery"
 
 [dependencies]
-clap = { workspace = true }
 migraloop-capture = { workspace = true }
 migraloop-delivery = { workspace = true }
 migraloop-platform-store = { workspace = true }
-migraloop-runtime = { workspace = true }
 migraloop-transform = { workspace = true }
 migraloop-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-tokio = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }

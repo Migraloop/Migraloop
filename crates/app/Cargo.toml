@@ -15,6 +15,7 @@ migraloop-capture = { workspace = true }
 migraloop-transform = { workspace = true }
 migraloop-delivery = { workspace = true }
 migraloop-platform-store = { workspace = true }
+migraloop-runtime = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
@@ -25,3 +26,6 @@ serde_json = { workspace = true }
 tempfile = "3.14"
 oracle = { workspace = true }
 migraloop-platform-store = { workspace = true }
+migraloop-runtime = { workspace = true }
+migraloop-types = { workspace = true }
+migraloop-capture = { workspace = true }
