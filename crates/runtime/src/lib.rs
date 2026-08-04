@@ -1,10 +1,10 @@
 //! Deployment runtime: apply, table-level Initial Load, Direct/Transform Pipeline
-//! Delivery, and Incremental Sync orchestration (including Affect Analysis → Derived
-//! maintenance → Delivery via the single transform Affect interface).
+//! Delivery, Incremental Sync orchestration (including Affect Analysis → Derived
+//! maintenance → Delivery via the single transform Affect interface), Pipeline
+//! lifecycle (pause / resume / remove / change-via-apply), Source Alignment Check,
+//! Drift Check, and status inventory reads.
 //!
-//! The Operator CLI is a thin adapter over this interface. Lifecycle / Align / Drift
-//! verbs remain a follow-up (#155). This module owns apply → Initial Load → Delivery
-//! (#152), Incremental Capture (#153), and Transform Affect maintenance (#154).
+//! The Operator CLI is a thin adapter over this interface.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,6 +31,7 @@ use thiserror::Error;
 
 mod observability;
 mod incremental;
+mod lifecycle;
 
 use crate::observability::{emit_event, EventValue};
 
@@ -38,6 +39,10 @@ pub use incremental::{
     apply_change_events_to_base_rows, format_output_identity, run_incremental_sync,
     run_continuous_incremental_sync, supervise_continuous_incremental_sync, sync_incremental,
     SyncCycleOutcome, SyncInvocation,
+};
+pub use lifecycle::{
+    drift_check, pause_pipeline, remove_pipeline, resume_pipeline, source_alignment_check,
+    status_inventory, StatusInventory, DEFAULT_ALIGNMENT_MAX_ROWS, DEFAULT_DRIFT_MAX_ROWS,
 };
 
 /// Dependency-graph seam marker (ADR-0024 modular monorepo).
