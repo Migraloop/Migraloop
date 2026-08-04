@@ -55,14 +55,8 @@ pub fn handoff_from_low_watermark(low_watermark: CapturePosition) -> CutoverHand
 /// Optional hand-off when Initial Load may pause before any watermark exists.
 pub fn handoff_from_optional_low_watermark(
     low_watermark: Option<CapturePosition>,
-) -> (Option<i64>, Option<i64>) {
-    match low_watermark {
-        Some(wm) => {
-            let handoff = handoff_from_low_watermark(wm);
-            (Some(handoff.low_watermark), Some(handoff.checkpoint))
-        }
-        None => (None, None),
-    }
+) -> Option<CutoverHandoff> {
+    low_watermark.map(handoff_from_low_watermark)
 }
 
 /// Inclusive resume cursor for Incremental Capture after cutover.

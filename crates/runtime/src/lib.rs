@@ -790,7 +790,7 @@ async fn persist_initial_load_pause(
     low_watermark: Option<CapturePosition>,
     cursor: Option<Vec<serde_json::Value>>,
 ) -> Result<(), RuntimeError> {
-    let (wm, checkpoint) = handoff_from_optional_low_watermark(low_watermark);
+    let handoff = handoff_from_optional_low_watermark(low_watermark);
     let dataset = BaseDataset {
         deployment_name: deployment_name.to_string(),
         source_table: table.to_string(),
@@ -802,8 +802,8 @@ async fn persist_initial_load_pause(
         row_count: rows_loaded as i32,
         sync_applied_changes: 0,
         sync_health: "unknown".to_string(),
-        capture_low_watermark: wm,
-        capture_checkpoint: checkpoint,
+        capture_low_watermark: handoff.map(|h| h.low_watermark),
+        capture_checkpoint: handoff.map(|h| h.checkpoint),
         sync_lag: 0,
         source_alignment: "unknown".to_string(),
         source_alignment_checked_rows: 0,
@@ -824,7 +824,10 @@ async fn persist_initial_load_pause(
         &[
             ("table", EventValue::from(table)),
             ("rows", EventValue::from(rows_loaded as i64)),
-            ("low_watermark", EventValue::from(wm.unwrap_or(0))),
+            (
+                "low_watermark",
+                EventValue::from(handoff.map(|h| h.low_watermark).unwrap_or(0)),
+            ),
             ("deployment", EventValue::from(deployment_name)),
         ],
     );

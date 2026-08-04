@@ -561,7 +561,7 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
                 }
                 _ => {}
             }
-            print_status_cutover_line(cutover_facts_from_base(base));
+            print_cutover_line("  Cutover:", cutover_facts_from_base(base));
             let sync_obs = surface
                 .sync
                 .iter()
@@ -684,32 +684,19 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Format Operator `status` cutover line from runtime [`CutoverFacts`] (issue #175).
-fn print_status_cutover_line(facts: CutoverFacts) {
+/// Format Operator cutover narrative from runtime [`CutoverFacts`] (issue #175).
+///
+/// `status` uses `"  Cutover:"`; `base` inspect uses `"cutover:"`.
+fn print_cutover_line(prefix: &str, facts: CutoverFacts) {
     match (facts.low_watermark, facts.checkpoint) {
         (Some(wm), Some(cp)) => {
-            println!("  Cutover: low-watermark={wm} checkpoint={cp}");
+            println!("{prefix} low-watermark={wm} checkpoint={cp}");
         }
         (Some(wm), None) => {
-            println!("  Cutover: low-watermark={wm} checkpoint=(none)");
+            println!("{prefix} low-watermark={wm} checkpoint=(none)");
         }
         _ => {
-            println!("  Cutover: low-watermark=(missing)");
-        }
-    }
-}
-
-/// Format Operator `base` cutover line from runtime [`CutoverFacts`] (issue #175).
-fn print_inspect_cutover_line(facts: CutoverFacts) {
-    match (facts.low_watermark, facts.checkpoint) {
-        (Some(wm), Some(cp)) => {
-            println!("cutover: low-watermark={wm} checkpoint={cp}");
-        }
-        (Some(wm), None) => {
-            println!("cutover: low-watermark={wm} checkpoint=(none)");
-        }
-        _ => {
-            println!("cutover: low-watermark=(missing)");
+            println!("{prefix} low-watermark=(missing)");
         }
     }
 }
@@ -726,7 +713,7 @@ async fn print_base(
         "Base Dataset: {} status={} rows={}",
         dataset.source_table, dataset.status, dataset.row_count
     );
-    print_inspect_cutover_line(cutover_facts_from_base(&dataset));
+    print_cutover_line("cutover:", cutover_facts_from_base(&dataset));
     let columns = dataset
         .columns
         .iter()
