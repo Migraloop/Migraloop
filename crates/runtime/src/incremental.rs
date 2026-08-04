@@ -1,9 +1,11 @@
 //! Incremental Sync orchestration for the Deployment runtime (#153).
 //!
-//! Owns Incremental Capture (including continuous supervise/resume), cutover
-//! overlap apply ordering, poison quarantine, schema-change pause, bounded
-//! backpressure, and ChangeEvent → Base Dataset apply. The Operator CLI is a
-//! thin adapter over [`sync_incremental`] / [`supervise_continuous_incremental_sync`].
+//! Owns Incremental Capture (including continuous supervise/resume), overlap
+//! apply ordering (Deliver-before-checkpoint + change-id dedupe), poison
+//! quarantine, schema-change pause, bounded backpressure, and ChangeEvent →
+//! Base Dataset apply. Cutover watermark / checkpoint / readiness live in
+//! [`crate::cutover`] (ADR-0004 / #175). The Operator CLI is a thin adapter over
+//! [`sync_incremental`] / [`supervise_continuous_incremental_sync`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,6 +24,7 @@ use migraloop_transform::{
     BaseChangeKind, MaintenanceStateBlob, TransformOp,
 };
 
+use crate::cutover::resume_for_incremental;
 use crate::observability::{emit_event, EventValue};
 use crate::{
     delivery_document_for_row, derived_columns_for_ops, ensure_store_session_healthy,
@@ -1151,38 +1154,26 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
             );
         }
 
-        // Resume from durable Platform Store checkpoint (inclusive SCN). Initial Load sets
-        // checkpoint = low-watermark-1 so the first Incremental still covers the ADR-0004
-        // overlap window. Inclusive resume plus change-id dedupe keeps same-SCN siblings
-        // visible after a mid-SCN stop or bounded window (issue #143). Prefer duplicates
-        // over gaps: Deliver each change before durable Base/checkpoint/change-id
-        // persistence so a Delivery failure can retry.
+        // Resume from durable Platform Store checkpoint (inclusive SCN). Cutover
+        // (`crate::cutover`) sets checkpoint = low-watermark-1 so the first Incremental
+        // still covers the ADR-0004 overlap window. Inclusive resume plus change-id
+        // dedupe keeps same-SCN siblings visible after a mid-SCN stop or bounded window
+        // (issue #143). Prefer duplicates over gaps: Deliver each change before durable
+        // Base/checkpoint/change-id persistence so a Delivery failure can retry.
         for (schema, table) in tables {
             let (dataset, base_rows) = store
                 .get_base_rows(&table, Some(&deployment.name))
                 .await
                 .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
-            let Some(low_watermark_i64) = dataset.capture_low_watermark else {
-                return Err(RuntimeError::Failed(format!(
-                    "cannot start Incremental Capture for {table} without low-watermark overlap \
-                     (cutover watermark missing; re-run Initial Load via `migraloop apply`)"
-                )));
-            };
-            let low_watermark = CapturePosition::from_i64(low_watermark_i64).ok_or_else(|| {
-                RuntimeError::Failed(format!(
-                    "invalid low-watermark for Base Dataset {table}: {low_watermark_i64}"
-                ))
-            })?;
-
-            let mut resume_from = match dataset.capture_checkpoint {
-                Some(cp) => CapturePosition::from_i64(cp).ok_or_else(|| {
-                    RuntimeError::Failed(format!(
-                        "invalid capture checkpoint for Base Dataset {table}: {cp}"
-                    ))
-                })?,
-                None => low_watermark,
-            };
+            let cutover = resume_for_incremental(
+                &table,
+                dataset.capture_low_watermark,
+                dataset.capture_checkpoint,
+            )?;
+            let low_watermark = cutover.low_watermark;
+            let mut resume_from = cutover.resume_from;
+            let checkpoint_before = cutover.checkpoint_before;
 
             let supported_names: BTreeSet<String> =
                 dataset.columns.iter().map(|c| c.name.clone()).collect();
@@ -1206,9 +1197,6 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                 }
             }
 
-            let checkpoint_before = dataset
-                .capture_checkpoint
-                .unwrap_or(low_watermark_i64.saturating_sub(1));
             let mut windows_processed = 0usize;
 
             // ADR-0020: bounded Incremental windows. Capture only fills up to
