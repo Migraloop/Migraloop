@@ -1510,10 +1510,11 @@ impl PlatformStore {
         Ok((dataset, rows))
     }
 
-    /// Persist Maintenance State JSON for a Transform Pipeline (distinct/addToSet).
+    /// Persist opaque Maintenance State JSON for a Transform Pipeline.
     ///
-    /// Callers serialize the transform-crate `MaintenanceState`. Pipelines that do not
-    /// require Maintenance State should call [`delete_maintenance_state`] instead.
+    /// The blob is produced by the transform Affect Analysis interface; the store does
+    /// not interpret its contents. Pipelines that do not require Maintenance State should
+    /// call [`delete_maintenance_state`] instead.
     pub async fn replace_maintenance_state(
         &self,
         deployment_name: &str,
@@ -2371,10 +2372,11 @@ pub async fn get_derived_rows(
     store.get_derived_rows(pipeline_name, deployment_name).await
 }
 
-/// Persist Maintenance State JSON for a Transform Pipeline (distinct/addToSet).
+/// Persist opaque Maintenance State JSON for a Transform Pipeline.
 ///
-/// Callers serialize the transform-crate `MaintenanceState`. Pipelines that do not
-/// require Maintenance State should call [`delete_maintenance_state`] instead.
+/// The blob is produced by the transform Affect Analysis interface; the store does
+/// not interpret its contents. Pipelines that do not require Maintenance State should
+/// call [`delete_maintenance_state`] instead.
 pub async fn replace_maintenance_state(
     database_url: &str,
     deployment_name: &str,

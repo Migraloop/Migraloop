@@ -148,23 +148,103 @@ pub enum AffectOutcome {
 /// One Maintenance State entry: refcount for a distinct identity or an addToSet member.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MaintenanceEntry {
+struct MaintenanceEntry {
     /// Distinct fields, or addToSet group keys.
-    pub identity: Map<String, Value>,
+    identity: Map<String, Value>,
     /// `None` for distinct; `Some(member)` for addToSet value membership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-    pub refcount: i64,
+    value: Option<Value>,
+    refcount: i64,
 }
 
 /// Platform-internal Maintenance State for operators that need value-level Affect Analysis.
 ///
 /// Created only when [`requires_maintenance_state`] is true (distinct / addToSet).
 /// Simple groupBy sum/count/min/max/avg must not invent this structure.
+/// Callers never see this type — use opaque [`MaintenanceStateBlob`] at the transform seam.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MaintenanceState {
-    pub entries: Vec<MaintenanceEntry>,
+struct MaintenanceState {
+    entries: Vec<MaintenanceEntry>,
+}
+
+/// Opaque Maintenance State for Platform Store persistence.
+///
+/// Transform owns when state is required, analyze/bump protocol (including skips), and
+/// serialization. Callers only load/save this blob — never inspect entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceStateBlob {
+    json: String,
+}
+
+impl MaintenanceStateBlob {
+    /// Wrap a previously persisted Platform Store TEXT value.
+    pub fn from_persisted(json: impl Into<String>) -> Self {
+        Self {
+            json: json.into(),
+        }
+    }
+
+    /// Opaque JSON string for Platform Store persistence.
+    pub fn as_str(&self) -> &str {
+        &self.json
+    }
+
+    /// Consume into the opaque JSON string for Platform Store persistence.
+    pub fn into_string(self) -> String {
+        self.json
+    }
+
+    fn from_state(state: &MaintenanceState) -> Result<Self, TransformError> {
+        let json = serde_json::to_string(state).map_err(|err| {
+            TransformError::Invalid(format!("failed to serialize Maintenance State: {err}"))
+        })?;
+        Ok(Self { json })
+    }
+
+    fn decode(&self) -> Result<MaintenanceState, TransformError> {
+        serde_json::from_str(&self.json).map_err(|err| {
+            TransformError::Invalid(format!("invalid Maintenance State JSON: {err}"))
+        })
+    }
+}
+
+/// Base change context for the single Affect Analysis entry point.
+#[derive(Debug, Clone, Copy)]
+pub struct BaseChangeContext<'a> {
+    /// Base Dataset table that just changed (primary or secondary).
+    pub changed_base: &'a str,
+    /// Pipeline primary `source.table`.
+    pub primary_base: &'a str,
+    pub kind: BaseChangeKind,
+    /// Pre-apply Base row (required for Update/Delete).
+    pub before: Option<&'a Map<String, Value>>,
+    /// After-image Base row (required for Insert/Update).
+    pub after: Option<&'a Map<String, Value>>,
+    /// Current primary Base rows (needed when a foreign Base changes).
+    pub primary_rows: &'a [Map<String, Value>],
+    /// Secondary Bases for equiLookup / union / unwind expansion.
+    pub secondary_bases: &'a BTreeMap<String, Vec<Map<String, Value>>>,
+}
+
+/// Result of the single Affect Analysis interface: recompute plan + next Maintenance State.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AffectAnalysis {
+    pub outcome: AffectOutcome,
+    /// Next Maintenance State when this transform uses one; already bumped (including skips).
+    /// `None` when the transform does not require Maintenance State.
+    pub next_maintenance_state: Option<MaintenanceStateBlob>,
+}
+
+/// Column metadata for Derived output schema inference (transform-owned).
+///
+/// Mirrors Platform Store Base/Derived column shape without coupling transform to the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputColumn {
+    pub name: String,
+    pub oracle_type: String,
+    pub precision: Option<i32>,
+    pub scale: Option<i32>,
 }
 
 /// Parse one declarative transform step JSON object into an analyzable operator.
@@ -1216,14 +1296,14 @@ fn affect_deps(ops: &[TransformOp]) -> AffectDeps {
                 ..
             } => {
                 // Output array depends on the local join key (foreign deps handled
-                // separately via analyze_affect_on_base).
+                // separately via analyze_base_change).
                 let deps = resolve_field_deps(&lineage, closed, &removed, local_field);
                 lineage.insert(as_name.clone(), deps);
                 removed.remove(as_name);
             }
             TransformOp::Union { .. } => {
                 // Primary-side field lineage is unchanged; secondary Base deps are
-                // analyzed via analyze_affect_on_base when `from` changes.
+                // analyzed via analyze_base_change when `from` changes.
             }
             TransformOp::Unwind { path } => {
                 // Expanding `path` keeps its Base deps used; object flatten drops
@@ -1310,7 +1390,7 @@ fn affect_deps(ops: &[TransformOp]) -> AffectDeps {
 ///
 /// For open (passthrough) transforms this is only the *explicit* dependency set
 /// (filter / addFields copies / rename sources). Removed fields are unused; other
-/// passthrough Base fields still affect output and are handled in [`analyze_affect`].
+/// passthrough Base fields still affect output and are handled in [`analyze_base_change`].
 pub fn used_base_fields(ops: &[TransformOp]) -> BTreeSet<String> {
     match affect_deps(ops) {
         AffectDeps::Closed(used) => used,
@@ -1415,9 +1495,197 @@ fn output_grouping_keys(ops: &[TransformOp]) -> Option<Vec<String>> {
 ///
 /// True for `distinct` / `addToSet`. False for simple groupBy sum/count/min/max/avg and
 /// row-grain operators — those must not invent blind side tables.
-pub fn requires_maintenance_state(ops: &[TransformOp]) -> bool {
+fn requires_maintenance_state(ops: &[TransformOp]) -> bool {
     ops.iter()
         .any(|op| matches!(op, TransformOp::Distinct { .. } | TransformOp::AddToSet { .. }))
+}
+
+/// Single Affect Analysis entry point for Deployment runtime and tests.
+///
+/// Accepts Base change context plus optional prior Maintenance State blob. Owns the
+/// Maintenance State protocol (when required, analyze, bump including skips) and returns
+/// a skip/recompute plan with the next opaque state when applicable. Callers do not choose
+/// among multiple analyze helpers.
+pub fn analyze_base_change(
+    ops: &[TransformOp],
+    change: &BaseChangeContext<'_>,
+    prior_maintenance_state: Option<&MaintenanceStateBlob>,
+) -> Result<AffectAnalysis, TransformError> {
+    let needs_ms = requires_maintenance_state(ops)
+        && table_names_eq(change.changed_base, change.primary_base);
+
+    let mut state = if needs_ms {
+        Some(match prior_maintenance_state {
+            Some(blob) => blob.decode()?,
+            None => MaintenanceState::default(),
+        })
+    } else {
+        None
+    };
+
+    let outcome = if let Some(state_ref) = state.as_ref() {
+        analyze_primary_affect_inner(
+            ops,
+            change.kind,
+            change.before,
+            change.after,
+            Some(state_ref),
+            change.secondary_bases,
+        )?
+    } else {
+        analyze_affect_on_base_with_bases(
+            ops,
+            change.changed_base,
+            change.primary_base,
+            change.kind,
+            change.before,
+            change.after,
+            change.primary_rows,
+            change.secondary_bases,
+        )?
+    };
+
+    // Value-level distinct/addToSet skips still update Maintenance State refcounts.
+    if let Some(state_mut) = state.as_mut() {
+        maintain_state_for_change(ops, state_mut, change.kind, change.before, change.after)?;
+    }
+
+    Ok(AffectAnalysis {
+        outcome,
+        next_maintenance_state: match state.as_ref() {
+            Some(s) => Some(MaintenanceStateBlob::from_state(s)?),
+            None => None,
+        },
+    })
+}
+
+/// Build initial Maintenance State after full Derived materialization.
+///
+/// Returns `None` when the transform does not require Maintenance State (callers should
+/// delete any persisted blob). Returns an opaque blob when distinct/addToSet need it.
+pub fn initial_maintenance_state(
+    ops: &[TransformOp],
+    primary_rows: &[Map<String, Value>],
+) -> Result<Option<MaintenanceStateBlob>, TransformError> {
+    if !requires_maintenance_state(ops) {
+        return Ok(None);
+    }
+    let state = build_maintenance_state(ops, primary_rows)?;
+    Ok(Some(MaintenanceStateBlob::from_state(&state)?))
+}
+
+/// Infer Derived output columns from the Rich Transform definition and Base column metadata.
+///
+/// Works for empty Derived results. Aggregate/`addFields`/`rename` aliases inherit the
+/// source field's Oracle type metadata. `equiLookup` `as` arrays and `addToSet` collections
+/// are nested documents (`JSON`). `unwind` of that path flattens object elements so the
+/// path is no longer nested — foreign Base column metadata in `secondary_columns` supplies
+/// types for those flattened / unioned fields.
+pub fn infer_derived_columns(
+    ops: &[TransformOp],
+    primary_columns: &[OutputColumn],
+    secondary_columns: &[OutputColumn],
+    derived_rows: &[Map<String, Value>],
+) -> Vec<OutputColumn> {
+    let base_names: Vec<String> = primary_columns.iter().map(|c| c.name.clone()).collect();
+    let mut names: BTreeSet<String> = derived_output_field_names(ops, &base_names)
+        .into_iter()
+        .collect();
+    for row in derived_rows {
+        names.extend(row.keys().cloned());
+    }
+    let mut by_name: BTreeMap<&str, &OutputColumn> =
+        primary_columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    // Primary wins on name clashes; secondary fills unwind-flattened foreign fields.
+    for col in secondary_columns {
+        by_name.entry(col.name.as_str()).or_insert(col);
+    }
+    let mut alias_source: BTreeMap<String, String> = BTreeMap::new();
+    let mut nested_document_fields: BTreeSet<String> = BTreeSet::new();
+    for op in ops {
+        match op {
+            TransformOp::GroupBy { aggregates, .. } => {
+                for agg in aggregates {
+                    alias_source.insert(agg.as_name.clone(), agg.field.clone());
+                }
+            }
+            TransformOp::AddFields { fields } => {
+                for spec in fields {
+                    if let AddFieldSource::Field(src) = &spec.source {
+                        // Chase prior rename/addFields aliases so type metadata
+                        // resolves to a Base column (e.g. displayName→customerName→NAME).
+                        let resolved = alias_source
+                            .get(src)
+                            .cloned()
+                            .unwrap_or_else(|| src.clone());
+                        alias_source.insert(spec.as_name.clone(), resolved);
+                    }
+                }
+            }
+            TransformOp::Rename { fields } => {
+                for spec in fields {
+                    let src = alias_source
+                        .get(&spec.from)
+                        .cloned()
+                        .unwrap_or_else(|| spec.from.clone());
+                    alias_source.insert(spec.to.clone(), src);
+                    if nested_document_fields.remove(&spec.from) {
+                        nested_document_fields.insert(spec.to.clone());
+                    }
+                }
+            }
+            TransformOp::EquiLookup { as_name, .. } => {
+                nested_document_fields.insert(as_name.clone());
+            }
+            TransformOp::Unwind { path } => {
+                // Object-element flatten removes the array path from Derived output.
+                nested_document_fields.remove(path);
+            }
+            TransformOp::AddToSet { as_name, .. } => {
+                // Distinct values collected into a JSON array.
+                nested_document_fields.insert(as_name.clone());
+            }
+            _ => {}
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            if nested_document_fields.contains(&name) {
+                OutputColumn {
+                    name,
+                    oracle_type: "JSON".to_string(),
+                    precision: None,
+                    scale: None,
+                }
+            } else if let Some(col) = by_name.get(name.as_str()) {
+                (*col).clone()
+            } else if let Some(source) = alias_source.get(&name) {
+                if let Some(col) = by_name.get(source.as_str()) {
+                    OutputColumn {
+                        name,
+                        oracle_type: col.oracle_type.clone(),
+                        precision: col.precision,
+                        scale: col.scale,
+                    }
+                } else {
+                    OutputColumn {
+                        name,
+                        oracle_type: "NUMBER".to_string(),
+                        precision: None,
+                        scale: None,
+                    }
+                }
+            } else {
+                OutputColumn {
+                    name,
+                    oracle_type: "VARCHAR2".to_string(),
+                    precision: None,
+                    scale: None,
+                }
+            }
+        })
+        .collect()
 }
 
 fn row_matches_group_keys(
@@ -1431,55 +1699,7 @@ fn row_matches_group_keys(
     })
 }
 
-/// Affect Analysis for a change on the Pipeline's primary Base Dataset.
-///
-/// `pre_apply` is the Base row before applying the change (required for Update/Delete).
-/// `after` is the change after-image (required for Insert/Update).
-///
-/// For multi-Base `equiLookup` Pipelines, prefer [`analyze_affect_on_base`] so foreign
-/// Base changes resolve the correct primary Output Identities. Pipelines with `unwind`
-/// after `equiLookup` should use [`analyze_affect_on_base_with_bases`] so expansion
-/// can read secondary Bases.
-pub fn analyze_affect(
-    ops: &[TransformOp],
-    kind: BaseChangeKind,
-    pre_apply: Option<&Map<String, Value>>,
-    after: Option<&Map<String, Value>>,
-) -> Result<AffectOutcome, TransformError> {
-    analyze_primary_affect(ops, kind, pre_apply, after, &BTreeMap::new())
-}
-
-/// Affect Analysis when the changed Base table is known (primary, equiLookup `from`,
-/// or `union.from`).
-///
-/// `primary_table` is the Pipeline `source.table`. `primary_rows` are current primary
-/// Base rows (needed to resolve Output Identities when a foreign Base changes).
-///
-/// For `unwind` (optionally after `equiLookup`), prefer [`analyze_affect_on_base_with_bases`]
-/// so 1→N Output Identities expand from secondary Bases.
-pub fn analyze_affect_on_base(
-    ops: &[TransformOp],
-    changed_table: &str,
-    primary_table: &str,
-    kind: BaseChangeKind,
-    pre_apply: Option<&Map<String, Value>>,
-    after: Option<&Map<String, Value>>,
-    primary_rows: &[Map<String, Value>],
-) -> Result<AffectOutcome, TransformError> {
-    analyze_affect_on_base_with_bases(
-        ops,
-        changed_table,
-        primary_table,
-        kind,
-        pre_apply,
-        after,
-        primary_rows,
-        &BTreeMap::new(),
-    )
-}
-
-/// Like [`analyze_affect_on_base`] with secondary Bases for `equiLookup` / `union` / `unwind`.
-pub fn analyze_affect_on_base_with_bases(
+fn analyze_affect_on_base_with_bases(
     ops: &[TransformOp],
     changed_table: &str,
     primary_table: &str,
@@ -1518,20 +1738,6 @@ fn analyze_primary_affect(
     secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
 ) -> Result<AffectOutcome, TransformError> {
     analyze_primary_affect_inner(ops, kind, pre_apply, after, None, secondary_bases)
-}
-
-/// Affect Analysis with Maintenance State for value-level distinct/addToSet skips.
-///
-/// Callers must pass the *pre-change* Maintenance State. Update refcounts via
-/// [`maintain_state_for_change`] after deciding the outcome (including skips).
-pub fn analyze_affect_with_maintenance(
-    ops: &[TransformOp],
-    kind: BaseChangeKind,
-    pre_apply: Option<&Map<String, Value>>,
-    after: Option<&Map<String, Value>>,
-    state: &MaintenanceState,
-) -> Result<AffectOutcome, TransformError> {
-    analyze_primary_affect_inner(ops, kind, pre_apply, after, Some(state), &BTreeMap::new())
 }
 
 fn analyze_primary_affect_inner(
@@ -1963,7 +2169,7 @@ fn state_refcount(
 }
 
 /// Build Maintenance State from current Base rows for distinct / addToSet.
-pub fn build_maintenance_state(
+fn build_maintenance_state(
     ops: &[TransformOp],
     rows: &[Map<String, Value>],
 ) -> Result<MaintenanceState, TransformError> {
@@ -1999,7 +2205,7 @@ pub fn build_maintenance_state(
 }
 
 /// Apply a Base change to Maintenance State refcounts (call after Affect Analysis).
-pub fn maintain_state_for_change(
+fn maintain_state_for_change(
     ops: &[TransformOp],
     state: &mut MaintenanceState,
     kind: BaseChangeKind,
@@ -3216,6 +3422,66 @@ mod tests {
             .collect()
     }
 
+    /// Primary-Base Affect Analysis via the single public interface.
+    fn analyze_primary(
+        ops: &[TransformOp],
+        kind: BaseChangeKind,
+        before: Option<&Map<String, Value>>,
+        after: Option<&Map<String, Value>>,
+        prior: Option<&MaintenanceStateBlob>,
+    ) -> AffectAnalysis {
+        let secondary = BTreeMap::new();
+        analyze_base_change(
+            ops,
+            &BaseChangeContext {
+                changed_base: "ORDERS",
+                primary_base: "ORDERS",
+                kind,
+                before,
+                after,
+                primary_rows: &[],
+                secondary_bases: &secondary,
+            },
+            prior,
+        )
+        .unwrap()
+    }
+
+    fn analyze_on_base(
+        ops: &[TransformOp],
+        changed_table: &str,
+        primary_table: &str,
+        kind: BaseChangeKind,
+        before: Option<&Map<String, Value>>,
+        after: Option<&Map<String, Value>>,
+        primary_rows: &[Map<String, Value>],
+        secondary_bases: &BTreeMap<String, Vec<Map<String, Value>>>,
+        prior: Option<&MaintenanceStateBlob>,
+    ) -> AffectAnalysis {
+        analyze_base_change(
+            ops,
+            &BaseChangeContext {
+                changed_base: changed_table,
+                primary_base: primary_table,
+                kind,
+                before,
+                after,
+                primary_rows,
+                secondary_bases,
+            },
+            prior,
+        )
+        .unwrap()
+    }
+
+    fn blob_refcount(
+        blob: &MaintenanceStateBlob,
+        identity: &Map<String, Value>,
+        value: Option<&Value>,
+    ) -> i64 {
+        state_refcount(&blob.decode().unwrap(), identity, value)
+    }
+
     #[test]
     fn rejects_script_steps() {
         let steps = vec![json!({"script": "return true"})];
@@ -3453,7 +3719,7 @@ mod tests {
             ("ADDRESS", json!("1 Main Ave")),
         ]);
         assert_eq!(
-            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after)).unwrap(),
+            analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after), None).outcome,
             AffectOutcome::SkipUnusedFields
         );
     }
@@ -3473,7 +3739,7 @@ mod tests {
             ("AMOUNT", json!("40.00")),
             ("ADDRESS", json!("1 Main Ave")),
         ]);
-        match analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_amount)).unwrap()
+        match analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_amount), None).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);
@@ -3489,7 +3755,7 @@ mod tests {
             ("ADDRESS", json!("1 Main Ave")),
         ]);
         assert!(matches!(
-            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_order_id)).unwrap(),
+            analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_order_id), None).outcome,
             AffectOutcome::Recompute { .. }
         ));
     }
@@ -3589,7 +3855,7 @@ mod tests {
             ("AMOUNT", json!("42.50")),
             ("ADDRESS", json!("1 Main Ave")),
         ]);
-        let outcome = analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after)).unwrap();
+        let outcome = analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after), None).outcome;
         assert_eq!(outcome, AffectOutcome::SkipUnusedFields);
     }
 
@@ -3632,7 +3898,7 @@ mod tests {
             ("AMOUNT", json!("50.00")),
             ("ADDRESS", json!("1 Main Ave")),
         ]);
-        let outcome = analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after)).unwrap();
+        let outcome = analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after), None).outcome;
         match outcome {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);
@@ -3665,7 +3931,7 @@ mod tests {
             ("AMOUNT", json!("5.00")),
             ("ADDRESS", json!("2 Side Rd")),
         ]);
-        let outcome = analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after)).unwrap();
+        let outcome = analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after), None).outcome;
         match outcome {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 2, "expected old+new identities, got {identities:?}");
@@ -3835,7 +4101,7 @@ mod tests {
             ("NOTES", json!("unused")),
         ]);
         assert_eq!(
-            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_email)).unwrap(),
+            analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_email), None).outcome,
             AffectOutcome::SkipUnusedFields
         );
 
@@ -3847,7 +4113,7 @@ mod tests {
             ("ACTIVE", json!(1)),
             ("NOTES", json!("unused")),
         ]);
-        match analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_name)).unwrap()
+        match analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_name), None).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);
@@ -3875,7 +4141,7 @@ mod tests {
             ("ADDRESS", json!("1 Main Ave")),
         ]);
         assert_eq!(
-            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_addr)).unwrap(),
+            analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_addr), None).outcome,
             AffectOutcome::SkipUnusedFields
         );
         let after_amount = row(&[
@@ -3884,7 +4150,7 @@ mod tests {
             ("ADDRESS", json!("1 Main St")),
         ]);
         assert!(matches!(
-            analyze_affect(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_amount)).unwrap(),
+            analyze_primary(&ops, BaseChangeKind::Update, Some(&pre), Some(&after_amount), None).outcome,
             AffectOutcome::Recompute { .. }
         ));
     }
@@ -4003,7 +4269,7 @@ mod tests {
             ("EMAIL", json!("new@x")),
         ]);
         assert_eq!(
-            analyze_affect_on_base(
+            analyze_on_base(
                 &ops,
                 "CUSTOMERS",
                 "CUSTOMERS",
@@ -4011,8 +4277,9 @@ mod tests {
                 Some(&pre),
                 Some(&after_email),
                 &customers,
-            )
-            .unwrap(),
+                &BTreeMap::new(),
+                None,
+            ).outcome,
             AffectOutcome::SkipUnusedFields
         );
 
@@ -4022,16 +4289,17 @@ mod tests {
             ("NAME", json!("Alicia")),
             ("EMAIL", json!("a@x")),
         ]);
-        match analyze_affect_on_base(
-            &ops,
-            "CUSTOMERS",
-            "CUSTOMERS",
-            BaseChangeKind::Update,
-            Some(&pre),
-            Some(&after_name),
-            &customers,
-        )
-        .unwrap()
+        match analyze_on_base(
+                &ops,
+                "CUSTOMERS",
+                "CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&pre),
+                Some(&after_name),
+                &customers,
+                &BTreeMap::new(),
+                None,
+            ).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);
@@ -4051,16 +4319,17 @@ mod tests {
             ("CUSTOMER_ID", json!(1)),
             ("AMOUNT", json!("50.00")),
         ]);
-        match analyze_affect_on_base(
-            &ops,
-            "ORDERS",
-            "CUSTOMERS",
-            BaseChangeKind::Update,
-            Some(&order_pre),
-            Some(&order_after),
-            &customers,
-        )
-        .unwrap()
+        match analyze_on_base(
+                &ops,
+                "ORDERS",
+                "CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&order_pre),
+                Some(&order_after),
+                &customers,
+                &BTreeMap::new(),
+                None,
+            ).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);
@@ -4153,16 +4422,17 @@ mod tests {
             ("CUSTOMER_ID", json!(1)),
             ("AMOUNT", json!("50.00")),
         ]);
-        match analyze_affect_on_base(
-            &ops,
-            "ORDERS",
-            "CUSTOMERS",
-            BaseChangeKind::Update,
-            Some(&order_pre),
-            Some(&order_after),
-            &customers,
-        )
-        .unwrap()
+        match analyze_on_base(
+                &ops,
+                "ORDERS",
+                "CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&order_pre),
+                Some(&order_after),
+                &customers,
+                &BTreeMap::new(),
+                None,
+            ).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);
@@ -4198,7 +4468,7 @@ mod tests {
             ("AMOUNT", json!("50.00")),
         ]);
         assert_eq!(
-            analyze_affect_on_base(
+            analyze_on_base(
                 &ops,
                 "ORDERS",
                 "CUSTOMERS",
@@ -4206,8 +4476,9 @@ mod tests {
                 Some(&order_pre),
                 Some(&order_after),
                 &customers,
-            )
-            .unwrap(),
+                &BTreeMap::new(),
+                None,
+            ).outcome,
             AffectOutcome::SkipUnusedFields
         );
     }
@@ -4301,8 +4572,7 @@ mod tests {
             }
         })])
         .unwrap();
-        assert!(!requires_maintenance_state(&ops));
-        assert!(build_maintenance_state(&ops, &[]).unwrap().entries.is_empty());
+        assert!(initial_maintenance_state(&ops, &[]).unwrap().is_none());
     }
 
     #[test]
@@ -4311,16 +4581,23 @@ mod tests {
             "distinct": { "fields": ["CUSTOMER_ID"] }
         })])
         .unwrap();
-        assert!(requires_maintenance_state(&ops));
 
         let base = vec![
             row(&[("ORDER_ID", json!(100)), ("CUSTOMER_ID", json!(1))]),
             row(&[("ORDER_ID", json!(101)), ("CUSTOMER_ID", json!(1))]),
             row(&[("ORDER_ID", json!(200)), ("CUSTOMER_ID", json!(2))]),
         ];
-        let mut state = build_maintenance_state(&ops, &base).unwrap();
-        assert_eq!(state_refcount(&state, &row(&[("CUSTOMER_ID", json!(1))]), None), 2);
-        assert_eq!(state_refcount(&state, &row(&[("CUSTOMER_ID", json!(2))]), None), 1);
+        let mut state = initial_maintenance_state(&ops, &base)
+            .unwrap()
+            .expect("distinct requires Maintenance State");
+        assert_eq!(
+            blob_refcount(&state, &row(&[("CUSTOMER_ID", json!(1))]), None),
+            2
+        );
+        assert_eq!(
+            blob_refcount(&state, &row(&[("CUSTOMER_ID", json!(2))]), None),
+            1
+        );
 
         // Unused ADDRESS-style field is not in distinct.fields — skip unused.
         let pre = row(&[
@@ -4333,82 +4610,72 @@ mod tests {
             ("CUSTOMER_ID", json!(1)),
             ("ADDRESS", json!("1 Main Ave")),
         ]);
-        assert_eq!(
-            analyze_affect_with_maintenance(
-                &ops,
-                BaseChangeKind::Update,
-                Some(&pre),
-                Some(&after_addr),
-                &state,
-            )
-            .unwrap(),
-            AffectOutcome::SkipUnusedFields
+        let analysis = analyze_primary(
+            &ops,
+            BaseChangeKind::Update,
+            Some(&pre),
+            Some(&after_addr),
+            Some(&state),
         );
+        assert_eq!(analysis.outcome, AffectOutcome::SkipUnusedFields);
+        state = analysis.next_maintenance_state.expect("next state");
 
         // Duplicate CUSTOMER_ID insert: value-level skip (already counted).
         let dup = row(&[("ORDER_ID", json!(103)), ("CUSTOMER_ID", json!(1))]);
-        assert_eq!(
-            analyze_affect_with_maintenance(
-                &ops,
-                BaseChangeKind::Insert,
-                None,
-                Some(&dup),
-                &state,
-            )
-            .unwrap(),
-            AffectOutcome::SkipValueUnchanged
+        let analysis = analyze_primary(
+            &ops,
+            BaseChangeKind::Insert,
+            None,
+            Some(&dup),
+            Some(&state),
         );
-        maintain_state_for_change(&ops, &mut state, BaseChangeKind::Insert, None, Some(&dup))
-            .unwrap();
-        assert_eq!(state_refcount(&state, &row(&[("CUSTOMER_ID", json!(1))]), None), 3);
+        assert_eq!(analysis.outcome, AffectOutcome::SkipValueUnchanged);
+        state = analysis.next_maintenance_state.expect("next state");
+        assert_eq!(
+            blob_refcount(&state, &row(&[("CUSTOMER_ID", json!(1))]), None),
+            3
+        );
 
         // New CUSTOMER_ID insert: recompute.
         let neu = row(&[("ORDER_ID", json!(300)), ("CUSTOMER_ID", json!(3))]);
-        match analyze_affect_with_maintenance(
+        let analysis = analyze_primary(
             &ops,
             BaseChangeKind::Insert,
             None,
             Some(&neu),
-            &state,
-        )
-        .unwrap()
-        {
+            Some(&state),
+        );
+        match analysis.outcome {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);
                 assert_eq!(identities[0].get("CUSTOMER_ID"), Some(&json!(3)));
             }
             other => panic!("expected Recompute for new distinct key, got {other:?}"),
         }
-        maintain_state_for_change(&ops, &mut state, BaseChangeKind::Insert, None, Some(&neu))
-            .unwrap();
+        state = analysis.next_maintenance_state.expect("next state");
 
         // Delete non-last contributor: skip.
         let del_dup = row(&[("ORDER_ID", json!(103)), ("CUSTOMER_ID", json!(1))]);
-        assert_eq!(
-            analyze_affect_with_maintenance(
-                &ops,
-                BaseChangeKind::Delete,
-                Some(&del_dup),
-                None,
-                &state,
-            )
-            .unwrap(),
-            AffectOutcome::SkipValueUnchanged
+        let analysis = analyze_primary(
+            &ops,
+            BaseChangeKind::Delete,
+            Some(&del_dup),
+            None,
+            Some(&state),
         );
-        maintain_state_for_change(&ops, &mut state, BaseChangeKind::Delete, Some(&del_dup), None)
-            .unwrap();
+        assert_eq!(analysis.outcome, AffectOutcome::SkipValueUnchanged);
+        state = analysis.next_maintenance_state.expect("next state");
 
         // Delete last contributor for customer 2: recompute (caller deletes identity).
         let del_last = row(&[("ORDER_ID", json!(200)), ("CUSTOMER_ID", json!(2))]);
-        match analyze_affect_with_maintenance(
+        let analysis = analyze_primary(
             &ops,
             BaseChangeKind::Delete,
             Some(&del_last),
             None,
-            &state,
-        )
-        .unwrap()
-        {
+            Some(&state),
+        );
+        match analysis.outcome {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities[0].get("CUSTOMER_ID"), Some(&json!(2)));
             }
@@ -4443,9 +4710,11 @@ mod tests {
                 ("AMOUNT", json!("42.50")),
             ]),
         ];
-        let mut state = build_maintenance_state(&ops, &base).unwrap();
+        let mut state = initial_maintenance_state(&ops, &base)
+            .unwrap()
+            .expect("addToSet requires Maintenance State");
         assert_eq!(
-            state_refcount(
+            blob_refcount(
                 &state,
                 &row(&[("CUSTOMER_ID", json!(1))]),
                 Some(&json!("42.50"))
@@ -4459,19 +4728,15 @@ mod tests {
             ("CUSTOMER_ID", json!(1)),
             ("AMOUNT", json!("10.00")),
         ]);
-        assert_eq!(
-            analyze_affect_with_maintenance(
-                &ops,
-                BaseChangeKind::Insert,
-                None,
-                Some(&dup),
-                &state,
-            )
-            .unwrap(),
-            AffectOutcome::SkipValueUnchanged
+        let analysis = analyze_primary(
+            &ops,
+            BaseChangeKind::Insert,
+            None,
+            Some(&dup),
+            Some(&state),
         );
-        maintain_state_for_change(&ops, &mut state, BaseChangeKind::Insert, None, Some(&dup))
-            .unwrap();
+        assert_eq!(analysis.outcome, AffectOutcome::SkipValueUnchanged);
+        state = analysis.next_maintenance_state.expect("next state");
 
         // Insert new AMOUNT → recompute.
         let neu = row(&[
@@ -4479,22 +4744,23 @@ mod tests {
             ("CUSTOMER_ID", json!(1)),
             ("AMOUNT", json!("7.00")),
         ]);
+        let analysis = analyze_primary(
+            &ops,
+            BaseChangeKind::Insert,
+            None,
+            Some(&neu),
+            Some(&state),
+        );
         assert!(matches!(
-            analyze_affect_with_maintenance(
-                &ops,
-                BaseChangeKind::Insert,
-                None,
-                Some(&neu),
-                &state,
-            )
-            .unwrap(),
+            analysis.outcome,
             AffectOutcome::Recompute { .. }
         ));
 
         // AMOUNT change that keeps the set unchanged (42.50→10.00 while both remain):
         // pre count(42.50)=2 → still 1 after; after count(10.00)=1 → still present.
-        // Wait: after maintain of neu we'd have 7.00; rebuild for clarity.
-        let mut state = build_maintenance_state(&ops, &base).unwrap();
+        let mut state = initial_maintenance_state(&ops, &base)
+            .unwrap()
+            .expect("addToSet requires Maintenance State");
         let pre = row(&[
             ("ORDER_ID", json!(102)),
             ("CUSTOMER_ID", json!(1)),
@@ -4506,25 +4772,15 @@ mod tests {
             ("AMOUNT", json!("10.00")),
         ]);
         // 42.50 refcount 2 → 1 (still in set); 10.00 refcount 1 → 2 (already in set) → skip.
-        assert_eq!(
-            analyze_affect_with_maintenance(
-                &ops,
-                BaseChangeKind::Update,
-                Some(&pre),
-                Some(&after),
-                &state,
-            )
-            .unwrap(),
-            AffectOutcome::SkipValueUnchanged
-        );
-        maintain_state_for_change(
+        let analysis = analyze_primary(
             &ops,
-            &mut state,
             BaseChangeKind::Update,
             Some(&pre),
             Some(&after),
-        )
-        .unwrap();
+            Some(&state),
+        );
+        assert_eq!(analysis.outcome, AffectOutcome::SkipValueUnchanged);
+        state = analysis.next_maintenance_state.expect("next state");
 
         // Change last 42.50 → 50.00: remove 42.50 from set, add 50.00 → recompute.
         let pre2 = row(&[
@@ -4537,15 +4793,15 @@ mod tests {
             ("CUSTOMER_ID", json!(1)),
             ("AMOUNT", json!("50.00")),
         ]);
+        let analysis = analyze_primary(
+            &ops,
+            BaseChangeKind::Update,
+            Some(&pre2),
+            Some(&after2),
+            Some(&state),
+        );
         assert!(matches!(
-            analyze_affect_with_maintenance(
-                &ops,
-                BaseChangeKind::Update,
-                Some(&pre2),
-                Some(&after2),
-                &state,
-            )
-            .unwrap(),
+            analysis.outcome,
             AffectOutcome::Recompute { .. }
         ));
     }
@@ -4583,9 +4839,11 @@ mod tests {
                 ("AMOUNT", json!("10.00")),
             ]),
         ];
-        let state = build_maintenance_state(&ops, &base).unwrap();
+        let state = initial_maintenance_state(&ops, &base)
+            .unwrap()
+            .expect("addToSet requires Maintenance State");
         assert_eq!(
-            state_refcount(&state, &row(&[("CUST", json!(1))]), Some(&json!("42.50"))),
+            blob_refcount(&state, &row(&[("CUST", json!(1))]), Some(&json!("42.50"))),
             1
         );
 
@@ -4595,17 +4853,14 @@ mod tests {
             ("CUSTOMER_ID", json!(1)),
             ("AMOUNT", json!("42.50")),
         ]);
-        assert_eq!(
-            analyze_affect_with_maintenance(
-                &ops,
-                BaseChangeKind::Insert,
-                None,
-                Some(&dup),
-                &state,
-            )
-            .unwrap(),
-            AffectOutcome::SkipValueUnchanged
+        let analysis = analyze_primary(
+            &ops,
+            BaseChangeKind::Insert,
+            None,
+            Some(&dup),
+            Some(&state),
         );
+        assert_eq!(analysis.outcome, AffectOutcome::SkipValueUnchanged);
 
         // New AMOUNT → recompute shaped identity CUST=1.
         let neu = row(&[
@@ -4613,20 +4868,101 @@ mod tests {
             ("CUSTOMER_ID", json!(1)),
             ("AMOUNT", json!("7.00")),
         ]);
-        match analyze_affect_with_maintenance(
+        let analysis = analyze_primary(
             &ops,
             BaseChangeKind::Insert,
             None,
             Some(&neu),
-            &state,
-        )
-        .unwrap()
-        {
+            Some(&state),
+        );
+        match analysis.outcome {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities[0].get("CUST"), Some(&json!(1)));
             }
             other => panic!("expected Recompute after rename+addToSet, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn infer_derived_columns_empty_filter_preserves_projected_schema() {
+        let ops = parse_transform_steps(&[
+            json!({"project": {"fields": ["ID", "NAME", "AMOUNT"]}}),
+            json!({"filter": {"field": "AMOUNT", "eq": "999.99"}}),
+            json!({
+                "groupBy": {
+                    "keys": ["NAME"],
+                    "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL"}]
+                }
+            }),
+        ])
+        .unwrap();
+        let primary = vec![
+            OutputColumn {
+                name: "ID".into(),
+                oracle_type: "NUMBER".into(),
+                precision: Some(10),
+                scale: Some(0),
+            },
+            OutputColumn {
+                name: "NAME".into(),
+                oracle_type: "VARCHAR2".into(),
+                precision: Some(100),
+                scale: None,
+            },
+            OutputColumn {
+                name: "AMOUNT".into(),
+                oracle_type: "NUMBER".into(),
+                precision: Some(12),
+                scale: Some(2),
+            },
+        ];
+        // Empty Derived rows — schema must still come from the transform definition.
+        let cols = infer_derived_columns(&ops, &primary, &[], &[]);
+        let by_name: BTreeMap<_, _> = cols.into_iter().map(|c| (c.name.clone(), c)).collect();
+        assert_eq!(by_name["NAME"].oracle_type, "VARCHAR2");
+        assert_eq!(by_name["TOTAL"].oracle_type, "NUMBER");
+        assert_eq!(by_name["TOTAL"].precision, Some(12));
+        assert_eq!(by_name["TOTAL"].scale, Some(2));
+        assert!(!by_name.contains_key("ID"));
+    }
+
+    #[test]
+    fn infer_derived_columns_marks_equilookup_and_addtoset_as_json() {
+        let lookup_ops = parse_transform_steps(&[json!({
+            "equiLookup": {
+                "from": "ORDERS",
+                "localField": "ID",
+                "foreignField": "CUSTOMER_ID",
+                "as": "orders"
+            }
+        })])
+        .unwrap();
+        let add_ops = parse_transform_steps(&[json!({
+            "addToSet": {
+                "keys": ["ID"],
+                "field": "NAME",
+                "as": "NAMES"
+            }
+        })])
+        .unwrap();
+        let primary = vec![
+            OutputColumn {
+                name: "ID".into(),
+                oracle_type: "NUMBER".into(),
+                precision: None,
+                scale: None,
+            },
+            OutputColumn {
+                name: "NAME".into(),
+                oracle_type: "VARCHAR2".into(),
+                precision: None,
+                scale: None,
+            },
+        ];
+        let lookup_cols = infer_derived_columns(&lookup_ops, &primary, &[], &[]);
+        assert!(lookup_cols.iter().any(|c| c.name == "orders" && c.oracle_type == "JSON"));
+        let add_cols = infer_derived_columns(&add_ops, &primary, &[], &[]);
+        assert!(add_cols.iter().any(|c| c.name == "NAMES" && c.oracle_type == "JSON"));
     }
 
     #[test]
@@ -4699,7 +5035,7 @@ mod tests {
             ("EMAIL", json!("new@x")),
         ]);
         assert_eq!(
-            analyze_affect_on_base_with_bases(
+            analyze_on_base(
                 &ops,
                 "CUSTOMERS",
                 "CUSTOMERS",
@@ -4708,8 +5044,8 @@ mod tests {
                 Some(&after_email),
                 &customers,
                 &secondary,
-            )
-            .unwrap(),
+                None,
+            ).outcome,
             AffectOutcome::SkipUnusedFields
         );
 
@@ -4719,17 +5055,17 @@ mod tests {
             ("NAME", json!("Alicia")),
             ("EMAIL", json!("a@x")),
         ]);
-        match analyze_affect_on_base_with_bases(
-            &ops,
-            "CUSTOMERS",
-            "CUSTOMERS",
-            BaseChangeKind::Update,
-            Some(&pre),
-            Some(&after_name),
-            &customers,
-            &secondary,
-        )
-        .unwrap()
+        match analyze_on_base(
+                &ops,
+                "CUSTOMERS",
+                "CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&pre),
+                Some(&after_name),
+                &customers,
+                &secondary,
+                None,
+            ).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 // pre + after images (NAME Alice→Alicia) both expand; ORDER_IDs overlap.
@@ -4750,17 +5086,17 @@ mod tests {
         let mut orders_after_delete = orders.clone();
         orders_after_delete.retain(|r| r.get("ORDER_ID") != Some(&json!(100)));
         secondary.insert("ORDERS".to_string(), orders_after_delete);
-        match analyze_affect_on_base_with_bases(
-            &ops,
-            "ORDERS",
-            "CUSTOMERS",
-            BaseChangeKind::Delete,
-            Some(&order_pre),
-            None,
-            &customers,
-            &secondary,
-        )
-        .unwrap()
+        match analyze_on_base(
+                &ops,
+                "ORDERS",
+                "CUSTOMERS",
+                BaseChangeKind::Delete,
+                Some(&order_pre),
+                None,
+                &customers,
+                &secondary,
+                None,
+            ).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 assert!(
@@ -4883,7 +5219,7 @@ mod tests {
             ("EMAIL", json!("new@x")),
         ]);
         assert_eq!(
-            analyze_affect_on_base(
+            analyze_on_base(
                 &ops,
                 "EAST_CUSTOMERS",
                 "EAST_CUSTOMERS",
@@ -4891,8 +5227,9 @@ mod tests {
                 Some(&pre),
                 Some(&after_email),
                 &east,
-            )
-            .unwrap(),
+                &BTreeMap::new(),
+                None,
+            ).outcome,
             AffectOutcome::SkipUnusedFields
         );
 
@@ -4902,16 +5239,17 @@ mod tests {
             ("NAME", json!("Alicia")),
             ("EMAIL", json!("a@x")),
         ]);
-        match analyze_affect_on_base(
-            &ops,
-            "EAST_CUSTOMERS",
-            "EAST_CUSTOMERS",
-            BaseChangeKind::Update,
-            Some(&pre),
-            Some(&after_name),
-            &east,
-        )
-        .unwrap()
+        match analyze_on_base(
+                &ops,
+                "EAST_CUSTOMERS",
+                "EAST_CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&pre),
+                Some(&after_name),
+                &east,
+                &BTreeMap::new(),
+                None,
+            ).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);
@@ -4928,7 +5266,7 @@ mod tests {
             ("EMAIL", json!("zoe@x")),
         ]);
         assert_eq!(
-            analyze_affect_on_base(
+            analyze_on_base(
                 &ops,
                 "WEST_CUSTOMERS",
                 "EAST_CUSTOMERS",
@@ -4936,8 +5274,9 @@ mod tests {
                 Some(&west_pre),
                 Some(&west_email),
                 &east,
-            )
-            .unwrap(),
+                &BTreeMap::new(),
+                None,
+            ).outcome,
             AffectOutcome::SkipUnusedFields
         );
 
@@ -4947,16 +5286,17 @@ mod tests {
             ("NAME", json!("Zora")),
             ("EMAIL", json!("z@x")),
         ]);
-        match analyze_affect_on_base(
-            &ops,
-            "WEST_CUSTOMERS",
-            "EAST_CUSTOMERS",
-            BaseChangeKind::Update,
-            Some(&west_pre),
-            Some(&west_name),
-            &east,
-        )
-        .unwrap()
+        match analyze_on_base(
+                &ops,
+                "WEST_CUSTOMERS",
+                "EAST_CUSTOMERS",
+                BaseChangeKind::Update,
+                Some(&west_pre),
+                Some(&west_name),
+                &east,
+                &BTreeMap::new(),
+                None,
+            ).outcome
         {
             AffectOutcome::Recompute { identities } => {
                 assert_eq!(identities.len(), 1);

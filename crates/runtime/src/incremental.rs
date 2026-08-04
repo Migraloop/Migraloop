@@ -20,10 +20,9 @@ use migraloop_platform_store::{
     BaseColumn, BaseDataset, Pipeline, PlatformStore, QuarantinedChange, SchemaChangeImpact,
 };
 use migraloop_transform::{
-    analyze_affect_on_base_with_bases, analyze_affect_with_maintenance,
-    evaluate_transform_for_identities_with_bases, identity_matches_row, maintain_state_for_change,
-    parse_transform_steps, requires_maintenance_state, secondary_base_refs, used_base_fields,
-    AffectOutcome, BaseChangeKind, MaintenanceState, TransformOp,
+    analyze_base_change, evaluate_transform_for_identities_with_bases, identity_matches_row,
+    parse_transform_steps, secondary_base_refs, used_base_fields, AffectOutcome, BaseChangeContext,
+    BaseChangeKind, MaintenanceStateBlob, TransformOp,
 };
 
 use crate::observability::{emit_event, EventValue};
@@ -31,14 +30,14 @@ use crate::{
     delivery_document_for_row, derived_columns_for_ops, ensure_oracle_source_prerequisites,
     ensure_store_session_healthy, load_secondary_bases_and_columns_for_pipeline,
     mongo_target_from_deployment, open_deployment_incremental_capture, output_identity_from_row,
-    persist_maintenance_state_json, pipeline_base_table_refs, pipeline_references_table,
+    persist_maintenance_state_blob, pipeline_base_table_refs, pipeline_references_table,
     source_columns_for_pipeline, source_timezone_opt, transform_ops_from_pipeline, RuntimeError,
 };
 
-async fn load_maintenance_state_for_pipeline(
+async fn load_maintenance_state_blob(
     store: &PlatformStore,
     pipeline: &Pipeline,
-) -> Result<MaintenanceState, RuntimeError> {
+) -> Result<Option<MaintenanceStateBlob>, RuntimeError> {
     match store
         .get_maintenance_state_json(
             &pipeline.deployment_name,
@@ -47,13 +46,8 @@ async fn load_maintenance_state_for_pipeline(
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?
     {
-        Some(json) => serde_json::from_str(&json).map_err(|err| {
-            RuntimeError::Failed(format!(
-                "Transform Pipeline {}: invalid Maintenance State JSON: {err}",
-                pipeline.name
-            ))
-        }),
-        None => Ok(MaintenanceState::default()),
+        Some(json) => Ok(Some(MaintenanceStateBlob::from_persisted(json))),
+        None => Ok(None),
     }
 }
 
@@ -114,13 +108,9 @@ async fn maintain_transform_pipeline_for_change(
 
     let kind = base_change_kind(change.op);
     let is_primary = changed_table.eq_ignore_ascii_case(&pipeline.source_table);
-    let needs_ms = requires_maintenance_state(&ops);
 
-    let mut maintenance = if needs_ms {
-        Some(load_maintenance_state_for_pipeline(store, pipeline).await?)
-    } else {
-        None
-    };
+    // Load opaque prior Maintenance State when present; transform decides whether it applies.
+    let prior_state = load_maintenance_state_blob(store, pipeline).await?;
 
     // Load secondary Bases before Affect Analysis so equiLookup/union/unwind can
     // resolve multi-Base Output Identities (including disappeared identities).
@@ -136,37 +126,26 @@ async fn maintain_transform_pipeline_for_change(
         }
     }
 
-    let outcome = if let (true, Some(state)) = (is_primary && needs_ms, maintenance.as_ref()) {
-        analyze_affect_with_maintenance(&ops, kind, pre_apply, after.as_ref(), state).map_err(
-            |err| RuntimeError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)),
-        )?
-    } else {
-        analyze_affect_on_base_with_bases(
-            &ops,
-            changed_table,
-            &pipeline.source_table,
+    let analysis = analyze_base_change(
+        &ops,
+        &BaseChangeContext {
+            changed_base: changed_table,
+            primary_base: &pipeline.source_table,
             kind,
-            pre_apply,
-            after.as_ref(),
-            &primary_rows,
-            &secondary,
-        )
-        .map_err(|err| RuntimeError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?
-    };
+            before: pre_apply,
+            after: after.as_ref(),
+            primary_rows: &primary_rows,
+            secondary_bases: &secondary,
+        },
+        prior_state.as_ref(),
+    )
+    .map_err(|err| RuntimeError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
 
-    // Value-level distinct/addToSet skips still update Maintenance State refcounts.
-    if let (true, Some(state)) = (is_primary && needs_ms, maintenance.as_mut()) {
-        maintain_state_for_change(&ops, state, kind, pre_apply, after.as_ref()).map_err(|err| {
-            RuntimeError::Failed(format!(
-                "Transform Pipeline {}: Maintenance State update failed: {err}",
-                pipeline.name
-            ))
-        })?;
-        persist_maintenance_state_json(&store, pipeline, state).await?;
-    }
-
-    match outcome {
+    match analysis.outcome {
         AffectOutcome::SkipUnusedFields => {
+            if let Some(next) = &analysis.next_maintenance_state {
+                persist_maintenance_state_blob(store, pipeline, next).await?;
+            }
             println!(
                 "Affect Analysis: Pipeline {} skipped (unused fields only)",
                 pipeline.name
@@ -174,6 +153,9 @@ async fn maintain_transform_pipeline_for_change(
             Ok(())
         }
         AffectOutcome::SkipValueUnchanged => {
+            if let Some(next) = &analysis.next_maintenance_state {
+                persist_maintenance_state_blob(store, pipeline, next).await?;
+            }
             println!(
                 "Affect Analysis: Pipeline {} skipped (value-level; no Derived change)",
                 pipeline.name
@@ -197,7 +179,13 @@ async fn maintain_transform_pipeline_for_change(
                 &ops,
                 &identities,
             )
-            .await
+            .await?;
+            // Persist next Maintenance State only after successful Derived/Delivery work
+            // so a Delivery retry cannot analyze/bump the same change twice.
+            if let Some(next) = &analysis.next_maintenance_state {
+                persist_maintenance_state_blob(store, pipeline, next).await?;
+            }
+            Ok(())
         }
     }
 }

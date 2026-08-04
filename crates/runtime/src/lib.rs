@@ -1,9 +1,10 @@
-//! Deployment runtime: apply, table-level Initial Load, Direct Pipeline Delivery,
-//! and Incremental Sync orchestration.
+//! Deployment runtime: apply, table-level Initial Load, Direct/Transform Pipeline
+//! Delivery, and Incremental Sync orchestration (including Affect Analysis → Derived
+//! maintenance → Delivery via the single transform Affect interface).
 //!
-//! The Operator CLI is a thin adapter over this interface. Affect Analysis deepening
-//! and lifecycle / Align / Drift verbs remain follow-ups (#154–#155). This module owns
-//! apply → Initial Load → Direct Delivery (#152) and Incremental Capture (#153).
+//! The Operator CLI is a thin adapter over this interface. Lifecycle / Align / Drift
+//! verbs remain a follow-up (#155). This module owns apply → Initial Load → Delivery
+//! (#152), Incremental Capture (#153), and Transform Affect maintenance (#154).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,9 +23,8 @@ use migraloop_platform_store::{
     OmittedColumn, Pipeline, PlatformStore, PlatformStoreHealth, SecretRef, SystemConnection,
 };
 use migraloop_transform::{
-    build_maintenance_state, derived_output_field_names, evaluate_transform_with_bases,
-    parse_transform_steps, requires_maintenance_state, secondary_base_refs, MaintenanceState,
-    TransformOp,
+    evaluate_transform_with_bases, infer_derived_columns, initial_maintenance_state,
+    parse_transform_steps, secondary_base_refs, MaintenanceStateBlob, OutputColumn, TransformOp,
 };
 use migraloop_types::resolve_secret_ref;
 use thiserror::Error;
@@ -1232,8 +1232,12 @@ pub async fn deliver_transform_pipeline_with_options(
             RuntimeError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name))
         })?;
 
-    let derived_columns =
-        derived_columns_for_ops(&base.columns, &ops, &derived_rows, &secondary_columns);
+    let derived_columns = derived_columns_for_ops(
+        &base.columns,
+        &ops,
+        &derived_rows,
+        &secondary_columns,
+    );
     let source_columns =
         source_columns_for_pipeline(deployment, &pipeline.source_schema, &pipeline.source_table)?;
     let managed_names: BTreeSet<String> = derived_columns
@@ -1270,7 +1274,7 @@ pub async fn deliver_transform_pipeline_with_options(
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
-    persist_maintenance_state_for_pipeline(store, pipeline, &ops, &base_maps).await?;
+    persist_initial_maintenance_state(store, pipeline, &ops, &base_maps).await?;
 
     println!(
         "Derived Dataset materialized: Pipeline {} ({} rows)",
@@ -1324,154 +1328,76 @@ pub async fn deliver_transform_pipeline_with_options(
     Ok(())
 }
 
-/// Columns for a Derived Dataset after project/addFields/rename/remove/equiLookup/unwind/union/groupBy,
-/// merged with keys observed in Derived rows. Works for empty Derived results.
-/// Aggregate/`addFields`/`rename` aliases inherit the source field's Oracle type metadata.
-/// `equiLookup` `as` arrays are nested documents (no Oracle scalar type). `unwind` of that
-/// path flattens object elements so the path is no longer nested — foreign Base column
-/// metadata in `secondary_columns` supplies types for those flattened / unioned fields.
+fn to_output_columns(columns: &[BaseColumn]) -> Vec<OutputColumn> {
+    columns
+        .iter()
+        .map(|c| OutputColumn {
+            name: c.name.clone(),
+            oracle_type: c.oracle_type.clone(),
+            precision: c.precision,
+            scale: c.scale,
+        })
+        .collect()
+}
+
+fn from_output_columns(columns: Vec<OutputColumn>) -> Vec<BaseColumn> {
+    columns
+        .into_iter()
+        .map(|c| BaseColumn {
+            name: c.name,
+            oracle_type: c.oracle_type,
+            precision: c.precision,
+            scale: c.scale,
+        })
+        .collect()
+}
+
+/// Derived columns via the transform schema-inference interface (no TransformOp walk here).
 pub fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
     ops: &[TransformOp],
     derived_rows: &[serde_json::Map<String, serde_json::Value>],
     secondary_columns: &[BaseColumn],
 ) -> Vec<BaseColumn> {
-    let base_names: Vec<String> = base_columns.iter().map(|c| c.name.clone()).collect();
-    let mut names: BTreeSet<String> = derived_output_field_names(ops, &base_names)
-        .into_iter()
-        .collect();
-    for row in derived_rows {
-        names.extend(row.keys().cloned());
-    }
-    let mut by_name: BTreeMap<&str, &BaseColumn> =
-        base_columns.iter().map(|c| (c.name.as_str(), c)).collect();
-    // Primary wins on name clashes; secondary fills unwind-flattened foreign fields.
-    for col in secondary_columns {
-        by_name.entry(col.name.as_str()).or_insert(col);
-    }
-    let mut alias_source: BTreeMap<String, String> = BTreeMap::new();
-    let mut nested_document_fields: BTreeSet<String> = BTreeSet::new();
-    for op in ops {
-        match op {
-            TransformOp::GroupBy { aggregates, .. } => {
-                for agg in aggregates {
-                    alias_source.insert(agg.as_name.clone(), agg.field.clone());
-                }
-            }
-            TransformOp::AddFields { fields } => {
-                for spec in fields {
-                    if let migraloop_transform::AddFieldSource::Field(src) = &spec.source {
-                        // Chase prior rename/addFields aliases so type metadata
-                        // resolves to a Base column (e.g. displayName→customerName→NAME).
-                        let resolved = alias_source
-                            .get(src)
-                            .cloned()
-                            .unwrap_or_else(|| src.clone());
-                        alias_source.insert(spec.as_name.clone(), resolved);
-                    }
-                }
-            }
-            TransformOp::Rename { fields } => {
-                for spec in fields {
-                    let src = alias_source
-                        .get(&spec.from)
-                        .cloned()
-                        .unwrap_or_else(|| spec.from.clone());
-                    alias_source.insert(spec.to.clone(), src);
-                    if nested_document_fields.remove(&spec.from) {
-                        nested_document_fields.insert(spec.to.clone());
-                    }
-                }
-            }
-            TransformOp::EquiLookup { as_name, .. } => {
-                nested_document_fields.insert(as_name.clone());
-            }
-            TransformOp::Unwind { path } => {
-                // Object-element flatten removes the array path from Derived output.
-                nested_document_fields.remove(path);
-            }
-            TransformOp::AddToSet { as_name, .. } => {
-                // Distinct values collected into a JSON array.
-                nested_document_fields.insert(as_name.clone());
-            }
-            _ => {}
-        }
-    }
-    names
-        .into_iter()
-        .map(|name| {
-            if nested_document_fields.contains(&name) {
-                BaseColumn {
-                    name,
-                    oracle_type: "JSON".to_string(),
-                    precision: None,
-                    scale: None,
-                }
-            } else if let Some(col) = by_name.get(name.as_str()) {
-                (*col).clone()
-            } else if let Some(source) = alias_source.get(&name) {
-                if let Some(col) = by_name.get(source.as_str()) {
-                    BaseColumn {
-                        name,
-                        oracle_type: col.oracle_type.clone(),
-                        precision: col.precision,
-                        scale: col.scale,
-                    }
-                } else {
-                    BaseColumn {
-                        name,
-                        oracle_type: "NUMBER".to_string(),
-                        precision: None,
-                        scale: None,
-                    }
-                }
-            } else {
-                BaseColumn {
-                    name,
-                    oracle_type: "VARCHAR2".to_string(),
-                    precision: None,
-                    scale: None,
-                }
-            }
-        })
-        .collect()
+    from_output_columns(infer_derived_columns(
+        ops,
+        &to_output_columns(base_columns),
+        &to_output_columns(secondary_columns),
+        derived_rows,
+    ))
 }
 
-pub async fn persist_maintenance_state_for_pipeline(
+async fn persist_initial_maintenance_state(
     store: &PlatformStore,
     pipeline: &Pipeline,
     ops: &[TransformOp],
     base_rows: &[serde_json::Map<String, serde_json::Value>],
 ) -> Result<(), RuntimeError> {
-    if !requires_maintenance_state(ops) {
-        store
-            .delete_maintenance_state(&pipeline.deployment_name, &pipeline.name)
-            .await
-            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-        return Ok(());
-    }
-    let state = build_maintenance_state(ops, base_rows).map_err(|err| {
+    match initial_maintenance_state(ops, base_rows).map_err(|err| {
         RuntimeError::Failed(format!(
             "Transform Pipeline {}: failed to build Maintenance State: {err}",
             pipeline.name
         ))
-    })?;
-    persist_maintenance_state_json(store, pipeline, &state).await
+    })? {
+        Some(blob) => persist_maintenance_state_blob(store, pipeline, &blob).await,
+        None => store
+            .delete_maintenance_state(&pipeline.deployment_name, &pipeline.name)
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string())),
+    }
 }
 
-pub async fn persist_maintenance_state_json(
+pub async fn persist_maintenance_state_blob(
     store: &PlatformStore,
     pipeline: &Pipeline,
-    state: &MaintenanceState,
+    state: &MaintenanceStateBlob,
 ) -> Result<(), RuntimeError> {
-    let state_json = serde_json::to_string(state).map_err(|err| {
-        RuntimeError::Failed(format!(
-            "Transform Pipeline {}: failed to serialize Maintenance State: {err}",
-            pipeline.name
-        ))
-    })?;
     store
-        .replace_maintenance_state(&pipeline.deployment_name, &pipeline.name, &state_json)
+        .replace_maintenance_state(
+            &pipeline.deployment_name,
+            &pipeline.name,
+            state.as_str(),
+        )
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))
 }
