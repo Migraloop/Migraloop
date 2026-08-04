@@ -765,23 +765,6 @@ impl PlatformStore {
         Ok(())
     }
 
-    /// Update Delivery status for one Pipeline.
-    pub async fn update_pipeline_delivery_status(
-        &self,
-        deployment_name: &str,
-        pipeline_name: &str,
-        delivery_status: &str,
-    ) -> Result<(), PlatformStoreError> {
-        self.record_delivery_progress(
-            deployment_name,
-            pipeline_name,
-            Some(delivery_status),
-            None,
-            None,
-        )
-        .await
-    }
-
     /// Persist Drift Check status for one Pipeline (issue #25).
     pub async fn update_pipeline_drift_status(
         &self,
@@ -816,60 +799,6 @@ impl PlatformStore {
             )));
         }
         Ok(())
-    }
-
-    /// Update Delivery status and optionally accumulate applied Output Identity changes.
-    pub async fn update_pipeline_delivery_progress(
-        &self,
-        deployment_name: &str,
-        pipeline_name: &str,
-        delivery_status: &str,
-        additional_applied_changes: Option<i32>,
-    ) -> Result<(), PlatformStoreError> {
-        self.record_delivery_progress(
-            deployment_name,
-            pipeline_name,
-            Some(delivery_status),
-            additional_applied_changes,
-            None,
-        )
-        .await
-    }
-
-    /// Persist Delivery Health lag (remaining pending Delivery work; ADR-0020 / issue #26).
-    pub async fn update_pipeline_delivery_lag(
-        &self,
-        deployment_name: &str,
-        pipeline_name: &str,
-        delivery_lag: i32,
-    ) -> Result<(), PlatformStoreError> {
-        self.record_delivery_progress(
-            deployment_name,
-            pipeline_name,
-            None,
-            None,
-            Some(delivery_lag),
-        )
-        .await
-    }
-
-    /// Update Delivery status, optional applied-count delta, and optional Delivery lag.
-    pub async fn update_pipeline_delivery_progress_with_lag(
-        &self,
-        deployment_name: &str,
-        pipeline_name: &str,
-        delivery_status: &str,
-        additional_applied_changes: Option<i32>,
-        delivery_lag: Option<i32>,
-    ) -> Result<(), PlatformStoreError> {
-        self.record_delivery_progress(
-            deployment_name,
-            pipeline_name,
-            Some(delivery_status),
-            additional_applied_changes,
-            delivery_lag,
-        )
-        .await
     }
 
     /// Record Delivery progress for one Pipeline (status, applied delta, and/or lag).
@@ -1622,16 +1551,6 @@ impl PlatformStore {
         Ok(())
     }
 
-    /// Persist or refresh a Poison Change quarantine (ADR-0015).
-    ///
-    /// Prefer [`quarantine_change`] at Deployment-intent call sites.
-    pub async fn upsert_quarantined_change(
-        &self,
-        record: &QuarantinedChange,
-    ) -> Result<(), PlatformStoreError> {
-        self.quarantine_change(record).await
-    }
-
     /// List active (status=quarantined) Poison Change records, optionally scoped.
     pub async fn list_quarantined_changes(
         &self,
@@ -1688,7 +1607,7 @@ impl PlatformStore {
     /// Mark a blocking Schema Change impact and pause the affected Pipeline (ADR-0009).
     ///
     /// Deployment-intent verb — Runtime Schema Change paths call this instead of
-    /// sequencing [`set_pipeline_paused`] and [`upsert_schema_change_impact`].
+    /// sequencing pause + impact-row column updates.
     pub async fn mark_schema_impact(
         &self,
         record: &SchemaChangeImpact,
@@ -1718,75 +1637,8 @@ impl PlatformStore {
             )));
         }
 
-        sqlx::query(
-            r#"
-            INSERT INTO schema_change_impacts (
-                deployment_name, pipeline_name, source_schema, source_table,
-                change_id, capture_position, ddl_summary, impact, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
-                source_schema = EXCLUDED.source_schema,
-                source_table = EXCLUDED.source_table,
-                capture_position = EXCLUDED.capture_position,
-                ddl_summary = EXCLUDED.ddl_summary,
-                impact = EXCLUDED.impact,
-                status = EXCLUDED.status,
-                warned_at = NOW()
-            "#,
-        )
-        .bind(&record.deployment_name)
-        .bind(&record.pipeline_name)
-        .bind(&record.source_schema)
-        .bind(&record.source_table)
-        .bind(&record.change_id)
-        .bind(record.capture_position)
-        .bind(&record.ddl_summary)
-        .bind(&record.impact)
-        .bind(&record.status)
-        .execute(&mut *tx)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-
+        upsert_schema_change_impact_in_tx(&mut tx, record).await?;
         tx.commit().await.map_err(PlatformStoreError::Persist)?;
-        Ok(())
-    }
-
-    /// Persist or refresh a Schema Change impact row without pausing (ADR-0009).
-    ///
-    /// Prefer [`mark_schema_impact`] when the blocking intent includes pause.
-    pub async fn upsert_schema_change_impact(
-        &self,
-        record: &SchemaChangeImpact,
-    ) -> Result<(), PlatformStoreError> {
-        let pool = &self.pool;
-        sqlx::query(
-            r#"
-            INSERT INTO schema_change_impacts (
-                deployment_name, pipeline_name, source_schema, source_table,
-                change_id, capture_position, ddl_summary, impact, status
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
-                source_schema = EXCLUDED.source_schema,
-                source_table = EXCLUDED.source_table,
-                capture_position = EXCLUDED.capture_position,
-                ddl_summary = EXCLUDED.ddl_summary,
-                impact = EXCLUDED.impact,
-                status = EXCLUDED.status,
-                warned_at = NOW()
-            "#,
-        )
-        .bind(&record.deployment_name)
-        .bind(&record.pipeline_name)
-        .bind(&record.source_schema)
-        .bind(&record.source_table)
-        .bind(&record.change_id)
-        .bind(record.capture_position)
-        .bind(&record.ddl_summary)
-        .bind(&record.impact)
-        .bind(&record.status)
-        .execute(pool)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
         Ok(())
     }
 
@@ -1971,6 +1823,41 @@ async fn record_applied_source_changes_in_tx(
         .await
         .map_err(PlatformStoreError::Persist)?;
     }
+    Ok(())
+}
+
+async fn upsert_schema_change_impact_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    record: &SchemaChangeImpact,
+) -> Result<(), PlatformStoreError> {
+    sqlx::query(
+        r#"
+            INSERT INTO schema_change_impacts (
+                deployment_name, pipeline_name, source_schema, source_table,
+                change_id, capture_position, ddl_summary, impact, status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (deployment_name, pipeline_name, change_id) DO UPDATE SET
+                source_schema = EXCLUDED.source_schema,
+                source_table = EXCLUDED.source_table,
+                capture_position = EXCLUDED.capture_position,
+                ddl_summary = EXCLUDED.ddl_summary,
+                impact = EXCLUDED.impact,
+                status = EXCLUDED.status,
+                warned_at = NOW()
+            "#,
+    )
+    .bind(&record.deployment_name)
+    .bind(&record.pipeline_name)
+    .bind(&record.source_schema)
+    .bind(&record.source_table)
+    .bind(&record.change_id)
+    .bind(record.capture_position)
+    .bind(&record.ddl_summary)
+    .bind(&record.impact)
+    .bind(&record.status)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
     Ok(())
 }
 
