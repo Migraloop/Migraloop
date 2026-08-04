@@ -22,7 +22,7 @@ use migraloop_platform_store::{
 };
 use migraloop_runtime::{
     cutover_facts_from_base, handoff_from_low_watermark, resume_for_incremental, SyncCycleOutcome,
-    SyncInvocation,
+    SyncInvocation, SyncOptions,
 };
 use serde_json::json;
 
@@ -248,6 +248,7 @@ async fn incremental_sync_rejects_missing_cutover_watermark() {
         SyncInvocation::OneShot,
         &fake_source,
         &fake_target,
+        SyncOptions::default(),
     )
     .await;
     let err = outcome.expect_err("Incremental without low-watermark must fail");
@@ -311,6 +312,7 @@ async fn cutover_handoff_enables_incremental_sync() {
         SyncInvocation::OneShot,
         &fake_source,
         &fake_target,
+        SyncOptions::default(),
     )
     .await
     .expect("Incremental Sync after cutover hand-off");

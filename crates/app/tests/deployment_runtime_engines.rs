@@ -25,7 +25,7 @@ use migraloop_platform_store::{
     BaseColumn, BaseDataset, Deployment, Pipeline, PlatformStore, SecretRef, SecretRefKind,
     SystemConnection, TlsSettings,
 };
-use migraloop_runtime::{SyncCycleOutcome, SyncInvocation};
+use migraloop_runtime::{SyncCycleOutcome, SyncInvocation, SyncOptions};
 use serde_json::json;
 
 fn admin_url() -> String {
@@ -221,6 +221,7 @@ async fn production_incremental_sync_accepts_fake_source_and_target_engines() {
         SyncInvocation::OneShot,
         &fake_source,
         &fake_target,
+        SyncOptions::default(),
     )
     .await
     .expect("production Incremental Sync with Fake Source/Target");
