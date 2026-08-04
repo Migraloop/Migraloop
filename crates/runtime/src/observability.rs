@@ -184,8 +184,9 @@ pub fn derive_sync_health(base: &BaseDataset) -> SyncHealth {
     if base.sync_lag > 0 {
         return SyncHealth::Lagging;
     }
+    // Initial Load may set cutover checkpoint without Incremental progress — stay unknown
+    // until applied changes / incremental status / durable ok|lagging label.
     if base.sync_applied_changes > 0
-        || base.capture_checkpoint.is_some()
         || base.status == "incremental"
         || stored.eq_ignore_ascii_case("ok")
         || stored.eq_ignore_ascii_case("lagging")
@@ -520,6 +521,14 @@ mod tests {
             derive_sync_health(&empty_base("unknown", 0, 0)),
             SyncHealth::Unknown
         );
+    }
+
+    #[test]
+    fn sync_health_unknown_when_only_cutover_checkpoint_present() {
+        // Initial Load establishes cutover checkpoint without Incremental applies.
+        let mut base = empty_base("unknown", 0, 0);
+        base.capture_checkpoint = Some(999);
+        assert_eq!(derive_sync_health(&base), SyncHealth::Unknown);
     }
 
     #[test]

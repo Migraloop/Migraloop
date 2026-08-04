@@ -33,7 +33,7 @@ fn mongo_host() -> String {
     std::env::var("MIGRALOOP_TEST_MONGO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-fn mongo_port() -> u16 {
+fn mongo_port() -> i32 {
     std::env::var("MIGRALOOP_TEST_MONGO_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
