@@ -41,8 +41,34 @@ pub(crate) fn output_identity_matches_poison_keys(
     poison_keys.contains(&migraloop_types::output_identity_key(identity))
 }
 
-fn identity_is_poison(identity: &serde_json::Value, poison_keys: &BTreeSet<String>) -> bool {
-    output_identity_matches_poison_keys(identity, poison_keys)
+/// Run a Delivery attempt with bounded retries and optional Downstream delay.
+///
+/// Shared by Transform maintain (and available to Direct paths) so Poison Change
+/// Handling owns the retry+quarantine-bound policy (ADR-0015). Backpressure delay
+/// is applied between attempts via the Backpressure seam helper.
+pub(crate) async fn with_bounded_delivery_retries<T, F, Fut>(
+    max_attempts: u32,
+    delivery_delay_ms: Option<u64>,
+    mut attempt_once: F,
+) -> Result<T, (u32, String)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last_error = String::new();
+    for attempt in 1..=max_attempts {
+        apply_delivery_delay(delivery_delay_ms).await;
+        match attempt_once().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_error = err;
+                if attempt < max_attempts {
+                    eprintln!("Delivery retry {attempt}/{max_attempts} failed: {last_error}");
+                }
+            }
+        }
+    }
+    Err((max_attempts, last_error))
 }
 
 pub(crate) async fn upsert_with_bounded_retries<T: TargetEngine>(
@@ -56,7 +82,7 @@ pub(crate) async fn upsert_with_bounded_retries<T: TargetEngine>(
     let mut last_error = String::new();
     for attempt in 1..=max_attempts {
         apply_delivery_delay(delivery_delay_ms).await;
-        if identity_is_poison(&document.identity, poison_keys) {
+        if output_identity_matches_poison_keys(&document.identity, poison_keys) {
             last_error = format!(
                 "injected poison Delivery failure for Output Identity {}",
                 format_output_identity(&document.identity)
@@ -88,7 +114,7 @@ pub(crate) async fn delete_with_bounded_retries<T: TargetEngine>(
     let mut last_error = String::new();
     for attempt in 1..=max_attempts {
         apply_delivery_delay(delivery_delay_ms).await;
-        if identity_is_poison(identity, poison_keys) {
+        if output_identity_matches_poison_keys(identity, poison_keys) {
             last_error = format!(
                 "injected poison Delivery failure for Output Identity {}",
                 format_output_identity(identity)

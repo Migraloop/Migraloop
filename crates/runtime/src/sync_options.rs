@@ -98,6 +98,18 @@ impl SyncOptions {
             },
             fail_after_changes: env_u32_gt0("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES"),
         }
+        .normalized()
+    }
+
+    /// Clamp knobs that must be > 0 (same contract as the legacy env filters).
+    pub(crate) fn normalized(mut self) -> Self {
+        if self.poison.max_attempts == 0 {
+            self.poison.max_attempts = 3;
+        }
+        if self.backpressure.queue_capacity == 0 {
+            self.backpressure.queue_capacity = 256;
+        }
+        self
     }
 }
 
@@ -138,6 +150,10 @@ fn env_csv_set(name: &str) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Process-global env knobs need exclusive access across parallel unit tests.
+    static ENV_COMPAT_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn production_defaults_match_documented_knobs() {
@@ -150,7 +166,26 @@ mod tests {
     }
 
     #[test]
+    fn normalized_clamps_zero_capacity_and_attempts() {
+        let opts = SyncOptions {
+            poison: PoisonOptions {
+                max_attempts: 0,
+                poison_identity_keys: BTreeSet::new(),
+            },
+            backpressure: BackpressureOptions {
+                queue_capacity: 0,
+                delivery_delay_ms: None,
+            },
+            fail_after_changes: None,
+        }
+        .normalized();
+        assert_eq!(opts.poison.max_attempts, 3);
+        assert_eq!(opts.backpressure.queue_capacity, 256);
+    }
+
+    #[test]
     fn from_env_compat_reads_legacy_knobs() {
+        let _guard = ENV_COMPAT_LOCK.lock().expect("env compat lock");
         std::env::set_var("MIGRALOOP_POISON_MAX_ATTEMPTS", "2");
         std::env::set_var("MIGRALOOP_DELIVERY_POISON_IDENTITIES", "1, 42");
         std::env::set_var("MIGRALOOP_SYNC_QUEUE_CAPACITY", "4");

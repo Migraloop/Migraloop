@@ -28,6 +28,7 @@ use crate::cutover::resume_for_incremental;
 use crate::observability::{emit_event, EventValue};
 use crate::poison::{
     delete_with_bounded_retries, quarantine_poison_change, upsert_with_bounded_retries,
+    with_bounded_delivery_retries,
 };
 use crate::schema_impact::apply_schema_change_impacts;
 use crate::sync_options::SyncOptions;
@@ -576,7 +577,8 @@ async fn run_incremental_sync_with_options(
     invocation: SyncInvocation,
     options: SyncOptions,
 ) -> Result<SyncCycleOutcome, RuntimeError> {
-    let prepared = prepare_incremental_sync_cycle(store, invocation, options).await?;
+    let prepared =
+        prepare_incremental_sync_cycle(store, invocation, options.normalized()).await?;
     let Some(mut cycle) = prepared else {
         return Ok(SyncCycleOutcome::Idle);
     };
@@ -638,7 +640,8 @@ pub async fn run_incremental_sync_with_engines<S: SourceEngine, T: TargetEngine>
     target: &T,
     options: SyncOptions,
 ) -> Result<SyncCycleOutcome, RuntimeError> {
-    let prepared = prepare_incremental_sync_cycle(store, invocation, options).await?;
+    let prepared =
+        prepare_incremental_sync_cycle(store, invocation, options.normalized()).await?;
     let Some(mut cycle) = prepared else {
         return Ok(SyncCycleOutcome::Idle);
     };
@@ -1239,73 +1242,60 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                         }
                                     }
                                     "transform" => {
-                                        let mut last_error = String::new();
-                                        let mut succeeded = false;
-                                        let mut next_ms = None;
-                                        for attempt in 1..=max_poison_attempts {
-                                            crate::backpressure::apply_delivery_delay(
-                                                delivery_delay_ms,
-                                            )
-                                            .await;
-                                            match maintain_transform_pipeline_for_change(
-                                                store,
-                                                pipeline,
-                                                target,
-                                                &table,
-                                                &rows,
-                                                change,
-                                                pre_apply.as_ref(),
-                                            )
-                                            .await
-                                            {
-                                                Ok(blob) => {
-                                                    next_ms = blob;
-                                                    succeeded = true;
-                                                    break;
-                                                }
-                                                Err(err) => {
-                                                    last_error = err.to_string();
-                                                    if attempt < max_poison_attempts {
-                                                        eprintln!(
-                                                            "Delivery retry {attempt}/{max_poison_attempts} \
-                                                             failed: {last_error}"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if !succeeded {
-                                            let identity = identity_value_from_change(
-                                                change,
-                                                if pipeline.output_identity.is_empty() {
-                                                    &dataset.primary_key
-                                                } else {
-                                                    &pipeline.output_identity
-                                                },
-                                            )
-                                            .unwrap_or_else(|_| {
-                                                serde_json::Value::Object(
-                                                    change
-                                                        .identity
-                                                        .iter()
-                                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                                        .collect(),
+                                        let maintain = with_bounded_delivery_retries(
+                                            max_poison_attempts,
+                                            delivery_delay_ms,
+                                            || async {
+                                                maintain_transform_pipeline_for_change(
+                                                    store,
+                                                    pipeline,
+                                                    target,
+                                                    &table,
+                                                    &rows,
+                                                    change,
+                                                    pre_apply.as_ref(),
                                                 )
-                                            });
-                                            quarantine_poison_change(
-                                                store,
-                                                pipeline,
-                                                &schema,
-                                                &table,
-                                                change,
-                                                identity,
-                                                "delivery",
-                                                max_poison_attempts,
-                                                &last_error,
-                                            )
-                                            .await?;
-                                        } else if let Some(blob) = next_ms {
-                                            pending_maintenance.push((pipeline, blob));
+                                                .await
+                                                .map_err(|err| err.to_string())
+                                            },
+                                        )
+                                        .await;
+                                        match maintain {
+                                            Ok(Some(blob)) => {
+                                                pending_maintenance.push((pipeline, blob));
+                                            }
+                                            Ok(None) => {}
+                                            Err((attempts, last_error)) => {
+                                                let identity = identity_value_from_change(
+                                                    change,
+                                                    if pipeline.output_identity.is_empty() {
+                                                        &dataset.primary_key
+                                                    } else {
+                                                        &pipeline.output_identity
+                                                    },
+                                                )
+                                                .unwrap_or_else(|_| {
+                                                    serde_json::Value::Object(
+                                                        change
+                                                            .identity
+                                                            .iter()
+                                                            .map(|(k, v)| (k.clone(), v.clone()))
+                                                            .collect(),
+                                                    )
+                                                });
+                                                quarantine_poison_change(
+                                                    store,
+                                                    pipeline,
+                                                    &schema,
+                                                    &table,
+                                                    change,
+                                                    identity,
+                                                    "delivery",
+                                                    attempts,
+                                                    &last_error,
+                                                )
+                                                .await?;
+                                            }
                                         }
                                         store.update_pipeline_delivery_lag(
                                                                                                         &pipeline.deployment_name,
