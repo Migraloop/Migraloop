@@ -122,13 +122,13 @@ fn optional_json_values_equal(left: Option<&Value>, right: Option<&Value>) -> bo
 }
 
 /// Equality after [`normalize_json_for_compare`] (plain JSON and Mongo Extended JSON).
-pub(crate) fn json_values_equal(left: &Value, right: &Value) -> bool {
+fn json_values_equal(left: &Value, right: &Value) -> bool {
     normalize_json_for_compare(left) == normalize_json_for_compare(right)
 }
 
 /// Collapse Mongo Extended JSON number/date wrappers so Alignment and Drift
 /// share one compare path.
-pub(crate) fn normalize_json_for_compare(value: &Value) -> Value {
+fn normalize_json_for_compare(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             if let Some(n) = map.get("$numberLong").and_then(|v| v.as_str()) {
