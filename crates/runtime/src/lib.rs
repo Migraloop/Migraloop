@@ -1175,11 +1175,12 @@ pub(crate) async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
     }
 
     store
-        .update_pipeline_delivery_progress(
+        .record_delivery_progress(
             &pipeline.deployment_name,
             &pipeline.name,
-            "delivered",
+            Some("delivered"),
             Some((delivered + deleted) as i32),
+            None,
         )
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
@@ -1353,11 +1354,12 @@ pub(crate) async fn deliver_transform_pipeline_with_options<T: TargetEngine>(
     }
 
     store
-        .update_pipeline_delivery_progress(
+        .record_delivery_progress(
             &pipeline.deployment_name,
             &pipeline.name,
-            "delivered",
+            Some("delivered"),
             Some((delivered + deleted) as i32),
+            None,
         )
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;

@@ -325,7 +325,13 @@ async fn duplicate_safe_redelivery_keeps_managed_outcomes_and_non_managed_fields
             .await
             .expect("open Platform Store for re-Delivery exercise");
         store
-            .update_pipeline_delivery_status("oracle-to-mongo", "customers", "pending")
+            .record_delivery_progress(
+                "oracle-to-mongo",
+                "customers",
+                Some("pending"),
+                None,
+                None,
+            )
             .await
             .expect("reset Pipeline Delivery status for re-Delivery exercise");
     }

@@ -70,7 +70,13 @@ async fn lab_update_pipeline_delivery_status(
         .await
         .map_err(|err| PlatformStoreErrorMapped(err.to_string()))?;
     store
-        .update_pipeline_delivery_status(deployment_name, pipeline_name, delivery_status)
+        .record_delivery_progress(
+            deployment_name,
+            pipeline_name,
+            Some(delivery_status),
+            None,
+            None,
+        )
         .await
         .map_err(|err| PlatformStoreErrorMapped(err.to_string()))
 }

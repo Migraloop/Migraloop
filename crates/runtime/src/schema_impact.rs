@@ -123,17 +123,6 @@ pub(crate) async fn apply_schema_change_impacts(
         let impact = classify_schema_impact(&deps, change);
         match impact {
             SchemaImpact::Blocking => {
-                if !pipeline.paused {
-                    store
-                        .set_pipeline_paused(
-                            &pipeline.deployment_name,
-                            &pipeline.name,
-                            true,
-                        )
-                        .await
-                        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-                    pipeline.paused = true;
-                }
                 let record = SchemaChangeImpact {
                     deployment_name: pipeline.deployment_name.clone(),
                     pipeline_name: pipeline.name.clone(),
@@ -146,9 +135,10 @@ pub(crate) async fn apply_schema_change_impacts(
                     status: "active".to_string(),
                 };
                 store
-                    .upsert_schema_change_impact(&record)
+                    .mark_schema_impact(&record)
                     .await
                     .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+                pipeline.paused = true;
                 eprintln!(
                     "WARN: Schema Change blocked Pipeline={} change_id={} ddl={} — \
                      pausing affected Pipeline (not poison quarantine)",
