@@ -21,17 +21,20 @@ pub fn output_identity_key(identity: &serde_json::Value) -> String {
     serde_json::to_string(identity).unwrap_or_else(|_| identity.to_string())
 }
 
-/// Shared Managed / Base column metadata (issues #171 / #181).
+/// Shared Managed / Base column metadata (issues #171 / #181 / #182).
 ///
 /// Source adapters map engine-specific type discovery into [`ColumnShape::data_type`].
 /// Runtime, Platform Store, Delivery, and transform consume this shape for Managed/Base
-/// column metadata; Oracle-named fields remain on store/delivery wire types until
-/// contract (#182). Table and column layouts still come from Source schema discovery
-/// for Pipeline-referenced tables — not a platform business schema catalog (ADR-0026).
+/// column metadata — store/delivery domain types no longer expose Oracle-named fields
+/// as the default shape. Prior-release Platform Store JSON may still carry `oracle_type`
+/// on read (ADR-0014 alias). Table and column layouts still come from Source schema
+/// discovery for Pipeline-referenced tables — not a platform business schema catalog
+/// (ADR-0026).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnShape {
     pub name: String,
     /// Source-declared type name at the shared layer (engine brand stays on adapters).
+    #[serde(alias = "oracle_type")]
     pub data_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precision: Option<i32>,
@@ -360,5 +363,15 @@ mod tests {
         assert_eq!(back.data_type, "NUMBER");
         assert_eq!(back.precision, Some(10));
         assert_eq!(back.scale, Some(2));
+    }
+
+    #[test]
+    fn column_shape_accepts_legacy_oracle_type_wire_key() {
+        let legacy = r#"{"name":"ID","oracle_type":"NUMBER","precision":10,"scale":0}"#;
+        let shape: ColumnShape = serde_json::from_str(legacy).unwrap();
+        assert_eq!(shape.data_type, "NUMBER");
+        let written = serde_json::to_string(&shape).unwrap();
+        assert!(written.contains(r#""data_type":"NUMBER""#));
+        assert!(!written.contains(r#""oracle_type""#));
     }
 }

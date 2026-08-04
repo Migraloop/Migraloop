@@ -119,7 +119,7 @@ mod tests {
             primary_key: vec!["ID".into()],
             columns: vec![BaseColumn {
                 name: "ID".into(),
-                oracle_type: "NUMBER".into(),
+                data_type: "NUMBER".into(),
                 precision: Some(10),
                 scale: Some(0),
             }],

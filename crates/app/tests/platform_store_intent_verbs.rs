@@ -103,7 +103,7 @@ fn sample_base(deployment_name: &str) -> BaseDataset {
         primary_key: vec!["ID".to_string()],
         columns: vec![BaseColumn {
             name: "ID".to_string(),
-            oracle_type: "NUMBER".to_string(),
+            data_type: "NUMBER".to_string(),
             precision: Some(10),
             scale: Some(0),
         }],

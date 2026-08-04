@@ -175,7 +175,7 @@ impl SourceColumn {
     /// Map this Source-discovered column into the shared Managed/Base column shape.
     ///
     /// Engine-specific fields (`oracle_type`, allow-list `supported`, size caps) stay
-    /// on [`SourceColumn`]; callers that need the shared shape use this path (issue #171).
+    /// on [`SourceColumn`]; Platform Store / Delivery consume [`ColumnShape`] (issue #182).
     pub fn column_shape(&self) -> ColumnShape {
         ColumnShape {
             name: self.name.clone(),

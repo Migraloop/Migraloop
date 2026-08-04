@@ -139,13 +139,13 @@ async fn production_incremental_sync_accepts_fake_source_and_target_engines() {
         columns: vec![
             BaseColumn {
                 name: "ID".into(),
-                oracle_type: "NUMBER".into(),
+                data_type: "NUMBER".into(),
                 precision: Some(10),
                 scale: Some(0),
             },
             BaseColumn {
                 name: "NAME".into(),
-                oracle_type: "VARCHAR2".into(),
+                data_type: "VARCHAR2".into(),
                 precision: None,
                 scale: None,
             },
