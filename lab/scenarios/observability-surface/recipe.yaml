@@ -20,6 +20,19 @@ workload:
     - sync with Downstream delay + small queue; stop mid-window (Backpressure structured log)
     - assert status Sync/Delivery Health lag; scrape Prometheus /metrics via migraloop run
     - sync catch-up; lag metrics return toward 0
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_delivery: true
+    sync:
+      require_logminer: true
+      allow_fail: true
 checks:
   correctness:
     - "Apply/sync emit structured JSON operator events (initial_load / backpressure / incremental_capture)"

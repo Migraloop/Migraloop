@@ -20,6 +20,19 @@ workload:
     - sync with Downstream Delivery delay + small queue capacity; stop mid-window
     - assert Backpressure signal, queue_depth within capacity, status lag > 0, not paused
     - sync catch-up without delay; lag → 0; Target receives backlog
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_delivery: true
+    sync:
+      require_logminer: true
+      allow_fail: true
 checks:
   correctness:
     - "Artificial Downstream slowness prints Backpressure with queue_depth ≤ capacity"

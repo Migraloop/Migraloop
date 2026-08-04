@@ -101,12 +101,17 @@ impl Default for ProductPathApplyOpts {
 pub(crate) struct ProductPathSyncOpts {
     #[serde(default = "default_true")]
     pub(crate) require_logminer: bool,
+    /// When true, `product_sync` keeps going after a non-zero sync exit (Lab escapes
+    /// that intentionally stop mid-window, e.g. backpressure / observability).
+    #[serde(default)]
+    pub(crate) allow_fail: bool,
 }
 
 impl Default for ProductPathSyncOpts {
     fn default() -> Self {
         Self {
             require_logminer: true,
+            allow_fail: false,
         }
     }
 }

@@ -21,6 +21,16 @@ workload:
     - assert Base repaired, Source unchanged by align, status shows Source Alignment
     - mutate Source ID=2; align --max-rows 1 — assert resource gate (not full slam)
     - align with larger budget — repair remaining Base row
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - assert
+    apply:
+      require_initial_load: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "align detects Base≠Source after controlled Source mutation (mismatched/repaired lines)"

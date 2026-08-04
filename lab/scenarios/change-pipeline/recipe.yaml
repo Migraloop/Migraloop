@@ -22,6 +22,19 @@ workload:
     - assert Derived/Target rebuilt with delete reconciliation; Shared Base not Initial-Loaded again
     - sync Incremental Capture under the new revision (Pipeline not left paused)
     - apply metadata-only description change; assert rebuild skipped
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_delivery: true
+      require_derived: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "Semantic revision: Derived/Target match ACTIVE==0 (Bob only); Alice/Carol reconciled away"

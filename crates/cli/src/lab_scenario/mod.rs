@@ -5,7 +5,7 @@
 //! `product_path` / checks / thresholds are the live interface. Scenarios with
 //! `workload.product_path` use shared prepare→apply→mutate→sync→assert steps;
 //! thin hooks supply Namespace seeds, rare escapes, and correctness asserts.
-//! Remaining Scenarios still use full `adapt_*` adapters until migrated.
+//! All shipped Scenarios use shared product-path steps with thin hooks.
 //! Lab-specific machinery: catalog listing from on-disk recipes, Scenario
 //! Namespace lifecycle (prepare / re-run wipe / manual remove / opt-in
 //! auto-remove), one-at-a-time lock, refusal of non-Lab / production engine
@@ -581,29 +581,23 @@ async fn scenario_run(
             return run_product_path_scenario(lab_dir, &recipe).await;
         }
         match scenario {
-            // product_path Scenarios (#173 / #178) are handled above; remaining use full adapters.
-            TRANSFORM_PIPELINE_ID => adapt_transform_pipeline(lab_dir, &recipe).await,
-            CONCURRENT_SOURCE_WORKLOAD_ID => {
-                adapt_concurrent_source_workload(lab_dir, &recipe).await
-            }
-            BULK_LOAD_ID => adapt_bulk_load(lab_dir, &recipe).await,
-            IDEMPOTENT_REDELIVERY_ID => adapt_idempotent_redelivery(lab_dir, &recipe).await,
-            PAUSE_RESUME_ID => adapt_pause_resume(lab_dir, &recipe).await,
-            REMOVE_PIPELINE_ID => adapt_remove_pipeline(lab_dir, &recipe).await,
-            CHANGE_PIPELINE_ID => adapt_change_pipeline(lab_dir, &recipe).await,
-            SCHEMA_CHANGE_PAUSE_ID => adapt_schema_change_pause(lab_dir, &recipe).await,
-            SOURCE_ALIGNMENT_ID => adapt_source_alignment(lab_dir, &recipe).await,
-            DRIFT_CHECK_ID => adapt_drift_check(lab_dir, &recipe).await,
-            BOUNDED_BACKPRESSURE_ID => adapt_bounded_backpressure(lab_dir, &recipe).await,
-            OBSERVABILITY_SURFACE_ID => adapt_observability_surface(lab_dir, &recipe).await,
-            PLATFORM_STORE_GUARDRAILS_ID => {
-                adapt_platform_store_guardrails(lab_dir, &recipe).await
-            }
-            BACKWARD_COMPATIBLE_UPGRADES_ID => {
-                adapt_backward_compatible_upgrades(lab_dir, &recipe).await
-            }
-            INITIAL_LOAD_THROTTLED_ID => adapt_initial_load_throttled(lab_dir, &recipe).await,
+            // product_path Scenarios (#173 / #178 / #179) are handled above.
             DIRECT_PIPELINE_ID
+            | TRANSFORM_PIPELINE_ID
+            | CONCURRENT_SOURCE_WORKLOAD_ID
+            | BULK_LOAD_ID
+            | IDEMPOTENT_REDELIVERY_ID
+            | PAUSE_RESUME_ID
+            | REMOVE_PIPELINE_ID
+            | CHANGE_PIPELINE_ID
+            | SCHEMA_CHANGE_PAUSE_ID
+            | SOURCE_ALIGNMENT_ID
+            | DRIFT_CHECK_ID
+            | BOUNDED_BACKPRESSURE_ID
+            | OBSERVABILITY_SURFACE_ID
+            | PLATFORM_STORE_GUARDRAILS_ID
+            | BACKWARD_COMPATIBLE_UPGRADES_ID
+            | INITIAL_LOAD_THROTTLED_ID
             | RT_PROJECT_ID
             | RT_FILTER_ID
             | RT_FIELD_OPS_ID
@@ -614,7 +608,7 @@ async fn scenario_run(
             | POISON_QUARANTINE_ID => Err(CliError::Failed(
                 format!(
                     "Lab Scenario `{scenario}` must declare workload.product_path in recipe.yaml \
-                     (shared product-path runner; issue #173 / #178)"
+                     (shared product-path runner; issue #173 / #178 / #179)"
                 ),
             )),
             _ => Err(CliError::Failed(format!(
@@ -924,33 +918,21 @@ fn adapter_ok(rows_applied: u64, capture_path_note: impl Into<String>) -> Adapte
     }
 }
 
-/// Apply Scenario deployment.yaml via the real product CLI path; require Initial Load.
-async fn product_apply_initial_load(
-    lab_dir: &Path,
-    scenario_id: &str,
-) -> Result<String, CliError> {
-    product_apply(
-        lab_dir,
-        scenario_id,
-        &ProductPathApplyOpts {
-            require_initial_load: true,
-            require_delivery: false,
-            require_derived: false,
-        },
-    )
-    .await
-}
-
 /// Apply Scenario deployment via the real product CLI path with recipe apply gates.
 async fn product_apply(
     lab_dir: &Path,
     scenario_id: &str,
     opts: &ProductPathApplyOpts,
+    apply_env: &[(String, String)],
 ) -> Result<String, CliError> {
     let config_path = deployment_config_path(lab_dir, scenario_id)?;
     let bin = lab_migraloop_bin();
     println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
+    let env_refs: Vec<(&str, &str)> = apply_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let apply_out = run_product_cli_with_env(
         &bin,
         &[
             "apply",
@@ -961,6 +943,7 @@ async fn product_apply(
                 CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
             })?,
         ],
+        &env_refs,
     )
     .await?;
     if opts.require_initial_load
@@ -985,20 +968,37 @@ async fn product_apply(
 }
 
 /// Incremental Capture + Delivery via real product path, with optional sync env escapes.
+///
+/// Returns `(sync_out, capture_note, sync_succeeded)`. When `opts.allow_fail` is set,
+/// a non-zero sync exit still returns output so hooks can observe mid-window stops.
 async fn product_sync(
     opts: &ProductPathSyncOpts,
-    sync_env: &[(&str, &str)],
-) -> Result<(String, String), CliError> {
+    sync_env: &[(String, String)],
+) -> Result<(String, String, bool), CliError> {
     let bin = lab_migraloop_bin();
-    if sync_env.is_empty() {
+    if sync_env.is_empty() && !opts.allow_fail {
         println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
     }
-    let sync_out = run_product_cli_with_env(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        sync_env,
-    )
-    .await?;
+    let env_refs: Vec<(&str, &str)> = sync_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (sync_ok, sync_out) = if opts.allow_fail {
+        run_product_cli_allow_fail(
+            &bin,
+            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+            &env_refs,
+        )
+        .await?
+    } else {
+        let out = run_product_cli_with_env(
+            &bin,
+            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+            &env_refs,
+        )
+        .await?;
+        (true, out)
+    };
     let has_logminer = sync_out.to_ascii_lowercase().contains("logminer");
     if opts.require_logminer && !has_logminer {
         return Err(CliError::Failed(format!(
@@ -1010,14 +1010,18 @@ async fn product_sync(
     } else {
         "Incremental Sync".to_string()
     };
-    Ok((sync_out, capture_note))
+    Ok((sync_out, capture_note, sync_ok))
 }
 
 /// Context accumulated while the shared product-path runner executes recipe steps.
 struct ProductPathRunContext {
     apply_out: String,
     sync_out: String,
+    /// Whether the last `product_sync` process exited successfully (false when allow_fail).
+    sync_ok: bool,
     capture_path_note: String,
+    /// Wall-clock start of the first `product_apply` step (bulk-load duration metrics).
+    apply_started: Option<Instant>,
 }
 
 /// Thin Scenario hooks for seed SQL, rare escapes, and correctness (#173 / #178).
@@ -1031,6 +1035,21 @@ enum ProductPathHooks {
     RtUnwind,
     RtDistinctAddtoset,
     PoisonQuarantine,
+    TransformPipeline,
+    ConcurrentSourceWorkload,
+    BulkLoad,
+    IdempotentRedelivery,
+    PauseResume,
+    RemovePipeline,
+    ChangePipeline,
+    SchemaChangePause,
+    SourceAlignment,
+    DriftCheck,
+    BoundedBackpressure,
+    ObservabilitySurface,
+    PlatformStoreGuardrails,
+    BackwardCompatibleUpgrades,
+    InitialLoadThrottled,
 }
 
 impl ProductPathHooks {
@@ -1045,10 +1064,41 @@ impl ProductPathHooks {
             RT_UNWIND_ID => Ok(Self::RtUnwind),
             RT_DISTINCT_ADDTOSET_ID => Ok(Self::RtDistinctAddtoset),
             POISON_QUARANTINE_ID => Ok(Self::PoisonQuarantine),
+            TRANSFORM_PIPELINE_ID => Ok(Self::TransformPipeline),
+            CONCURRENT_SOURCE_WORKLOAD_ID => Ok(Self::ConcurrentSourceWorkload),
+            BULK_LOAD_ID => Ok(Self::BulkLoad),
+            IDEMPOTENT_REDELIVERY_ID => Ok(Self::IdempotentRedelivery),
+            PAUSE_RESUME_ID => Ok(Self::PauseResume),
+            REMOVE_PIPELINE_ID => Ok(Self::RemovePipeline),
+            CHANGE_PIPELINE_ID => Ok(Self::ChangePipeline),
+            SCHEMA_CHANGE_PAUSE_ID => Ok(Self::SchemaChangePause),
+            SOURCE_ALIGNMENT_ID => Ok(Self::SourceAlignment),
+            DRIFT_CHECK_ID => Ok(Self::DriftCheck),
+            BOUNDED_BACKPRESSURE_ID => Ok(Self::BoundedBackpressure),
+            OBSERVABILITY_SURFACE_ID => Ok(Self::ObservabilitySurface),
+            PLATFORM_STORE_GUARDRAILS_ID => Ok(Self::PlatformStoreGuardrails),
+            BACKWARD_COMPATIBLE_UPGRADES_ID => Ok(Self::BackwardCompatibleUpgrades),
+            INITIAL_LOAD_THROTTLED_ID => Ok(Self::InitialLoadThrottled),
             other => Err(CliError::Failed(format!(
                 "Lab Scenario `{other}` declares workload.product_path but has no product-path hooks \
                  (migrate the Scenario or remove product_path from recipe.yaml)"
             ))),
+        }
+    }
+
+    fn apply_env(&self) -> Vec<(String, String)> {
+        match self {
+            Self::InitialLoadThrottled => vec![
+                (
+                    "MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE".to_string(),
+                    INITIAL_LOAD_THROTTLED_CHUNK_SIZE.to_string(),
+                ),
+                (
+                    "MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS".to_string(),
+                    INITIAL_LOAD_THROTTLED_PAUSE_AFTER.to_string(),
+                ),
+            ],
+            _ => vec![],
         }
     }
 
@@ -1063,6 +1113,23 @@ impl ProductPathHooks {
             Self::RtUnwind => prepare_rt_unwind_namespace(lab_dir).await,
             Self::RtDistinctAddtoset => prepare_rt_distinct_addtoset_namespace(lab_dir).await,
             Self::PoisonQuarantine => prepare_poison_quarantine_namespace(lab_dir).await,
+            Self::TransformPipeline => prepare_transform_pipeline_namespace(lab_dir).await,
+            Self::ConcurrentSourceWorkload => prepare_concurrent_source_namespace(lab_dir).await,
+            Self::BulkLoad => prepare_bulk_load_namespace(lab_dir).await,
+            Self::IdempotentRedelivery => prepare_idempotent_redelivery_namespace(lab_dir).await,
+            Self::PauseResume => prepare_pause_resume_namespace(lab_dir).await,
+            Self::RemovePipeline => prepare_remove_pipeline_namespace(lab_dir).await,
+            Self::ChangePipeline => prepare_change_pipeline_namespace(lab_dir).await,
+            Self::SchemaChangePause => prepare_schema_change_pause_namespace(lab_dir).await,
+            Self::SourceAlignment => prepare_source_alignment_namespace(lab_dir).await,
+            Self::DriftCheck => prepare_drift_check_namespace(lab_dir).await,
+            Self::BoundedBackpressure => prepare_bounded_backpressure_namespace(lab_dir).await,
+            Self::ObservabilitySurface => prepare_observability_surface_namespace(lab_dir).await,
+            Self::PlatformStoreGuardrails => prepare_platform_store_guardrails_namespace(lab_dir).await,
+            Self::BackwardCompatibleUpgrades => {
+                prepare_backward_compatible_upgrades_namespace(lab_dir).await
+            }
+            Self::InitialLoadThrottled => prepare_initial_load_throttled_namespace(lab_dir).await,
         }
     }
 
@@ -1339,6 +1406,217 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 Ok(())
             }
             Self::PoisonQuarantine => Ok(()),
+            Self::TransformPipeline => {
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(TRANSFORM_ORDER_TOTALS_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let customers_base = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        TRANSFORM_CUSTOMERS_TABLE,
+                    ],
+                )
+                .await?;
+                let orders_base = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        TRANSFORM_ORDERS_TABLE,
+                    ],
+                )
+                .await?;
+                if !(managed_field_present(&customers_base, "NAME", "Alice")
+                    && managed_field_present(&customers_base, "NAME", "Bob"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load customers Base check failed (expected Alice and Bob):\n{customers_base}"
+                    )));
+                }
+                if !(managed_field_present(&orders_base, "AMOUNT", "10")
+                    && managed_field_present(&orders_base, "AMOUNT", "20")
+                    && managed_field_present(&orders_base, "AMOUNT", "5"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load orders Base check failed (expected amounts 10/20/5):\n{orders_base}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        TRANSFORM_ORDER_TOTALS_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(inspect_mentions_amount(&derived_after_apply, "30")
+                    && inspect_mentions_amount(&derived_after_apply, "5"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load Derived check failed (expected totals 30 and 5):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::ConcurrentSourceWorkload => {
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(CONCURRENT_ORDER_TOTALS_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let customers_base = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        CONCURRENT_CUSTOMERS_TABLE,
+                    ],
+                )
+                .await?;
+                let orders_base = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        CONCURRENT_ORDERS_TABLE,
+                    ],
+                )
+                .await?;
+                if !(managed_field_present(&customers_base, "NAME", "Alice")
+                    && managed_field_present(&customers_base, "NAME", "Bob"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load customers Base check failed (expected Alice and Bob):\n{customers_base}"
+                    )));
+                }
+                if !(managed_field_present(&orders_base, "AMOUNT", "10")
+                    && managed_field_present(&orders_base, "AMOUNT", "20")
+                    && managed_field_present(&orders_base, "AMOUNT", "5"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load orders Base check failed (expected amounts 10/20/5):\n{orders_base}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        CONCURRENT_ORDER_TOTALS_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(inspect_mentions_amount(&derived_after_apply, "30")
+                    && inspect_mentions_amount(&derived_after_apply, "5"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load Derived check failed (expected totals 30 and 5):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::ObservabilitySurface => {
+                if !(apply_out.contains("\"event\":\"initial_load_complete\"")
+                    || apply_out.contains("\"event\": \"initial_load_complete\"")
+                    || apply_out.contains("\"event\":\"delivery_complete\"")
+                    || apply_out.contains("\"event\": \"delivery_complete\""))
+                {
+                    return Err(CliError::Failed(format!(
+                        "expected structured Initial Load / Delivery operator events on apply:\n{apply_out}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::ChangePipeline => {
+                let target_v1 = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        CHANGE_PIPELINE_ACTIVE_COLLECTION,
+                    ],
+                )
+                .await?;
+                if !(managed_name_present(&target_v1, "Alice")
+                    && managed_name_present(&target_v1, "Carol")
+                    && !managed_name_present(&target_v1, "Bob"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial ACTIVE==1 Target must Deliver Alice/Carol only:\n{target_v1}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::InitialLoadThrottled => {
+                if !(apply_out.contains("Initial Load paused")
+                    || apply_out.contains("initial_load_paused")
+                    || apply_out.contains("\"event\":\"initial_load_paused\""))
+                {
+                    return Err(CliError::Failed(format!(
+                        "expected Initial Load pause after bounded chunks:\n{apply_out}"
+                    )));
+                }
+                let progress_paused = apply_out
+                    .lines()
+                    .filter(|l| l.contains("initial_load_progress") || l.contains("Initial Load progress"))
+                    .count();
+                if progress_paused < 2 {
+                    return Err(CliError::Failed(format!(
+                        "expected >=2 Initial Load progress signals before pause, got {progress_paused}:\n{apply_out}"
+                    )));
+                }
+                let status_paused = run_product_cli(
+                    &bin,
+                    &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                )
+                .await?;
+                if !(status_paused.contains("status=initial_load_paused")
+                    || status_paused.contains("Initial Load paused"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "expected durable Initial Load paused status:\n{status_paused}"
+                    )));
+                }
+                if !status_paused.contains("low-watermark=") {
+                    return Err(CliError::Failed(format!(
+                        "expected cutover low-watermark after paused chunked load:\n{status_paused}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::BulkLoad
+            | Self::IdempotentRedelivery
+            | Self::PauseResume
+            | Self::RemovePipeline
+            | Self::SchemaChangePause
+            | Self::SourceAlignment
+            | Self::DriftCheck
+            | Self::BoundedBackpressure
+            | Self::PlatformStoreGuardrails
+            | Self::BackwardCompatibleUpgrades => Ok(()),
         }
     }
 
@@ -1359,6 +1637,56 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
             Self::PoisonQuarantine => {
                 println!("Lab Scenario: driving Source mutations (update/insert/delete)...");
             }
+            Self::TransformPipeline => {
+                println!("Lab Scenario: driving multi-table Source insert/update/delete...");
+            }
+            Self::ConcurrentSourceWorkload => {
+                println!(
+                    "Lab Scenario: driving concurrent Source workload \
+(parallel customers + orders sessions)..."
+                );
+            }
+            Self::BoundedBackpressure => {
+                println!(
+                    "Lab Scenario: inserting Source backlog ({BOUNDED_BACKPRESSURE_BACKLOG} rows)..."
+                );
+            }
+            Self::ObservabilitySurface => {
+                println!(
+                    "Lab Scenario: inserting Source backlog ({OBSERVABILITY_SURFACE_BACKLOG} rows)..."
+                );
+            }
+            Self::PauseResume => {
+                println!("Lab Scenario: pause Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE} via CLI...");
+            }
+            Self::RemovePipeline => {
+                println!("Lab Scenario: remove Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} via CLI...");
+            }
+            Self::ChangePipeline => {
+                println!(
+                    "Lab Scenario: apply semantic Transform revision (ACTIVE==0) via real product path..."
+                );
+            }
+            Self::SchemaChangePause => {
+                println!(
+                    "Lab Scenario: driving Source DDL (DROP COLUMN NAME on {SCHEMA_CHANGE_PAUSE_TABLE})..."
+                );
+            }
+            Self::SourceAlignment => {
+                println!(
+                    "Lab Scenario: mutating Source ID=1 → AlignedAlice (controlled Base≠Source; no sync)..."
+                );
+            }
+            Self::DriftCheck => {
+                println!("Lab Scenario: align Base as trusted Drift baseline...");
+            }
+            Self::IdempotentRedelivery => {
+                println!("Lab Scenario: driving Source insert/update/delete...");
+            }
+            Self::BulkLoad
+            | Self::PlatformStoreGuardrails
+            | Self::BackwardCompatibleUpgrades
+            | Self::InitialLoadThrottled => {}
         }
         match self {
             Self::DirectPipeline => mutate_direct_pipeline_source(lab_dir).await,
@@ -1370,10 +1698,245 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
             Self::RtUnwind => mutate_rt_unwind_source(lab_dir).await,
             Self::RtDistinctAddtoset => mutate_rt_distinct_addtoset_source(lab_dir).await,
             Self::PoisonQuarantine => mutate_poison_quarantine_source(lab_dir).await,
+            Self::TransformPipeline => mutate_transform_pipeline_source(lab_dir).await,
+            Self::ConcurrentSourceWorkload => mutate_concurrent_source_workload(lab_dir).await,
+            Self::BulkLoad => Ok(()),
+            Self::IdempotentRedelivery => mutate_idempotent_redelivery_source(lab_dir).await,
+            Self::PauseResume => {
+                let bin = lab_migraloop_bin();
+                let pause_out = run_product_cli(
+                    &bin,
+                    &[
+                        "pause",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        PAUSE_RESUME_CUSTOMERS_PIPELINE,
+                        "--deployment",
+                        PAUSE_RESUME_DEPLOYMENT,
+                    ],
+                )
+                .await?;
+                if !pause_out.to_ascii_lowercase().contains("paused") {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario pause did not report paused Pipeline:\n{pause_out}"
+                    )));
+                }
+                println!("Lab Scenario: driving Source mutations on both Namespace tables...");
+                mutate_pause_resume_source(lab_dir).await
+            }
+            Self::RemovePipeline => {
+                let bin = lab_migraloop_bin();
+                let remove_out = run_product_cli(
+                    &bin,
+                    &[
+                        "remove",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        REMOVE_PIPELINE_CUSTOMERS_PIPELINE,
+                        "--deployment",
+                        REMOVE_PIPELINE_DEPLOYMENT,
+                    ],
+                )
+                .await?;
+                if !remove_out.to_ascii_lowercase().contains("removed") {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario remove did not report removed Pipeline:\n{remove_out}"
+                    )));
+                }
+                let status_after_remove = run_product_cli(
+                    &bin,
+                    &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                )
+                .await?;
+                if status_after_remove.contains(&format!("Pipeline: {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} (")) {
+                    return Err(CliError::Failed(format!(
+                        "status must no longer list removed Pipeline as active:\n{status_after_remove}"
+                    )));
+                }
+                if !status_after_remove
+                    .contains(&format!("Pipeline: {REMOVE_PIPELINE_REPORTING_PIPELINE} ("))
+                {
+                    return Err(CliError::Failed(format!(
+                        "status must still list remaining Pipeline:\n{status_after_remove}"
+                    )));
+                }
+                if !status_after_remove.contains(&format!("Base Dataset: {REMOVE_PIPELINE_CUSTOMERS_TABLE}"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Shared Base must remain after remove:\n{status_after_remove}"
+                    )));
+                }
+                if !status_after_remove.contains(REMOVE_PIPELINE_DEPLOYMENT) {
+                    return Err(CliError::Failed(format!(
+                        "Deployment must remain up after Pipeline remove:\n{status_after_remove}"
+                    )));
+                }
+                println!("Lab Scenario: driving Source mutations on Shared Base table...");
+                mutate_remove_pipeline_source(lab_dir).await
+            }
+            Self::ChangePipeline => {
+                let bin = lab_migraloop_bin();
+                let semantic_config =
+                    scenario_config_path(lab_dir, CHANGE_PIPELINE_ID, CHANGE_PIPELINE_SEMANTIC_CONFIG)?;
+                let apply_v2 = run_product_cli(
+                    &bin,
+                    &[
+                        "apply",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--file",
+                        semantic_config.to_str().ok_or_else(|| {
+                            CliError::Failed(
+                                "Scenario semantic revision path is not valid UTF-8".to_string(),
+                            )
+                        })?,
+                    ],
+                )
+                .await?;
+                let apply_v2_lower = apply_v2.to_ascii_lowercase();
+                if !(apply_v2_lower.contains("revision")
+                    && apply_v2.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE)
+                    && (apply_v2_lower.contains("paused") || apply_v2_lower.contains("pause")))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Semantic revision must pause old Delivery and report Pipeline revision:\n{apply_v2}"
+                    )));
+                }
+                if !apply_v2.contains(&format!(
+                    "Derived Dataset materialized: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
+                )) {
+                    return Err(CliError::Failed(format!(
+                        "Semantic revision must rebuild Derived:\n{apply_v2}"
+                    )));
+                }
+                if apply_v2.contains(&format!(
+                    "Initial Load complete: Base Dataset {CHANGE_PIPELINE_CUSTOMERS_TABLE}"
+                )) {
+                    return Err(CliError::Failed(format!(
+                        "Shared Base must not be rebuilt on Pipeline revision:\n{apply_v2}"
+                    )));
+                }
+                if apply_v2.contains(&format!(
+                    "Delivery complete: Pipeline {CHANGE_PIPELINE_REPORTING_PIPELINE}"
+                )) {
+                    return Err(CliError::Failed(format!(
+                        "Unchanged sibling Pipeline must not be re-Delivered on revision:\n{apply_v2}"
+                    )));
+                }
+                let derived_v2 = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        CHANGE_PIPELINE_ACTIVE_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(managed_name_present(&derived_v2, "Bob")
+                    && !managed_name_present(&derived_v2, "Alice")
+                    && !managed_name_present(&derived_v2, "Carol"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Rebuilt Derived must match ACTIVE==0 filter:\n{derived_v2}"
+                    )));
+                }
+                let target_v2 = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        CHANGE_PIPELINE_ACTIVE_COLLECTION,
+                    ],
+                )
+                .await?;
+                if !(managed_name_present(&target_v2, "Bob")
+                    && !managed_name_present(&target_v2, "Alice")
+                    && !managed_name_present(&target_v2, "Carol"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Re-Delivery must upsert Bob and reconcile-delete Alice/Carol:\n{target_v2}"
+                    )));
+                }
+                let base_after = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        CHANGE_PIPELINE_CUSTOMERS_TABLE,
+                    ],
+                )
+                .await?;
+                if !(managed_name_present(&base_after, "Alice")
+                    && managed_name_present(&base_after, "Bob")
+                    && managed_name_present(&base_after, "Carol"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Shared Base rows must remain after Pipeline revision:\n{base_after}"
+                    )));
+                }
+                let reporting = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        CHANGE_PIPELINE_REPORTING_COLLECTION,
+                    ],
+                )
+                .await?;
+                if !(managed_name_present(&reporting, "Alice")
+                    && managed_name_present(&reporting, "Bob")
+                    && managed_name_present(&reporting, "Carol"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Sibling Direct Target must remain from Shared Base:\n{reporting}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::SchemaChangePause => mutate_schema_change_pause_source_ddl(lab_dir).await,
+            Self::SourceAlignment => mutate_source_alignment_name(lab_dir, 1, "AlignedAlice").await,
+            Self::DriftCheck => {
+                let bin = lab_migraloop_bin();
+                let align_out = run_product_cli(
+                    &bin,
+                    &[
+                        "align",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        DRIFT_CHECK_TABLE,
+                    ],
+                )
+                .await?;
+                if !align_out.to_ascii_lowercase().contains("source alignment") {
+                    return Err(CliError::Failed(format!(
+                        "align must establish Drift baseline:\n{align_out}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: mutating Target Managed NAME→DRIFTED + planting non-Managed EXTRA..."
+                );
+                plant_drift_check_target_drift(lab_dir, 1, "DRIFTED", true).await
+            }
+            Self::BoundedBackpressure => insert_bounded_backpressure_backlog(lab_dir).await,
+            Self::ObservabilitySurface => insert_observability_surface_backlog(lab_dir).await,
+            Self::PlatformStoreGuardrails | Self::BackwardCompatibleUpgrades | Self::InitialLoadThrottled => {
+                Ok(())
+            }
         }
     }
 
-    fn before_sync(&self) {
+    async fn before_sync(&self, lab_dir: &Path) -> Result<(), CliError> {
         match self {
             Self::PoisonQuarantine => {
                 println!(
@@ -1381,27 +1944,122 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                      for Output Identity {POISON_QUARANTINE_IDENTITY}..."
                 );
             }
+            Self::BoundedBackpressure => {
+                println!(
+                    "Lab Scenario: sync under Downstream delay with queue capacity={} \
+(fail after {} durable checkpoint)...",
+                    BOUNDED_BACKPRESSURE_CAPACITY, BOUNDED_BACKPRESSURE_FAIL_AFTER
+                );
+            }
+            Self::ObservabilitySurface => {
+                println!(
+                    "Lab Scenario: sync under Downstream delay with queue capacity={} \
+(fail after {} durable checkpoint)...",
+                    OBSERVABILITY_SURFACE_CAPACITY, OBSERVABILITY_SURFACE_FAIL_AFTER
+                );
+            }
+            Self::SchemaChangePause => {
+                let bin = lab_migraloop_bin();
+                let status_before = run_product_cli(
+                    &bin,
+                    &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                )
+                .await?;
+                let checkpoint = parse_capture_checkpoint(&status_before).ok_or_else(|| {
+                    CliError::Failed(format!(
+                        "could not parse capture checkpoint from status before sync:\n{status_before}"
+                    ))
+                })?;
+                let inject_scn = checkpoint.saturating_add(1) as u64;
+                let inject_path = lab_dir.join(".schema-change-pause-inject.json");
+                let inject_body = format!(
+                    r#"{{
+  "changes": [
+    {{
+      "scn": {inject_scn},
+      "table": "{SCHEMA_CHANGE_PAUSE_TABLE}",
+      "schema": "SYNC_USER",
+      "kind": "drop_column",
+      "columns": ["NAME"],
+      "summary": "ALTER TABLE {SCHEMA_CHANGE_PAUSE_TABLE} DROP COLUMN NAME"
+    }}
+  ]
+}}"#
+                );
+                fs::write(&inject_path, inject_body).map_err(|err| {
+                    CliError::Failed(format!(
+                        "failed to write Schema Change inject file {}: {err}",
+                        inject_path.display()
+                    ))
+                })?;
+                println!(
+                    "Lab Scenario: sync Incremental Capture with Schema Change event for the Source DDL \
+         (drop managed NAME at scn={inject_scn}; inject bridges LogMiner DDL capture gap)..."
+                );
+            }
             _ => {}
         }
+        Ok(())
     }
 
-    fn sync_env(&self) -> Vec<(&'static str, &'static str)> {
+    fn sync_env(&self, lab_dir: &Path) -> Vec<(String, String)> {
         match self {
             Self::PoisonQuarantine => vec![
                 (
-                    "MIGRALOOP_DELIVERY_POISON_IDENTITIES",
-                    POISON_QUARANTINE_IDENTITY,
+                    "MIGRALOOP_DELIVERY_POISON_IDENTITIES".to_string(),
+                    POISON_QUARANTINE_IDENTITY.to_string(),
                 ),
                 (
-                    "MIGRALOOP_POISON_MAX_ATTEMPTS",
-                    POISON_QUARANTINE_MAX_ATTEMPTS,
+                    "MIGRALOOP_POISON_MAX_ATTEMPTS".to_string(),
+                    POISON_QUARANTINE_MAX_ATTEMPTS.to_string(),
                 ),
             ],
+            Self::BoundedBackpressure => vec![
+                (
+                    "MIGRALOOP_SYNC_QUEUE_CAPACITY".to_string(),
+                    BOUNDED_BACKPRESSURE_CAPACITY.to_string(),
+                ),
+                (
+                    "MIGRALOOP_DELIVERY_DELAY_MS".to_string(),
+                    BOUNDED_BACKPRESSURE_DELAY_MS.to_string(),
+                ),
+                (
+                    "MIGRALOOP_SYNC_FAIL_AFTER_CHANGES".to_string(),
+                    BOUNDED_BACKPRESSURE_FAIL_AFTER.to_string(),
+                ),
+            ],
+            Self::ObservabilitySurface => vec![
+                (
+                    "MIGRALOOP_SYNC_QUEUE_CAPACITY".to_string(),
+                    OBSERVABILITY_SURFACE_CAPACITY.to_string(),
+                ),
+                (
+                    "MIGRALOOP_DELIVERY_DELAY_MS".to_string(),
+                    OBSERVABILITY_SURFACE_DELAY_MS.to_string(),
+                ),
+                (
+                    "MIGRALOOP_SYNC_FAIL_AFTER_CHANGES".to_string(),
+                    OBSERVABILITY_SURFACE_FAIL_AFTER.to_string(),
+                ),
+            ],
+            Self::SchemaChangePause => {
+                let inject_path = lab_dir.join(".schema-change-pause-inject.json");
+                vec![(
+                    "MIGRALOOP_INJECT_SCHEMA_CHANGES".to_string(),
+                    inject_path.to_string_lossy().into_owned(),
+                )]
+            }
             _ => vec![],
         }
     }
 
-    async fn after_sync(&self, sync_out: &str) -> Result<(), CliError> {
+    async fn after_sync(
+        &self,
+        lab_dir: &Path,
+        sync_out: &str,
+        sync_ok: bool,
+    ) -> Result<(), CliError> {
+        let bin = lab_migraloop_bin();
         match self {
             Self::PoisonQuarantine => {
                 let sync_lower = sync_out.to_ascii_lowercase();
@@ -1420,12 +2078,324 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 }
                 Ok(())
             }
+            Self::PauseResume => {
+                if sync_out.contains(&format!("Delivery complete: Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE}"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "paused Pipeline must not Deliver during sync:\n{sync_out}"
+                    )));
+                }
+                if !(sync_out.contains(&format!("Delivery complete: Pipeline {PAUSE_RESUME_ORDERS_PIPELINE}"))
+                    || sync_out.contains(PAUSE_RESUME_ORDERS_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "unaffected Pipeline must still Deliver during sync:\n{sync_out}"
+                    )));
+                }
+                let customers_target_paused = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        PAUSE_RESUME_CUSTOMERS_COLLECTION,
+                    ],
+                )
+                .await?;
+                if !(managed_name_present(&customers_target_paused, "Alice")
+                    && managed_name_present(&customers_target_paused, "Bob")
+                    && !managed_name_present(&customers_target_paused, "Alicia"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "while paused, customers Target must retain Initial Load (Alice/Bob, not Alicia):\n{customers_target_paused}"
+                    )));
+                }
+                let orders_target = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        PAUSE_RESUME_ORDERS_COLLECTION,
+                    ],
+                )
+                .await?;
+                if !(orders_target.contains("50.00") || orders_target.contains("\"50\"")) {
+                    return Err(CliError::Failed(format!(
+                        "unaffected orders Pipeline must Deliver Incremental update:\n{orders_target}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::RemovePipeline => {
+                if sync_out.contains(&format!(
+                    "Delivery complete: Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE}"
+                )) {
+                    return Err(CliError::Failed(format!(
+                        "removed Pipeline must not Deliver during sync:\n{sync_out}"
+                    )));
+                }
+                if !(sync_out.contains(&format!(
+                    "Delivery complete: Pipeline {REMOVE_PIPELINE_REPORTING_PIPELINE}"
+                )) || sync_out.contains(REMOVE_PIPELINE_REPORTING_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "remaining Pipeline must still Deliver from Shared Base during sync:\n{sync_out}"
+                    )));
+                }
+                let customers_target = mongosh_in_mongo(
+                    lab_dir,
+                    &format!(
+                        "JSON.stringify(db.getCollection('{REMOVE_PIPELINE_CUSTOMERS_COLLECTION}').find().toArray())"
+                    ),
+                )
+                .await
+                .map_err(|err| {
+                    CliError::Failed(format!(
+                        "Failed to inspect removed Pipeline Target via mongosh:\n{err}"
+                    ))
+                })?;
+                if !(managed_name_present(&customers_target, "Alice")
+                    && managed_name_present(&customers_target, "Bob")
+                    && !managed_name_present(&customers_target, "Alicia"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "removed Pipeline Target must retain Initial Load (Alice/Bob, not Alicia):\n{customers_target}"
+                    )));
+                }
+                let reporting_target = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        REMOVE_PIPELINE_REPORTING_COLLECTION,
+                    ],
+                )
+                .await?;
+                if !(managed_name_present(&reporting_target, "Alicia")
+                    && managed_name_present(&reporting_target, "Carol")
+                    && !managed_name_present(&reporting_target, "Bob"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "remaining Pipeline must Deliver Incremental updates from Shared Base:\n{reporting_target}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::SchemaChangePause => {
+                let inject_path = lab_dir.join(".schema-change-pause-inject.json");
+                let _ = fs::remove_file(&inject_path);
+                let sync_lower = sync_out.to_ascii_lowercase();
+                if !(sync_lower.contains("warn")
+                    && sync_lower.contains("schema change")
+                    && sync_lower.contains("paused"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "sync must WARN and pause on blocking Schema Change:\n{sync_out}"
+                    )));
+                }
+                if sync_lower.contains("alert: poison") || sync_out.contains("Quarantine:") {
+                    return Err(CliError::Failed(format!(
+                        "blocking DDL pause must be distinct from poison quarantine:\n{sync_out}"
+                    )));
+                }
+                if !sync_lower.contains("not poison quarantine") {
+                    return Err(CliError::Failed(format!(
+                        "blocking DDL pause should explicitly distinguish poison quarantine:\n{sync_out}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::BoundedBackpressure => {
+                if sync_ok {
+                    return Err(CliError::Failed(format!(
+                        "expected mid-sync stop under Downstream slowness (FAIL_AFTER), got success:\n{sync_out}"
+                    )));
+                }
+                let slow_lower = sync_out.to_ascii_lowercase();
+                if !(sync_out.contains("Backpressure:") || slow_lower.contains("backpressure")) {
+                    return Err(CliError::Failed(format!(
+                        "expected Backpressure signal while Downstream is slow:\n{sync_out}"
+                    )));
+                }
+                let mut peak_depth = 0i32;
+                for line in sync_out.lines() {
+                    if let Some(rest) = line.split("queue_depth=").nth(1) {
+                        if let Some(n) = rest
+                            .split_whitespace()
+                            .next()
+                            .and_then(|s| s.parse::<i32>().ok())
+                        {
+                            peak_depth = peak_depth.max(n);
+                        }
+                    }
+                }
+                if peak_depth <= 0 || peak_depth > 2 {
+                    return Err(CliError::Failed(format!(
+                        "queue_depth must stay within capacity=2 under backpressure, peak={peak_depth}:\n{sync_out}"
+                    )));
+                }
+                if slow_lower
+                    .lines()
+                    .any(|line| line.contains("paused") && line.contains(BOUNDED_BACKPRESSURE_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "backpressure must not pause the Pipeline for Downstream slowness:\n{sync_out}"
+                    )));
+                }
+                let status_mid = run_product_cli(
+                    &bin,
+                    &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                )
+                .await?;
+                let sync_lag = parse_sync_lag_for_table(&status_mid, BOUNDED_BACKPRESSURE_TABLE).ok_or_else(
+                    || {
+                        CliError::Failed(format!(
+                            "could not parse Sync Health lag under backpressure:\n{status_mid}"
+                        ))
+                    },
+                )?;
+                if sync_lag < 10 {
+                    return Err(CliError::Failed(format!(
+                        "Sync Health lag must reflect Source backlog under backpressure (not only window remainder), got {sync_lag}:\n{status_mid}"
+                    )));
+                }
+                let delivery_lag =
+                    parse_delivery_lag_for_pipeline(&status_mid, BOUNDED_BACKPRESSURE_PIPELINE)
+                        .ok_or_else(|| {
+                            CliError::Failed(format!(
+                                "could not parse Delivery Health lag under backpressure:\n{status_mid}"
+                            ))
+                        })?;
+                if delivery_lag < 10 {
+                    return Err(CliError::Failed(format!(
+                        "Delivery Health lag must reflect Downstream backlog under delay, got {delivery_lag}:\n{status_mid}"
+                    )));
+                }
+                if status_mid.contains("Delivery Health: paused") {
+                    return Err(CliError::Failed(format!(
+                        "default must not pause Pipeline for mere Downstream slowness:\n{status_mid}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::ObservabilitySurface => {
+                if sync_ok {
+                    return Err(CliError::Failed(format!(
+                        "expected mid-sync stop under Downstream slowness (FAIL_AFTER), got success:\n{sync_out}"
+                    )));
+                }
+                if !(sync_out.contains("\"event\":\"backpressure\"")
+                    || sync_out.contains("\"event\": \"backpressure\""))
+                {
+                    return Err(CliError::Failed(format!(
+                        "expected structured backpressure event JSON:\n{sync_out}"
+                    )));
+                }
+                if !(sync_out.contains("\"event\":\"incremental_capture\"")
+                    || sync_out.contains("\"event\": \"incremental_capture\""))
+                {
+                    return Err(CliError::Failed(format!(
+                        "expected structured incremental_capture event JSON:\n{sync_out}"
+                    )));
+                }
+                let status_mid = run_product_cli(
+                    &bin,
+                    &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                )
+                .await?;
+                if !(status_mid.contains("Sync Health:")
+                    && status_mid.contains("Delivery Health:")
+                    && status_mid.contains(&format!("Pipeline: {OBSERVABILITY_SURFACE_PIPELINE}")))
+                {
+                    return Err(CliError::Failed(format!(
+                        "status must include Sync Health, Delivery Health, and Pipeline status:\n{status_mid}"
+                    )));
+                }
+                let sync_lag = parse_sync_lag_for_table(&status_mid, OBSERVABILITY_SURFACE_TABLE).ok_or_else(
+                    || {
+                        CliError::Failed(format!(
+                            "could not parse Sync Health lag under Observability Surface probe:\n{status_mid}"
+                        ))
+                    },
+                )?;
+                if sync_lag < 10 {
+                    return Err(CliError::Failed(format!(
+                        "Sync Health lag must reflect Source backlog, got {sync_lag}:\n{status_mid}"
+                    )));
+                }
+                let delivery_lag =
+                    parse_delivery_lag_for_pipeline(&status_mid, OBSERVABILITY_SURFACE_PIPELINE)
+                        .ok_or_else(|| {
+                            CliError::Failed(format!(
+                                "could not parse Delivery Health lag under Observability Surface probe:\n{status_mid}"
+                            ))
+                        })?;
+                if delivery_lag < 10 {
+                    return Err(CliError::Failed(format!(
+                        "Delivery Health lag must reflect Downstream backlog, got {delivery_lag}:\n{status_mid}"
+                    )));
+                }
+                let metrics_body = scrape_run_metrics(&bin, LAB_PLATFORM_STORE_URL).await?;
+                if !(metrics_body.contains("migraloop_sync_lag")
+                    && metrics_body.contains("migraloop_delivery_lag")
+                    && (metrics_body.contains("migraloop_quarantined_changes")
+                        || metrics_body.contains("migraloop_failures")))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Prometheus /metrics must expose lag and failure counters:\n{metrics_body}"
+                    )));
+                }
+                let metric_sync_lag = parse_prometheus_gauge(&metrics_body, "migraloop_sync_lag").ok_or_else(
+                    || {
+                        CliError::Failed(format!(
+                            "could not parse migraloop_sync_lag from metrics:\n{metrics_body}"
+                        ))
+                    },
+                )?;
+                if metric_sync_lag < 1.0 {
+                    return Err(CliError::Failed(format!(
+                        "migraloop_sync_lag must reflect backlog, got {metric_sync_lag}:\n{metrics_body}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::ChangePipeline => {
+                if sync_out.to_ascii_lowercase().contains("error")
+                    && !sync_out.to_ascii_lowercase().contains("no changes")
+                {
+                    return Err(CliError::Failed(format!(
+                        "Incremental sync after Pipeline revision must succeed:\n{sync_out}"
+                    )));
+                }
+                let status_after_sync = run_product_cli(
+                    &bin,
+                    &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                )
+                .await?;
+                if status_after_sync
+                    .to_ascii_lowercase()
+                    .lines()
+                    .any(|line| line.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE) && line.contains("paused"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Pipeline must not remain paused after revision when continuing incremental:\n{status_after_sync}"
+                    )));
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
 
     async fn assert_correctness(
         &self,
+        lab_dir: &Path,
+        recipe: &ScenarioRecipe,
         ctx: &ProductPathRunContext,
     ) -> Result<AdapterOutcome, CliError> {
         let bin = lab_migraloop_bin();
@@ -1902,6 +2872,1603 @@ addToSet Derived:\n{add_after}\naddToSet Target:\n{add_target}"
                 }
                 Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
             }
+            Self::TransformPipeline => {
+                let customers_base_after = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        TRANSFORM_CUSTOMERS_TABLE,
+                    ],
+                )
+                .await?;
+                let derived_after = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        TRANSFORM_ORDER_TOTALS_PIPELINE,
+                    ],
+                )
+                .await?;
+                let customers_target = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        TRANSFORM_CUSTOMERS_COLLECTION,
+                    ],
+                )
+                .await?;
+                let totals_target = run_product_cli(
+                    &bin,
+                    &[
+                        "target",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--collection",
+                        TRANSFORM_ORDER_TOTALS_COLLECTION,
+                    ],
+                )
+                .await?;
+                let customers_base_ok = managed_field_present(&customers_base_after, "NAME", "Alicia")
+                    && managed_field_present(&customers_base_after, "NAME", "Carol")
+                    && !managed_field_present(&customers_base_after, "NAME", "Bob");
+                let customers_target_ok = managed_field_present(&customers_target, "NAME", "Alicia")
+                    && managed_field_present(&customers_target, "NAME", "Carol")
+                    && !managed_field_present(&customers_target, "NAME", "Bob");
+                let derived_ok = inspect_mentions_amount(&derived_after, "35")
+                    && inspect_mentions_amount(&derived_after, "50")
+                    && !inspect_mentions_amount(&derived_after, "30")
+                    && managed_field_present(&derived_after, "ORDER_COUNT", "2")
+                    && managed_field_present(&derived_after, "ORDER_COUNT", "1")
+                    && (managed_field_present(&derived_after, "MIN_AMOUNT", "15")
+                        || managed_field_present(&derived_after, "MIN_AMOUNT", "15.00"))
+                    && (managed_field_present(&derived_after, "MAX_AMOUNT", "20")
+                        || managed_field_present(&derived_after, "MAX_AMOUNT", "20.00"))
+                    && (managed_field_present(&derived_after, "AVG_AMOUNT", "17.5")
+                        || managed_field_present(&derived_after, "AVG_AMOUNT", "17.50"));
+                let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
+                    && inspect_mentions_amount(&totals_target, "50")
+                    && !inspect_mentions_amount(&totals_target, "30")
+                    && managed_field_present(&totals_target, "ORDER_COUNT", "2")
+                    && managed_field_present(&totals_target, "ORDER_COUNT", "1")
+                    && (managed_field_present(&totals_target, "MIN_AMOUNT", "15")
+                        || managed_field_present(&totals_target, "MIN_AMOUNT", "15.00"))
+                    && (managed_field_present(&totals_target, "MAX_AMOUNT", "20")
+                        || managed_field_present(&totals_target, "MAX_AMOUNT", "20.00"))
+                    && (managed_field_present(&totals_target, "AVG_AMOUNT", "17.5")
+                        || managed_field_present(&totals_target, "AVG_AMOUNT", "17.50"));
+                if !(customers_base_ok && customers_target_ok && derived_ok && totals_target_ok) {
+                    return Err(CliError::Failed(format!(
+                        "correctness checks failed after multi-table insert/update/delete.\n\
+Customers Base:\n{customers_base_after}\nCustomers Target:\n{customers_target}\n\
+Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
+                    )));
+                }
+                println!(
+                    "Lab Scenario: correctness checks passed (Base + Derived + Target Managed outcomes)"
+                );
+                if !ctx.sync_out.trim().is_empty() {
+                    println!(
+                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                        ctx.capture_path_note
+                    );
+                }
+                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+            }
+            Self::ConcurrentSourceWorkload => {
+                    let max_settle_ms = recipe.thresholds.max_settle_ms.ok_or_else(|| {
+                        CliError::Failed(
+                            "Lab Scenario concurrent-source-workload recipe must declare thresholds.max_settle_ms"
+                                .to_string(),
+                        )
+                    })?;
+                    // US47: wait until Delivery catches up within recipe thresholds before final asserts.
+                    println!(
+                        "Lab Scenario: settling Incremental Capture + Delivery within max_settle_ms={max_settle_ms}..."
+                    );
+                    let settle_started = Instant::now();
+                    let mut sync_out;
+                    let mut capture_note = String::new();
+                    let mut last_detail = String::new();
+
+                    loop {
+                        let settle_ms = settle_started.elapsed().as_millis();
+                        if settle_ms > max_settle_ms {
+                            // Outcomes never reached expected Managed state — correctness fails.
+                            // Runner also fails recipe max_settle_ms (equal-weight threshold axis).
+                            return Ok(AdapterOutcome {
+                                correctness: false,
+                                detail: format!(
+                                    "correctness: concurrent Source Managed outcomes not settled \
+                (elapsed settle_ms={settle_ms}). {last_detail}"
+                                ),
+                                metrics: ScenarioMetrics {
+                                    settle_ms: Some(settle_ms),
+                                    lag: None,
+                                    rows_per_s: None,
+                                    duration_ms: None,
+                                    rows_applied: count_delivery_ops(&ctx.apply_out) + count_delivery_ops(&ctx.sync_out),
+                                    capture_path_note: capture_note,
+                                },
+                            });
+                        }
+
+                        sync_out = run_product_cli(
+                            &bin,
+                            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                        )
+                        .await?;
+                        if sync_out.to_ascii_lowercase().contains("logminer") {
+                            capture_note = "LogMiner".to_string();
+                        } else if capture_note.is_empty() {
+                            return Err(CliError::Failed(format!(
+                                "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
+                            )));
+                        }
+
+                        let customers_base_after = run_product_cli(
+                            &bin,
+                            &[
+                                "base",
+                                "--platform-store-url",
+                                LAB_PLATFORM_STORE_URL,
+                                "--table",
+                                CONCURRENT_CUSTOMERS_TABLE,
+                            ],
+                        )
+                        .await?;
+                        let derived_after = run_product_cli(
+                            &bin,
+                            &[
+                                "derived",
+                                "--platform-store-url",
+                                LAB_PLATFORM_STORE_URL,
+                                "--pipeline",
+                                CONCURRENT_ORDER_TOTALS_PIPELINE,
+                            ],
+                        )
+                        .await?;
+                        let customers_target = run_product_cli(
+                            &bin,
+                            &[
+                                "target",
+                                "--platform-store-url",
+                                LAB_PLATFORM_STORE_URL,
+                                "--collection",
+                                CONCURRENT_CUSTOMERS_COLLECTION,
+                            ],
+                        )
+                        .await?;
+                        let totals_target = run_product_cli(
+                            &bin,
+                            &[
+                                "target",
+                                "--platform-store-url",
+                                LAB_PLATFORM_STORE_URL,
+                                "--collection",
+                                CONCURRENT_ORDER_TOTALS_COLLECTION,
+                            ],
+                        )
+                        .await?;
+
+                        // Customers Direct: Alicia + Carol present, Bob deleted.
+                        let customers_base_ok = managed_field_present(&customers_base_after, "NAME", "Alicia")
+                            && managed_field_present(&customers_base_after, "NAME", "Carol")
+                            && !managed_field_present(&customers_base_after, "NAME", "Bob");
+                        let customers_target_ok = managed_field_present(&customers_target, "NAME", "Alicia")
+                            && managed_field_present(&customers_target, "NAME", "Carol")
+                            && !managed_field_present(&customers_target, "NAME", "Bob");
+                        // After concurrent mutate: cust1=20+5+10=35, cust2=5+15+30=50.
+                        let derived_ok = inspect_mentions_amount(&derived_after, "35")
+                            && inspect_mentions_amount(&derived_after, "50")
+                            && !inspect_mentions_amount(&derived_after, "30");
+                        let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
+                            && inspect_mentions_amount(&totals_target, "50")
+                            && !inspect_mentions_amount(&totals_target, "30");
+
+                        if customers_base_ok && customers_target_ok && derived_ok && totals_target_ok {
+                            break;
+                        }
+
+                        last_detail = format!(
+                            "correctness not yet settled.\n\
+                Customers Base:\n{customers_base_after}\nCustomers Target:\n{customers_target}\n\
+                Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
+                        );
+                        tokio::time::sleep(CONCURRENT_SETTLE_POLL).await;
+                    }
+
+                    let settle_ms = settle_started.elapsed().as_millis();
+                    let rows_applied = count_delivery_ops(&ctx.apply_out) + count_delivery_ops(&ctx.sync_out);
+                    println!(
+                        "Lab Scenario: correctness checks passed after concurrent Source settle \
+                (settle_ms={settle_ms}, Base + Derived + Target Managed outcomes)"
+                    );
+                    if !ctx.sync_out.trim().is_empty() {
+                        println!("Lab Scenario: Incremental Capture ({}) and Delivery complete", ctx.capture_path_note);
+                    }
+
+                    // Runner evaluates recipe max_settle_ms against measured settle_ms (US21 / US36).
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: Some(settle_ms),
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied,
+                            capture_path_note: capture_note,
+                        },
+                    })
+            }
+
+            Self::BulkLoad => {
+                    let max_lag = recipe.thresholds.max_lag.ok_or_else(|| {
+                        CliError::Failed("Lab Scenario bulk-load recipe must declare thresholds.max_lag".to_string())
+                    })?;
+                    let max_duration_ms = recipe.thresholds.max_duration_ms.ok_or_else(|| {
+                        CliError::Failed(
+                            "Lab Scenario bulk-load recipe must declare thresholds.max_duration_ms".to_string(),
+                        )
+                    })?;
+                    let load_started = ctx.apply_started.ok_or_else(|| {
+                        CliError::Failed("internal: bulk-load missing apply_started".to_string())
+                    })?;
+                    // US47: wait until Delivery/Health catch up within recipe duration before final asserts.
+                    println!(
+                        "Lab Scenario: settling bulk Delivery / Sync Health within \
+                max_duration_ms={max_duration_ms}..."
+                    );
+                    let mut last_detail = String::new();
+                    let mut settled = false;
+                    let (base_rows, target_rows, lag) = loop {
+                        let measured_duration_ms = load_started.elapsed().as_millis();
+                        let base_after = run_product_cli(
+                            &bin,
+                            &[
+                                "base",
+                                "--platform-store-url",
+                                LAB_PLATFORM_STORE_URL,
+                                "--table",
+                                BULK_LOAD_TABLE,
+                            ],
+                        )
+                        .await?;
+                        let target_after = run_product_cli(
+                            &bin,
+                            &[
+                                "target",
+                                "--platform-store-url",
+                                LAB_PLATFORM_STORE_URL,
+                                "--collection",
+                                BULK_LOAD_COLLECTION,
+                            ],
+                        )
+                        .await?;
+                        let status_out = run_product_cli(
+                            &bin,
+                            &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                        )
+                        .await?;
+
+                        let base_rows = parse_inspect_row_count(&base_after).ok_or_else(|| {
+                            CliError::Failed(format!(
+                                "Lab Scenario could not parse Base row count after bulk Initial Load:\n{base_after}"
+                            ))
+                        })?;
+                        let target_rows = parse_target_document_count(&target_after).ok_or_else(|| {
+                            CliError::Failed(format!(
+                                "Lab Scenario could not parse Target document count after bulk Delivery:\n{target_after}"
+                            ))
+                        })?;
+                        let lag = parse_sync_lag_for_table(&status_out, BULK_LOAD_TABLE).ok_or_else(|| {
+                            CliError::Failed(format!(
+                                "Lab Scenario could not parse Sync Health lag for {BULK_LOAD_TABLE}:\n{status_out}"
+                            ))
+                        })?;
+
+                        let rows_ok = base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
+                        let lag_ok = lag <= max_lag;
+                        if rows_ok && lag_ok {
+                            settled = true;
+                            break (base_rows, target_rows, lag);
+                        }
+
+                        last_detail = format!(
+                            "bulk Delivery/Health not yet caught up \
+                (base_rows={base_rows} target_rows={target_rows} lag={lag}).\n\
+                Base:\n{base_after}\nTarget:\n{target_after}\nStatus:\n{status_out}"
+                        );
+                        if measured_duration_ms > max_duration_ms {
+                            break (base_rows, target_rows, lag);
+                        }
+                        tokio::time::sleep(BULK_LOAD_SETTLE_POLL).await;
+                    };
+
+                    let measured_duration_ms = load_started.elapsed().as_millis();
+                    let measured_rows_per_s = if load_started.elapsed().as_secs_f64() > 0.0 {
+                        BULK_LOAD_ROW_COUNT as f64 / load_started.elapsed().as_secs_f64()
+                    } else {
+                        BULK_LOAD_ROW_COUNT as f64
+                    };
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out).max(base_rows);
+                    // Correctness is row-level Managed outcomes; runner evaluates lag/duration/throughput.
+                    let correctness =
+                        base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
+                    let mut detail = if correctness {
+                        String::new()
+                    } else {
+                        format!(
+                            "correctness: expected rows={BULK_LOAD_ROW_COUNT} \
+                base_rows={base_rows} target_rows={target_rows}"
+                        )
+                    };
+                    if !settled && !last_detail.is_empty() {
+                        let settle_note = format!(
+                            "bulk Delivery/Health settle incomplete within \
+                max_duration_ms={max_duration_ms}. {last_detail}"
+                        );
+                        if detail.is_empty() {
+                            detail = settle_note;
+                        } else {
+                            detail = format!("{detail}; {settle_note}");
+                        }
+                    }
+
+                    if correctness {
+                        println!(
+                            "Lab Scenario: correctness passed \
+                (base/target rows={BULK_LOAD_ROW_COUNT}, lag={lag}, \
+                duration_ms={measured_duration_ms}, rows_per_s={measured_rows_per_s:.2}); \
+                thresholds evaluated by recipe-driven runner"
+                        );
+                    } else {
+                        println!(
+                            "Lab Scenario: correctness failed (base_rows={base_rows} target_rows={target_rows}); \
+                metrics lag={lag} duration_ms={measured_duration_ms} rows_per_s={measured_rows_per_s:.2}"
+                        );
+                    }
+
+                    Ok(AdapterOutcome {
+                        correctness,
+                        detail,
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: Some(lag),
+                            rows_per_s: Some(measured_rows_per_s),
+                            duration_ms: Some(measured_duration_ms),
+                            rows_applied,
+                            capture_path_note: "Initial Load".to_string(),
+                        },
+                    })
+            }
+
+            Self::IdempotentRedelivery => {
+                    let config_path = deployment_config_path(lab_dir, IDEMPOTENT_REDELIVERY_ID)?;
+                    let config_str = config_path.to_str().ok_or_else(|| {
+                        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+                    })?;
+                    let target_before = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            IDEMPOTENT_REDELIVERY_COLLECTION,
+                        ],
+                    )
+                    .await?;
+                    let docs_before = parse_target_document_count(&target_before).ok_or_else(|| {
+                        CliError::Failed(format!(
+                            "Lab Scenario could not parse Target document count before re-Delivery:\n{target_before}"
+                        ))
+                    })?;
+                    let before_ok = managed_name_present(&target_before, "Alicia")
+                        && managed_name_present(&target_before, "Carol")
+                        && !managed_name_present(&target_before, "Bob");
+                    if !before_ok || docs_before != 2 {
+                        return Err(CliError::Failed(format!(
+                            "pre-redelivery Managed Target baseline failed (expected Alicia+Carol, Bob absent, documents=2):\n{target_before}"
+                        )));
+                    }
+
+                    // Plant a non-Managed field so re-Delivery proves Managed-only upsert (US48-adjacent / US49).
+                    println!(
+                        "Lab Scenario: planting non-Managed Target field before duplicate-safe re-Delivery..."
+                    );
+                    plant_idempotent_redelivery_operator_note(lab_dir).await?;
+
+                    // Lab orchestration only: mark Pipeline Delivery pending so the next real `apply`
+                    // re-Delivers current Base Output Identities (at-least-once / upsert-by-identity).
+                    println!(
+                        "Lab Scenario: resetting Pipeline Delivery status to force duplicate-safe re-Delivery..."
+                    );
+                    lab_update_pipeline_delivery_status(IDEMPOTENT_REDELIVERY_DEPLOYMENT,
+                        IDEMPOTENT_REDELIVERY_PIPELINE,
+                        "pending",
+                    )
+                    .await
+                    .map_err(|err| {
+                        CliError::Failed(format!(
+                            "Failed to reset Pipeline Delivery status for re-Delivery exercise:\n{err}"
+                        ))
+                    })?;
+
+                    println!("Lab Scenario: re-apply via real product path (duplicate-safe re-Delivery)...");
+                    let reapply_out = run_product_cli(
+                        &bin,
+                        &[
+                            "apply",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--file",
+                            config_str,
+                        ],
+                    )
+                    .await?;
+                    if !reapply_out.to_ascii_lowercase().contains("delivery") {
+                        return Err(CliError::Failed(format!(
+                            "Lab Scenario re-apply must perform Delivery (duplicate-safe re-Delivery):\n{reapply_out}"
+                        )));
+                    }
+                    // Must not reload existing Base on re-apply (ADR-0019) — re-Delivery of current Base only.
+                    if reapply_out.contains("Initial Load")
+                        || reapply_out.to_ascii_lowercase().contains("initial_load")
+                    {
+                        return Err(CliError::Failed(format!(
+                            "Lab Scenario re-apply must not reload Base (expected Delivery-only re-run):\n{reapply_out}"
+                        )));
+                    }
+                    let redelivery_ops = count_delivery_ops(&reapply_out);
+                    if redelivery_ops < 2 {
+                        return Err(CliError::Failed(format!(
+                            "Lab Scenario re-apply must re-Deliver current Base Output Identities \
+                             (expected ≥2 Delivery ops, got {redelivery_ops}):\n{reapply_out}"
+                        )));
+                    }
+
+                    let base_after = run_product_cli(
+                        &bin,
+                        &[
+                            "base",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--table",
+                            IDEMPOTENT_REDELIVERY_TABLE,
+                        ],
+                    )
+                    .await?;
+                    let target_after = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            IDEMPOTENT_REDELIVERY_COLLECTION,
+                        ],
+                    )
+                    .await?;
+                    let docs_after = parse_target_document_count(&target_after).ok_or_else(|| {
+                        CliError::Failed(format!(
+                            "Lab Scenario could not parse Target document count after re-Delivery:\n{target_after}"
+                        ))
+                    })?;
+
+                    let base_ok = managed_name_present(&base_after, "Alicia")
+                        && managed_name_present(&base_after, "Carol")
+                        && !managed_name_present(&base_after, "Bob");
+                    let target_ok = managed_name_present(&target_after, "Alicia")
+                        && managed_name_present(&target_after, "Carol")
+                        && !managed_name_present(&target_after, "Bob");
+                    let count_ok = docs_after == docs_before && docs_after == 2;
+                    let note_ok = target_after.contains(IDEMPOTENT_REDELIVERY_OPERATOR_NOTE);
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out)
+                        + count_delivery_ops(&ctx.sync_out)
+                        + count_delivery_ops(&reapply_out);
+
+                    if !(base_ok && target_ok && count_ok && note_ok) {
+                        return Err(CliError::Failed(format!(
+                            "correctness checks failed after duplicate-safe re-Delivery \
+                             (base_ok={base_ok} target_ok={target_ok} count_ok={count_ok} \
+                             docs_before={docs_before} docs_after={docs_after} note_ok={note_ok}).\n\
+                             Base:\n{base_after}\nTarget:\n{target_after}"
+                        )));
+                    }
+
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (Managed outcomes stable; document count={docs_after}; non-Managed field preserved)"
+                    );
+                    if !ctx.sync_out.trim().is_empty() {
+                        println!("Lab Scenario: Incremental Capture ({}) and Delivery complete", ctx.capture_path_note);
+                    }
+                    println!("Lab Scenario: duplicate-safe re-Delivery complete on real product apply path");
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: ctx.capture_path_note.clone(),
+                        },
+                    })
+            }
+
+            Self::PauseResume => {
+
+
+                    println!("Lab Scenario: resume Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE} (catch-up Delivery)...");
+                    let resume_out = run_product_cli(
+                        &bin,
+                        &[
+                            "resume",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--pipeline",
+                            PAUSE_RESUME_CUSTOMERS_PIPELINE,
+                            "--deployment",
+                            PAUSE_RESUME_DEPLOYMENT,
+                        ],
+                    )
+                    .await?;
+                    if !(resume_out.to_ascii_lowercase().contains("resum")
+                        && resume_out.to_ascii_lowercase().contains("delivery"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "Lab Scenario resume must catch up Delivery from durable state:\n{resume_out}"
+                        )));
+                    }
+
+                    let customers_target = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            PAUSE_RESUME_CUSTOMERS_COLLECTION,
+                        ],
+                    )
+                    .await?;
+                    let customers_ok = managed_name_present(&customers_target, "Alicia")
+                        && managed_name_present(&customers_target, "Carol")
+                        && !managed_name_present(&customers_target, "Bob");
+                    if !customers_ok {
+                        return Err(CliError::Failed(format!(
+                            "after resume, customers Target must match durable Base (Alicia+Carol, Bob absent):\n{customers_target}"
+                        )));
+                    }
+
+                    let status_out = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if status_out
+                        .lines()
+                        .any(|line| line.contains(PAUSE_RESUME_CUSTOMERS_PIPELINE) && line.contains("paused"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "status must not keep customers Pipeline paused after resume:\n{status_out}"
+                        )));
+                    }
+                    if !status_out.contains(PAUSE_RESUME_ORDERS_PIPELINE) {
+                        return Err(CliError::Failed(format!(
+                            "status must still list unaffected orders Pipeline:\n{status_out}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out)
+                        + count_delivery_ops(&ctx.sync_out)
+                        + count_delivery_ops(&resume_out);
+
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (pause stopped customers Delivery; resume catch-up; orders unaffected)"
+                    );
+                    if !ctx.sync_out.trim().is_empty() {
+                        println!(
+                            "Lab Scenario: Incremental Capture ({}) complete",
+                            ctx.capture_path_note
+                        );
+                    }
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: ctx.capture_path_note.clone(),
+                        },
+                    })
+            }
+
+            Self::BoundedBackpressure => {
+
+
+                    println!("Lab Scenario: catch-up sync without Downstream delay...");
+                    let catch_out = run_product_cli_with_env(
+                        &bin,
+                        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                        &[(
+                            "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+                            BOUNDED_BACKPRESSURE_CAPACITY,
+                        )],
+                    )
+                    .await?;
+                    let capture_note = if catch_out.to_ascii_lowercase().contains("logminer") {
+                        "LogMiner".to_string()
+                    } else {
+                        return Err(CliError::Failed(format!(
+                            "Lab Scenario catch-up sync must use real LogMiner path:\n{catch_out}"
+                        )));
+                    };
+
+                    let status_after = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    let sync_lag_after =
+                        parse_sync_lag_for_table(&status_after, BOUNDED_BACKPRESSURE_TABLE).unwrap_or(-1);
+                    let delivery_lag_after =
+                        parse_delivery_lag_for_pipeline(&status_after, BOUNDED_BACKPRESSURE_PIPELINE).unwrap_or(-1);
+                    if sync_lag_after != 0 || delivery_lag_after != 0 {
+                        return Err(CliError::Failed(format!(
+                            "lag must return to 0 after catch-up (sync={sync_lag_after}, delivery={delivery_lag_after}):\n{status_after}"
+                        )));
+                    }
+                    if status_after.contains("Delivery Health: paused") {
+                        return Err(CliError::Failed(format!(
+                            "Pipeline must remain unpaused after backpressure catch-up:\n{status_after}"
+                        )));
+                    }
+
+                    let target_out = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            BOUNDED_BACKPRESSURE_COLLECTION,
+                        ],
+                    )
+                    .await?;
+                    if !(managed_name_present(&target_out, "User100")
+                        && managed_name_present(&target_out, "User119"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "Target must receive backlog rows User100..User119 after catch-up:\n{target_out}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out)
+                        + count_delivery_ops(&ctx.sync_out)
+                        + count_delivery_ops(&catch_out);
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (bounded backpressure; visible lag; catch-up; Pipeline not paused)"
+                    );
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: Some(sync_lag_after),
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: capture_note,
+                        },
+                    })
+            }
+
+            Self::InitialLoadThrottled => {
+                    let config_path = deployment_config_path(lab_dir, INITIAL_LOAD_THROTTLED_ID)?;
+                    let config_str = config_path.to_str().ok_or_else(|| {
+                        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+                    })?;
+                    println!(
+                        "Lab Scenario: resume apply with rate_limit={INITIAL_LOAD_THROTTLED_RATE}/s \
+                and store delay for backoff..."
+                    );
+                    let resume_out = run_product_cli_with_env(
+                        &bin,
+                        &[
+                            "apply",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--file",
+                            config_str,
+                        ],
+                        &[
+                            (
+                                "MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE",
+                                INITIAL_LOAD_THROTTLED_CHUNK_SIZE,
+                            ),
+                            (
+                                "MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC",
+                                INITIAL_LOAD_THROTTLED_RATE,
+                            ),
+                            (
+                                "MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS",
+                                INITIAL_LOAD_THROTTLED_STORE_DELAY_MS,
+                            ),
+                        ],
+                    )
+                    .await?;
+                    if !(resume_out.contains("Initial Load complete")
+                        || resume_out.contains("\"event\":\"initial_load_complete\""))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "expected Initial Load complete after resume:\n{resume_out}"
+                        )));
+                    }
+                    if !(resume_out.contains("rate_limit=")
+                        || resume_out.contains("rate_limit_rows_per_sec"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "expected Operator-visible rate_limit on resume apply:\n{resume_out}"
+                        )));
+                    }
+                    if !(resume_out.contains("Initial Load backoff")
+                        || resume_out.contains("initial_load_backoff"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "expected Initial Load backoff under store pressure:\n{resume_out}"
+                        )));
+                    }
+
+                    let status_after = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if !(status_after.contains("status=initial_load_complete")
+                        && status_after.contains(&format!("rows={INITIAL_LOAD_THROTTLED_ROW_COUNT}")))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "expected complete Base with {INITIAL_LOAD_THROTTLED_ROW_COUNT} rows:\n{status_after}"
+                        )));
+                    }
+
+                    let capture_note = if resume_out.to_ascii_lowercase().contains("oci") {
+                        "Initial Load (chunked OCI)".to_string()
+                    } else {
+                        "Initial Load (chunked)".to_string()
+                    };
+                    println!(
+                        "Lab Scenario: {INITIAL_LOAD_THROTTLED_ID} checks passed \
+                         (chunked progress; pause/resume; rate_limit; backoff; watermark retained)"
+                    );
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: Some(0),
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: INITIAL_LOAD_THROTTLED_ROW_COUNT as u64,
+                            capture_path_note: capture_note,
+                        },
+                    })
+            }
+
+            Self::ObservabilitySurface => {
+                    println!("Lab Scenario: catch-up sync without Downstream delay...");
+                    let catch_out = run_product_cli_with_env(
+                        &bin,
+                        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                        &[(
+                            "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+                            OBSERVABILITY_SURFACE_CAPACITY,
+                        )],
+                    )
+                    .await?;
+                    let capture_note = if catch_out.to_ascii_lowercase().contains("logminer") {
+                        "LogMiner".to_string()
+                    } else {
+                        return Err(CliError::Failed(format!(
+                            "Lab Scenario catch-up sync must use real LogMiner path:\n{catch_out}"
+                        )));
+                    };
+
+                    let status_after = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    let sync_lag_after =
+                        parse_sync_lag_for_table(&status_after, OBSERVABILITY_SURFACE_TABLE).unwrap_or(-1);
+                    let delivery_lag_after =
+                        parse_delivery_lag_for_pipeline(&status_after, OBSERVABILITY_SURFACE_PIPELINE).unwrap_or(-1);
+                    if sync_lag_after != 0 || delivery_lag_after != 0 {
+                        return Err(CliError::Failed(format!(
+                            "lag must return to 0 after catch-up (sync={sync_lag_after}, delivery={delivery_lag_after}):\n{status_after}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out)
+                        + count_delivery_ops(&ctx.sync_out)
+                        + count_delivery_ops(&catch_out);
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (structured logs; Sync/Delivery Health; Prometheus lag/failures)"
+                    );
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: Some(sync_lag_after),
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: capture_note,
+                        },
+                    })
+            }
+
+            Self::PlatformStoreGuardrails => {
+
+
+                    println!("Lab Scenario: status without disk inject (bundled settings must pass guardrails)...");
+                    let status_ok = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if !status_ok.contains("Platform Store: healthy") {
+                        return Err(CliError::Failed(format!(
+                            "bundled Platform Store must satisfy Guardrail minimums:\n{status_ok}"
+                        )));
+                    }
+                    if status_ok.contains("Guardrails rejected") {
+                        return Err(CliError::Failed(format!(
+                            "bundled Platform Store settings must not be rejected by Guardrails:\n{status_ok}"
+                        )));
+                    }
+
+                    println!("Lab Scenario: status rejects absurdly low shared_buffers (inject)...");
+                    let (reject_ok, reject_out) = run_product_cli_allow_fail(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                        &[(
+                            "MIGRALOOP_INJECT_PLATFORM_STORE_SHARED_BUFFERS_BYTES",
+                            "1048576",
+                        )],
+                    )
+                    .await?;
+                    if reject_ok {
+                        return Err(CliError::Failed(format!(
+                            "status must reject absurdly low shared_buffers:\n{reject_out}"
+                        )));
+                    }
+                    let reject_lower = reject_out.to_ascii_lowercase();
+                    if !(reject_lower.contains("guardrails") && reject_lower.contains("shared_buffers")) {
+                        return Err(CliError::Failed(format!(
+                            "expected Guardrails shared_buffers rejection:\n{reject_out}"
+                        )));
+                    }
+
+                    println!(
+                        "Lab Scenario: status with injected low free disk ({PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES} bytes)..."
+                    );
+                    let status_warn = run_product_cli_with_env(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                        &[(
+                            "MIGRALOOP_INJECT_PLATFORM_STORE_FREE_DISK_BYTES",
+                            PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES,
+                        )],
+                    )
+                    .await?;
+                    if !status_warn.contains("Platform Store: healthy") {
+                        return Err(CliError::Failed(format!(
+                            "disk warn must leave Platform Store healthy:\n{status_warn}"
+                        )));
+                    }
+                    let warn_lower = status_warn.to_ascii_lowercase();
+                    if !(status_warn.contains("WARN:") && warn_lower.contains("disk")) {
+                        return Err(CliError::Failed(format!(
+                            "expected free-disk WARN on status:\n{status_warn}"
+                        )));
+                    }
+                    if !(status_warn.contains("platform_store_disk_warn")
+                        || status_warn.contains("\"event\":\"platform_store_disk_warn\""))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "expected structured platform_store_disk_warn event:\n{status_warn}"
+                        )));
+                    }
+                    if status_warn.contains("Delivery Health: paused")
+                        || status_warn
+                            .lines()
+                            .any(|line| line.contains("Pipeline:") && line.contains("paused"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "disk threshold must not auto-pause Pipelines:\n{status_warn}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out);
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (Guardrails minimums ok; disk warn-only; Pipeline not paused)"
+                    );
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: "LogMiner".to_string(),
+                        },
+                    })
+            }
+
+            Self::BackwardCompatibleUpgrades => {
+                    let older_config_path = scenario_config_path(
+                        lab_dir,
+                        BACKWARD_COMPATIBLE_UPGRADES_ID,
+                        BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG,
+                    )?;
+                    let older_config_str = older_config_path.to_str().ok_or_else(|| {
+                        CliError::Failed("Scenario older-config path is not valid UTF-8".to_string())
+                    })?;
+                    println!("Lab Scenario: status before upgrade migrate...");
+                    let status_before = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if !status_before.contains("Platform Store: healthy")
+                        || !status_before.contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
+                        || !status_before.contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "pre-upgrade status missing healthy store / Deployment / Base:\n{status_before}"
+                        )));
+                    }
+                    let schema_line = status_before
+                        .lines()
+                        .find(|l| l.starts_with("Schema version:"))
+                        .unwrap_or("Schema version: (missing)")
+                        .to_string();
+
+                    println!("Lab Scenario: migraloop migrate (upgrade path)...");
+                    let migrate_out = run_product_cli(
+                        &bin,
+                        &["migrate", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if !migrate_out.to_ascii_lowercase().contains("migration")
+                        && !migrate_out.contains("Platform Store")
+                    {
+                        return Err(CliError::Failed(format!(
+                            "migrate did not report Platform Store migration success:\n{migrate_out}"
+                        )));
+                    }
+
+                    println!("Lab Scenario: status after upgrade migrate...");
+                    let status_after_migrate = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if !status_after_migrate.contains("Platform Store: healthy") {
+                        return Err(CliError::Failed(format!(
+                            "store must stay healthy after upgrade migrate:\n{status_after_migrate}"
+                        )));
+                    }
+                    if !status_after_migrate.contains(schema_line.trim()) {
+                        return Err(CliError::Failed(format!(
+                            "Schema version must remain at latest after upgrade migrate \
+                             (expected `{schema_line}`):\n{status_after_migrate}"
+                        )));
+                    }
+                    if !status_after_migrate
+                        .contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
+                        || !status_after_migrate
+                            .contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "Deployment/Base must survive upgrade migrate (no wipe):\n{status_after_migrate}"
+                        )));
+                    }
+
+                    println!(
+                        "Lab Scenario: apply older SemVer-compatible config ({BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG})..."
+                    );
+                    let older_apply = run_product_cli(
+                        &bin,
+                        &[
+                            "apply",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--file",
+                            older_config_str,
+                        ],
+                    )
+                    .await?;
+                    if older_apply.contains("Initial Load complete") {
+                        return Err(CliError::Failed(format!(
+                            "older compatible config must not rebuild Base from scratch:\n{older_apply}"
+                        )));
+                    }
+
+                    let status_final = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if !status_final.contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
+                        || !status_final.contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "Deployment/Base must remain after older config apply:\n{status_final}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out);
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (migrate preserved Deployment; older v1.0.0 config applies without rebuild)"
+                    );
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: "LogMiner".to_string(),
+                        },
+                    })
+            }
+
+            Self::SchemaChangePause => {
+
+
+                    let status_out = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    let status_lower = status_out.to_ascii_lowercase();
+                    if !(status_out.contains(SCHEMA_CHANGE_PAUSE_PIPELINE)
+                        && (status_out.contains("Delivery Health: paused")
+                            || status_lower.contains("delivery health: paused"))
+                        && status_lower.contains("schema change")
+                        && status_lower.contains("blocking"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "status must show Delivery Health paused + Schema Change blocking:\n{status_out}"
+                        )));
+                    }
+                    if status_lower.contains("quarantine")
+                        && !status_out.contains("Quarantine: (none)")
+                        && status_lower.contains("unhealthy / not aligned")
+                    {
+                        return Err(CliError::Failed(format!(
+                            "blocking DDL must not create poison quarantine rows:\n{status_out}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out) + count_delivery_ops(&ctx.sync_out);
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (blocking DDL warn+pause; distinct from poison quarantine)"
+                    );
+                    if !ctx.sync_out.trim().is_empty() {
+                        println!(
+                            "Lab Scenario: Incremental Capture ({}) complete",
+                            ctx.capture_path_note
+                        );
+                    }
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied,
+                            capture_path_note: ctx.capture_path_note.clone(),
+                        },
+                    })
+            }
+
+            Self::SourceAlignment => {
+
+
+                    println!("Lab Scenario: running Source Alignment Check (default resource-gated budget)...");
+                    let align_out = run_product_cli(
+                        &bin,
+                        &[
+                            "align",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--table",
+                            SOURCE_ALIGNMENT_TABLE,
+                        ],
+                    )
+                    .await?;
+                    let align_lower = align_out.to_ascii_lowercase();
+                    if !(align_lower.contains("source alignment")
+                        && (align_lower.contains("mismatched") || align_lower.contains("misaligned"))
+                        && align_lower.contains("repaired"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "align must detect mismatch and repair Base from Source:\n{align_out}"
+                        )));
+                    }
+                    if align_lower.contains("write source") || align_lower.contains("updating source") {
+                        return Err(CliError::Failed(format!(
+                            "align must never write Source:\n{align_out}"
+                        )));
+                    }
+
+                    let base_out = run_product_cli(
+                        &bin,
+                        &[
+                            "base",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--table",
+                            SOURCE_ALIGNMENT_TABLE,
+                        ],
+                    )
+                    .await?;
+                    if !managed_name_present(&base_out, "AlignedAlice") || managed_name_present(&base_out, "Alice")
+                    {
+                        return Err(CliError::Failed(format!(
+                            "Base must be repaired to AlignedAlice from Source:\n{base_out}"
+                        )));
+                    }
+
+                    let source_name = query_source_alignment_name(lab_dir, 1).await?;
+                    if source_name != "AlignedAlice" {
+                        return Err(CliError::Failed(format!(
+                            "Source must remain AlignedAlice after align (never written by check); got {source_name:?}"
+                        )));
+                    }
+
+                    let status_out = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if !(status_out.contains("Source Alignment:")
+                        && status_out.to_ascii_lowercase().contains("aligned"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "status must show Source Alignment after check:\n{status_out}"
+                        )));
+                    }
+
+                    println!(
+                        "Lab Scenario: mutating Source ID=2 → BobAligned; align --max-rows 1 (resource gate)..."
+                    );
+                    mutate_source_alignment_name(lab_dir, 2, "BobAligned").await?;
+                    let gated_out = run_product_cli(
+                        &bin,
+                        &[
+                            "align",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--table",
+                            SOURCE_ALIGNMENT_TABLE,
+                            "--max-rows",
+                            "1",
+                        ],
+                    )
+                    .await?;
+                    let gated_lower = gated_out.to_ascii_lowercase();
+                    if !(gated_lower.contains("maxrows=1")
+                        && (gated_lower.contains("partial") || gated_lower.contains("truncated")))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "resource-gated align must report maxRows=1 and partial/truncated:\n{gated_out}"
+                        )));
+                    }
+                    let base_gated = run_product_cli(
+                        &bin,
+                        &[
+                            "base",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--table",
+                            SOURCE_ALIGNMENT_TABLE,
+                        ],
+                    )
+                    .await?;
+                    if managed_name_present(&base_gated, "BobAligned") {
+                        return Err(CliError::Failed(format!(
+                            "max-rows=1 must not full-slam repair Bob:\n{base_gated}"
+                        )));
+                    }
+
+                    println!("Lab Scenario: align with larger budget to repair remaining Base row...");
+                    let full_out = run_product_cli(
+                        &bin,
+                        &[
+                            "align",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--table",
+                            SOURCE_ALIGNMENT_TABLE,
+                            "--max-rows",
+                            "1000",
+                        ],
+                    )
+                    .await?;
+                    let base_full = run_product_cli(
+                        &bin,
+                        &[
+                            "base",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--table",
+                            SOURCE_ALIGNMENT_TABLE,
+                        ],
+                    )
+                    .await?;
+                    if !managed_name_present(&base_full, "BobAligned") {
+                        return Err(CliError::Failed(format!(
+                            "larger budget must repair Bob from Source:\n{full_out}\n{base_full}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out);
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (detect + repair Base from Source; resource-gated max-rows; Source not written)"
+                    );
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: "Source Alignment Check (OCI reads)".to_string(),
+                        },
+                    })
+            }
+
+            Self::DriftCheck => {
+                    println!("Lab Scenario: running Drift Check (default resource-gated budget)...");
+                    let drift_out = run_product_cli(
+                        &bin,
+                        &[
+                            "drift",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--pipeline",
+                            DRIFT_CHECK_PIPELINE,
+                        ],
+                    )
+                    .await?;
+                    let drift_lower = drift_out.to_ascii_lowercase();
+                    if !(drift_lower.contains("drift")
+                        && (drift_lower.contains("mismatched") || drift_lower.contains("drifted"))
+                        && drift_lower.contains("repaired"))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "drift must detect Managed mismatch and auto-repair:\n{drift_out}"
+                        )));
+                    }
+
+                    let target_out = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            DRIFT_CHECK_COLLECTION,
+                        ],
+                    )
+                    .await?;
+                    if !managed_name_present(&target_out, "Alice") || managed_name_present(&target_out, "DRIFTED")
+                    {
+                        return Err(CliError::Failed(format!(
+                            "Managed fields must be auto-repaired to Alice:\n{target_out}"
+                        )));
+                    }
+                    if !(target_out.contains(DRIFT_CHECK_EXTRA_FIELD) || target_out.contains("EXTRA")) {
+                        return Err(CliError::Failed(format!(
+                            "non-Managed EXTRA must survive Managed auto-repair:\n{target_out}"
+                        )));
+                    }
+
+                    let status_out = run_product_cli(
+                        &bin,
+                        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+                    )
+                    .await?;
+                    if !(status_out.contains("Drift:")
+                        && (status_out.to_ascii_lowercase().contains("ok")
+                            || status_out.to_ascii_lowercase().contains("partial")))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "status must show Drift after check:\n{status_out}"
+                        )));
+                    }
+
+                    println!(
+                        "Lab Scenario: mutating Target ID=2 → CORRUPT_BOB; drift --max-rows 1 (resource gate)..."
+                    );
+                    plant_drift_check_target_drift(lab_dir, 2, "CORRUPT_BOB", false).await?;
+                    let gated_out = run_product_cli(
+                        &bin,
+                        &[
+                            "drift",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--pipeline",
+                            DRIFT_CHECK_PIPELINE,
+                            "--max-rows",
+                            "1",
+                        ],
+                    )
+                    .await?;
+                    let gated_lower = gated_out.to_ascii_lowercase();
+                    if !(gated_lower.contains("maxrows=1")
+                        && (gated_lower.contains("partial") || gated_lower.contains("truncated")))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "resource-gated drift must report maxRows=1 and partial/truncated:\n{gated_out}"
+                        )));
+                    }
+                    let target_gated = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            DRIFT_CHECK_COLLECTION,
+                        ],
+                    )
+                    .await?;
+                    if !target_gated.contains("CORRUPT_BOB") {
+                        return Err(CliError::Failed(format!(
+                            "max-rows=1 must not full-slam repair Bob:\n{target_gated}"
+                        )));
+                    }
+
+                    println!("Lab Scenario: drift with larger budget to repair remaining Managed drift...");
+                    let full_out = run_product_cli(
+                        &bin,
+                        &[
+                            "drift",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--pipeline",
+                            DRIFT_CHECK_PIPELINE,
+                            "--max-rows",
+                            "1000",
+                        ],
+                    )
+                    .await?;
+                    let target_full = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            DRIFT_CHECK_COLLECTION,
+                        ],
+                    )
+                    .await?;
+                    if !managed_name_present(&target_full, "Bob") || target_full.contains("CORRUPT_BOB") {
+                        return Err(CliError::Failed(format!(
+                            "larger budget must repair Bob Managed fields:\n{full_out}\n{target_full}"
+                        )));
+                    }
+                    if !(target_full.contains(DRIFT_CHECK_EXTRA_FIELD) || target_full.contains("EXTRA")) {
+                        return Err(CliError::Failed(format!(
+                            "non-Managed EXTRA must still be preserved after full drift:\n{target_full}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out);
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (detect + Managed auto-repair; non-Managed preserved; resource-gated max-rows)"
+                    );
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: "Drift Check (Managed-field Target repair)".to_string(),
+                        },
+                    })
+            }
+
+            Self::RemovePipeline => {
+
+
+                    let base_out = run_product_cli(
+                        &bin,
+                        &[
+                            "base",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--table",
+                            REMOVE_PIPELINE_CUSTOMERS_TABLE,
+                        ],
+                    )
+                    .await?;
+                    if !(managed_name_present(&base_out, "Alicia") && managed_name_present(&base_out, "Carol")) {
+                        return Err(CliError::Failed(format!(
+                            "Shared Base must continue Incremental Capture for remaining Pipeline:\n{base_out}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out)
+                        + count_delivery_ops(&ctx.sync_out);
+
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (remove ceased customers Delivery; Shared Base kept; reporting Delivered)"
+                    );
+                    if !ctx.sync_out.trim().is_empty() {
+                        println!(
+                            "Lab Scenario: Incremental Capture ({}) complete",
+                            ctx.capture_path_note
+                        );
+                    }
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: ctx.capture_path_note.clone(),
+                        },
+                    })
+            }
+
+            Self::ChangePipeline => {
+                    let metadata_config =
+                        scenario_config_path(lab_dir, CHANGE_PIPELINE_ID, CHANGE_PIPELINE_METADATA_CONFIG)?;
+                    let target_v2 = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            CHANGE_PIPELINE_ACTIVE_COLLECTION,
+                        ],
+                    )
+                    .await?;
+
+                    println!("Lab Scenario: apply metadata-only description change...");
+                    let apply_meta = run_product_cli(
+                        &bin,
+                        &[
+                            "apply",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--file",
+                            metadata_config.to_str().ok_or_else(|| {
+                                CliError::Failed("Scenario metadata revision path is not valid UTF-8".to_string())
+                            })?,
+                        ],
+                    )
+                    .await?;
+                    let apply_meta_lower = apply_meta.to_ascii_lowercase();
+                    if !(apply_meta_lower.contains("metadata")
+                        && apply_meta_lower.contains("skip")
+                        && apply_meta.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE))
+                    {
+                        return Err(CliError::Failed(format!(
+                            "Metadata-only change must report rebuild skipped:\n{apply_meta}"
+                        )));
+                    }
+                    if apply_meta.contains(&format!(
+                        "Derived Dataset materialized: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
+                    )) || apply_meta.contains(&format!(
+                        "Delivery complete: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
+                    )) {
+                        return Err(CliError::Failed(format!(
+                            "Metadata-only change must not rebuild Derived or re-Deliver:\n{apply_meta}"
+                        )));
+                    }
+
+                    let target_meta = run_product_cli(
+                        &bin,
+                        &[
+                            "target",
+                            "--platform-store-url",
+                            LAB_PLATFORM_STORE_URL,
+                            "--collection",
+                            CHANGE_PIPELINE_ACTIVE_COLLECTION,
+                        ],
+                    )
+                    .await?;
+                    if target_meta != target_v2 {
+                        return Err(CliError::Failed(format!(
+                            "Metadata-only change must leave Target unchanged.\nBefore:\n{target_v2}\nAfter:\n{target_meta}"
+                        )));
+                    }
+
+                    let rows_applied = count_delivery_ops(&ctx.apply_out)
+                        + count_delivery_ops(&ctx.sync_out)
+                        + count_delivery_ops(&apply_meta);
+
+                    println!(
+                        "Lab Scenario: correctness checks passed \
+                         (semantic revision rebuilt Derived/re-Delivered; incremental continued; \
+                Shared Base kept; metadata-only skipped)"
+                    );
+
+                    Ok(AdapterOutcome {
+                        correctness: true,
+                        detail: String::new(),
+                        metrics: ScenarioMetrics {
+                            settle_ms: None,
+                            lag: None,
+                            rows_per_s: None,
+                            duration_ms: None,
+                            rows_applied: rows_applied,
+                            capture_path_note: String::new(),
+                        },
+                    })
+            }
         }
     }
 }
@@ -1925,7 +4492,9 @@ async fn run_product_path_scenario(
     let mut ctx = ProductPathRunContext {
         apply_out: String::new(),
         sync_out: String::new(),
+        sync_ok: true,
         capture_path_note: String::new(),
+        apply_started: None,
     };
 
     for step in steps {
@@ -1937,24 +4506,27 @@ async fn run_product_path_scenario(
                 );
             }
             ProductPathStepKind::ProductApply => {
+                let apply_env = hooks.apply_env();
+                ctx.apply_started = Some(Instant::now());
                 ctx.apply_out =
-                    product_apply(lab_dir, &recipe.id, &product_path.apply).await?;
+                    product_apply(lab_dir, &recipe.id, &product_path.apply, &apply_env).await?;
                 hooks.after_apply(lab_dir, &ctx.apply_out).await?;
             }
             ProductPathStepKind::Mutate => {
                 hooks.mutate(lab_dir).await?;
             }
             ProductPathStepKind::ProductSync => {
-                hooks.before_sync();
-                let env = hooks.sync_env();
-                let (sync_out, capture_note) =
+                hooks.before_sync(lab_dir).await?;
+                let env = hooks.sync_env(lab_dir);
+                let (sync_out, capture_note, sync_ok) =
                     product_sync(&product_path.sync, &env).await?;
-                hooks.after_sync(&sync_out).await?;
+                hooks.after_sync(lab_dir, &sync_out, sync_ok).await?;
                 ctx.sync_out = sync_out;
+                ctx.sync_ok = sync_ok;
                 ctx.capture_path_note = capture_note;
             }
             ProductPathStepKind::Assert => {
-                return hooks.assert_correctness(&ctx).await;
+                return hooks.assert_correctness(lab_dir, recipe, &ctx).await;
             }
         }
     }
@@ -2136,232 +4708,6 @@ fn ensure_lab_fixture_engines_for_scenario(
     )))
 }
 
-async fn adapt_transform_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {TRANSFORM_PIPELINE_ID}");
-    println!(
-        "Scenario Namespace: tables={TRANSFORM_CUSTOMERS_TABLE},{TRANSFORM_ORDERS_TABLE} \
-collections={TRANSFORM_CUSTOMERS_COLLECTION},{TRANSFORM_ORDER_TOTALS_COLLECTION} \
-deployment={TRANSFORM_PIPELINE_DEPLOYMENT}"
-    );
-
-    prepare_transform_pipeline_namespace(lab_dir).await?;
-    println!(
-        "Lab Scenario: Scenario Namespace prepared (multi-table schema + seed + supplemental logging)"
-    );
-
-    let config_path = deployment_config_path(lab_dir, TRANSFORM_PIPELINE_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.to_ascii_lowercase().contains("derived")
-        || apply_out.contains(TRANSFORM_ORDER_TOTALS_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-        )));
-    }
-
-    let customers_base = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            TRANSFORM_CUSTOMERS_TABLE,
-        ],
-    )
-    .await?;
-    let orders_base = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            TRANSFORM_ORDERS_TABLE,
-        ],
-    )
-    .await?;
-    if !(managed_field_present(&customers_base, "NAME", "Alice")
-        && managed_field_present(&customers_base, "NAME", "Bob"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load customers Base check failed (expected Alice and Bob):\n{customers_base}"
-        )));
-    }
-    if !(managed_field_present(&orders_base, "AMOUNT", "10")
-        && managed_field_present(&orders_base, "AMOUNT", "20")
-        && managed_field_present(&orders_base, "AMOUNT", "5"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load orders Base check failed (expected amounts 10/20/5):\n{orders_base}"
-        )));
-    }
-
-    let derived_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            TRANSFORM_ORDER_TOTALS_PIPELINE,
-        ],
-    )
-    .await?;
-    // Seed totals: customer 1 = 10+20=30, customer 2 = 5.
-    if !(inspect_mentions_amount(&derived_after_apply, "30")
-        && inspect_mentions_amount(&derived_after_apply, "5"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load Derived check failed (expected totals 30 and 5):\n{derived_after_apply}"
-        )));
-    }
-
-    println!("Lab Scenario: driving multi-table Source insert/update/delete...");
-    mutate_transform_pipeline_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let customers_base_after = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            TRANSFORM_CUSTOMERS_TABLE,
-        ],
-    )
-    .await?;
-    let derived_after = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            TRANSFORM_ORDER_TOTALS_PIPELINE,
-        ],
-    )
-    .await?;
-    let customers_target = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            TRANSFORM_CUSTOMERS_COLLECTION,
-        ],
-    )
-    .await?;
-    let totals_target = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            TRANSFORM_ORDER_TOTALS_COLLECTION,
-        ],
-    )
-    .await?;
-
-    // Customers Direct: Alicia + Carol present, Bob deleted.
-    let customers_base_ok = managed_field_present(&customers_base_after, "NAME", "Alicia")
-        && managed_field_present(&customers_base_after, "NAME", "Carol")
-        && !managed_field_present(&customers_base_after, "NAME", "Bob");
-    let customers_target_ok = managed_field_present(&customers_target, "NAME", "Alicia")
-        && managed_field_present(&customers_target, "NAME", "Carol")
-        && !managed_field_present(&customers_target, "NAME", "Bob");
-    // Orders Transform after mutate: cust1=20+15 → sum 35 / count 2 / min 15 / max 20 / avg 17.5;
-    // cust2=50 (order 1 deleted, order 3 updated).
-    let derived_ok = inspect_mentions_amount(&derived_after, "35")
-        && inspect_mentions_amount(&derived_after, "50")
-        && !inspect_mentions_amount(&derived_after, "30")
-        && managed_field_present(&derived_after, "ORDER_COUNT", "2")
-        && managed_field_present(&derived_after, "ORDER_COUNT", "1")
-        && (managed_field_present(&derived_after, "MIN_AMOUNT", "15")
-            || managed_field_present(&derived_after, "MIN_AMOUNT", "15.00"))
-        && (managed_field_present(&derived_after, "MAX_AMOUNT", "20")
-            || managed_field_present(&derived_after, "MAX_AMOUNT", "20.00"))
-        && (managed_field_present(&derived_after, "AVG_AMOUNT", "17.5")
-            || managed_field_present(&derived_after, "AVG_AMOUNT", "17.50"));
-    let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
-        && inspect_mentions_amount(&totals_target, "50")
-        && !inspect_mentions_amount(&totals_target, "30")
-        && managed_field_present(&totals_target, "ORDER_COUNT", "2")
-        && managed_field_present(&totals_target, "ORDER_COUNT", "1")
-        && (managed_field_present(&totals_target, "MIN_AMOUNT", "15")
-            || managed_field_present(&totals_target, "MIN_AMOUNT", "15.00"))
-        && (managed_field_present(&totals_target, "MAX_AMOUNT", "20")
-            || managed_field_present(&totals_target, "MAX_AMOUNT", "20.00"))
-        && (managed_field_present(&totals_target, "AVG_AMOUNT", "17.5")
-            || managed_field_present(&totals_target, "AVG_AMOUNT", "17.50"));
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-
-    if !(customers_base_ok && customers_target_ok && derived_ok && totals_target_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after multi-table insert/update/delete.\n\
-Customers Base:\n{customers_base_after}\nCustomers Target:\n{customers_target}\n\
-Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed (Base + Derived + Target Managed outcomes)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
 
 /// Managed field presence in Base/Target/Derived JSON inspect output.
 fn managed_field_present(inspect: &str, field: &str, value: &str) -> bool {
@@ -3290,259 +5636,6 @@ EXIT;\n"
         })
 }
 
-async fn adapt_concurrent_source_workload(lab_dir: &Path, recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    // max_settle_ms is the live recipe interface (not a duplicated constant).
-    let max_settle_ms = recipe.thresholds.max_settle_ms.ok_or_else(|| {
-        CliError::Failed(
-            "Lab Scenario concurrent-source-workload recipe must declare thresholds.max_settle_ms"
-                .to_string(),
-        )
-    })?;
-    println!(
-        "Lab Scenario: recipe uses intra-Scenario parallel Source sessions \
-(not a second concurrent Scenario run); max_settle_ms={max_settle_ms}"
-    );
-
-    prepare_concurrent_source_namespace(lab_dir).await?;
-    println!(
-        "Lab Scenario: Scenario Namespace prepared (multi-table schema + seed + supplemental logging)"
-    );
-
-    let config_path = deployment_config_path(lab_dir, CONCURRENT_SOURCE_WORKLOAD_ID)?;
-    let bin = lab_migraloop_bin();
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.to_ascii_lowercase().contains("derived")
-        || apply_out.contains(CONCURRENT_ORDER_TOTALS_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-        )));
-    }
-
-    let customers_base = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            CONCURRENT_CUSTOMERS_TABLE,
-        ],
-    )
-    .await?;
-    let orders_base = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            CONCURRENT_ORDERS_TABLE,
-        ],
-    )
-    .await?;
-    if !(managed_field_present(&customers_base, "NAME", "Alice")
-        && managed_field_present(&customers_base, "NAME", "Bob"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load customers Base check failed (expected Alice and Bob):\n{customers_base}"
-        )));
-    }
-    if !(managed_field_present(&orders_base, "AMOUNT", "10")
-        && managed_field_present(&orders_base, "AMOUNT", "20")
-        && managed_field_present(&orders_base, "AMOUNT", "5"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load orders Base check failed (expected amounts 10/20/5):\n{orders_base}"
-        )));
-    }
-
-    let derived_after_apply = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            CONCURRENT_ORDER_TOTALS_PIPELINE,
-        ],
-    )
-    .await?;
-    // Seed totals: customer 1 = 10+20=30, customer 2 = 5.
-    if !(inspect_mentions_amount(&derived_after_apply, "30")
-        && inspect_mentions_amount(&derived_after_apply, "5"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial Load Derived check failed (expected totals 30 and 5):\n{derived_after_apply}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: driving concurrent Source workload \
-(parallel customers + orders sessions)..."
-    );
-    mutate_concurrent_source_workload(lab_dir).await?;
-
-    // US47: wait until Delivery catches up within recipe thresholds before final asserts.
-    println!(
-        "Lab Scenario: settling Incremental Capture + Delivery within max_settle_ms={max_settle_ms}..."
-    );
-    let settle_started = Instant::now();
-    let mut sync_out = String::new();
-    let mut capture_note = String::new();
-    let mut last_detail = String::new();
-
-    loop {
-        let settle_ms = settle_started.elapsed().as_millis();
-        if settle_ms > max_settle_ms {
-            // Outcomes never reached expected Managed state — correctness fails.
-            // Runner also fails recipe max_settle_ms (equal-weight threshold axis).
-            return Ok(AdapterOutcome {
-                correctness: false,
-                detail: format!(
-                    "correctness: concurrent Source Managed outcomes not settled \
-(elapsed settle_ms={settle_ms}). {last_detail}"
-                ),
-                metrics: ScenarioMetrics {
-                    settle_ms: Some(settle_ms),
-                    lag: None,
-                    rows_per_s: None,
-                    duration_ms: None,
-                    rows_applied: count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out),
-                    capture_path_note: capture_note,
-                },
-            });
-        }
-
-        sync_out = run_product_cli(
-            &bin,
-            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        )
-        .await?;
-        if sync_out.to_ascii_lowercase().contains("logminer") {
-            capture_note = "LogMiner".to_string();
-        } else if capture_note.is_empty() {
-            return Err(CliError::Failed(format!(
-                "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-            )));
-        }
-
-        let customers_base_after = run_product_cli(
-            &bin,
-            &[
-                "base",
-                "--platform-store-url",
-                LAB_PLATFORM_STORE_URL,
-                "--table",
-                CONCURRENT_CUSTOMERS_TABLE,
-            ],
-        )
-        .await?;
-        let derived_after = run_product_cli(
-            &bin,
-            &[
-                "derived",
-                "--platform-store-url",
-                LAB_PLATFORM_STORE_URL,
-                "--pipeline",
-                CONCURRENT_ORDER_TOTALS_PIPELINE,
-            ],
-        )
-        .await?;
-        let customers_target = run_product_cli(
-            &bin,
-            &[
-                "target",
-                "--platform-store-url",
-                LAB_PLATFORM_STORE_URL,
-                "--collection",
-                CONCURRENT_CUSTOMERS_COLLECTION,
-            ],
-        )
-        .await?;
-        let totals_target = run_product_cli(
-            &bin,
-            &[
-                "target",
-                "--platform-store-url",
-                LAB_PLATFORM_STORE_URL,
-                "--collection",
-                CONCURRENT_ORDER_TOTALS_COLLECTION,
-            ],
-        )
-        .await?;
-
-        // Customers Direct: Alicia + Carol present, Bob deleted.
-        let customers_base_ok = managed_field_present(&customers_base_after, "NAME", "Alicia")
-            && managed_field_present(&customers_base_after, "NAME", "Carol")
-            && !managed_field_present(&customers_base_after, "NAME", "Bob");
-        let customers_target_ok = managed_field_present(&customers_target, "NAME", "Alicia")
-            && managed_field_present(&customers_target, "NAME", "Carol")
-            && !managed_field_present(&customers_target, "NAME", "Bob");
-        // After concurrent mutate: cust1=20+5+10=35, cust2=5+15+30=50.
-        let derived_ok = inspect_mentions_amount(&derived_after, "35")
-            && inspect_mentions_amount(&derived_after, "50")
-            && !inspect_mentions_amount(&derived_after, "30");
-        let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
-            && inspect_mentions_amount(&totals_target, "50")
-            && !inspect_mentions_amount(&totals_target, "30");
-
-        if customers_base_ok && customers_target_ok && derived_ok && totals_target_ok {
-            break;
-        }
-
-        last_detail = format!(
-            "correctness not yet settled.\n\
-Customers Base:\n{customers_base_after}\nCustomers Target:\n{customers_target}\n\
-Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
-        );
-        tokio::time::sleep(CONCURRENT_SETTLE_POLL).await;
-    }
-
-    let settle_ms = settle_started.elapsed().as_millis();
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-    println!(
-        "Lab Scenario: correctness checks passed after concurrent Source settle \
-(settle_ms={settle_ms}, Base + Derived + Target Managed outcomes)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-
-    // Runner evaluates recipe max_settle_ms against measured settle_ms (US21 / US36).
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: Some(settle_ms),
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
 
 /// Fully remove concurrent-source-workload Scenario Namespace. Idempotent.
 async fn remove_concurrent_source_namespace(lab_dir: &Path) -> Result<(), CliError> {
@@ -3707,161 +5800,6 @@ EXIT;\n"
     Ok(())
 }
 
-async fn adapt_bulk_load(lab_dir: &Path, recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    // Thresholds are the live recipe interface — runner evaluates them against metrics.
-    let max_lag = recipe.thresholds.max_lag.ok_or_else(|| {
-        CliError::Failed("Lab Scenario bulk-load recipe must declare thresholds.max_lag".to_string())
-    })?;
-    let max_duration_ms = recipe.thresholds.max_duration_ms.ok_or_else(|| {
-        CliError::Failed(
-            "Lab Scenario bulk-load recipe must declare thresholds.max_duration_ms".to_string(),
-        )
-    })?;
-    println!(
-        "Lab Scenario: bulk Source volume rows={BULK_LOAD_ROW_COUNT} \
-(recipe namespace.deployment={}, thresholds from recipe)",
-        recipe.namespace.deployment
-    );
-
-    prepare_bulk_load_namespace(lab_dir).await?;
-    println!(
-        "Lab Scenario: Scenario Namespace prepared \
-(schema + ~{BULK_LOAD_ROW_COUNT} Source inserts + supplemental logging)"
-    );
-
-    let bin = lab_migraloop_bin();
-    let load_started = Instant::now();
-    let apply_out = product_apply_initial_load(lab_dir, BULK_LOAD_ID).await?;
-
-    // US47: wait until Delivery/Health catch up within recipe duration before final asserts.
-    println!(
-        "Lab Scenario: settling bulk Delivery / Sync Health within \
-max_duration_ms={max_duration_ms}..."
-    );
-    let mut last_detail = String::new();
-    let mut settled = false;
-    let (base_rows, target_rows, lag) = loop {
-        let measured_duration_ms = load_started.elapsed().as_millis();
-        let base_after = run_product_cli(
-            &bin,
-            &[
-                "base",
-                "--platform-store-url",
-                LAB_PLATFORM_STORE_URL,
-                "--table",
-                BULK_LOAD_TABLE,
-            ],
-        )
-        .await?;
-        let target_after = run_product_cli(
-            &bin,
-            &[
-                "target",
-                "--platform-store-url",
-                LAB_PLATFORM_STORE_URL,
-                "--collection",
-                BULK_LOAD_COLLECTION,
-            ],
-        )
-        .await?;
-        let status_out = run_product_cli(
-            &bin,
-            &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        )
-        .await?;
-
-        let base_rows = parse_inspect_row_count(&base_after).ok_or_else(|| {
-            CliError::Failed(format!(
-                "Lab Scenario could not parse Base row count after bulk Initial Load:\n{base_after}"
-            ))
-        })?;
-        let target_rows = parse_target_document_count(&target_after).ok_or_else(|| {
-            CliError::Failed(format!(
-                "Lab Scenario could not parse Target document count after bulk Delivery:\n{target_after}"
-            ))
-        })?;
-        let lag = parse_sync_lag_for_table(&status_out, BULK_LOAD_TABLE).ok_or_else(|| {
-            CliError::Failed(format!(
-                "Lab Scenario could not parse Sync Health lag for {BULK_LOAD_TABLE}:\n{status_out}"
-            ))
-        })?;
-
-        let rows_ok = base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
-        let lag_ok = lag <= max_lag;
-        if rows_ok && lag_ok {
-            settled = true;
-            break (base_rows, target_rows, lag);
-        }
-
-        last_detail = format!(
-            "bulk Delivery/Health not yet caught up \
-(base_rows={base_rows} target_rows={target_rows} lag={lag}).\n\
-Base:\n{base_after}\nTarget:\n{target_after}\nStatus:\n{status_out}"
-        );
-        if measured_duration_ms > max_duration_ms {
-            break (base_rows, target_rows, lag);
-        }
-        tokio::time::sleep(BULK_LOAD_SETTLE_POLL).await;
-    };
-
-    let measured_duration_ms = load_started.elapsed().as_millis();
-    let measured_rows_per_s = if load_started.elapsed().as_secs_f64() > 0.0 {
-        BULK_LOAD_ROW_COUNT as f64 / load_started.elapsed().as_secs_f64()
-    } else {
-        BULK_LOAD_ROW_COUNT as f64
-    };
-
-    let rows_applied = count_delivery_ops(&apply_out).max(base_rows);
-    // Correctness is row-level Managed outcomes; runner evaluates lag/duration/throughput.
-    let correctness =
-        base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
-    let mut detail = if correctness {
-        String::new()
-    } else {
-        format!(
-            "correctness: expected rows={BULK_LOAD_ROW_COUNT} \
-base_rows={base_rows} target_rows={target_rows}"
-        )
-    };
-    if !settled && !last_detail.is_empty() {
-        let settle_note = format!(
-            "bulk Delivery/Health settle incomplete within \
-max_duration_ms={max_duration_ms}. {last_detail}"
-        );
-        if detail.is_empty() {
-            detail = settle_note;
-        } else {
-            detail = format!("{detail}; {settle_note}");
-        }
-    }
-
-    if correctness {
-        println!(
-            "Lab Scenario: correctness passed \
-(base/target rows={BULK_LOAD_ROW_COUNT}, lag={lag}, \
-duration_ms={measured_duration_ms}, rows_per_s={measured_rows_per_s:.2}); \
-thresholds evaluated by recipe-driven runner"
-        );
-    } else {
-        println!(
-            "Lab Scenario: correctness failed (base_rows={base_rows} target_rows={target_rows}); \
-metrics lag={lag} duration_ms={measured_duration_ms} rows_per_s={measured_rows_per_s:.2}"
-        );
-    }
-
-    Ok(AdapterOutcome {
-        correctness,
-        detail,
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: Some(lag),
-            rows_per_s: Some(measured_rows_per_s),
-            duration_ms: Some(measured_duration_ms),
-            rows_applied,
-            capture_path_note: "Initial Load".to_string(),
-        },
-    })
-}
 
 /// Fully remove bulk-load Scenario Namespace. Idempotent.
 async fn remove_bulk_load_namespace(lab_dir: &Path) -> Result<(), CliError> {
@@ -4105,432 +6043,9 @@ EXIT;\n"
 
 /// Issue #86 / PRD #55 US49: exercise at-least-once Delivery via duplicate-safe re-Delivery
 /// on the real product apply path inside a Scenario Namespace.
-async fn adapt_idempotent_redelivery(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {IDEMPOTENT_REDELIVERY_ID}");
-    println!(
-        "Scenario Namespace: table={IDEMPOTENT_REDELIVERY_TABLE} \
-collection={IDEMPOTENT_REDELIVERY_COLLECTION} deployment={IDEMPOTENT_REDELIVERY_DEPLOYMENT}"
-    );
-
-    prepare_idempotent_redelivery_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, IDEMPOTENT_REDELIVERY_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !apply_out.to_ascii_lowercase().contains("delivery") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source insert/update/delete...");
-    mutate_idempotent_redelivery_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-
-    let target_before = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            IDEMPOTENT_REDELIVERY_COLLECTION,
-        ],
-    )
-    .await?;
-    let docs_before = parse_target_document_count(&target_before).ok_or_else(|| {
-        CliError::Failed(format!(
-            "Lab Scenario could not parse Target document count before re-Delivery:\n{target_before}"
-        ))
-    })?;
-    let before_ok = managed_name_present(&target_before, "Alicia")
-        && managed_name_present(&target_before, "Carol")
-        && !managed_name_present(&target_before, "Bob");
-    if !before_ok || docs_before != 2 {
-        return Err(CliError::Failed(format!(
-            "pre-redelivery Managed Target baseline failed (expected Alicia+Carol, Bob absent, documents=2):\n{target_before}"
-        )));
-    }
-
-    // Plant a non-Managed field so re-Delivery proves Managed-only upsert (US48-adjacent / US49).
-    println!(
-        "Lab Scenario: planting non-Managed Target field before duplicate-safe re-Delivery..."
-    );
-    plant_idempotent_redelivery_operator_note(lab_dir).await?;
-
-    // Lab orchestration only: mark Pipeline Delivery pending so the next real `apply`
-    // re-Delivers current Base Output Identities (at-least-once / upsert-by-identity).
-    println!(
-        "Lab Scenario: resetting Pipeline Delivery status to force duplicate-safe re-Delivery..."
-    );
-    lab_update_pipeline_delivery_status(IDEMPOTENT_REDELIVERY_DEPLOYMENT,
-        IDEMPOTENT_REDELIVERY_PIPELINE,
-        "pending",
-    )
-    .await
-    .map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to reset Pipeline Delivery status for re-Delivery exercise:\n{err}"
-        ))
-    })?;
-
-    println!("Lab Scenario: re-apply via real product path (duplicate-safe re-Delivery)...");
-    let reapply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !reapply_out.to_ascii_lowercase().contains("delivery") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario re-apply must perform Delivery (duplicate-safe re-Delivery):\n{reapply_out}"
-        )));
-    }
-    // Must not reload existing Base on re-apply (ADR-0019) — re-Delivery of current Base only.
-    if reapply_out.contains("Initial Load")
-        || reapply_out.to_ascii_lowercase().contains("initial_load")
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario re-apply must not reload Base (expected Delivery-only re-run):\n{reapply_out}"
-        )));
-    }
-    let redelivery_ops = count_delivery_ops(&reapply_out);
-    if redelivery_ops < 2 {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario re-apply must re-Deliver current Base Output Identities \
-             (expected ≥2 Delivery ops, got {redelivery_ops}):\n{reapply_out}"
-        )));
-    }
-
-    let base_after = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            IDEMPOTENT_REDELIVERY_TABLE,
-        ],
-    )
-    .await?;
-    let target_after = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            IDEMPOTENT_REDELIVERY_COLLECTION,
-        ],
-    )
-    .await?;
-    let docs_after = parse_target_document_count(&target_after).ok_or_else(|| {
-        CliError::Failed(format!(
-            "Lab Scenario could not parse Target document count after re-Delivery:\n{target_after}"
-        ))
-    })?;
-
-    let base_ok = managed_name_present(&base_after, "Alicia")
-        && managed_name_present(&base_after, "Carol")
-        && !managed_name_present(&base_after, "Bob");
-    let target_ok = managed_name_present(&target_after, "Alicia")
-        && managed_name_present(&target_after, "Carol")
-        && !managed_name_present(&target_after, "Bob");
-    let count_ok = docs_after == docs_before && docs_after == 2;
-    let note_ok = target_after.contains(IDEMPOTENT_REDELIVERY_OPERATOR_NOTE);
-
-    let rows_applied = count_delivery_ops(&apply_out)
-        + count_delivery_ops(&sync_out)
-        + count_delivery_ops(&reapply_out);
-
-    if !(base_ok && target_ok && count_ok && note_ok) {
-        return Err(CliError::Failed(format!(
-            "correctness checks failed after duplicate-safe re-Delivery \
-             (base_ok={base_ok} target_ok={target_ok} count_ok={count_ok} \
-             docs_before={docs_before} docs_after={docs_after} note_ok={note_ok}).\n\
-             Base:\n{base_after}\nTarget:\n{target_after}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (Managed outcomes stable; document count={docs_after}; non-Managed field preserved)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) and Delivery complete");
-    }
-    println!("Lab Scenario: duplicate-safe re-Delivery complete on real product apply path");
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
 
 /// Issue #19 / ADR-0007: pause stops Delivery for one Pipeline; resume catch-up
 /// from durable Base; other Pipelines keep Delivering on the real product path.
-async fn adapt_pause_resume(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {PAUSE_RESUME_ID}");
-    println!(
-        "Scenario Namespace: tables={PAUSE_RESUME_CUSTOMERS_TABLE},{PAUSE_RESUME_ORDERS_TABLE} \
-collections={PAUSE_RESUME_CUSTOMERS_COLLECTION},{PAUSE_RESUME_ORDERS_COLLECTION} \
-deployment={PAUSE_RESUME_DEPLOYMENT}"
-    );
-
-    prepare_pause_resume_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, PAUSE_RESUME_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !apply_out.to_ascii_lowercase().contains("delivery") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!("Lab Scenario: pause Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE} via CLI...");
-    let pause_out = run_product_cli(
-        &bin,
-        &[
-            "pause",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            PAUSE_RESUME_CUSTOMERS_PIPELINE,
-            "--deployment",
-            PAUSE_RESUME_DEPLOYMENT,
-        ],
-    )
-    .await?;
-    if !pause_out.to_ascii_lowercase().contains("paused") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario pause did not report paused Pipeline:\n{pause_out}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source mutations on both Namespace tables...");
-    mutate_pause_resume_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-    if sync_out.contains(&format!("Delivery complete: Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE}"))
-    {
-        return Err(CliError::Failed(format!(
-            "paused Pipeline must not Deliver during sync:\n{sync_out}"
-        )));
-    }
-    if !(sync_out.contains(&format!("Delivery complete: Pipeline {PAUSE_RESUME_ORDERS_PIPELINE}"))
-        || sync_out.contains(PAUSE_RESUME_ORDERS_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "unaffected Pipeline must still Deliver during sync:\n{sync_out}"
-        )));
-    }
-
-    let customers_target_paused = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            PAUSE_RESUME_CUSTOMERS_COLLECTION,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&customers_target_paused, "Alice")
-        && managed_name_present(&customers_target_paused, "Bob")
-        && !managed_name_present(&customers_target_paused, "Alicia"))
-    {
-        return Err(CliError::Failed(format!(
-            "while paused, customers Target must retain Initial Load (Alice/Bob, not Alicia):\n{customers_target_paused}"
-        )));
-    }
-
-    let orders_target = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            PAUSE_RESUME_ORDERS_COLLECTION,
-        ],
-    )
-    .await?;
-    if !(orders_target.contains("50.00") || orders_target.contains("\"50\"")) {
-        return Err(CliError::Failed(format!(
-            "unaffected orders Pipeline must Deliver Incremental update:\n{orders_target}"
-        )));
-    }
-
-    println!("Lab Scenario: resume Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE} (catch-up Delivery)...");
-    let resume_out = run_product_cli(
-        &bin,
-        &[
-            "resume",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            PAUSE_RESUME_CUSTOMERS_PIPELINE,
-            "--deployment",
-            PAUSE_RESUME_DEPLOYMENT,
-        ],
-    )
-    .await?;
-    if !(resume_out.to_ascii_lowercase().contains("resum")
-        && resume_out.to_ascii_lowercase().contains("delivery"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario resume must catch up Delivery from durable state:\n{resume_out}"
-        )));
-    }
-
-    let customers_target = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            PAUSE_RESUME_CUSTOMERS_COLLECTION,
-        ],
-    )
-    .await?;
-    let customers_ok = managed_name_present(&customers_target, "Alicia")
-        && managed_name_present(&customers_target, "Carol")
-        && !managed_name_present(&customers_target, "Bob");
-    if !customers_ok {
-        return Err(CliError::Failed(format!(
-            "after resume, customers Target must match durable Base (Alicia+Carol, Bob absent):\n{customers_target}"
-        )));
-    }
-
-    let status_out = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if status_out
-        .lines()
-        .any(|line| line.contains(PAUSE_RESUME_CUSTOMERS_PIPELINE) && line.contains("paused"))
-    {
-        return Err(CliError::Failed(format!(
-            "status must not keep customers Pipeline paused after resume:\n{status_out}"
-        )));
-    }
-    if !status_out.contains(PAUSE_RESUME_ORDERS_PIPELINE) {
-        return Err(CliError::Failed(format!(
-            "status must still list unaffected orders Pipeline:\n{status_out}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out)
-        + count_delivery_ops(&sync_out)
-        + count_delivery_ops(&resume_out);
-
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (pause stopped customers Delivery; resume catch-up; orders unaffected)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
 
 async fn remove_pause_resume_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -4748,393 +6263,7 @@ EXIT;\n"
 }
 
 
-async fn adapt_bounded_backpressure(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {BOUNDED_BACKPRESSURE_ID}");
-    println!(
-        "Scenario Namespace: table={BOUNDED_BACKPRESSURE_TABLE} \
-collection={BOUNDED_BACKPRESSURE_COLLECTION} deployment={BOUNDED_BACKPRESSURE_DEPLOYMENT}"
-    );
 
-    prepare_bounded_backpressure_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, BOUNDED_BACKPRESSURE_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !apply_out.to_ascii_lowercase().contains("delivery") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: inserting Source backlog ({BOUNDED_BACKPRESSURE_BACKLOG} rows)..."
-    );
-    insert_bounded_backpressure_backlog(lab_dir).await?;
-
-    println!(
-        "Lab Scenario: sync under Downstream delay with queue capacity={} \
-(fail after {} durable checkpoint)...",
-        BOUNDED_BACKPRESSURE_CAPACITY, BOUNDED_BACKPRESSURE_FAIL_AFTER
-    );
-    let (slow_ok, slow_out) = run_product_cli_allow_fail(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        &[
-            (
-                "MIGRALOOP_SYNC_QUEUE_CAPACITY",
-                BOUNDED_BACKPRESSURE_CAPACITY,
-            ),
-            (
-                "MIGRALOOP_DELIVERY_DELAY_MS",
-                BOUNDED_BACKPRESSURE_DELAY_MS,
-            ),
-            (
-                "MIGRALOOP_SYNC_FAIL_AFTER_CHANGES",
-                BOUNDED_BACKPRESSURE_FAIL_AFTER,
-            ),
-        ],
-    )
-    .await?;
-    if slow_ok {
-        return Err(CliError::Failed(format!(
-            "expected mid-sync stop under Downstream slowness (FAIL_AFTER), got success:\n{slow_out}"
-        )));
-    }
-    if !slow_out.to_ascii_lowercase().contains("logminer") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{slow_out}"
-        )));
-    }
-    let slow_lower = slow_out.to_ascii_lowercase();
-    if !(slow_out.contains("Backpressure:") || slow_lower.contains("backpressure")) {
-        return Err(CliError::Failed(format!(
-            "expected Backpressure signal while Downstream is slow:\n{slow_out}"
-        )));
-    }
-    let mut peak_depth = 0i32;
-    for line in slow_out.lines() {
-        if let Some(rest) = line.split("queue_depth=").nth(1) {
-            if let Some(n) = rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<i32>().ok())
-            {
-                peak_depth = peak_depth.max(n);
-            }
-        }
-    }
-    if peak_depth <= 0 || peak_depth > 2 {
-        return Err(CliError::Failed(format!(
-            "queue_depth must stay within capacity=2 under backpressure, peak={peak_depth}:\n{slow_out}"
-        )));
-    }
-    if slow_lower
-        .lines()
-        .any(|line| line.contains("paused") && line.contains(BOUNDED_BACKPRESSURE_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "backpressure must not pause the Pipeline for Downstream slowness:\n{slow_out}"
-        )));
-    }
-
-    let status_mid = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let sync_lag = parse_sync_lag_for_table(&status_mid, BOUNDED_BACKPRESSURE_TABLE).ok_or_else(
-        || {
-            CliError::Failed(format!(
-                "could not parse Sync Health lag under backpressure:\n{status_mid}"
-            ))
-        },
-    )?;
-    if sync_lag < 10 {
-        return Err(CliError::Failed(format!(
-            "Sync Health lag must reflect Source backlog under backpressure (not only window remainder), got {sync_lag}:\n{status_mid}"
-        )));
-    }
-    let delivery_lag = parse_delivery_lag_for_pipeline(&status_mid, BOUNDED_BACKPRESSURE_PIPELINE)
-        .ok_or_else(|| {
-            CliError::Failed(format!(
-                "could not parse Delivery Health lag under backpressure:\n{status_mid}"
-            ))
-        })?;
-    if delivery_lag < 10 {
-        return Err(CliError::Failed(format!(
-            "Delivery Health lag must reflect Downstream backlog under delay, got {delivery_lag}:\n{status_mid}"
-        )));
-    }
-    if status_mid.contains("Delivery Health: paused") {
-        return Err(CliError::Failed(format!(
-            "default must not pause Pipeline for mere Downstream slowness:\n{status_mid}"
-        )));
-    }
-
-    println!("Lab Scenario: catch-up sync without Downstream delay...");
-    let catch_out = run_product_cli_with_env(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        &[(
-            "MIGRALOOP_SYNC_QUEUE_CAPACITY",
-            BOUNDED_BACKPRESSURE_CAPACITY,
-        )],
-    )
-    .await?;
-    let capture_note = if catch_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario catch-up sync must use real LogMiner path:\n{catch_out}"
-        )));
-    };
-
-    let status_after = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let sync_lag_after =
-        parse_sync_lag_for_table(&status_after, BOUNDED_BACKPRESSURE_TABLE).unwrap_or(-1);
-    let delivery_lag_after =
-        parse_delivery_lag_for_pipeline(&status_after, BOUNDED_BACKPRESSURE_PIPELINE).unwrap_or(-1);
-    if sync_lag_after != 0 || delivery_lag_after != 0 {
-        return Err(CliError::Failed(format!(
-            "lag must return to 0 after catch-up (sync={sync_lag_after}, delivery={delivery_lag_after}):\n{status_after}"
-        )));
-    }
-    if status_after.contains("Delivery Health: paused") {
-        return Err(CliError::Failed(format!(
-            "Pipeline must remain unpaused after backpressure catch-up:\n{status_after}"
-        )));
-    }
-
-    let target_out = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            BOUNDED_BACKPRESSURE_COLLECTION,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&target_out, "User100")
-        && managed_name_present(&target_out, "User119"))
-    {
-        return Err(CliError::Failed(format!(
-            "Target must receive backlog rows User100..User119 after catch-up:\n{target_out}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out)
-        + count_delivery_ops(&slow_out)
-        + count_delivery_ops(&catch_out);
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (bounded backpressure; visible lag; catch-up; Pipeline not paused)"
-    );
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: Some(sync_lag_after),
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
-
-async fn adapt_initial_load_throttled(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {INITIAL_LOAD_THROTTLED_ID}");
-    println!(
-        "Scenario Namespace: table={INITIAL_LOAD_THROTTLED_TABLE} \
-collection={INITIAL_LOAD_THROTTLED_COLLECTION} deployment={INITIAL_LOAD_THROTTLED_DEPLOYMENT}"
-    );
-    prepare_initial_load_throttled_namespace(lab_dir).await?;
-
-    let config_path = deployment_config_path(lab_dir, INITIAL_LOAD_THROTTLED_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!(
-        "Lab Scenario: apply with chunk_size={INITIAL_LOAD_THROTTLED_CHUNK_SIZE} \
-pause_after={INITIAL_LOAD_THROTTLED_PAUSE_AFTER}..."
-    );
-    let paused_out = run_product_cli_with_env(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-        &[
-            (
-                "MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE",
-                INITIAL_LOAD_THROTTLED_CHUNK_SIZE,
-            ),
-            (
-                "MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS",
-                INITIAL_LOAD_THROTTLED_PAUSE_AFTER,
-            ),
-        ],
-    )
-    .await?;
-    if !(paused_out.contains("Initial Load paused")
-        || paused_out.contains("initial_load_paused")
-        || paused_out.contains("\"event\":\"initial_load_paused\""))
-    {
-        return Err(CliError::Failed(format!(
-            "expected Initial Load pause after bounded chunks:\n{paused_out}"
-        )));
-    }
-    let progress_paused = paused_out
-        .lines()
-        .filter(|l| l.contains("initial_load_progress") || l.contains("Initial Load progress"))
-        .count();
-    if progress_paused < 2 {
-        return Err(CliError::Failed(format!(
-            "expected >=2 Initial Load progress signals before pause, got {progress_paused}:\n{paused_out}"
-        )));
-    }
-
-    let status_paused = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !(status_paused.contains("status=initial_load_paused")
-        || status_paused.contains("Initial Load paused"))
-    {
-        return Err(CliError::Failed(format!(
-            "expected durable Initial Load paused status:\n{status_paused}"
-        )));
-    }
-    if !status_paused.contains("low-watermark=") {
-        return Err(CliError::Failed(format!(
-            "expected cutover low-watermark after paused chunked load:\n{status_paused}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: resume apply with rate_limit={INITIAL_LOAD_THROTTLED_RATE}/s \
-and store delay for backoff..."
-    );
-    let resume_out = run_product_cli_with_env(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-        &[
-            (
-                "MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE",
-                INITIAL_LOAD_THROTTLED_CHUNK_SIZE,
-            ),
-            (
-                "MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC",
-                INITIAL_LOAD_THROTTLED_RATE,
-            ),
-            (
-                "MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS",
-                INITIAL_LOAD_THROTTLED_STORE_DELAY_MS,
-            ),
-        ],
-    )
-    .await?;
-    if !(resume_out.contains("Initial Load complete")
-        || resume_out.contains("\"event\":\"initial_load_complete\""))
-    {
-        return Err(CliError::Failed(format!(
-            "expected Initial Load complete after resume:\n{resume_out}"
-        )));
-    }
-    if !(resume_out.contains("rate_limit=")
-        || resume_out.contains("rate_limit_rows_per_sec"))
-    {
-        return Err(CliError::Failed(format!(
-            "expected Operator-visible rate_limit on resume apply:\n{resume_out}"
-        )));
-    }
-    if !(resume_out.contains("Initial Load backoff")
-        || resume_out.contains("initial_load_backoff"))
-    {
-        return Err(CliError::Failed(format!(
-            "expected Initial Load backoff under store pressure:\n{resume_out}"
-        )));
-    }
-
-    let status_after = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !(status_after.contains("status=initial_load_complete")
-        && status_after.contains(&format!("rows={INITIAL_LOAD_THROTTLED_ROW_COUNT}")))
-    {
-        return Err(CliError::Failed(format!(
-            "expected complete Base with {INITIAL_LOAD_THROTTLED_ROW_COUNT} rows:\n{status_after}"
-        )));
-    }
-
-    let capture_note = if resume_out.to_ascii_lowercase().contains("oci") {
-        "Initial Load (chunked OCI)".to_string()
-    } else {
-        "Initial Load (chunked)".to_string()
-    };
-    println!(
-        "Lab Scenario: {INITIAL_LOAD_THROTTLED_ID} checks passed \
-         (chunked progress; pause/resume; rate_limit; backoff; watermark retained)"
-    );
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: Some(0),
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: INITIAL_LOAD_THROTTLED_ROW_COUNT as u64,
-            capture_path_note: capture_note,
-        },
-    })
-}
 
 async fn remove_initial_load_throttled_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -5313,222 +6442,6 @@ EXIT;\n"
         })
 }
 
-async fn adapt_observability_surface(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {OBSERVABILITY_SURFACE_ID}");
-    println!(
-        "Scenario Namespace: table={OBSERVABILITY_SURFACE_TABLE} \
-collection={OBSERVABILITY_SURFACE_COLLECTION} deployment={OBSERVABILITY_SURFACE_DEPLOYMENT}"
-    );
-
-    prepare_observability_surface_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, OBSERVABILITY_SURFACE_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !(apply_out.contains("\"event\":\"initial_load_complete\"")
-        || apply_out.contains("\"event\": \"initial_load_complete\"")
-        || apply_out.contains("\"event\":\"delivery_complete\"")
-        || apply_out.contains("\"event\": \"delivery_complete\""))
-    {
-        return Err(CliError::Failed(format!(
-            "expected structured Initial Load / Delivery operator events on apply:\n{apply_out}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: inserting Source backlog ({OBSERVABILITY_SURFACE_BACKLOG} rows)..."
-    );
-    insert_observability_surface_backlog(lab_dir).await?;
-
-    println!(
-        "Lab Scenario: sync under Downstream delay with queue capacity={} \
-(fail after {} durable checkpoint)...",
-        OBSERVABILITY_SURFACE_CAPACITY, OBSERVABILITY_SURFACE_FAIL_AFTER
-    );
-    let (slow_ok, slow_out) = run_product_cli_allow_fail(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        &[
-            (
-                "MIGRALOOP_SYNC_QUEUE_CAPACITY",
-                OBSERVABILITY_SURFACE_CAPACITY,
-            ),
-            (
-                "MIGRALOOP_DELIVERY_DELAY_MS",
-                OBSERVABILITY_SURFACE_DELAY_MS,
-            ),
-            (
-                "MIGRALOOP_SYNC_FAIL_AFTER_CHANGES",
-                OBSERVABILITY_SURFACE_FAIL_AFTER,
-            ),
-        ],
-    )
-    .await?;
-    if slow_ok {
-        return Err(CliError::Failed(format!(
-            "expected mid-sync stop under Downstream slowness (FAIL_AFTER), got success:\n{slow_out}"
-        )));
-    }
-    if !slow_out.to_ascii_lowercase().contains("logminer") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{slow_out}"
-        )));
-    }
-    if !(slow_out.contains("\"event\":\"backpressure\"")
-        || slow_out.contains("\"event\": \"backpressure\""))
-    {
-        return Err(CliError::Failed(format!(
-            "expected structured backpressure event JSON:\n{slow_out}"
-        )));
-    }
-    if !(slow_out.contains("\"event\":\"incremental_capture\"")
-        || slow_out.contains("\"event\": \"incremental_capture\""))
-    {
-        return Err(CliError::Failed(format!(
-            "expected structured incremental_capture event JSON:\n{slow_out}"
-        )));
-    }
-
-    let status_mid = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !(status_mid.contains("Sync Health:")
-        && status_mid.contains("Delivery Health:")
-        && status_mid.contains(&format!("Pipeline: {OBSERVABILITY_SURFACE_PIPELINE}")))
-    {
-        return Err(CliError::Failed(format!(
-            "status must include Sync Health, Delivery Health, and Pipeline status:\n{status_mid}"
-        )));
-    }
-    let sync_lag = parse_sync_lag_for_table(&status_mid, OBSERVABILITY_SURFACE_TABLE).ok_or_else(
-        || {
-            CliError::Failed(format!(
-                "could not parse Sync Health lag under Observability Surface probe:\n{status_mid}"
-            ))
-        },
-    )?;
-    if sync_lag < 10 {
-        return Err(CliError::Failed(format!(
-            "Sync Health lag must reflect Source backlog, got {sync_lag}:\n{status_mid}"
-        )));
-    }
-    let delivery_lag =
-        parse_delivery_lag_for_pipeline(&status_mid, OBSERVABILITY_SURFACE_PIPELINE).ok_or_else(
-            || {
-                CliError::Failed(format!(
-                    "could not parse Delivery Health lag under Observability Surface probe:\n{status_mid}"
-                ))
-            },
-        )?;
-    if delivery_lag < 10 {
-        return Err(CliError::Failed(format!(
-            "Delivery Health lag must reflect Downstream backlog, got {delivery_lag}:\n{status_mid}"
-        )));
-    }
-
-    println!("Lab Scenario: scraping Prometheus /metrics via migraloop run...");
-    let metrics_body = scrape_run_metrics(&bin, LAB_PLATFORM_STORE_URL).await?;
-    if !(metrics_body.contains("migraloop_sync_lag")
-        && metrics_body.contains("migraloop_delivery_lag")
-        && (metrics_body.contains("migraloop_quarantined_changes")
-            || metrics_body.contains("migraloop_failures")))
-    {
-        return Err(CliError::Failed(format!(
-            "Prometheus /metrics must expose lag and failure counters:\n{metrics_body}"
-        )));
-    }
-    let metric_sync_lag = parse_prometheus_gauge(&metrics_body, "migraloop_sync_lag").ok_or_else(
-        || {
-            CliError::Failed(format!(
-                "could not parse migraloop_sync_lag from metrics:\n{metrics_body}"
-            ))
-        },
-    )?;
-    if metric_sync_lag < 1.0 {
-        return Err(CliError::Failed(format!(
-            "migraloop_sync_lag must reflect backlog, got {metric_sync_lag}:\n{metrics_body}"
-        )));
-    }
-
-    println!("Lab Scenario: catch-up sync without Downstream delay...");
-    let catch_out = run_product_cli_with_env(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        &[(
-            "MIGRALOOP_SYNC_QUEUE_CAPACITY",
-            OBSERVABILITY_SURFACE_CAPACITY,
-        )],
-    )
-    .await?;
-    let capture_note = if catch_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario catch-up sync must use real LogMiner path:\n{catch_out}"
-        )));
-    };
-
-    let status_after = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let sync_lag_after =
-        parse_sync_lag_for_table(&status_after, OBSERVABILITY_SURFACE_TABLE).unwrap_or(-1);
-    let delivery_lag_after =
-        parse_delivery_lag_for_pipeline(&status_after, OBSERVABILITY_SURFACE_PIPELINE).unwrap_or(-1);
-    if sync_lag_after != 0 || delivery_lag_after != 0 {
-        return Err(CliError::Failed(format!(
-            "lag must return to 0 after catch-up (sync={sync_lag_after}, delivery={delivery_lag_after}):\n{status_after}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out)
-        + count_delivery_ops(&slow_out)
-        + count_delivery_ops(&catch_out);
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (structured logs; Sync/Delivery Health; Prometheus lag/failures)"
-    );
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: Some(sync_lag_after),
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
 
 async fn remove_observability_surface_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -5633,140 +6546,6 @@ EXIT;\n"
         })
 }
 
-async fn adapt_platform_store_guardrails(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {PLATFORM_STORE_GUARDRAILS_ID}");
-    println!(
-        "Scenario Namespace: table={PLATFORM_STORE_GUARDRAILS_TABLE} \
-collection={PLATFORM_STORE_GUARDRAILS_COLLECTION} deployment={PLATFORM_STORE_GUARDRAILS_DEPLOYMENT}"
-    );
-
-    prepare_platform_store_guardrails_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, PLATFORM_STORE_GUARDRAILS_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!("Lab Scenario: status without disk inject (bundled settings must pass guardrails)...");
-    let status_ok = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !status_ok.contains("Platform Store: healthy") {
-        return Err(CliError::Failed(format!(
-            "bundled Platform Store must satisfy Guardrail minimums:\n{status_ok}"
-        )));
-    }
-    if status_ok.contains("Guardrails rejected") {
-        return Err(CliError::Failed(format!(
-            "bundled Platform Store settings must not be rejected by Guardrails:\n{status_ok}"
-        )));
-    }
-
-    println!("Lab Scenario: status rejects absurdly low shared_buffers (inject)...");
-    let (reject_ok, reject_out) = run_product_cli_allow_fail(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        &[(
-            "MIGRALOOP_INJECT_PLATFORM_STORE_SHARED_BUFFERS_BYTES",
-            "1048576",
-        )],
-    )
-    .await?;
-    if reject_ok {
-        return Err(CliError::Failed(format!(
-            "status must reject absurdly low shared_buffers:\n{reject_out}"
-        )));
-    }
-    let reject_lower = reject_out.to_ascii_lowercase();
-    if !(reject_lower.contains("guardrails") && reject_lower.contains("shared_buffers")) {
-        return Err(CliError::Failed(format!(
-            "expected Guardrails shared_buffers rejection:\n{reject_out}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: status with injected low free disk ({PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES} bytes)..."
-    );
-    let status_warn = run_product_cli_with_env(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        &[(
-            "MIGRALOOP_INJECT_PLATFORM_STORE_FREE_DISK_BYTES",
-            PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES,
-        )],
-    )
-    .await?;
-    if !status_warn.contains("Platform Store: healthy") {
-        return Err(CliError::Failed(format!(
-            "disk warn must leave Platform Store healthy:\n{status_warn}"
-        )));
-    }
-    let warn_lower = status_warn.to_ascii_lowercase();
-    if !(status_warn.contains("WARN:") && warn_lower.contains("disk")) {
-        return Err(CliError::Failed(format!(
-            "expected free-disk WARN on status:\n{status_warn}"
-        )));
-    }
-    if !(status_warn.contains("platform_store_disk_warn")
-        || status_warn.contains("\"event\":\"platform_store_disk_warn\""))
-    {
-        return Err(CliError::Failed(format!(
-            "expected structured platform_store_disk_warn event:\n{status_warn}"
-        )));
-    }
-    if status_warn.contains("Delivery Health: paused")
-        || status_warn
-            .lines()
-            .any(|line| line.contains("Pipeline:") && line.contains("paused"))
-    {
-        return Err(CliError::Failed(format!(
-            "disk threshold must not auto-pause Pipelines:\n{status_warn}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out);
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (Guardrails minimums ok; disk warn-only; Pipeline not paused)"
-    );
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: "LogMiner".to_string(),
-        },
-    })
-}
 
 async fn remove_platform_store_guardrails_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -5844,164 +6623,6 @@ EXIT;\n"
         })
 }
 
-async fn adapt_backward_compatible_upgrades(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {BACKWARD_COMPATIBLE_UPGRADES_ID}");
-    println!(
-        "Scenario Namespace: table={BACKWARD_COMPATIBLE_UPGRADES_TABLE} \
-collection={BACKWARD_COMPATIBLE_UPGRADES_COLLECTION} \
-deployment={BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"
-    );
-
-    prepare_backward_compatible_upgrades_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, BACKWARD_COMPATIBLE_UPGRADES_ID)?;
-    let older_config_path = scenario_config_path(
-        lab_dir,
-        BACKWARD_COMPATIBLE_UPGRADES_ID,
-        BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG,
-    )?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-    let older_config_str = older_config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario older-config path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!("Lab Scenario: status before upgrade migrate...");
-    let status_before = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !status_before.contains("Platform Store: healthy")
-        || !status_before.contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
-        || !status_before.contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
-    {
-        return Err(CliError::Failed(format!(
-            "pre-upgrade status missing healthy store / Deployment / Base:\n{status_before}"
-        )));
-    }
-    let schema_line = status_before
-        .lines()
-        .find(|l| l.starts_with("Schema version:"))
-        .unwrap_or("Schema version: (missing)")
-        .to_string();
-
-    println!("Lab Scenario: migraloop migrate (upgrade path)...");
-    let migrate_out = run_product_cli(
-        &bin,
-        &["migrate", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !migrate_out.to_ascii_lowercase().contains("migration")
-        && !migrate_out.contains("Platform Store")
-    {
-        return Err(CliError::Failed(format!(
-            "migrate did not report Platform Store migration success:\n{migrate_out}"
-        )));
-    }
-
-    println!("Lab Scenario: status after upgrade migrate...");
-    let status_after_migrate = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !status_after_migrate.contains("Platform Store: healthy") {
-        return Err(CliError::Failed(format!(
-            "store must stay healthy after upgrade migrate:\n{status_after_migrate}"
-        )));
-    }
-    if !status_after_migrate.contains(schema_line.trim()) {
-        return Err(CliError::Failed(format!(
-            "Schema version must remain at latest after upgrade migrate \
-             (expected `{schema_line}`):\n{status_after_migrate}"
-        )));
-    }
-    if !status_after_migrate
-        .contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
-        || !status_after_migrate
-            .contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
-    {
-        return Err(CliError::Failed(format!(
-            "Deployment/Base must survive upgrade migrate (no wipe):\n{status_after_migrate}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: apply older SemVer-compatible config ({BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG})..."
-    );
-    let older_apply = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            older_config_str,
-        ],
-    )
-    .await?;
-    if older_apply.contains("Initial Load complete") {
-        return Err(CliError::Failed(format!(
-            "older compatible config must not rebuild Base from scratch:\n{older_apply}"
-        )));
-    }
-
-    let status_final = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !status_final.contains(&format!("Deployment: {BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}"))
-        || !status_final.contains(&format!("Base Dataset: {BACKWARD_COMPATIBLE_UPGRADES_TABLE}"))
-    {
-        return Err(CliError::Failed(format!(
-            "Deployment/Base must remain after older config apply:\n{status_final}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out);
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (migrate preserved Deployment; older v1.0.0 config applies without rebuild)"
-    );
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: "LogMiner".to_string(),
-        },
-    })
-}
 
 async fn remove_backward_compatible_upgrades_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -6209,178 +6830,6 @@ fn parse_capture_checkpoint(status_out: &str) -> Option<i64> {
     None
 }
 
-async fn adapt_schema_change_pause(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {SCHEMA_CHANGE_PAUSE_ID}");
-    println!(
-        "Scenario Namespace: table={SCHEMA_CHANGE_PAUSE_TABLE} \
-collection={SCHEMA_CHANGE_PAUSE_COLLECTION} deployment={SCHEMA_CHANGE_PAUSE_DEPLOYMENT}"
-    );
-
-    prepare_schema_change_pause_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, SCHEMA_CHANGE_PAUSE_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !apply_out.to_ascii_lowercase().contains("delivery") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
-        )));
-    }
-
-    let status_before = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let checkpoint = parse_capture_checkpoint(&status_before).ok_or_else(|| {
-        CliError::Failed(format!(
-            "could not parse capture checkpoint from status after apply:\n{status_before}"
-        ))
-    })?;
-    let inject_scn = checkpoint.saturating_add(1) as u64;
-
-    // Real Source DDL workload on the Lab Oracle (ADR-0025 Source-driving seam).
-    // LogMiner DDL contents are not yet reconstructed on the OCI path, so sync also
-    // receives the matching Schema Change event via MIGRALOOP_INJECT_SCHEMA_CHANGES
-    // (same class of test/Lab seam as MIGRALOOP_DELIVERY_POISON_IDENTITIES).
-    println!(
-        "Lab Scenario: driving Source DDL (DROP COLUMN NAME on {SCHEMA_CHANGE_PAUSE_TABLE})..."
-    );
-    mutate_schema_change_pause_source_ddl(lab_dir).await?;
-
-    let inject_path = lab_dir.join(".schema-change-pause-inject.json");
-    let inject_body = format!(
-        r#"{{
-  "changes": [
-    {{
-      "scn": {inject_scn},
-      "table": "{SCHEMA_CHANGE_PAUSE_TABLE}",
-      "schema": "SYNC_USER",
-      "kind": "drop_column",
-      "columns": ["NAME"],
-      "summary": "ALTER TABLE {SCHEMA_CHANGE_PAUSE_TABLE} DROP COLUMN NAME"
-    }}
-  ]
-}}"#
-    );
-    fs::write(&inject_path, inject_body).map_err(|err| {
-        CliError::Failed(format!(
-            "failed to write Schema Change inject file {}: {err}",
-            inject_path.display()
-        ))
-    })?;
-    let inject_str = inject_path.to_str().ok_or_else(|| {
-        CliError::Failed("Schema Change inject path is not valid UTF-8".to_string())
-    })?;
-
-    println!(
-        "Lab Scenario: sync Incremental Capture with Schema Change event for the Source DDL \
-         (drop managed NAME at scn={inject_scn}; inject bridges LogMiner DDL capture gap)..."
-    );
-    let sync_out = run_product_cli_with_env(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-        &[("MIGRALOOP_INJECT_SCHEMA_CHANGES", inject_str)],
-    )
-    .await?;
-    let _ = fs::remove_file(&inject_path);
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-    let sync_lower = sync_out.to_ascii_lowercase();
-    if !(sync_lower.contains("warn")
-        && sync_lower.contains("schema change")
-        && sync_lower.contains("paused"))
-    {
-        return Err(CliError::Failed(format!(
-            "sync must WARN and pause on blocking Schema Change:\n{sync_out}"
-        )));
-    }
-    if sync_lower.contains("alert: poison") || sync_out.contains("Quarantine:") {
-        return Err(CliError::Failed(format!(
-            "blocking DDL pause must be distinct from poison quarantine:\n{sync_out}"
-        )));
-    }
-    if !sync_lower.contains("not poison quarantine") {
-        return Err(CliError::Failed(format!(
-            "blocking DDL pause should explicitly distinguish poison quarantine:\n{sync_out}"
-        )));
-    }
-
-    let status_out = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let status_lower = status_out.to_ascii_lowercase();
-    if !(status_out.contains(SCHEMA_CHANGE_PAUSE_PIPELINE)
-        && (status_out.contains("Delivery Health: paused")
-            || status_lower.contains("delivery health: paused"))
-        && status_lower.contains("schema change")
-        && status_lower.contains("blocking"))
-    {
-        return Err(CliError::Failed(format!(
-            "status must show Delivery Health paused + Schema Change blocking:\n{status_out}"
-        )));
-    }
-    if status_lower.contains("quarantine")
-        && !status_out.contains("Quarantine: (none)")
-        && status_lower.contains("unhealthy / not aligned")
-    {
-        return Err(CliError::Failed(format!(
-            "blocking DDL must not create poison quarantine rows:\n{status_out}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out) + count_delivery_ops(&sync_out);
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (blocking DDL warn+pause; distinct from poison quarantine)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
 
 async fn remove_schema_change_pause_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -6478,205 +6927,6 @@ EXIT;\n"
         })
 }
 
-async fn adapt_source_alignment(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {SOURCE_ALIGNMENT_ID}");
-    println!(
-        "Scenario Namespace: table={SOURCE_ALIGNMENT_TABLE} \
-collection={SOURCE_ALIGNMENT_COLLECTION} deployment={SOURCE_ALIGNMENT_DEPLOYMENT} \
-pipeline={SOURCE_ALIGNMENT_PIPELINE}"
-    );
-
-    prepare_source_alignment_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, SOURCE_ALIGNMENT_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: mutating Source ID=1 → AlignedAlice (controlled Base≠Source; no sync)..."
-    );
-    mutate_source_alignment_name(lab_dir, 1, "AlignedAlice").await?;
-
-    println!("Lab Scenario: running Source Alignment Check (default resource-gated budget)...");
-    let align_out = run_product_cli(
-        &bin,
-        &[
-            "align",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            SOURCE_ALIGNMENT_TABLE,
-        ],
-    )
-    .await?;
-    let align_lower = align_out.to_ascii_lowercase();
-    if !(align_lower.contains("source alignment")
-        && (align_lower.contains("mismatched") || align_lower.contains("misaligned"))
-        && align_lower.contains("repaired"))
-    {
-        return Err(CliError::Failed(format!(
-            "align must detect mismatch and repair Base from Source:\n{align_out}"
-        )));
-    }
-    if align_lower.contains("write source") || align_lower.contains("updating source") {
-        return Err(CliError::Failed(format!(
-            "align must never write Source:\n{align_out}"
-        )));
-    }
-
-    let base_out = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            SOURCE_ALIGNMENT_TABLE,
-        ],
-    )
-    .await?;
-    if !managed_name_present(&base_out, "AlignedAlice") || managed_name_present(&base_out, "Alice")
-    {
-        return Err(CliError::Failed(format!(
-            "Base must be repaired to AlignedAlice from Source:\n{base_out}"
-        )));
-    }
-
-    let source_name = query_source_alignment_name(lab_dir, 1).await?;
-    if source_name != "AlignedAlice" {
-        return Err(CliError::Failed(format!(
-            "Source must remain AlignedAlice after align (never written by check); got {source_name:?}"
-        )));
-    }
-
-    let status_out = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !(status_out.contains("Source Alignment:")
-        && status_out.to_ascii_lowercase().contains("aligned"))
-    {
-        return Err(CliError::Failed(format!(
-            "status must show Source Alignment after check:\n{status_out}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: mutating Source ID=2 → BobAligned; align --max-rows 1 (resource gate)..."
-    );
-    mutate_source_alignment_name(lab_dir, 2, "BobAligned").await?;
-    let gated_out = run_product_cli(
-        &bin,
-        &[
-            "align",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            SOURCE_ALIGNMENT_TABLE,
-            "--max-rows",
-            "1",
-        ],
-    )
-    .await?;
-    let gated_lower = gated_out.to_ascii_lowercase();
-    if !(gated_lower.contains("maxrows=1")
-        && (gated_lower.contains("partial") || gated_lower.contains("truncated")))
-    {
-        return Err(CliError::Failed(format!(
-            "resource-gated align must report maxRows=1 and partial/truncated:\n{gated_out}"
-        )));
-    }
-    let base_gated = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            SOURCE_ALIGNMENT_TABLE,
-        ],
-    )
-    .await?;
-    if managed_name_present(&base_gated, "BobAligned") {
-        return Err(CliError::Failed(format!(
-            "max-rows=1 must not full-slam repair Bob:\n{base_gated}"
-        )));
-    }
-
-    println!("Lab Scenario: align with larger budget to repair remaining Base row...");
-    let full_out = run_product_cli(
-        &bin,
-        &[
-            "align",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            SOURCE_ALIGNMENT_TABLE,
-            "--max-rows",
-            "1000",
-        ],
-    )
-    .await?;
-    let base_full = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            SOURCE_ALIGNMENT_TABLE,
-        ],
-    )
-    .await?;
-    if !managed_name_present(&base_full, "BobAligned") {
-        return Err(CliError::Failed(format!(
-            "larger budget must repair Bob from Source:\n{full_out}\n{base_full}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out);
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (detect + repair Base from Source; resource-gated max-rows; Source not written)"
-    );
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: "Source Alignment Check (OCI reads)".to_string(),
-        },
-    })
-}
 
 async fn remove_source_alignment_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -6725,222 +6975,6 @@ EXIT;\n"
     Ok(())
 }
 
-async fn adapt_drift_check(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {DRIFT_CHECK_ID}");
-    println!(
-        "Scenario Namespace: table={DRIFT_CHECK_TABLE} \
-collection={DRIFT_CHECK_COLLECTION} deployment={DRIFT_CHECK_DEPLOYMENT} \
-pipeline={DRIFT_CHECK_PIPELINE}"
-    );
-
-    prepare_drift_check_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, DRIFT_CHECK_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load")
-        || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!("Lab Scenario: align Base as trusted Drift baseline...");
-    let align_out = run_product_cli(
-        &bin,
-        &[
-            "align",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            DRIFT_CHECK_TABLE,
-        ],
-    )
-    .await?;
-    if !align_out.to_ascii_lowercase().contains("source alignment") {
-        return Err(CliError::Failed(format!(
-            "align must establish Drift baseline:\n{align_out}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: mutating Target Managed NAME→DRIFTED + planting non-Managed EXTRA..."
-    );
-    plant_drift_check_target_drift(lab_dir, 1, "DRIFTED", true).await?;
-
-    println!("Lab Scenario: running Drift Check (default resource-gated budget)...");
-    let drift_out = run_product_cli(
-        &bin,
-        &[
-            "drift",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            DRIFT_CHECK_PIPELINE,
-        ],
-    )
-    .await?;
-    let drift_lower = drift_out.to_ascii_lowercase();
-    if !(drift_lower.contains("drift")
-        && (drift_lower.contains("mismatched") || drift_lower.contains("drifted"))
-        && drift_lower.contains("repaired"))
-    {
-        return Err(CliError::Failed(format!(
-            "drift must detect Managed mismatch and auto-repair:\n{drift_out}"
-        )));
-    }
-
-    let target_out = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            DRIFT_CHECK_COLLECTION,
-        ],
-    )
-    .await?;
-    if !managed_name_present(&target_out, "Alice") || managed_name_present(&target_out, "DRIFTED")
-    {
-        return Err(CliError::Failed(format!(
-            "Managed fields must be auto-repaired to Alice:\n{target_out}"
-        )));
-    }
-    if !(target_out.contains(DRIFT_CHECK_EXTRA_FIELD) || target_out.contains("EXTRA")) {
-        return Err(CliError::Failed(format!(
-            "non-Managed EXTRA must survive Managed auto-repair:\n{target_out}"
-        )));
-    }
-
-    let status_out = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if !(status_out.contains("Drift:")
-        && (status_out.to_ascii_lowercase().contains("ok")
-            || status_out.to_ascii_lowercase().contains("partial")))
-    {
-        return Err(CliError::Failed(format!(
-            "status must show Drift after check:\n{status_out}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: mutating Target ID=2 → CORRUPT_BOB; drift --max-rows 1 (resource gate)..."
-    );
-    plant_drift_check_target_drift(lab_dir, 2, "CORRUPT_BOB", false).await?;
-    let gated_out = run_product_cli(
-        &bin,
-        &[
-            "drift",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            DRIFT_CHECK_PIPELINE,
-            "--max-rows",
-            "1",
-        ],
-    )
-    .await?;
-    let gated_lower = gated_out.to_ascii_lowercase();
-    if !(gated_lower.contains("maxrows=1")
-        && (gated_lower.contains("partial") || gated_lower.contains("truncated")))
-    {
-        return Err(CliError::Failed(format!(
-            "resource-gated drift must report maxRows=1 and partial/truncated:\n{gated_out}"
-        )));
-    }
-    let target_gated = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            DRIFT_CHECK_COLLECTION,
-        ],
-    )
-    .await?;
-    if !target_gated.contains("CORRUPT_BOB") {
-        return Err(CliError::Failed(format!(
-            "max-rows=1 must not full-slam repair Bob:\n{target_gated}"
-        )));
-    }
-
-    println!("Lab Scenario: drift with larger budget to repair remaining Managed drift...");
-    let full_out = run_product_cli(
-        &bin,
-        &[
-            "drift",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            DRIFT_CHECK_PIPELINE,
-            "--max-rows",
-            "1000",
-        ],
-    )
-    .await?;
-    let target_full = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            DRIFT_CHECK_COLLECTION,
-        ],
-    )
-    .await?;
-    if !managed_name_present(&target_full, "Bob") || target_full.contains("CORRUPT_BOB") {
-        return Err(CliError::Failed(format!(
-            "larger budget must repair Bob Managed fields:\n{full_out}\n{target_full}"
-        )));
-    }
-    if !(target_full.contains(DRIFT_CHECK_EXTRA_FIELD) || target_full.contains("EXTRA")) {
-        return Err(CliError::Failed(format!(
-            "non-Managed EXTRA must still be preserved after full drift:\n{target_full}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out);
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (detect + Managed auto-repair; non-Managed preserved; resource-gated max-rows)"
-    );
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: "Drift Check (Managed-field Target repair)".to_string(),
-        },
-    })
-}
 
 async fn remove_drift_check_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -7125,212 +7159,6 @@ EXIT;\n"
     Ok(name)
 }
 
-async fn adapt_remove_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {REMOVE_PIPELINE_ID}");
-    println!(
-        "Scenario Namespace: table={REMOVE_PIPELINE_CUSTOMERS_TABLE} \
-collections={REMOVE_PIPELINE_CUSTOMERS_COLLECTION},{REMOVE_PIPELINE_REPORTING_COLLECTION} \
-deployment={REMOVE_PIPELINE_DEPLOYMENT}"
-    );
-
-    prepare_remove_pipeline_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let config_path = deployment_config_path(lab_dir, REMOVE_PIPELINE_ID)?;
-    let bin = lab_migraloop_bin();
-    let config_str = config_path.to_str().ok_or_else(|| {
-        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-    })?;
-
-    println!("Lab Scenario: apply Deployment via real product path...");
-    let apply_out = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_str,
-        ],
-    )
-    .await?;
-    if !(apply_out.contains("Initial Load") || apply_out.to_ascii_lowercase().contains("initial_load"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Initial Load (real product path required):\n{apply_out}"
-        )));
-    }
-    if !apply_out.to_ascii_lowercase().contains("delivery") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario apply did not report Delivery (real product path required):\n{apply_out}"
-        )));
-    }
-
-    println!("Lab Scenario: remove Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} via CLI...");
-    let remove_out = run_product_cli(
-        &bin,
-        &[
-            "remove",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            REMOVE_PIPELINE_CUSTOMERS_PIPELINE,
-            "--deployment",
-            REMOVE_PIPELINE_DEPLOYMENT,
-        ],
-    )
-    .await?;
-    if !remove_out.to_ascii_lowercase().contains("removed") {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario remove did not report removed Pipeline:\n{remove_out}"
-        )));
-    }
-
-    let status_after_remove = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if status_after_remove.contains(&format!("Pipeline: {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} (")) {
-        return Err(CliError::Failed(format!(
-            "status must no longer list removed Pipeline as active:\n{status_after_remove}"
-        )));
-    }
-    if !status_after_remove
-        .contains(&format!("Pipeline: {REMOVE_PIPELINE_REPORTING_PIPELINE} ("))
-    {
-        return Err(CliError::Failed(format!(
-            "status must still list remaining Pipeline:\n{status_after_remove}"
-        )));
-    }
-    if !status_after_remove.contains(&format!("Base Dataset: {REMOVE_PIPELINE_CUSTOMERS_TABLE}"))
-    {
-        return Err(CliError::Failed(format!(
-            "Shared Base must remain after remove:\n{status_after_remove}"
-        )));
-    }
-    if !status_after_remove.contains(REMOVE_PIPELINE_DEPLOYMENT) {
-        return Err(CliError::Failed(format!(
-            "Deployment must remain up after Pipeline remove:\n{status_after_remove}"
-        )));
-    }
-
-    println!("Lab Scenario: driving Source mutations on Shared Base table...");
-    mutate_remove_pipeline_source(lab_dir).await?;
-
-    println!("Lab Scenario: sync Incremental Capture + Delivery via real product path...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    let capture_note = if sync_out.to_ascii_lowercase().contains("logminer") {
-        "LogMiner".to_string()
-    } else {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario sync must use real LogMiner path (not contract/stub):\n{sync_out}"
-        )));
-    };
-    if sync_out.contains(&format!(
-        "Delivery complete: Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE}"
-    )) {
-        return Err(CliError::Failed(format!(
-            "removed Pipeline must not Deliver during sync:\n{sync_out}"
-        )));
-    }
-    if !(sync_out.contains(&format!(
-        "Delivery complete: Pipeline {REMOVE_PIPELINE_REPORTING_PIPELINE}"
-    )) || sync_out.contains(REMOVE_PIPELINE_REPORTING_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "remaining Pipeline must still Deliver from Shared Base during sync:\n{sync_out}"
-        )));
-    }
-
-    // Removed Pipeline has no Target Binding — inspect Target via Lab mongosh.
-    let customers_target = mongosh_in_mongo(
-        lab_dir,
-        &format!(
-            "JSON.stringify(db.getCollection('{REMOVE_PIPELINE_CUSTOMERS_COLLECTION}').find().toArray())"
-        ),
-    )
-    .await
-    .map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to inspect removed Pipeline Target via mongosh:\n{err}"
-        ))
-    })?;
-    if !(managed_name_present(&customers_target, "Alice")
-        && managed_name_present(&customers_target, "Bob")
-        && !managed_name_present(&customers_target, "Alicia"))
-    {
-        return Err(CliError::Failed(format!(
-            "removed Pipeline Target must retain Initial Load (Alice/Bob, not Alicia):\n{customers_target}"
-        )));
-    }
-
-    let reporting_target = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            REMOVE_PIPELINE_REPORTING_COLLECTION,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&reporting_target, "Alicia")
-        && managed_name_present(&reporting_target, "Carol")
-        && !managed_name_present(&reporting_target, "Bob"))
-    {
-        return Err(CliError::Failed(format!(
-            "remaining Pipeline must Deliver Incremental updates from Shared Base:\n{reporting_target}"
-        )));
-    }
-
-    let base_out = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            REMOVE_PIPELINE_CUSTOMERS_TABLE,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&base_out, "Alicia") && managed_name_present(&base_out, "Carol")) {
-        return Err(CliError::Failed(format!(
-            "Shared Base must continue Incremental Capture for remaining Pipeline:\n{base_out}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_out)
-        + count_delivery_ops(&sync_out)
-        + count_delivery_ops(&remove_out);
-
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (remove ceased customers Delivery; Shared Base kept; reporting Delivered)"
-    );
-    if !sync_out.trim().is_empty() {
-        println!("Lab Scenario: Incremental Capture ({capture_note}) complete");
-    }
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: capture_note,
-        },
-    })
-}
 
 async fn remove_remove_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -7734,295 +7562,6 @@ impl Drop for ScenarioLock {
     }
 }
 
-async fn adapt_change_pipeline(lab_dir: &Path, _recipe: &ScenarioRecipe) -> Result<AdapterOutcome, CliError> {
-    println!("Lab Scenario: {CHANGE_PIPELINE_ID}");
-    println!(
-        "Scenario Namespace: table={CHANGE_PIPELINE_CUSTOMERS_TABLE} \
-collections={CHANGE_PIPELINE_ACTIVE_COLLECTION},{CHANGE_PIPELINE_REPORTING_COLLECTION} \
-deployment={CHANGE_PIPELINE_DEPLOYMENT}"
-    );
-
-    prepare_change_pipeline_namespace(lab_dir).await?;
-    println!("Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)");
-
-    let bin = lab_migraloop_bin();
-    let initial_config = deployment_config_path(lab_dir, CHANGE_PIPELINE_ID)?;
-    let semantic_config =
-        scenario_config_path(lab_dir, CHANGE_PIPELINE_ID, CHANGE_PIPELINE_SEMANTIC_CONFIG)?;
-    let metadata_config =
-        scenario_config_path(lab_dir, CHANGE_PIPELINE_ID, CHANGE_PIPELINE_METADATA_CONFIG)?;
-
-    println!("Lab Scenario: apply initial Deployment (Transform ACTIVE==1 + shared Direct)...");
-    let apply_v1 = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            initial_config.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    if !(apply_v1.contains("Derived Dataset materialized")
-        || apply_v1.contains("Delivery complete: Pipeline"))
-    {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario initial apply did not Deliver Pipelines:\n{apply_v1}"
-        )));
-    }
-
-    let target_v1 = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            CHANGE_PIPELINE_ACTIVE_COLLECTION,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&target_v1, "Alice")
-        && managed_name_present(&target_v1, "Carol")
-        && !managed_name_present(&target_v1, "Bob"))
-    {
-        return Err(CliError::Failed(format!(
-            "Initial ACTIVE==1 Target must Deliver Alice/Carol only:\n{target_v1}"
-        )));
-    }
-
-    println!(
-        "Lab Scenario: apply semantic Transform revision (ACTIVE==0) via real product path..."
-    );
-    let apply_v2 = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            semantic_config.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario semantic revision path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    let apply_v2_lower = apply_v2.to_ascii_lowercase();
-    if !(apply_v2_lower.contains("revision")
-        && apply_v2.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE)
-        && (apply_v2_lower.contains("paused") || apply_v2_lower.contains("pause")))
-    {
-        return Err(CliError::Failed(format!(
-            "Semantic revision must pause old Delivery and report Pipeline revision:\n{apply_v2}"
-        )));
-    }
-    if !apply_v2.contains(&format!(
-        "Derived Dataset materialized: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
-    )) {
-        return Err(CliError::Failed(format!(
-            "Semantic revision must rebuild Derived:\n{apply_v2}"
-        )));
-    }
-    if apply_v2.contains(&format!(
-        "Initial Load complete: Base Dataset {CHANGE_PIPELINE_CUSTOMERS_TABLE}"
-    )) {
-        return Err(CliError::Failed(format!(
-            "Shared Base must not be rebuilt on Pipeline revision:\n{apply_v2}"
-        )));
-    }
-    if apply_v2.contains(&format!(
-        "Delivery complete: Pipeline {CHANGE_PIPELINE_REPORTING_PIPELINE}"
-    )) {
-        return Err(CliError::Failed(format!(
-            "Unchanged sibling Pipeline must not be re-Delivered on revision:\n{apply_v2}"
-        )));
-    }
-
-    let derived_v2 = run_product_cli(
-        &bin,
-        &[
-            "derived",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--pipeline",
-            CHANGE_PIPELINE_ACTIVE_PIPELINE,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&derived_v2, "Bob")
-        && !managed_name_present(&derived_v2, "Alice")
-        && !managed_name_present(&derived_v2, "Carol"))
-    {
-        return Err(CliError::Failed(format!(
-            "Rebuilt Derived must match ACTIVE==0 filter:\n{derived_v2}"
-        )));
-    }
-
-    let target_v2 = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            CHANGE_PIPELINE_ACTIVE_COLLECTION,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&target_v2, "Bob")
-        && !managed_name_present(&target_v2, "Alice")
-        && !managed_name_present(&target_v2, "Carol"))
-    {
-        return Err(CliError::Failed(format!(
-            "Re-Delivery must upsert Bob and reconcile-delete Alice/Carol:\n{target_v2}"
-        )));
-    }
-
-    let base_after = run_product_cli(
-        &bin,
-        &[
-            "base",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--table",
-            CHANGE_PIPELINE_CUSTOMERS_TABLE,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&base_after, "Alice")
-        && managed_name_present(&base_after, "Bob")
-        && managed_name_present(&base_after, "Carol"))
-    {
-        return Err(CliError::Failed(format!(
-            "Shared Base rows must remain after Pipeline revision:\n{base_after}"
-        )));
-    }
-
-    let reporting = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            CHANGE_PIPELINE_REPORTING_COLLECTION,
-        ],
-    )
-    .await?;
-    if !(managed_name_present(&reporting, "Alice")
-        && managed_name_present(&reporting, "Bob")
-        && managed_name_present(&reporting, "Carol"))
-    {
-        return Err(CliError::Failed(format!(
-            "Sibling Direct Target must remain from Shared Base:\n{reporting}"
-        )));
-    }
-
-    println!("Lab Scenario: sync Incremental Capture under the new revision...");
-    let sync_out = run_product_cli(
-        &bin,
-        &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if sync_out.to_ascii_lowercase().contains("error")
-        && !sync_out.to_ascii_lowercase().contains("no changes")
-    {
-        return Err(CliError::Failed(format!(
-            "Incremental sync after Pipeline revision must succeed:\n{sync_out}"
-        )));
-    }
-    let status_after_sync = run_product_cli(
-        &bin,
-        &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-    )
-    .await?;
-    if status_after_sync
-        .to_ascii_lowercase()
-        .lines()
-        .any(|line| line.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE) && line.contains("paused"))
-    {
-        return Err(CliError::Failed(format!(
-            "Pipeline must not remain paused after revision when continuing incremental:\n{status_after_sync}"
-        )));
-    }
-
-    println!("Lab Scenario: apply metadata-only description change...");
-    let apply_meta = run_product_cli(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            metadata_config.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario metadata revision path is not valid UTF-8".to_string())
-            })?,
-        ],
-    )
-    .await?;
-    let apply_meta_lower = apply_meta.to_ascii_lowercase();
-    if !(apply_meta_lower.contains("metadata")
-        && apply_meta_lower.contains("skip")
-        && apply_meta.contains(CHANGE_PIPELINE_ACTIVE_PIPELINE))
-    {
-        return Err(CliError::Failed(format!(
-            "Metadata-only change must report rebuild skipped:\n{apply_meta}"
-        )));
-    }
-    if apply_meta.contains(&format!(
-        "Derived Dataset materialized: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
-    )) || apply_meta.contains(&format!(
-        "Delivery complete: Pipeline {CHANGE_PIPELINE_ACTIVE_PIPELINE}"
-    )) {
-        return Err(CliError::Failed(format!(
-            "Metadata-only change must not rebuild Derived or re-Deliver:\n{apply_meta}"
-        )));
-    }
-
-    let target_meta = run_product_cli(
-        &bin,
-        &[
-            "target",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--collection",
-            CHANGE_PIPELINE_ACTIVE_COLLECTION,
-        ],
-    )
-    .await?;
-    if target_meta != target_v2 {
-        return Err(CliError::Failed(format!(
-            "Metadata-only change must leave Target unchanged.\nBefore:\n{target_v2}\nAfter:\n{target_meta}"
-        )));
-    }
-
-    let rows_applied = count_delivery_ops(&apply_v1)
-        + count_delivery_ops(&apply_v2)
-        + count_delivery_ops(&sync_out)
-        + count_delivery_ops(&apply_meta);
-
-    println!(
-        "Lab Scenario: correctness checks passed \
-         (semantic revision rebuilt Derived/re-Delivered; incremental continued; \
-Shared Base kept; metadata-only skipped)"
-    );
-
-    Ok(AdapterOutcome {
-        correctness: true,
-        detail: String::new(),
-        metrics: ScenarioMetrics {
-            settle_ms: None,
-            lag: None,
-            rows_per_s: None,
-            duration_ms: None,
-            rows_applied: rows_applied,
-            capture_path_note: String::new(),
-        },
-    })
-}
 
 async fn remove_change_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
     println!(
@@ -8556,8 +8095,8 @@ mod tests {
             "summary={summary}"
         );
         assert!(
-            summary.contains("product_path=none"),
-            "bulk-load stays on full adapter until later migration; summary={summary}"
+            summary.contains("product_path.steps=3"),
+            "bulk-load uses product_path prepare→apply→assert; summary={summary}"
         );
         assert!(
             summary.contains(&format!(
@@ -8582,40 +8121,91 @@ mod tests {
     #[test]
     fn product_path_recipes_drive_shared_steps_for_migrated_batch() {
         let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab/scenarios");
-        for (id, require_delivery, require_derived) in [
-            (DIRECT_PIPELINE_ID, false, false),
-            (RT_PROJECT_ID, false, true),
-            (RT_FILTER_ID, false, true),
-            (RT_FIELD_OPS_ID, false, true),
-            (RT_EQUILOOKUP_ID, false, true),
-            (RT_UNION_ID, false, true),
-            (RT_UNWIND_ID, false, true),
-            (RT_DISTINCT_ADDTOSET_ID, false, true),
-            (POISON_QUARANTINE_ID, true, false),
+        let five_step = [
+            ProductPathStepKind::PrepareNamespace,
+            ProductPathStepKind::ProductApply,
+            ProductPathStepKind::Mutate,
+            ProductPathStepKind::ProductSync,
+            ProductPathStepKind::Assert,
+        ];
+        let four_step_no_sync = [
+            ProductPathStepKind::PrepareNamespace,
+            ProductPathStepKind::ProductApply,
+            ProductPathStepKind::Mutate,
+            ProductPathStepKind::Assert,
+        ];
+        let three_step = [
+            ProductPathStepKind::PrepareNamespace,
+            ProductPathStepKind::ProductApply,
+            ProductPathStepKind::Assert,
+        ];
+
+        for (id, plan, require_delivery, require_derived, allow_fail) in [
+            (DIRECT_PIPELINE_ID, five_step.as_slice(), false, false, false),
+            (RT_PROJECT_ID, five_step.as_slice(), false, true, false),
+            (RT_FILTER_ID, five_step.as_slice(), false, true, false),
+            (RT_FIELD_OPS_ID, five_step.as_slice(), false, true, false),
+            (RT_EQUILOOKUP_ID, five_step.as_slice(), false, true, false),
+            (RT_UNION_ID, five_step.as_slice(), false, true, false),
+            (RT_UNWIND_ID, five_step.as_slice(), false, true, false),
+            (RT_DISTINCT_ADDTOSET_ID, five_step.as_slice(), false, true, false),
+            (POISON_QUARANTINE_ID, five_step.as_slice(), true, false, false),
+            (TRANSFORM_PIPELINE_ID, five_step.as_slice(), false, true, false),
+            (IDEMPOTENT_REDELIVERY_ID, five_step.as_slice(), true, false, false),
+            (PAUSE_RESUME_ID, five_step.as_slice(), true, false, false),
+            (REMOVE_PIPELINE_ID, five_step.as_slice(), true, false, false),
+            (CHANGE_PIPELINE_ID, five_step.as_slice(), true, true, false),
+            (SCHEMA_CHANGE_PAUSE_ID, five_step.as_slice(), true, false, false),
+            (BOUNDED_BACKPRESSURE_ID, five_step.as_slice(), true, false, true),
+            (OBSERVABILITY_SURFACE_ID, five_step.as_slice(), true, false, true),
+            (
+                CONCURRENT_SOURCE_WORKLOAD_ID,
+                four_step_no_sync.as_slice(),
+                false,
+                true,
+                false,
+            ),
+            (SOURCE_ALIGNMENT_ID, four_step_no_sync.as_slice(), false, false, false),
+            (DRIFT_CHECK_ID, four_step_no_sync.as_slice(), false, false, false),
+            (BULK_LOAD_ID, three_step.as_slice(), false, false, false),
+            (
+                PLATFORM_STORE_GUARDRAILS_ID,
+                three_step.as_slice(),
+                false,
+                false,
+                false,
+            ),
+            (
+                BACKWARD_COMPATIBLE_UPGRADES_ID,
+                three_step.as_slice(),
+                false,
+                false,
+                false,
+            ),
+            (
+                INITIAL_LOAD_THROTTLED_ID,
+                three_step.as_slice(),
+                false,
+                false,
+                false,
+            ),
         ] {
             let recipe = load_recipe(&lab.join(id).join("recipe.yaml"))
                 .unwrap_or_else(|err| panic!("load {id}: {err}"));
-            let plan = product_path_plan(&recipe)
+            let actual = product_path_plan(&recipe)
                 .unwrap_or_else(|| panic!("{id} must declare workload.product_path"));
-            assert_eq!(
-                plan,
-                &[
-                    ProductPathStepKind::PrepareNamespace,
-                    ProductPathStepKind::ProductApply,
-                    ProductPathStepKind::Mutate,
-                    ProductPathStepKind::ProductSync,
-                    ProductPathStepKind::Assert,
-                ],
-                "{id} product_path.steps"
-            );
+            assert_eq!(actual, plan, "{id} product_path.steps");
             let pp = recipe.workload.product_path.as_ref().expect("product_path");
-            assert!(pp.apply.require_initial_load, "{id}");
+            if id != INITIAL_LOAD_THROTTLED_ID {
+                assert!(pp.apply.require_initial_load, "{id}");
+            }
             assert_eq!(pp.apply.require_delivery, require_delivery, "{id}");
             assert_eq!(pp.apply.require_derived, require_derived, "{id}");
             assert!(pp.sync.require_logminer, "{id}");
+            assert_eq!(pp.sync.allow_fail, allow_fail, "{id}");
             let summary = recipe_interface_summary(&recipe);
             assert!(
-                summary.contains("product_path.steps=5"),
+                summary.contains(&format!("product_path.steps={}", plan.len())),
                 "{id} summary={summary}"
             );
             ProductPathHooks::for_recipe(&recipe).unwrap_or_else(|err| {
@@ -8684,6 +8274,7 @@ mod tests {
             apply: Default::default(),
             sync: ProductPathSyncOpts {
                 require_logminer: false,
+                allow_fail: false,
             },
         };
         let err = validate_product_path("demo.yaml", &mock_sync).expect_err("logminer required");

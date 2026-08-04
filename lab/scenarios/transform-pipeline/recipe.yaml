@@ -21,6 +21,18 @@ workload:
     - apply Deployment via real product path (Initial Load + Derived)
     - mutate multi-table Source insert/update/delete
     - sync Incremental Capture + Delivery via real LogMiner path
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_derived: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "Customers Base/Target Managed NAME: Alicia and Carol present; Bob absent"

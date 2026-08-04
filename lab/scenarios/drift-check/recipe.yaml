@@ -22,6 +22,16 @@ workload:
     - assert Managed restored, non-Managed EXTRA preserved, status shows Drift
     - mutate Target ID=2; drift --max-rows 1 — assert resource gate (not full slam)
     - drift with larger budget — repair remaining Managed drift
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - assert
+    apply:
+      require_initial_load: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "drift detects Managed-field Target drift after controlled mutation (mismatched/repaired lines)"

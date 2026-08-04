@@ -21,6 +21,18 @@ workload:
     - remove customers Pipeline via CLI
     - mutate Source
     - sync Incremental Capture; removed Pipeline skips Delivery; reporting Pipeline Delivers from Shared Base
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_delivery: true
+    sync:
+      require_logminer: true
 checks:
   correctness:
     - "After remove: status no longer lists customers Pipeline; reporting Pipeline remains"

@@ -217,8 +217,8 @@ fn print_recipe_interface(recipe: &ScenarioRecipe) {
             product_path.apply.require_derived
         );
         println!(
-            "Lab Scenario product_path.sync: require_logminer={}",
-            product_path.sync.require_logminer
+            "Lab Scenario product_path.sync: require_logminer={} allow_fail={}",
+            product_path.sync.require_logminer, product_path.sync.allow_fail
         );
     }
     if !recipe.checks.correctness.is_empty() {
