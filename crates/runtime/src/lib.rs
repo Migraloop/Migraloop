@@ -28,7 +28,7 @@ use migraloop_capture::{
     TypeError,
 };
 use migraloop_delivery::{
-    DeliveryColumn, DeliveryDocument, ManagedFieldAs, MongoTargetConnection, TargetEngine,
+    DeliveryDocument, ManagedFieldAs, MongoTargetConnection, TargetEngine,
 };
 use migraloop_platform_store::{
     check_store_settings, disk_warn_message, BaseColumn, BaseDataset, Deployment, DerivedDataset,
@@ -36,7 +36,7 @@ use migraloop_platform_store::{
 };
 use migraloop_transform::{
     evaluate_transform_with_bases, infer_derived_columns, initial_maintenance_state,
-    parse_transform_steps, secondary_base_refs, MaintenanceStateBlob, OutputColumn, TransformOp,
+    parse_transform_steps, secondary_base_refs, MaintenanceStateBlob, TransformOp,
 };
 use migraloop_types::{output_identity_key, resolve_secret_ref};
 use thiserror::Error;
@@ -257,10 +257,6 @@ fn base_columns_from_source(columns: &[&SourceColumn]) -> Vec<BaseColumn> {
     columns.iter().map(|c| c.column_shape()).collect()
 }
 
-fn delivery_columns_from_base(columns: &[BaseColumn]) -> Vec<DeliveryColumn> {
-    columns.to_vec()
-}
-
 pub(crate) fn apply_field_mappings_to_row(
     row: &serde_json::Map<String, serde_json::Value>,
     pipeline: &Pipeline,
@@ -360,7 +356,7 @@ pub(crate) fn delivery_document_for_row(
     Ok(DeliveryDocument {
         identity,
         managed_fields: managed,
-        columns: delivery_columns_from_base(columns),
+        columns: columns.to_vec(),
         field_as: pipeline.field_mappings.clone(),
     })
 }
@@ -1372,14 +1368,6 @@ pub(crate) async fn deliver_transform_pipeline_with_options<T: TargetEngine>(
     Ok(())
 }
 
-fn to_output_columns(columns: &[BaseColumn]) -> Vec<OutputColumn> {
-    columns.to_vec()
-}
-
-fn from_output_columns(columns: Vec<OutputColumn>) -> Vec<BaseColumn> {
-    columns
-}
-
 /// Derived columns via the transform schema-inference interface (no TransformOp walk here).
 pub(crate) fn derived_columns_for_ops(
     base_columns: &[BaseColumn],
@@ -1387,12 +1375,8 @@ pub(crate) fn derived_columns_for_ops(
     derived_rows: &[serde_json::Map<String, serde_json::Value>],
     secondary_columns: &[BaseColumn],
 ) -> Vec<BaseColumn> {
-    from_output_columns(infer_derived_columns(
-        ops,
-        &to_output_columns(base_columns),
-        &to_output_columns(secondary_columns),
-        derived_rows,
-    ))
+    // OutputColumn / BaseColumn are both ColumnShape after #182 — no remap.
+    infer_derived_columns(ops, base_columns, secondary_columns, derived_rows)
 }
 
 async fn persist_initial_maintenance_state(

@@ -38,8 +38,8 @@ enum NumberMongoMapping {
     Unsafe,
 }
 
-fn normalize_oracle_type(oracle_type: &str) -> String {
-    let trimmed = oracle_type.trim();
+fn normalize_data_type(data_type: &str) -> String {
+    let trimmed = data_type.trim();
     let base = trimmed
         .split_once('(')
         .map(|(head, _)| head)
@@ -235,11 +235,11 @@ pub fn value_to_bson(
         return json_fallback_to_bson(field, value);
     };
 
-    let oracle = normalize_oracle_type(&column.data_type);
-    if oracle == "JSON" {
+    let data_type = normalize_data_type(&column.data_type);
+    if data_type == "JSON" {
         return nested_json_to_bson(field, value);
     }
-    match oracle.as_str() {
+    match data_type.as_str() {
         "NUMBER" => number_to_bson(field, value, column.precision, column.scale, mapping),
         "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" => float_to_bson(field, value),
         "DATE" | "TIMESTAMP" | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMP WITH LOCAL TIME ZONE" => {
@@ -251,7 +251,7 @@ pub fn value_to_bson(
         },
         other => Err(DeliveryError::Conversion {
             field: field.to_string(),
-            reason: format!("unsupported Oracle type {other} for Delivery"),
+            reason: format!("unsupported Source type {other} for Delivery"),
         }),
     }
 }
