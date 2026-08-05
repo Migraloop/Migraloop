@@ -2322,73 +2322,37 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
         let rows_applied =
             count_delivery_ops(&ctx.apply_out) + count_delivery_ops(&ctx.sync_out);
         match self {
-            Self::DirectPipeline => {
+            Self::DirectPipeline
+            | Self::RtProject
+            | Self::RtFilter
+            | Self::RtFieldOps
+            | Self::RtEquilookup
+            | Self::RtUnion
+            | Self::RtUnwind
+            | Self::RtDistinctAddtoset
+            | Self::PoisonQuarantine
+            | Self::TransformPipeline => {
+                let passed_msg = match self {
+                    Self::DirectPipeline => "Base + Target Managed outcomes",
+                    Self::RtProject => "projected Derived + Target Managed outcomes",
+                    Self::RtFilter => "filtered Derived + Target Managed outcomes",
+                    Self::RtFieldOps => {
+                        "addFields/rename/remove Derived + Target Managed outcomes"
+                    }
+                    Self::RtEquilookup => {
+                        "equiLookup multi-Base Derived + Target Managed outcomes"
+                    }
+                    Self::RtUnion => "union multi-Base Derived + Target Managed outcomes",
+                    Self::RtUnwind => "unwind Output Identities insert/update/delete",
+                    Self::RtDistinctAddtoset => "distinct + addToSet Derived/Target outcomes",
+                    Self::PoisonQuarantine => {
+                        "poison identity quarantined; Pipeline continued; status unhealthy"
+                    }
+                    Self::TransformPipeline => "Base + Derived + Target Managed outcomes",
+                    _ => unreachable!("recipe-driven assert variants only"),
+                };
                 Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "Base + Target Managed outcomes",
-                )
-                .await
-            }
-            Self::RtProject => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "projected Derived + Target Managed outcomes",
-                )
-                .await
-            }
-            Self::RtFilter => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "filtered Derived + Target Managed outcomes",
-                )
-                .await
-            }
-            Self::RtFieldOps => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "addFields/rename/remove Derived + Target Managed outcomes",
-                )
-                .await
-            }
-            Self::RtEquilookup => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "equiLookup multi-Base Derived + Target Managed outcomes",
-                )
-                .await
-            }
-            Self::RtUnion => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "union multi-Base Derived + Target Managed outcomes",
-                )
-                .await
-            }
-            Self::RtUnwind => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "unwind Output Identities insert/update/delete",
-                )
-                .await
-            }
-            Self::RtDistinctAddtoset => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "distinct + addToSet Derived/Target outcomes",
-                )
-                .await
-            }
-            Self::PoisonQuarantine => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "poison identity quarantined; Pipeline continued; status unhealthy",
-                )
-                .await
-            }
-            Self::TransformPipeline => {
-                Self::assert_via_recipe_correctness(
-                    lab_dir, recipe, ctx, rows_applied,
-                    "Base + Derived + Target Managed outcomes",
+                    lab_dir, recipe, ctx, rows_applied, passed_msg,
                 )
                 .await
             }

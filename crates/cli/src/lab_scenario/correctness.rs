@@ -117,9 +117,9 @@ impl InspectKey {
 
 /// Validate runnable correctness vocabulary for a recipe (#205).
 ///
-/// When `product_path` is present, every check must be a complete runnable
-/// inspect expectation (not empty prose). Catalog product_path Scenarios must
-/// declare at least one check so the runner has something to execute.
+/// Every check must be a complete runnable inspect expectation. When
+/// `product_path` is set, fail fast with an explicit product_path-oriented
+/// message if checks are missing — the assert step needs something to execute.
 pub(crate) fn validate_runnable_correctness(
     path_display: &str,
     checks: &[CorrectnessCheck],
@@ -127,15 +127,16 @@ pub(crate) fn validate_runnable_correctness(
 ) -> Result<(), CliError> {
     if checks.is_empty() {
         return Err(CliError::Failed(format!(
-            "Lab Scenario recipe {path_display} must declare checks.correctness"
+            "Lab Scenario recipe {path_display} must declare checks.correctness{}",
+            if has_product_path {
+                " (product_path assert requires runnable checks; issue #205)"
+            } else {
+                ""
+            }
         )));
     }
     for (idx, check) in checks.iter().enumerate() {
         validate_one_check(path_display, idx, check)?;
-    }
-    if has_product_path {
-        // Fail fast: product_path assert needs executable checks the runner can run.
-        let _ = checks;
     }
     Ok(())
 }
@@ -289,12 +290,15 @@ pub(crate) fn expect_satisfied(inspect: &str, check: &CorrectnessCheck) -> Resul
 }
 
 fn surface_identity(check: &CorrectnessCheck) -> String {
-    match check.surface {
-        CorrectnessSurface::Base => check.table.clone().unwrap_or_default(),
-        CorrectnessSurface::Derived => check.pipeline.clone().unwrap_or_default(),
-        CorrectnessSurface::Target => check.collection.clone().unwrap_or_default(),
-        CorrectnessSurface::Status => "status".to_string(),
-    }
+    InspectKey::from_check(check)
+        .map(|k| {
+            if k.identity.is_empty() {
+                "status".to_string()
+            } else {
+                k.identity
+            }
+        })
+        .unwrap_or_else(|_| "?".to_string())
 }
 
 /// Evaluate already-fetched inspect blobs against a check list (settle loops).
@@ -680,6 +684,16 @@ mod tests {
             .expect_err("empty expect");
         assert!(
             err.to_string().contains("runnable expectation"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn validate_runnable_correctness_fails_fast_for_product_path_without_checks() {
+        let err = validate_runnable_correctness("demo.yaml", &[], true)
+            .expect_err("product_path needs checks");
+        assert!(
+            err.to_string().contains("product_path assert requires runnable checks"),
             "err={err}"
         );
     }
