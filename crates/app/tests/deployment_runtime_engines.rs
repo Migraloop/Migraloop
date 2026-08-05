@@ -105,33 +105,14 @@ async fn production_incremental_sync_accepts_fake_source_and_target_engines() {
         .await
         .expect("upsert deployment");
 
-    let pipeline = Pipeline {
-        deployment_name: deployment.name.clone(),
-        name: "customers".into(),
-        mode: "direct".into(),
-        source_table: "CUSTOMERS".into(),
-        source_schema: String::new(),
-        target_collection: "customers".into(),
-        delivery_status: "pending".into(),
-        delivery_applied_changes: 0,
-        delivery_lag: 0,
-        paused: false,
-        description: String::new(),
-        field_mappings: Default::default(),
-        output_identity: vec![],
-        transform_json: None,
-        drift_status: "unknown".into(),
-        drift_checked_rows: 0,
-        drift_mismatched_rows: 0,
-    };
+    let pipeline = customers_direct_pipeline(&deployment.name);
     store
         .replace_pipelines(&deployment.name, std::slice::from_ref(&pipeline))
         .await
         .expect("upsert pipeline");
 
-    let mut seed_row = serde_json::Map::new();
-    seed_row.insert("ID".into(), json!(1));
-    seed_row.insert("NAME".into(), json!("Ada"));
+    let seed_row: serde_json::Map<String, serde_json::Value> =
+        customers_seed_row().into_iter().collect();
     let dataset = BaseDataset {
         deployment_name: deployment.name.clone(),
         source_schema: String::new(),
@@ -177,42 +158,14 @@ async fn production_incremental_sync_accepts_fake_source_and_target_engines() {
 
     let fake_source = FakeSource::new().with_table(
         "CUSTOMERS",
-        FakeSourceTable {
-            columns: vec![
-                SourceColumn {
-                    name: "ID".into(),
-                    oracle_type: "NUMBER".into(),
-                    supported: true,
-                    precision: Some(10),
-                    scale: Some(0),
-                    size: None,
-                },
-                SourceColumn {
-                    name: "NAME".into(),
-                    oracle_type: "VARCHAR2".into(),
-                    supported: true,
-                    precision: None,
-                    scale: None,
-                    size: Some(100),
-                },
-            ],
-            primary_key: vec!["ID".into()],
-            rows: vec![{
-                let mut row = BTreeMap::new();
-                row.insert("ID".into(), json!(1));
-                row.insert("NAME".into(), json!("Ada"));
-                row
-            }],
-            low_watermark: CapturePosition(1000),
-            changes: vec![ChangeEvent {
-                table: "CUSTOMERS".into(),
-                op: ChangeOp::Update,
-                identity,
-                row: Some(updated_row),
-                position: CapturePosition(1001),
-                change_id: "fake-change-1001".into(),
-            }],
-        },
+        customers_fake_table(vec![ChangeEvent {
+            table: "CUSTOMERS".into(),
+            op: ChangeOp::Update,
+            identity,
+            row: Some(updated_row),
+            position: CapturePosition(1001),
+            change_id: "fake-change-1001".into(),
+        }]),
     );
     let fake_target = FakeTarget::new();
     assert_eq!(fake_source.kind_label(), "fake");
@@ -261,6 +214,66 @@ fn fake_system_connection() -> SystemConnection {
     }
 }
 
+fn customers_source_columns() -> Vec<SourceColumn> {
+    vec![
+        SourceColumn {
+            name: "ID".into(),
+            oracle_type: "NUMBER".into(),
+            supported: true,
+            precision: Some(10),
+            scale: Some(0),
+            size: None,
+        },
+        SourceColumn {
+            name: "NAME".into(),
+            oracle_type: "VARCHAR2".into(),
+            supported: true,
+            precision: None,
+            scale: None,
+            size: Some(100),
+        },
+    ]
+}
+
+fn customers_seed_row() -> BTreeMap<String, serde_json::Value> {
+    let mut row = BTreeMap::new();
+    row.insert("ID".into(), json!(1));
+    row.insert("NAME".into(), json!("Ada"));
+    row
+}
+
+fn customers_direct_pipeline(deployment_name: &str) -> Pipeline {
+    Pipeline {
+        deployment_name: deployment_name.to_string(),
+        name: "customers".into(),
+        mode: "direct".into(),
+        source_table: "CUSTOMERS".into(),
+        source_schema: String::new(),
+        target_collection: "customers".into(),
+        delivery_status: "pending".into(),
+        delivery_applied_changes: 0,
+        delivery_lag: 0,
+        paused: false,
+        description: String::new(),
+        field_mappings: Default::default(),
+        output_identity: vec![],
+        transform_json: None,
+        drift_status: "unknown".into(),
+        drift_checked_rows: 0,
+        drift_mismatched_rows: 0,
+    }
+}
+
+fn customers_fake_table(changes: Vec<ChangeEvent>) -> FakeSourceTable {
+    FakeSourceTable {
+        columns: customers_source_columns(),
+        primary_key: vec!["ID".into()],
+        rows: vec![customers_seed_row()],
+        low_watermark: CapturePosition(1000),
+        changes,
+    }
+}
+
 /// Full production apply / Initial Load / Delivery with Fake Source + Fake Target (#206).
 ///
 /// Deployment kinds are intentionally non-oracle / non-mongodb so the injected
@@ -280,58 +293,10 @@ async fn production_apply_accepts_fake_source_and_target_engines() {
         target: fake_system_connection(),
     };
 
-    let pipeline = Pipeline {
-        deployment_name: deployment.name.clone(),
-        name: "customers".into(),
-        mode: "direct".into(),
-        source_table: "CUSTOMERS".into(),
-        source_schema: String::new(),
-        target_collection: "customers".into(),
-        delivery_status: "pending".into(),
-        delivery_applied_changes: 0,
-        delivery_lag: 0,
-        paused: false,
-        description: String::new(),
-        field_mappings: Default::default(),
-        output_identity: vec![],
-        transform_json: None,
-        drift_status: "unknown".into(),
-        drift_checked_rows: 0,
-        drift_mismatched_rows: 0,
-    };
+    let pipeline = customers_direct_pipeline(&deployment.name);
 
-    let fake_source = FakeSource::new().with_table(
-        "CUSTOMERS",
-        FakeSourceTable {
-            columns: vec![
-                SourceColumn {
-                    name: "ID".into(),
-                    oracle_type: "NUMBER".into(),
-                    supported: true,
-                    precision: Some(10),
-                    scale: Some(0),
-                    size: None,
-                },
-                SourceColumn {
-                    name: "NAME".into(),
-                    oracle_type: "VARCHAR2".into(),
-                    supported: true,
-                    precision: None,
-                    scale: None,
-                    size: Some(100),
-                },
-            ],
-            primary_key: vec!["ID".into()],
-            rows: vec![{
-                let mut row = BTreeMap::new();
-                row.insert("ID".into(), json!(1));
-                row.insert("NAME".into(), json!("Ada"));
-                row
-            }],
-            low_watermark: CapturePosition(1000),
-            changes: vec![],
-        },
-    );
+    let fake_source =
+        FakeSource::new().with_table("CUSTOMERS", customers_fake_table(vec![]));
     let fake_target = FakeTarget::new();
     assert_eq!(fake_source.kind_label(), "fake");
     assert_eq!(fake_target.kind_label(), "fake");
@@ -395,25 +360,7 @@ async fn factory_incremental_sync_rejects_non_oracle_kind_via_factory() {
         .upsert_deployment(&deployment)
         .await
         .expect("upsert deployment");
-    let pipeline = Pipeline {
-        deployment_name: deployment.name.clone(),
-        name: "customers".into(),
-        mode: "direct".into(),
-        source_table: "CUSTOMERS".into(),
-        source_schema: String::new(),
-        target_collection: "customers".into(),
-        delivery_status: "pending".into(),
-        delivery_applied_changes: 0,
-        delivery_lag: 0,
-        paused: false,
-        description: String::new(),
-        field_mappings: Default::default(),
-        output_identity: vec![],
-        transform_json: None,
-        drift_status: "unknown".into(),
-        drift_checked_rows: 0,
-        drift_mismatched_rows: 0,
-    };
+    let pipeline = customers_direct_pipeline(&deployment.name);
     store
         .replace_pipelines(&deployment.name, std::slice::from_ref(&pipeline))
         .await
