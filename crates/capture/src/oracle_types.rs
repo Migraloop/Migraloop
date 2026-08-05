@@ -1,19 +1,21 @@
 //! Schema-driven Oracle type allow-list, NUMBER precision, and temporal rules.
 //!
 //! ADR-0018 / ADR-0022 / ADR-0023.
+//!
+//! NUMBER→Mongo classification is owned next to [`migraloop_types::ColumnShape`]
+//! (issue #202). This module re-exports / calls through so existing capture callers
+//! stay green until contract (#207) deletes the twin surface.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use thiserror::Error;
 
+pub use migraloop_types::{
+    classify_number, NumberMongoMapping, DECIMAL128_MAX_PRECISION, INT64_SAFE_PRECISION,
+};
+
 /// Maximum RAW byte length accepted in v1 (cap from ADR-0018 intent).
 pub const RAW_SIZE_CAP_BYTES: i32 = 2000;
-
-/// Decimal128 significant digits (IEEE 754 decimal128).
-pub const DECIMAL128_MAX_PRECISION: i32 = 34;
-
-/// Signed Int64 / NumberLong digit budget that always fits.
-pub const INT64_SAFE_PRECISION: i32 = 18;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TypeError {
@@ -38,17 +40,6 @@ pub enum TypeError {
     InvalidTimezone(String),
     #[error("invalid temporal value {0:?}: {1}")]
     InvalidTemporal(String, String),
-}
-
-/// How a declared Oracle NUMBER maps into Mongo numeric types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NumberMongoMapping {
-    /// scale 0 (or absent scale treated as integer) and precision ≤ 18 → NumberLong
-    Long,
-    /// precision ≤ 34 and fits Decimal128 → Decimal128 (never IEEE double)
-    Decimal128,
-    /// declared precision/scale cannot fit safe Mongo numeric types
-    Unsafe,
 }
 
 /// Zone used to interpret naive DATE / TIMESTAMP / TIMESTAMP WITH LOCAL TIME ZONE.
@@ -134,29 +125,6 @@ pub fn is_allow_listed_oracle_type(oracle_type: &str, size: Option<i32>) -> bool
         "RAW" => matches!(size, Some(n) if (0..=RAW_SIZE_CAP_BYTES).contains(&n)),
         _ => false,
     }
-}
-
-/// Classify NUMBER(p,s) for precision-preserving Mongo mapping (ADR-0023).
-///
-/// Unconstrained / missing precision is unsafe — never default to IEEE double.
-pub fn classify_number(precision: Option<i32>, scale: Option<i32>) -> NumberMongoMapping {
-    let Some(precision) = precision else {
-        return NumberMongoMapping::Unsafe;
-    };
-    if precision <= 0 || precision > 38 {
-        return NumberMongoMapping::Unsafe;
-    }
-    let scale = scale.unwrap_or(0);
-    if scale < 0 || scale > precision {
-        return NumberMongoMapping::Unsafe;
-    }
-    if scale == 0 && precision <= INT64_SAFE_PRECISION {
-        return NumberMongoMapping::Long;
-    }
-    if precision <= DECIMAL128_MAX_PRECISION {
-        return NumberMongoMapping::Decimal128;
-    }
-    NumberMongoMapping::Unsafe
 }
 
 /// Resolve the timezone used to interpret naive DATE/TIMESTAMP (ADR-0022).

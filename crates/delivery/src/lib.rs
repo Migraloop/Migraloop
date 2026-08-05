@@ -4,7 +4,8 @@
 //! non-Managed keys are left alone (ADR-0002). Inserts are identity + Managed.
 //!
 //! Conversion is schema-driven (ADR-0018 / ADR-0022 / ADR-0023): NUMBER → Long or
-//! Decimal128 (never default IEEE double); temporals → UTC DateTime.
+//! Decimal128 via shared [`migraloop_types::classify_number`] next to [`ColumnShape`]
+//! (never default IEEE double); temporals → UTC DateTime.
 
 mod engine;
 
@@ -15,7 +16,7 @@ use std::time::Duration;
 
 use bson::{doc, Bson, Document};
 use chrono::{DateTime, Utc};
-use migraloop_types::{ColumnShape, TlsSettings};
+use migraloop_types::{classify_number, ColumnShape, NumberMongoMapping, TlsSettings};
 use mongodb::options::{ClientOptions, Tls, TlsOptions, UpdateOptions};
 use mongodb::{Client, Collection};
 use serde_json::Value;
@@ -29,15 +30,6 @@ pub use engine::{
 /// Module seam marker retained by the single app binary.
 pub const SEAM: &str = "delivery";
 
-/// Delivery-side NUMBER→Mongo mapping (mirrors ADR-0023; kept here so Delivery
-/// does not depend on the capture crate — ADR-0024 seam).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumberMongoMapping {
-    Long,
-    Decimal128,
-    Unsafe,
-}
-
 fn normalize_data_type(data_type: &str) -> String {
     let trimmed = data_type.trim();
     let base = trimmed
@@ -46,26 +38,6 @@ fn normalize_data_type(data_type: &str) -> String {
         .unwrap_or(trimmed)
         .trim();
     base.to_ascii_uppercase()
-}
-
-fn classify_number(precision: Option<i32>, scale: Option<i32>) -> NumberMongoMapping {
-    let Some(precision) = precision else {
-        return NumberMongoMapping::Unsafe;
-    };
-    if precision <= 0 || precision > 38 {
-        return NumberMongoMapping::Unsafe;
-    }
-    let scale = scale.unwrap_or(0);
-    if scale < 0 || scale > precision {
-        return NumberMongoMapping::Unsafe;
-    }
-    if scale == 0 && precision <= 18 {
-        return NumberMongoMapping::Long;
-    }
-    if precision <= 34 {
-        return NumberMongoMapping::Decimal128;
-    }
-    NumberMongoMapping::Unsafe
 }
 
 #[derive(Debug, Error)]
@@ -95,8 +67,8 @@ pub struct MongoTargetConnection {
 /// Column schema used for schema-driven BSON conversion.
 ///
 /// Domain metadata is the shared [`ColumnShape`] — Oracle-named fields are not
-/// the Delivery domain default (issue #182). NUMBER mapping behaviour is
-/// unchanged (ADR-0018 / ADR-0023).
+/// the Delivery domain default (issue #182). NUMBER classification calls through
+/// to the shared home next to [`ColumnShape`] (issue #202 / ADR-0023).
 pub type DeliveryColumn = ColumnShape;
 
 /// One Output Identity plus the Managed fields Delivery will write.
