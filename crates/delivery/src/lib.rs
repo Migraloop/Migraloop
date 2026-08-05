@@ -67,8 +67,8 @@ pub struct MongoTargetConnection {
 /// Column schema used for schema-driven BSON conversion.
 ///
 /// Domain metadata is the shared [`ColumnShape`] — Oracle-named fields are not
-/// the Delivery domain default (issue #182). NUMBER classification calls through
-/// to the shared home next to [`ColumnShape`] (issue #202 / ADR-0023).
+/// the Delivery domain default (issue #182). NUMBER classification lives only
+/// next to [`ColumnShape`] (issue #207 / ADR-0023).
 pub type DeliveryColumn = ColumnShape;
 
 /// One Output Identity plus the Managed fields Delivery will write.

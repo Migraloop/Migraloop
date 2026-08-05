@@ -160,7 +160,7 @@ fn fake_customers_source(change_name: &str) -> FakeSource {
             columns: vec![
                 SourceColumn {
                     name: "ID".into(),
-                    oracle_type: "NUMBER".into(),
+                    data_type: "NUMBER".into(),
                     supported: true,
                     precision: Some(10),
                     scale: Some(0),
@@ -168,7 +168,7 @@ fn fake_customers_source(change_name: &str) -> FakeSource {
                 },
                 SourceColumn {
                     name: "NAME".into(),
-                    oracle_type: "VARCHAR2".into(),
+                    data_type: "VARCHAR2".into(),
                     supported: true,
                     precision: None,
                     scale: None,

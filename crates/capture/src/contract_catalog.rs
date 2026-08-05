@@ -73,7 +73,7 @@ impl ContractSourceCatalog {
         // Apply the same allow-list rules as live OCI discovery (ADR-0018).
         for column in &mut snapshot.columns {
             column.supported =
-                column.supported && is_allow_listed_oracle_type(&column.oracle_type, column.size);
+                column.supported && is_allow_listed_oracle_type(&column.data_type, column.size);
         }
         self.tables.insert(key, snapshot);
     }
@@ -378,7 +378,7 @@ mod tests {
                 // Author wrongly claims BLOB is supported — catalog must correct.
                 SourceColumn {
                     name: "PHOTO".into(),
-                    oracle_type: "BLOB".into(),
+                    data_type: "BLOB".into(),
                     supported: true,
                     precision: None,
                     scale: None,

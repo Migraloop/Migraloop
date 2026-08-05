@@ -50,8 +50,8 @@ pub const INT64_SAFE_PRECISION: i32 = 18;
 
 /// How a declared NUMBER(p,s) maps into Mongo numeric types (ADR-0023).
 ///
-/// Lives next to [`ColumnShape`] so capture and Delivery can share one classification
-/// home (issue #202); adapter-private allow-list rules stay elsewhere (ADR-0018).
+/// Lives next to [`ColumnShape`] as the single classification home (issue #207);
+/// adapter-private allow-list rules stay elsewhere (ADR-0018).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumberMongoMapping {
     /// scale 0 (or absent scale treated as integer) and precision ≤ 18 → NumberLong

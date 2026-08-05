@@ -91,7 +91,7 @@ fn row(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
 fn number_col(name: &str, precision: i32, scale: i32) -> SourceColumn {
     SourceColumn {
         name: name.to_string(),
-        oracle_type: "NUMBER".to_string(),
+        data_type: "NUMBER".to_string(),
         supported: true,
         precision: Some(precision),
         scale: Some(scale),
@@ -102,7 +102,7 @@ fn number_col(name: &str, precision: i32, scale: i32) -> SourceColumn {
 fn varchar_col(name: &str) -> SourceColumn {
     SourceColumn {
         name: name.to_string(),
-        oracle_type: "VARCHAR2".to_string(),
+        data_type: "VARCHAR2".to_string(),
         supported: true,
         precision: None,
         scale: None,

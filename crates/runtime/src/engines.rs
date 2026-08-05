@@ -6,7 +6,7 @@
 //! public Deployment runtime surface (#172).
 //!
 //! #206: Managed validation trusts engine-agnostic column metadata (`supported` +
-//! `data_type()`), not Oracle allow-list helpers at the runtime seam.
+//! `data_type`), not Oracle allow-list helpers at the runtime seam.
 
 use migraloop_capture::{
     CapturePosition, FakeSource, FakeSourceTable, InitialLoadChunk, InitialLoadChunkOptions,
@@ -144,7 +144,7 @@ fn customers_fake_source() -> FakeSource {
             columns: vec![
                 SourceColumn {
                     name: "ID".into(),
-                    oracle_type: "NUMBER".into(),
+                    data_type: "NUMBER".into(),
                     supported: true,
                     precision: Some(10),
                     scale: Some(0),
@@ -152,7 +152,7 @@ fn customers_fake_source() -> FakeSource {
                 },
                 SourceColumn {
                     name: "NAME".into(),
-                    oracle_type: "VARCHAR2".into(),
+                    data_type: "VARCHAR2".into(),
                     supported: true,
                     precision: None,
                     scale: None,
@@ -204,7 +204,7 @@ async fn engine_seam_swaps_source_and_target_adapters_without_rewrite() {
         vec![
             SourceColumn {
                 name: "ID".into(),
-                oracle_type: "NUMBER".into(),
+                data_type: "NUMBER".into(),
                 supported: true,
                 precision: Some(10),
                 scale: Some(0),
@@ -212,7 +212,7 @@ async fn engine_seam_swaps_source_and_target_adapters_without_rewrite() {
             },
             SourceColumn {
                 name: "NAME".into(),
-                oracle_type: "VARCHAR2".into(),
+                data_type: "VARCHAR2".into(),
                 supported: true,
                 precision: None,
                 scale: None,
@@ -288,7 +288,7 @@ fn managed_validation_trusts_source_supported_flag_not_oracle_allow_list() {
     // Adapter-declared supported — even when the type name would fail Oracle allow-list.
     let columns = vec![SourceColumn {
         name: "BIO".into(),
-        oracle_type: "BLOB".into(),
+        data_type: "BLOB".into(),
         supported: true,
         precision: None,
         scale: None,
@@ -305,7 +305,7 @@ fn managed_validation_rejects_unsupported_via_supported_flag_and_data_type() {
     let pipeline = sample_pipeline_with_field("BIO", ManagedFieldAs::String);
     let columns = vec![SourceColumn {
         name: "BIO".into(),
-        oracle_type: "BLOB".into(),
+        data_type: "BLOB".into(),
         supported: false,
         precision: None,
         scale: None,

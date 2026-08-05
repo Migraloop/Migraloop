@@ -218,7 +218,7 @@ fn customers_source_columns() -> Vec<SourceColumn> {
     vec![
         SourceColumn {
             name: "ID".into(),
-            oracle_type: "NUMBER".into(),
+            data_type: "NUMBER".into(),
             supported: true,
             precision: Some(10),
             scale: Some(0),
@@ -226,7 +226,7 @@ fn customers_source_columns() -> Vec<SourceColumn> {
         },
         SourceColumn {
             name: "NAME".into(),
-            oracle_type: "VARCHAR2".into(),
+            data_type: "VARCHAR2".into(),
             supported: true,
             precision: None,
             scale: None,

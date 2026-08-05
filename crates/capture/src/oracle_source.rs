@@ -394,7 +394,7 @@ pub(crate) fn discover_columns(
         let supported = is_allow_listed_oracle_type(&data_type, size);
         columns.push(SourceColumn {
             name: column_name,
-            oracle_type: data_type,
+            data_type,
             supported,
             precision: data_precision,
             scale: data_scale,
@@ -477,7 +477,7 @@ fn text_to_json(text: Option<String>, column: &SourceColumn) -> Result<Value, Ca
     let Some(text) = text else {
         return Ok(Value::Null);
     };
-    let normalized = normalize_oracle_type(&column.oracle_type);
+    let normalized = normalize_oracle_type(&column.data_type);
     match normalized.as_str() {
         "NUMBER" | "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" => parse_number_json(&text),
         _ => Ok(Value::String(text)),
