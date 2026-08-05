@@ -327,11 +327,7 @@ pub async fn resume_pipeline(
     }
 
     store
-        .set_pipeline_paused(&pipeline.deployment_name, &pipeline.name, false)
-        .await
-        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-    store
-        .clear_schema_change_impacts(&pipeline.deployment_name, &pipeline.name)
+        .resume_pipeline(&pipeline.deployment_name, &pipeline.name)
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
@@ -391,19 +387,17 @@ pub async fn remove_pipeline(
     ensure_store_session_healthy(store).await?;
     let pipeline = resolve_named_pipeline(store, pipeline_name, deployment_name).await?;
 
-    store
-        .delete_pipeline(&pipeline.deployment_name, &pipeline.name)
-        .await
-        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-
     // Keep Shared Bases still referenced by remaining Pipelines; prune only tables
     // no longer referenced (same capture-scope rule as apply — ADR-0019 / ADR-0007).
+    // Keep-set is computed before remove so the deleted Pipeline is excluded.
     let remaining = store
         .list_pipelines()
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?
         .into_iter()
-        .filter(|p| p.deployment_name == pipeline.deployment_name)
+        .filter(|p| {
+            p.deployment_name == pipeline.deployment_name && p.name != pipeline.name
+        })
         .collect::<Vec<_>>();
     let mut keep = BTreeSet::new();
     for remaining_pipeline in &remaining {
@@ -413,7 +407,11 @@ pub async fn remove_pipeline(
     }
     let keep_tables: Vec<(String, String)> = keep.into_iter().collect();
     store
-        .delete_base_datasets_not_in(&pipeline.deployment_name, &keep_tables)
+        .remove_pipeline(
+            &pipeline.deployment_name,
+            &pipeline.name,
+            &keep_tables,
+        )
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
@@ -634,7 +632,7 @@ async fn align_one_base(
     };
 
     store
-        .replace_base_dataset(&updated, &rows)
+        .record_source_alignment_progress(&updated, &rows)
         .await
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
@@ -766,7 +764,7 @@ async fn drift_one_pipeline(
     let checked = expected_docs.len() as i32;
     let drift_status = persisted_status(truncated, "ok");
     store
-        .update_pipeline_drift_status(
+        .record_drift_outcome(
             &pipeline.deployment_name,
             &pipeline.name,
             drift_status,

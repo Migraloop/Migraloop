@@ -1,8 +1,9 @@
-//! Platform Store Deployment-intent persistence verbs (issue #177 / #168).
+//! Platform Store Deployment-intent persistence verbs (issues #177 / #204 / #168).
 //!
-//! Agreed seam (#168 Testing Decisions): exercise session intent verbs for
-//! Sync/Delivery progress, quarantine, and schema-impact — not fine-grained
-//! column CRUD sequencing. Postgres remains the only store engine (ADR-0001).
+//! Agreed seam (#168 / #199 Testing Decisions): exercise session intent verbs for
+//! Sync/Delivery progress, quarantine, schema-impact, Source Alignment, Drift,
+//! and Pipeline lifecycle composites — not fine-grained column CRUD sequencing.
+//! Postgres remains the only store engine (ADR-0001).
 
 mod common;
 
@@ -326,4 +327,201 @@ async fn mark_schema_impact_pauses_pipeline_and_persists_blocking_impact() {
     assert_eq!(impacts[0].change_id, "ddl-1");
     assert_eq!(impacts[0].impact, "blocking");
     assert_eq!(impacts[0].status, "active");
+}
+
+#[tokio::test]
+async fn record_source_alignment_progress_persists_alignment_and_base_rows() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-align"))
+        .await
+        .expect("upsert Deployment");
+
+    let mut seed = serde_json::Map::new();
+    seed.insert("ID".to_string(), serde_json::json!(1));
+    store
+        .replace_base_dataset(&sample_base("intent-align"), &[seed])
+        .await
+        .expect("seed Base");
+
+    let mut repaired = serde_json::Map::new();
+    repaired.insert("ID".to_string(), serde_json::json!(2));
+    let mut dataset = sample_base("intent-align");
+    dataset.row_count = 1;
+    dataset.source_alignment = "aligned".to_string();
+    dataset.source_alignment_checked_rows = 1;
+    dataset.source_alignment_mismatched_rows = 1;
+    // Alignment repair clears Initial Load cursor; Sync checkpoints stay.
+    dataset.initial_load_cursor = None;
+
+    store
+        .record_source_alignment_progress(&dataset, &[repaired])
+        .await
+        .expect("record Source Alignment progress");
+
+    let (loaded, rows) = store
+        .get_base_rows("CUSTOMERS", Some("intent-align"))
+        .await
+        .expect("load Base");
+    assert_eq!(loaded.source_alignment, "aligned");
+    assert_eq!(loaded.source_alignment_checked_rows, 1);
+    assert_eq!(loaded.source_alignment_mismatched_rows, 1);
+    assert_eq!(loaded.capture_checkpoint, Some(120));
+    assert_eq!(loaded.capture_low_watermark, Some(100));
+    assert_eq!(loaded.sync_applied_changes, 1);
+    assert_eq!(loaded.sync_health, "ok");
+    assert!(loaded.initial_load_cursor.is_none());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data.get("ID"), Some(&serde_json::json!(2)));
+}
+
+#[tokio::test]
+async fn record_drift_outcome_persists_pipeline_drift_fields() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-drift"))
+        .await
+        .expect("upsert Deployment");
+    store
+        .replace_pipelines(
+            "intent-drift",
+            &[sample_pipeline("intent-drift", "customers")],
+        )
+        .await
+        .expect("replace Pipelines");
+
+    store
+        .record_drift_outcome("intent-drift", "customers", "ok", 5, 0)
+        .await
+        .expect("record Drift outcome");
+
+    let pipeline = store
+        .list_pipelines()
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|p| p.name == "customers")
+        .expect("pipeline");
+    assert_eq!(pipeline.drift_status, "ok");
+    assert_eq!(pipeline.drift_checked_rows, 5);
+    assert_eq!(pipeline.drift_mismatched_rows, 0);
+
+    let err = store
+        .record_drift_outcome("intent-drift", "missing", "partial", 1, 1)
+        .await
+        .expect_err("missing Pipeline must NotFound");
+    assert!(
+        err.to_string().contains("not found"),
+        "expected NotFound, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn resume_pipeline_unpauses_and_clears_schema_impacts() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-resume"))
+        .await
+        .expect("upsert Deployment");
+    store
+        .replace_pipelines(
+            "intent-resume",
+            &[sample_pipeline("intent-resume", "customers")],
+        )
+        .await
+        .expect("replace Pipelines");
+
+    store
+        .mark_schema_impact(&SchemaChangeImpact {
+            deployment_name: "intent-resume".to_string(),
+            pipeline_name: "customers".to_string(),
+            source_schema: "APP".to_string(),
+            source_table: "CUSTOMERS".to_string(),
+            change_id: "ddl-resume".to_string(),
+            capture_position: 300,
+            ddl_summary: "ALTER TABLE APP.CUSTOMERS ADD (Y NUMBER)".to_string(),
+            impact: "blocking".to_string(),
+            status: "active".to_string(),
+        })
+        .await
+        .expect("mark schema impact");
+
+    store
+        .resume_pipeline("intent-resume", "customers")
+        .await
+        .expect("resume Pipeline persistence");
+
+    let pipeline = store
+        .list_pipelines()
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|p| p.name == "customers")
+        .expect("pipeline");
+    assert!(
+        !pipeline.paused,
+        "resume_pipeline must clear durable pause"
+    );
+
+    let active = store
+        .list_schema_change_impacts(Some("intent-resume"))
+        .await
+        .expect("list active impacts");
+    assert!(
+        active.is_empty(),
+        "resume_pipeline must clear active schema impacts"
+    );
+}
+
+#[tokio::test]
+async fn remove_pipeline_deletes_pipeline_and_prunes_unreferenced_bases() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-remove"))
+        .await
+        .expect("upsert Deployment");
+
+    let customers = sample_pipeline("intent-remove", "customers");
+    let mut orders = sample_pipeline("intent-remove", "orders");
+    orders.source_table = "ORDERS".to_string();
+    orders.target_collection = "orders".to_string();
+    store
+        .replace_pipelines("intent-remove", &[customers, orders])
+        .await
+        .expect("replace Pipelines");
+
+    let customers_base = sample_base("intent-remove");
+    let mut orders_base = sample_base("intent-remove");
+    orders_base.source_table = "ORDERS".to_string();
+    let mut crow = serde_json::Map::new();
+    crow.insert("ID".to_string(), serde_json::json!(1));
+    let mut orow = serde_json::Map::new();
+    orow.insert("ID".to_string(), serde_json::json!(10));
+    store
+        .replace_base_dataset(&customers_base, &[crow])
+        .await
+        .expect("seed customers Base");
+    store
+        .replace_base_dataset(&orders_base, &[orow])
+        .await
+        .expect("seed orders Base");
+
+    // Runtime supplies keep_tables from remaining Pipeline Base refs.
+    store
+        .remove_pipeline(
+            "intent-remove",
+            "orders",
+            &[("APP".to_string(), "CUSTOMERS".to_string())],
+        )
+        .await
+        .expect("remove Pipeline with Base cleanup");
+
+    let pipelines = store.list_pipelines().await.expect("list pipelines");
+    assert_eq!(pipelines.len(), 1);
+    assert_eq!(pipelines[0].name, "customers");
+
+    let bases = store.list_base_datasets().await.expect("list bases");
+    assert_eq!(bases.len(), 1);
+    assert_eq!(bases[0].source_table, "CUSTOMERS");
+    assert_eq!(bases[0].source_schema, "APP");
 }
