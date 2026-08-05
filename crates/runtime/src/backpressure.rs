@@ -23,9 +23,14 @@ pub(crate) struct BoundedWindow {
 
 impl BoundedWindow {
     /// Build policy from typed [`BackpressureOptions`] (`SyncOptions.backpressure`).
+    ///
+    /// Callers should pass options already normalized by [`crate::SyncOptions`]
+    /// (zero capacity is clamped there). Defensive clamp here matches that default
+    /// via [`BackpressureOptions::default`] so a raw `0` cannot create an unbounded
+    /// or empty window.
     pub(crate) fn from_options(options: &BackpressureOptions) -> Self {
         let capacity = if options.queue_capacity == 0 {
-            256
+            BackpressureOptions::default().queue_capacity
         } else {
             options.queue_capacity
         };
@@ -69,7 +74,7 @@ impl BoundedWindow {
     /// Full window slows further capture; Downstream delay alone does not pause
     /// Pipelines.
     pub(crate) fn is_full(&self, queue_depth: usize) -> bool {
-        queue_depth >= self.capacity && self.capacity > 0
+        queue_depth >= self.capacity
     }
 
     /// Observe a filled window: emit Operator-visible Backpressure when full.

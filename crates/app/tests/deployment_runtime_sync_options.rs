@@ -1,15 +1,15 @@
-//! Typed Sync options seam for Poison / Schema Change / Backpressure (issue #176).
+//! Typed Sync options seam for Poison / Schema Change / Backpressure (#176 / #203).
 //!
-//! Agreed seams (#168 Testing Decisions / #176 / #180 AC):
+//! Agreed seams (#168 Testing Decisions / #176 / #180 / #199 / #203 AC):
 //! 1. Operator CLI / RQG contract-path twins remain the Release Quality Gate
 //!    (typed SyncOptions CLI flags are the primary fault path; env is a thin shim).
 //! 2. Deployment runtime interface — in-process tests exercise fault paths via
-//!    typed [`SyncOptions`], not process env vars.
+//!    typed [`SyncOptions`], not process env vars — including Backpressure
+//!    bounded-window policy driven by `SyncOptions.backpressure`.
 //!
-//! This file drives production Incremental Sync with Fake Source/Target and
-//! explicit poison identity options (ADR-0015). Schema Change pause (ADR-0009)
-//! and bounded Backpressure (ADR-0020) remain distinct internal seams; their
-//! Operator-visible outcomes stay covered by existing CLI twins.
+//! Fake Source/Target exercises Poison quarantine (ADR-0015) and bounded
+//! Backpressure (ADR-0020) without pausing Pipelines. Schema Change pause
+//! (ADR-0009) stays a distinct seam (CLI twins).
 
 mod common;
 
@@ -24,7 +24,7 @@ use migraloop_platform_store::{
     SystemConnection, TlsSettings,
 };
 use migraloop_runtime::{
-    PoisonOptions, SyncCycleOutcome, SyncInvocation, SyncOptions,
+    BackpressureOptions, PoisonOptions, SyncCycleOutcome, SyncInvocation, SyncOptions,
 };
 use serde_json::json;
 
@@ -292,5 +292,198 @@ async fn typed_sync_options_quarantine_poison_identity_without_env() {
     assert!(
         docs.contains("Caroline"),
         "Pipeline must continue and Deliver non-poison peer, got:\n{docs}"
+    );
+}
+
+/// Bounded Backpressure via typed SyncOptions — capacity drives windowing;
+/// Downstream delay does not pause Pipelines (ADR-0020 / issue #203).
+#[tokio::test]
+async fn typed_sync_options_bounded_window_applies_without_pipeline_pause() {
+    std::env::remove_var("MIGRALOOP_SYNC_QUEUE_CAPACITY");
+    std::env::remove_var("MIGRALOOP_DELIVERY_DELAY_MS");
+
+    let url = ephemeral_database_url().await;
+    let store = PlatformStore::open(&url)
+        .await
+        .expect("open Platform Store session");
+    store.migrate().await.expect("migrate via session");
+
+    let deployment = Deployment {
+        name: "typed-opts-backpressure".into(),
+        source: fake_connection("fake"),
+        target: fake_connection("fake"),
+    };
+    store
+        .upsert_deployment(&deployment)
+        .await
+        .expect("upsert deployment");
+
+    let pipeline = Pipeline {
+        deployment_name: deployment.name.clone(),
+        name: "customers".into(),
+        mode: "direct".into(),
+        source_table: "CUSTOMERS".into(),
+        source_schema: String::new(),
+        target_collection: "customers".into(),
+        delivery_status: "pending".into(),
+        delivery_applied_changes: 0,
+        delivery_lag: 0,
+        paused: false,
+        description: String::new(),
+        field_mappings: Default::default(),
+        output_identity: vec![],
+        transform_json: None,
+        drift_status: "unknown".into(),
+        drift_checked_rows: 0,
+        drift_mismatched_rows: 0,
+    };
+    store
+        .replace_pipelines(&deployment.name, std::slice::from_ref(&pipeline))
+        .await
+        .expect("upsert pipeline");
+
+    let mut seed = serde_json::Map::new();
+    seed.insert("ID".into(), json!(1));
+    seed.insert("NAME".into(), json!("Alice"));
+
+    let dataset = BaseDataset {
+        deployment_name: deployment.name.clone(),
+        source_schema: String::new(),
+        source_table: "CUSTOMERS".into(),
+        status: "initial_load_complete".into(),
+        primary_key: vec!["ID".into()],
+        columns: vec![
+            BaseColumn {
+                name: "ID".into(),
+                data_type: "NUMBER".into(),
+                precision: Some(10),
+                scale: Some(0),
+            },
+            BaseColumn {
+                name: "NAME".into(),
+                data_type: "VARCHAR2".into(),
+                precision: None,
+                scale: None,
+            },
+        ],
+        omitted_columns: vec![],
+        row_count: 1,
+        sync_applied_changes: 0,
+        sync_health: "ok".into(),
+        capture_low_watermark: Some(1000),
+        capture_checkpoint: Some(999),
+        sync_lag: 0,
+        source_alignment: "unknown".into(),
+        source_alignment_checked_rows: 0,
+        source_alignment_mismatched_rows: 0,
+        initial_load_cursor: None,
+    };
+    store
+        .replace_base_dataset(&dataset, &[seed])
+        .await
+        .expect("seed Base Dataset");
+
+    // Five Incremental updates — more than queue_capacity=2 — so Sync must
+    // take multiple bounded windows (ADR-0020) rather than one unbounded buffer.
+    let mut changes = Vec::new();
+    for (i, name) in ["A", "B", "C", "D", "E"].iter().enumerate() {
+        let scn = 1001u64 + i as u64;
+        let mut identity = BTreeMap::new();
+        identity.insert("ID".into(), json!(1));
+        let mut row = BTreeMap::new();
+        row.insert("ID".into(), json!(1));
+        row.insert("NAME".into(), json!(name));
+        changes.push(ChangeEvent {
+            table: "CUSTOMERS".into(),
+            op: ChangeOp::Update,
+            identity,
+            row: Some(row),
+            position: CapturePosition(scn),
+            change_id: format!("fake-bp-{scn}"),
+        });
+    }
+
+    let fake_source = FakeSource::new().with_table(
+        "CUSTOMERS",
+        FakeSourceTable {
+            columns: vec![
+                SourceColumn {
+                    name: "ID".into(),
+                    oracle_type: "NUMBER".into(),
+                    supported: true,
+                    precision: Some(10),
+                    scale: Some(0),
+                    size: None,
+                },
+                SourceColumn {
+                    name: "NAME".into(),
+                    oracle_type: "VARCHAR2".into(),
+                    supported: true,
+                    precision: None,
+                    scale: None,
+                    size: Some(100),
+                },
+            ],
+            primary_key: vec!["ID".into()],
+            rows: vec![],
+            low_watermark: CapturePosition(1000),
+            changes,
+        },
+    );
+    let fake_target = FakeTarget::new();
+
+    let options = SyncOptions {
+        backpressure: BackpressureOptions {
+            queue_capacity: 2,
+            delivery_delay_ms: Some(5),
+        },
+        ..SyncOptions::default()
+    };
+
+    let outcome = migraloop_runtime::run_incremental_sync_with_engines(
+        &store,
+        SyncInvocation::OneShot,
+        &fake_source,
+        &fake_target,
+        options,
+    )
+    .await
+    .expect("Incremental Sync under bounded Backpressure should succeed");
+    assert_eq!(outcome, SyncCycleOutcome::Progressed);
+
+    let pipelines = store.list_pipelines().await.expect("list Pipelines");
+    let customers = pipelines
+        .iter()
+        .find(|p| p.name == "customers")
+        .expect("customers pipeline");
+    assert!(
+        !customers.paused,
+        "bounded Backpressure must not pause the Pipeline (ADR-0020 ≠ ADR-0009)"
+    );
+    assert_eq!(
+        customers.delivery_lag, 0,
+        "after drain, Delivery Health lag should be 0, got {}",
+        customers.delivery_lag
+    );
+
+    let (base, rows) = store
+        .get_base_rows("CUSTOMERS", Some("typed-opts-backpressure"))
+        .await
+        .expect("Base rows");
+    assert_eq!(base.sync_lag, 0, "Base Sync lag should be 0 after catch-up");
+    let base_json = serde_json::to_string(&rows).expect("serialize base");
+    assert!(
+        base_json.contains("\"E\""),
+        "all bounded windows must apply; final NAME=E expected, got:\n{base_json}"
+    );
+
+    let listed = fake_target
+        .list_documents("customers")
+        .await
+        .expect("list via TargetEngine");
+    let docs = serde_json::to_string(&listed).expect("serialize docs");
+    assert!(
+        docs.contains("E"),
+        "Target must receive final Delivered NAME after multi-window Sync, got:\n{docs}"
     );
 }
