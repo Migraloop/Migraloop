@@ -44,6 +44,14 @@ _Avoid_: Zero-impact backfill, unbounded full-table slam, assuming a separate re
 Ongoing change capture into Base Datasets after Initial Load, driving Affect Analysis, Derived updates, and Delivery. Capture mechanisms are pluggable per Source System kind (and may offer more than one mechanism per kind). For Oracle, v1 ships **LogMiner** first; other Oracle mechanisms may be added later without changing Sync/Pipeline/Delivery concepts. Engine-specific **Source Prerequisites** (e.g. Oracle supplemental logging, adequate redo retention) are documented and checked before run; unmet prerequisites fail fast with a clear error (see ADR-0021).
 _Avoid_: Initial Load (different phase), hard-wiring the domain to a single vendor capture product, discovering missing Oracle logging only after silent data loss
 
+**Change Ordering**:
+Within one Base Dataset, Incremental Capture must apply changes for the same source key in capture order. Across different source keys, reordering or parallelism is allowed only when maintenance still converges to the correct eventual state—including per-Output-Identity recompute from Base when a running aggregate lacks enough information (see ADR-0029).
+_Avoid_: Requiring a global Deployment total order by default, treating every Rich Transform as order-insensitive, fixing normal-path reorder bugs primarily via later checks, accelerating only Direct Pipelines while leaving Transform out of throughput work
+
+**Eventual Consistency**:
+When Sync and Delivery are healthy, Managed Columns/fields on the Target System converge to the platform's expected dataset; lag is allowed; at-least-once duplicate applies remain acceptable. Normal Incremental Capture must process the change stream correctly and must not abandon that duty; Source Alignment Check and Drift Check are edge-case safety nets, not the primary correctness path.
+_Avoid_: Exactly-once end-to-end as a v1 requirement, Sync Check (say Source Alignment Check / Drift Check), accepting permanent Managed drift while health looks fine
+
 **Source Prerequisites**:
 Per-engine requirements the Source System must satisfy for Sync to be correct (see ADR-0021). The platform documents them and validates at startup/apply time; it does not assume operators already know, and v1 does not auto-mutate Source settings to “fix” them.
 _Avoid_: Undocumented tribal knowledge, auto-altering customer Oracle config by default
@@ -105,8 +113,8 @@ Whether capture from source into a Base Dataset is caught up and applying succes
 _Avoid_: Sync success (ambiguous), replication lag (mechanism-specific)
 
 **Source Alignment Check**:
-A non-real-time, resource-gated verification that a Base Dataset matches its source. Required before the platform may treat that Base Dataset as a reliable baseline for Drift Check. Must keep source reads lightweight and run only when the source has enough spare capacity. When misalignment is found, the platform repairs the Base Dataset from source using data already required for the check where possible—not by writing to the source.
-_Avoid_: Trusting Sync Health alone, full table dump
+A non-real-time, resource-gated verification that a Base Dataset matches its source. Required before the platform may treat that Base Dataset as a reliable baseline for Drift Check. Must keep source reads lightweight and run only when the source has enough spare capacity. When misalignment is found, the platform repairs the Base Dataset from source using data already required for the check where possible—not by writing to the source. It is a shipped correctness safety net for edge cases—not a substitute for correct Incremental Capture.
+_Avoid_: Trusting Sync Health alone, full table dump, Sync Check (ambiguous—prefer this term or Drift Check)
 
 **Delivery Health**:
 Whether the change stream for a Pipeline's Target Binding is caught up and applying successfully (lag, checkpoints, apply failures). Edits to non-Managed Columns are irrelevant to this signal.
@@ -169,5 +177,5 @@ When a single change or Output Identity repeatedly fails to apply but the rest o
 _Avoid_: Pausing the whole Pipeline for one bad row, silent skip, infinite retry blocking the stream
 
 **Drift Check**:
-A non-real-time, resource-gated verification that Managed Columns on the target match the platform's expected dataset for that Pipeline. Uses the platform dataset as baseline only when Source Alignment (for Bases) or equivalent Derived correctness guarantees hold. By default, detected drift on Managed Columns is auto-repaired back to the Pipeline's expected values; non-Managed Columns are ignored. Auto-repair must not imply extra source load beyond what alignment/verification already requires.
+A non-real-time, resource-gated verification that Managed Columns on the target match the platform's expected dataset for that Pipeline. Uses the platform dataset as baseline only when Source Alignment (for Bases) or equivalent Derived correctness guarantees hold. By default, detected drift on Managed Columns is auto-repaired back to the Pipeline's expected values; non-Managed Columns are ignored. Auto-repair must not imply extra source load beyond what alignment/verification already requires. Like Source Alignment Check, it is a shipped edge-case safety net—not permission to skip normal Delivery correctness.
 _Avoid_: Sync check (ambiguous), audit (too vague), preserving manual edits on Managed Columns
