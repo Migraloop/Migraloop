@@ -55,6 +55,18 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Derived/Target are one document per ORDER_ID after unwind flatten"
-    - "Primary NAME and foreign AMOUNT updates refresh unwound identities; deleted order is removed"
+    - surface: derived
+      pipeline: lab-ru-orders
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+      contains: ["50"]
+      not_contains: ["42.50", "101"]
+    - surface: target
+      collection: lab_ru_orders
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+      contains: ["50"]
+      not_contains: ["101"]
 thresholds: {}

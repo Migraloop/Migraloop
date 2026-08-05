@@ -46,5 +46,18 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Base and Target Managed NAME after mutate: Alicia and Carol present; Bob absent"
+    - surface: base
+      table: LAB_DP_CUSTOMERS
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+    - surface: target
+      collection: lab_dp_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
 thresholds: {}

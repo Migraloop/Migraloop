@@ -53,6 +53,19 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Derived/Target concatenate both EAST and WEST rows by Output Identity"
-    - "Primary EAST and secondary WEST NAME incremental updates both refresh Derived/Target"
+    - surface: derived
+      pipeline: lab-rnu-customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Zora }
+        - { field: NAME, value: Wade }
+      absent:
+        - { field: NAME, value: Alice }
+        - { field: NAME, value: Zoe }
+    - surface: target
+      collection: lab_rnu_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Zora }
+        - { field: NAME, value: Wade }
 thresholds: {}

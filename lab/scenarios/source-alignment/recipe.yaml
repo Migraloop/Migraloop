@@ -46,8 +46,8 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "align detects Base≠Source after controlled Source mutation (mismatched/repaired lines)"
-    - "Base is repaired from Source reads; Source NAME remains AlignedAlice (align never writes Source)"
-    - "status shows Source Alignment after check"
-    - "align --max-rows 1 is resource-gated (partial/truncated; does not repair unchecked rows)"
+    - surface: base
+      table: LAB_SA_CUSTOMERS
+      present:
+        - { field: NAME, value: AlignedAlice }
 thresholds: {}

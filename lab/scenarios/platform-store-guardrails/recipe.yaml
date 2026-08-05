@@ -42,8 +42,7 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "bundled Platform Store settings satisfy product minimums (status healthy without inject)"
-    - "status rejects absurdly low store settings via Guardrails"
-    - "status under low free disk emits WARN and platform_store_disk_warn; store remains healthy"
-    - "Pipeline is not paused solely because disk threshold crossed"
+    - surface: status
+      contains:
+        - "Platform Store"
 thresholds: {}

@@ -46,6 +46,20 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Derived/Target Managed NAME: Alicia and Carol present; Bob absent"
-    - "Projected shape: EMAIL not present as Managed field on Derived/Target"
+    - surface: derived
+      pipeline: lab-rp-customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+      field_absent: [EMAIL]
+    - surface: target
+      collection: lab_rp_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+      field_absent: [EMAIL]
 thresholds: {}

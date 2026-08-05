@@ -57,8 +57,18 @@ workload:
       require_logminer: true
       # allow_fail: true         # ops escapes that intentionally stop mid-sync
 checks:
-  correctness:
-    - Expected Managed Base/Target/Derived outcomes
+  correctness:                  # executable inspect vocabulary (#205)
+    - surface: base             # base | derived | target | status
+      table: LAB_EXAMPLE
+      present:
+        - { field: NAME, value: Alicia }
+      absent:
+        - { field: NAME, value: Bob }
+    - surface: target
+      collection: lab_example
+      present:
+        - { field: NAME, value: Alicia }
+      field_absent: [EMAIL]     # optional; also contains/not_contains/amount_*/row_count/document_count
 thresholds:                     # optional; equal weight with correctness
   max_settle_ms: 300000
   max_lag: 0
@@ -66,23 +76,24 @@ thresholds:                     # optional; equal weight with correctness
   min_rows_per_s: 50.0
 ```
 
-Typed `workload.product_path` steps (issues #173 / #178 / #179 / #201): `prepare_namespace`,
+Typed `workload.product_path` steps (issues #173 / #178 / #179 / #201 / #205): `prepare_namespace`,
 `product_apply`, `mutate`, `product_sync`, `assert`. The shared runner owns Namespace
-lifecycle (wipe / CREATE / supplemental logging / seed, and optional `mutate_sql`) plus
-apply/sync on the real product CLI path. Scenario hooks only supply rare escapes
-(e.g. typed SyncOptions CLI flags for poison / delay / fail-after / queue capacity,
-schema-change inject env for the DDL file bridge, parallel Source sessions, CLI pause /
-remove / revision verbs, generated backlog inserts, `sync.allow_fail` mid-window stops)
-and correctness asserts. All selectable catalog Scenarios declare `product_path` and
-`namespace.lifecycle`.
+lifecycle (wipe / CREATE / supplemental logging / seed, and optional `mutate_sql`),
+executable `checks.correctness` (Managed field present/absent, Derived/Target inspect,
+status text, row/document counts), plus apply/sync on the real product CLI path.
+Scenario hooks only supply rare escapes (e.g. typed SyncOptions CLI flags for poison /
+delay / fail-after / queue capacity, schema-change inject env for the DDL file bridge,
+parallel Source sessions, CLI pause / remove / revision verbs, generated backlog inserts,
+`sync.allow_fail` mid-window stops, settle orchestration). All selectable catalog
+Scenarios declare `product_path`, `namespace.lifecycle`, and runnable `checks.correctness`.
 
 Optional `sync.allow_fail: true` keeps going after a non-zero sync exit so ops Scenarios
 (backpressure / observability) can observe mid-window stops, then finish in hooks.
 
 ## Adding a Scenario while building a feature
 
-1. Create `lab/scenarios/<id>/recipe.yaml` + `deployment.yaml` (reuse the operator Deployment format). Prefer `workload.product_path` for the common prepare→apply→mutate→sync→assert path, and declare `namespace.lifecycle` (tables + `seed_sql`, optional `mutate_sql`) so the shared runner owns Namespace wipe/prepare.
-2. Register the Scenario id and implement thin hooks only for rare escapes + correctness assert (not copy-paste prepare/remove triples). Recipe `workload` / `namespace.lifecycle` / `checks` / `thresholds` are the recipe-driven runner interface — do not duplicate threshold values, Namespace wipe/prepare SQL, or the common product-path sequence as Rust constants.
+1. Create `lab/scenarios/<id>/recipe.yaml` + `deployment.yaml` (reuse the operator Deployment format). Prefer `workload.product_path` for the common prepare→apply→mutate→sync→assert path, declare `namespace.lifecycle` (tables + `seed_sql`, optional `mutate_sql`) so the shared runner owns Namespace wipe/prepare, and declare executable `checks.correctness` inspect expectations.
+2. Register the Scenario id and implement thin hooks only for rare escapes (not copy-paste prepare/remove triples or isomorphic inspect asserts). Recipe `workload` / `namespace.lifecycle` / `checks.correctness` / `thresholds` are the recipe-driven runner interface — do not duplicate threshold values, Namespace wipe/prepare SQL, Managed present/absent inspect arms, or the common product-path sequence as Rust constants.
 3. Confirm `migraloop lab scenario list` shows the new summary from the recipe.
 4. Manually verify with `migraloop lab scenario run <id>` on a Lab Fixture (`lab up`). Keep ignored CLI-seam coverage for the happy path; do **not** add a CI Release Quality Gate that runs the full catalog (ADR-0025 / ADR-0011).
 

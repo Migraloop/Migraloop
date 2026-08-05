@@ -48,7 +48,21 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "After duplicate-safe re-Delivery: Target Managed NAME Alicia and Carol present; Bob absent"
-    - "Target document count unchanged after re-Delivery (no duplicate Output Identities)"
-    - "Non-Managed operatorNote preserved across Managed-field upsert re-Delivery"
+    - surface: base
+      table: LAB_IR_CUSTOMERS
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+    - surface: target
+      collection: lab_ir_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+      document_count: 2
+      contains:
+        - lab-keep-across-redelivery
 thresholds: {}

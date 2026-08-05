@@ -48,8 +48,18 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Poison identity 1 is quarantined after bounded retries (ALERT + Quarantine lines)"
-    - "Pipeline continues: Target Delivers Carol insert and Bob delete; identity 1 stays Alice"
-    - "status Delivery Health unhealthy with quarantined identity=1 (unhealthy / not aligned)"
-    - "Pipeline is not paused for the poison row"
+    - surface: target
+      collection: lab_pq_customers
+      present:
+        - { field: NAME, value: Alice }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+    - surface: status
+      contains:
+        - "Delivery Health: unhealthy"
+        - lab-pq-customers
+        - quarantine
+        - identity=1
 thresholds: {}

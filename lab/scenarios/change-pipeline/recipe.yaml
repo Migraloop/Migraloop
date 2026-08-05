@@ -49,8 +49,11 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Semantic revision: Derived/Target match ACTIVE==0 (Bob only); Alice/Carol reconciled away"
-    - "Shared Base CUSTOMERS not rebuilt on revision (no Initial Load for that table)"
-    - "After revision: sync continues incremental; Pipeline is not left paused"
-    - "Metadata-only description change skips Derived rebuild and re-Delivery"
+    - surface: target
+      collection: lab_cp_active_customers
+      present:
+        - { field: NAME, value: Bob }
+      absent:
+        - { field: NAME, value: Alice }
+        - { field: NAME, value: Carol }
 thresholds: {}

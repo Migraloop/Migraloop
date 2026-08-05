@@ -1,12 +1,13 @@
-//! Recipe-driven Lab Scenario runner (issues #157, #173, #201 / ADR-0025).
+//! Recipe-driven Lab Scenario runner (issues #157, #173, #201, #205 / ADR-0025).
 //!
 //! When `workload.product_path` is set, the runner executes shared product-path
 //! steps from recipe data (prepare / apply / mutate / sync / assert).
 //! `namespace.lifecycle` owns isomorphic Namespace wipe / CREATE / seed / optional
-//! mutate SQL (`namespace.rs`). Scenario hooks supply only rare escapes and
-//! correctness asserts. Adapters return measured metrics + correctness; the
-//! runner evaluates `recipe.yaml` thresholds as equal-weight fail axes and
-//! builds the report.
+//! mutate SQL (`namespace.rs`). `checks.correctness` is an executable inspect
+//! vocabulary (`correctness.rs`). Scenario hooks supply only rare escapes
+//! (poison status, schema DDL, pause timing, settle orchestration). Adapters
+//! return measured metrics + correctness; the runner evaluates `recipe.yaml`
+//! thresholds as equal-weight fail axes and builds the report.
 
 use crate::CliError;
 
@@ -226,7 +227,10 @@ fn print_recipe_interface(recipe: &ScenarioRecipe) {
     if !recipe.checks.correctness.is_empty() {
         println!("Lab Scenario checks.correctness:");
         for check in &recipe.checks.correctness {
-            println!("  - {check}");
+            println!(
+                "  - {}",
+                super::correctness::format_check_summary(check)
+            );
         }
     }
     let t = &recipe.thresholds;

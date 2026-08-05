@@ -46,8 +46,6 @@ workload:
       allow_fail: true
 checks:
   correctness:
-    - "Apply/sync emit structured JSON operator events (initial_load / backpressure / incremental_capture)"
-    - "status includes Sync Health, Delivery Health, and Pipeline status"
-    - "Prometheus /metrics exposes migraloop_sync_lag, migraloop_delivery_lag, failure counters"
-    - "Catch-up completes with lag=0 on status and metrics"
+    - surface: status
+      contains: ["Sync Health"]
 thresholds: {}

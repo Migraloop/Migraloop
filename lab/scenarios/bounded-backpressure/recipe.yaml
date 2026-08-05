@@ -46,8 +46,7 @@ workload:
       allow_fail: true
 checks:
   correctness:
-    - "Artificial Downstream slowness prints Backpressure with queue_depth ≤ capacity"
-    - "Sync Health / Delivery Health lag reflect delay mid-sync (not paused)"
-    - "Catch-up completes with lag=0 and Target Managed outcomes for backlog rows"
-    - "Pipeline is not paused merely for Downstream slowness"
+    - surface: target
+      collection: lab_bp_customers
+      contains: [User100, User119]
 thresholds: {}

@@ -45,8 +45,8 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "drift detects Managed-field Target drift after controlled mutation (mismatched/repaired lines)"
-    - "Managed fields auto-repaired to platform expected values; non-Managed EXTRA preserved"
-    - "status shows Drift after check"
-    - "drift --max-rows 1 is resource-gated (partial/truncated; does not repair unchecked identities)"
+    - surface: target
+      collection: lab_dc_customers
+      contains:
+        - keep-me-non-managed
 thresholds: {}
