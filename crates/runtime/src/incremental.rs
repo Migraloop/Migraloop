@@ -1,13 +1,15 @@
-//! Incremental Sync orchestration for the Deployment runtime (#153 / #176 / #180).
+//! Incremental Sync orchestration for the Deployment runtime (#153 / #176 / #180 / #203).
 //!
 //! Owns Incremental Capture (including continuous supervise/resume), overlap
 //! apply ordering (Deliver-before-checkpoint + change-id dedupe), and
 //! ChangeEvent → Base Dataset apply. Poison quarantine, Schema Change pause,
-//! and bounded Backpressure sit behind small internal seams (`crate::poison`,
+//! and bounded Backpressure sit behind distinct internal seams (`crate::poison`,
 //! `crate::schema_impact`, `crate::backpressure`) with typed [`SyncOptions`] on
-//! the sync invocation. Cutover watermark / checkpoint / readiness live in
-//! [`crate::cutover`] (ADR-0004 / #175). The Operator CLI is a thin adapter over
-//! [`sync_incremental`] / [`supervise_continuous_incremental_sync`].
+//! the sync invocation. Bounded-window queue policy (capacity / fetch sizing /
+//! full-window slowdown signals) lives in [`crate::backpressure`], not only emit
+//! helpers. Cutover watermark / checkpoint / readiness live in [`crate::cutover`]
+//! (ADR-0004 / #175). The Operator CLI is a thin adapter over [`sync_incremental`]
+//! / [`supervise_continuous_incremental_sync`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,7 +25,7 @@ use migraloop_transform::{
     TransformOp,
 };
 
-use crate::backpressure::{emit_backpressure, window_under_backpressure};
+use crate::backpressure::BoundedWindow;
 use crate::cutover::resume_for_incremental;
 use crate::observability::{emit_event, EventValue};
 use crate::poison::{
@@ -772,8 +774,10 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
         let fail_after = cycle.options.fail_after_changes;
         let max_poison_attempts = cycle.options.poison.max_attempts;
         let poison_identity_keys = cycle.options.poison.poison_identity_keys.clone();
-        let queue_capacity = cycle.options.backpressure.queue_capacity;
-        let delivery_delay_ms = cycle.options.backpressure.delivery_delay_ms;
+        // ADR-0020 / #203: bounded-window policy lives in the Backpressure module.
+        let window = BoundedWindow::from_options(&cycle.options.backpressure);
+        let queue_capacity = window.capacity();
+        let delivery_delay_ms = window.delivery_delay_ms();
         let quiet = cycle.quiet;
         // ADR-0021: fail-fast Source Prerequisites before Incremental Capture.
         // Source engine is provided by factory wiring or injection (issue #169).
@@ -839,13 +843,14 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
 
             let mut windows_processed = 0usize;
 
-            // ADR-0020: bounded Incremental windows. Capture only fills up to
-            // queue_capacity; Downstream slowness drains slowly and backpressures
-            // further fetch instead of buffering the full backlog in RAM.
+            // ADR-0020 / #203: bounded Incremental windows via Backpressure module.
+            // Capture only fills up to window capacity; Downstream slowness drains
+            // slowly and backpressures further fetch instead of buffering the full
+            // backlog in RAM.
             loop {
                 // Already-applied ids at/after the inclusive resume SCN must be skipped
                 // *before* the bounded window limit so same-SCN siblings are not starved
-                // by re-fetched duplicates (issue #143).
+                // by re-fetched duplicates (issue #143). Fetch sizing is Backpressure policy.
                 let applied_at_or_after = store
                     .list_applied_change_ids_from_position(
                         &deployment.name,
@@ -856,7 +861,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                     .await
                     .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                 let applied_skip: BTreeSet<_> = applied_at_or_after.into_iter().collect();
-                let fetch_limit = Some(queue_capacity.saturating_add(applied_skip.len()));
+                let fetch_limit = window.fetch_limit(applied_skip.len());
 
                 // Count Source backlog without materializing row images so Sync/
                 // Delivery Health lag can reflect delay under a bounded window.
@@ -867,11 +872,11 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                 let fetched_changes = capture
                     .fetch_changes_in_schema_limited(&schema, &table, resume_from, fetch_limit)
                     .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-                let candidate_changes: Vec<_> = fetched_changes
-                    .into_iter()
-                    .filter(|c| !applied_skip.contains(&c.change_id))
-                    .take(queue_capacity)
-                    .collect();
+                let candidate_changes = window.take_up_to_capacity(
+                    fetched_changes
+                        .into_iter()
+                        .filter(|c| !applied_skip.contains(&c.change_id)),
+                );
                 let table_schema_changes: Vec<SchemaChangeEvent> = injected_schema_changes
                     .iter()
                     .filter(|c| c.table.eq_ignore_ascii_case(&table))
@@ -915,9 +920,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                 // (RS_ID/SSN) is preserved — do not re-order by change_id string
                 // (op sorts before rs_id/ssn and can invert capture order).
                 items.sort_by(|a, b| a.position().cmp(&b.position()));
-                if items.len() > queue_capacity {
-                    items.truncate(queue_capacity);
-                }
+                window.truncate_to_capacity(&mut items);
 
                 if items.is_empty() {
                     let status =
@@ -968,17 +971,13 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
 
                 let queue_depth = items.len();
                 let reported_lag = pending_at_window_start as i32;
-                // Backpressure seam (ADR-0020): full bounded window slows capture;
-                // Downstream delay alone does not pause Pipelines.
-                if window_under_backpressure(queue_depth, queue_capacity) {
-                    emit_backpressure(
-                        &table,
-                        &deployment.name,
-                        queue_depth,
-                        queue_capacity,
-                        reported_lag,
-                    );
-                }
+                // Backpressure module owns full-window signal (ADR-0020 / #203).
+                window.observe_filled_window(
+                    &table,
+                    &deployment.name,
+                    queue_depth,
+                    reported_lag,
+                );
 
                 if !quiet {
                     if windows_processed == 0 {
