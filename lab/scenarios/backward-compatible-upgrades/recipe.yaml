@@ -44,8 +44,7 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "migrate after an existing Deployment leaves Platform Store healthy at latest schema"
-    - "Deployment / Pipeline / Base Dataset survive migrate (no wipe)"
-    - "older SemVer-compatible apiVersion (migraloop.dev/v1.0.0) still applies"
-    - "re-apply after upgrade does not Initial Load / rebuild Base from scratch"
+    - surface: status
+      contains:
+        - lab-backward-compatible-upgrades
 thresholds: {}

@@ -61,6 +61,38 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Customers Base/Target Managed NAME: Alicia and Carol present; Bob absent"
-    - "Derived and order-totals Target: sum 35/50, count 2/1, min/max/avg for cust1 (15/20/17.5); not stale 30"
+    - surface: base
+      table: LAB_TP_CUSTOMERS
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+    - surface: target
+      collection: lab_tp_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+    - surface: derived
+      pipeline: lab-tp-order-totals
+      amount_present: ["35", "50"]
+      amount_absent: ["30"]
+      present:
+        - { field: ORDER_COUNT, value: "2" }
+        - { field: ORDER_COUNT, value: "1" }
+        - { field: MIN_AMOUNT, value: "15" }
+        - { field: MAX_AMOUNT, value: "20" }
+        - { field: AVG_AMOUNT, value: "17.5" }
+    - surface: target
+      collection: lab_tp_order_totals
+      amount_present: ["35", "50"]
+      amount_absent: ["30"]
+      present:
+        - { field: ORDER_COUNT, value: "2" }
+        - { field: ORDER_COUNT, value: "1" }
+        - { field: MIN_AMOUNT, value: "15" }
+        - { field: MAX_AMOUNT, value: "20" }
+        - { field: AVG_AMOUNT, value: "17.5" }
 thresholds: {}

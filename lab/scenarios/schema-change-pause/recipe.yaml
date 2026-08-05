@@ -47,7 +47,8 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Blocking DDL emits WARN and pauses the affected Pipeline"
-    - "sync does not quarantine / poison-pause the Pipeline"
-    - "status shows Delivery Health paused and Schema Change blocking (not quarantine unhealthy)"
+    - surface: status
+      contains:
+        - "Delivery Health: paused"
+        - Schema Change
 thresholds: {}

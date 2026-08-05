@@ -1,11 +1,12 @@
-//! Lab Scenario recipe types and on-disk loaders (ADR-0025 / issues #157, #173, #201).
+//! Lab Scenario recipe types and on-disk loaders (ADR-0025 / issues #157, #173, #201, #205).
 //!
 //! `recipe.yaml` is the runner interface for workload steps, optional typed
 //! `product_path` steps, Scenario Namespace lifecycle (tables / seed / mutate),
-//! checks, and equal-weight metric thresholds. Thin adapters keep only rare
-//! escapes and correctness asserts; they must not duplicate threshold constants,
-//! Namespace wipe/prepare triples, or the common prepare→apply→mutate→sync path
-//! when `product_path` is set.
+//! executable `checks.correctness`, and equal-weight metric thresholds. Thin
+//! adapters keep only rare escapes (and seed SQL that cannot be shared); they
+//! must not duplicate threshold constants, Namespace wipe/prepare triples,
+//! isomorphic correctness inspect arms, or the common prepare→apply→mutate→sync
+//! path when `product_path` is set.
 
 use std::fs;
 use std::path::Path;
@@ -14,6 +15,7 @@ use serde::Deserialize;
 
 use crate::CliError;
 
+use super::correctness::{validate_runnable_correctness, CorrectnessCheck};
 use super::registered_scenario_ids;
 
 #[derive(Debug, Deserialize)]
@@ -145,8 +147,9 @@ impl Default for ProductPathSyncOpts {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScenarioRecipeChecks {
+    /// Executable / data-driven correctness vocabulary (#205).
     #[serde(default)]
-    pub(crate) correctness: Vec<String>,
+    pub(crate) correctness: Vec<CorrectnessCheck>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -250,14 +253,14 @@ pub(crate) fn load_recipe(path: &Path) -> Result<ScenarioRecipe, CliError> {
             path.display()
         )));
     }
-    if recipe.checks.correctness.is_empty() {
-        return Err(CliError::Failed(format!(
-            "Lab Scenario recipe {} must declare checks.correctness",
-            path.display()
-        )));
-    }
+    let path_display = path.display().to_string();
+    let has_product_path = recipe.workload.product_path.is_some();
+    validate_runnable_correctness(
+        &path_display,
+        &recipe.checks.correctness,
+        has_product_path,
+    )?;
     if let Some(product_path) = &recipe.workload.product_path {
-        let path_display = path.display().to_string();
         validate_product_path(&path_display, product_path)?;
         let has_prepare = product_path
             .steps

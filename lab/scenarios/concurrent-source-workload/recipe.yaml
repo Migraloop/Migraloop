@@ -53,7 +53,27 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Customers Base/Target Managed NAME: Alicia and Carol present; Bob absent"
-    - "Derived and order-totals Target after contention: totals 35 and 50 (not stale 30)"
+    - surface: base
+      table: LAB_CW_CUSTOMERS
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+    - surface: target
+      collection: lab_cw_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
+    - surface: derived
+      pipeline: lab-cw-order-totals
+      amount_present: ["35", "50"]
+      amount_absent: ["30"]
+    - surface: target
+      collection: lab_cw_order_totals
+      amount_present: ["35", "50"]
+      amount_absent: ["30"]
 thresholds:
   max_settle_ms: 300000

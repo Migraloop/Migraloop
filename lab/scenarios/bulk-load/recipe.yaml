@@ -40,7 +40,12 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - Base and Target Managed row counts equal bulk volume (100000)
+    - surface: base
+      table: LAB_BL_ITEMS
+      row_count: 100000
+    - surface: target
+      collection: lab_bl_items
+      document_count: 100000
 thresholds:
   max_lag: 0
   max_duration_ms: 600000

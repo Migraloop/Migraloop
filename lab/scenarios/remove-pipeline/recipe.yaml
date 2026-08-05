@@ -46,7 +46,11 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "After remove: status no longer lists customers Pipeline; reporting Pipeline remains"
-    - "Shared Base CUSTOMERS remains available after remove"
-    - "While removed: customers Target retains Initial Load (Alice/Bob); reporting Target receives Incremental update"
+    - surface: base
+      table: LAB_RP_CUSTOMERS
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
 thresholds: {}

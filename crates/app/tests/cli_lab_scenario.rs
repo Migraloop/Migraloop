@@ -127,7 +127,10 @@ workload:
     - apply via real product path
 {product_path}checks:
   correctness:
-    - Managed outcomes match recipe expectations
+    - surface: base
+      table: LAB_TEST
+      present:
+        - {{ field: NAME, value: Alice }}
 {thresholds}"#
         ),
     )

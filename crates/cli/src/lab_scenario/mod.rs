@@ -1,13 +1,16 @@
 //! Lab Scenario catalog, recipe-driven run orchestration, and Namespace cleanup
-//! (issues #60–#66, #63, #85, #86, #157, #173, #201 / ADR-0025).
+//! (issues #60–#66, #63, #85, #86, #157, #173, #201, #205 / ADR-0025).
 //!
-//! Recipe-driven runner (`runner.rs` + `namespace.rs`): `recipe.yaml` workload /
-//! optional `product_path` / Namespace lifecycle / checks / thresholds are the
-//! live interface. Scenarios with `workload.product_path` use shared
+//! Recipe-driven runner (`runner.rs` + `namespace.rs` + `correctness.rs`):
+//! `recipe.yaml` workload / optional `product_path` / Namespace lifecycle /
+//! executable `checks.correctness` / thresholds are the live interface.
+//! Scenarios with `workload.product_path` use shared
 //! prepare→apply→mutate→sync→assert steps; `namespace.lifecycle` drives wipe /
-//! CREATE / supplemental logging / seed (and optional mutate SQL). Thin hooks
-//! keep only rare escapes and correctness asserts. All shipped Scenarios use
-//! shared product-path steps with thin hooks.
+//! CREATE / supplemental logging / seed (and optional mutate SQL);
+//! `checks.correctness` runs isomorphic Managed/Derived/Target inspect
+//! expectations. Thin hooks keep only rare escapes (poison status, schema DDL,
+//! pause timing, settle orchestration). All shipped Scenarios use shared
+//! product-path steps with thin hooks.
 //! Lab-specific machinery: catalog listing from on-disk recipes, Scenario
 //! Namespace lifecycle (prepare / re-run wipe / manual remove / opt-in
 //! auto-remove), one-at-a-time lock, refusal of non-Lab / production engine
@@ -17,6 +20,7 @@
 //! (#86) resets Pipeline Delivery status in Platform Store so a second real
 //! `apply` re-Delivers the same Output Identities (at-least-once / upsert).
 
+mod correctness;
 mod namespace;
 mod recipe;
 mod runner;
@@ -41,6 +45,11 @@ use crate::lab::{
 use crate::CliError;
 use migraloop_platform_store::PlatformStore;
 
+use self::correctness::{
+    execute_recipe_correctness, fetch_all, fetched_satisfies, inspect_mentions_amount,
+    inspect_mentions_email_field, managed_field_present, managed_name_present,
+    parse_inspect_row_count, parse_target_document_count,
+};
 use self::namespace::{mutate_namespace_from_recipe, prepare_namespace, wipe_namespace};
 use self::recipe::{
     load_recipe, load_selectable_catalog, load_selectable_recipes, ProductPathApplyOpts,
@@ -976,8 +985,9 @@ struct ProductPathRunContext {
     apply_started: Option<Instant>,
 }
 
-/// Thin Scenario hooks for rare escapes and correctness (#173 / #178 / #201).
+/// Thin Scenario hooks for rare escapes (#173 / #178 / #201 / #205).
 /// Namespace wipe/prepare/seed (and optional mutate SQL) live in `namespace.lifecycle`.
+/// Isomorphic Managed/Derived/Target correctness lives in recipe `checks.correctness`.
 enum ProductPathHooks {
     DirectPipeline,
     RtProject,
@@ -2283,6 +2293,25 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
         }
     }
 
+    /// Recipe-driven isomorphic assert (#205): run checks.correctness then adapter_ok.
+    async fn assert_via_recipe_correctness(
+        lab_dir: &Path,
+        recipe: &ScenarioRecipe,
+        ctx: &ProductPathRunContext,
+        rows_applied: u64,
+        passed_msg: &str,
+    ) -> Result<AdapterOutcome, CliError> {
+        execute_recipe_correctness(lab_dir, recipe).await?;
+        println!("Lab Scenario: correctness checks passed ({passed_msg})");
+        if !ctx.sync_out.trim().is_empty() {
+            println!(
+                "Lab Scenario: Incremental Capture ({}) and Delivery complete",
+                ctx.capture_path_note
+            );
+        }
+        Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+    }
+
     async fn assert_correctness(
         &self,
         lab_dir: &Path,
@@ -2293,566 +2322,39 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
         let rows_applied =
             count_delivery_ops(&ctx.apply_out) + count_delivery_ops(&ctx.sync_out);
         match self {
-            Self::DirectPipeline => {
-                let base_after = run_product_cli(
-                    &bin,
-                    &[
-                        "base",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--table",
-                        DIRECT_PIPELINE_TABLE,
-                    ],
+            Self::DirectPipeline
+            | Self::RtProject
+            | Self::RtFilter
+            | Self::RtFieldOps
+            | Self::RtEquilookup
+            | Self::RtUnion
+            | Self::RtUnwind
+            | Self::RtDistinctAddtoset
+            | Self::PoisonQuarantine
+            | Self::TransformPipeline => {
+                let passed_msg = match self {
+                    Self::DirectPipeline => "Base + Target Managed outcomes",
+                    Self::RtProject => "projected Derived + Target Managed outcomes",
+                    Self::RtFilter => "filtered Derived + Target Managed outcomes",
+                    Self::RtFieldOps => {
+                        "addFields/rename/remove Derived + Target Managed outcomes"
+                    }
+                    Self::RtEquilookup => {
+                        "equiLookup multi-Base Derived + Target Managed outcomes"
+                    }
+                    Self::RtUnion => "union multi-Base Derived + Target Managed outcomes",
+                    Self::RtUnwind => "unwind Output Identities insert/update/delete",
+                    Self::RtDistinctAddtoset => "distinct + addToSet Derived/Target outcomes",
+                    Self::PoisonQuarantine => {
+                        "poison identity quarantined; Pipeline continued; status unhealthy"
+                    }
+                    Self::TransformPipeline => "Base + Derived + Target Managed outcomes",
+                    _ => unreachable!("recipe-driven assert variants only"),
+                };
+                Self::assert_via_recipe_correctness(
+                    lab_dir, recipe, ctx, rows_applied, passed_msg,
                 )
-                .await?;
-                let target_after = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        DIRECT_PIPELINE_COLLECTION,
-                    ],
-                )
-                .await?;
-                let base_ok = managed_name_present(&base_after, "Alicia")
-                    && managed_name_present(&base_after, "Carol")
-                    && !managed_name_present(&base_after, "Bob");
-                let target_ok = managed_name_present(&target_after, "Alicia")
-                    && managed_name_present(&target_after, "Carol")
-                    && !managed_name_present(&target_after, "Bob");
-                if !(base_ok && target_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after insert/update/delete.\nBase:\n{base_after}\nTarget:\n{target_after}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (Base + Target Managed outcomes)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::RtProject => {
-                let derived_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        RT_PROJECT_PIPELINE,
-                    ],
-                )
-                .await?;
-                let target_after = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        RT_PROJECT_COLLECTION,
-                    ],
-                )
-                .await?;
-                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-                    && managed_field_present(&derived_after, "NAME", "Carol")
-                    && !managed_field_present(&derived_after, "NAME", "Bob")
-                    && !inspect_mentions_email_field(&derived_after);
-                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-                    && managed_field_present(&target_after, "NAME", "Carol")
-                    && !managed_field_present(&target_after, "NAME", "Bob")
-                    && !inspect_mentions_email_field(&target_after);
-                if !(derived_ok && target_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after project insert/update/delete.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (projected Derived + Target Managed outcomes)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::RtFilter => {
-                let derived_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        RT_FILTER_PIPELINE,
-                    ],
-                )
-                .await?;
-                let target_after = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        RT_FILTER_COLLECTION,
-                    ],
-                )
-                .await?;
-                // After mutate: Alicia + flipped Bob + Carol ACTIVE=1; Dana ACTIVE=0 stays filtered out.
-                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-                    && managed_field_present(&derived_after, "NAME", "Bob")
-                    && managed_field_present(&derived_after, "NAME", "Carol")
-                    && !managed_field_present(&derived_after, "NAME", "Dana");
-                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-                    && managed_field_present(&target_after, "NAME", "Bob")
-                    && managed_field_present(&target_after, "NAME", "Carol")
-                    && !managed_field_present(&target_after, "NAME", "Dana");
-                if !(derived_ok && target_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after filter insert/update/delete.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (filtered Derived + Target Managed outcomes)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::RtFieldOps => {
-                let derived_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        RT_FIELD_OPS_PIPELINE,
-                    ],
-                )
-                .await?;
-                let target_after = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        RT_FIELD_OPS_COLLECTION,
-                    ],
-                )
-                .await?;
-                let derived_ok = managed_field_present(&derived_after, "customerName", "Alicia")
-                    && managed_field_present(&derived_after, "displayName", "Alicia")
-                    && managed_field_present(&derived_after, "customerName", "Carol")
-                    && managed_field_present(&derived_after, "source", "oracle")
-                    && !managed_field_present(&derived_after, "customerName", "Bob")
-                    && !inspect_mentions_email_field(&derived_after);
-                let target_ok = managed_field_present(&target_after, "customerName", "Alicia")
-                    && managed_field_present(&target_after, "displayName", "Alicia")
-                    && managed_field_present(&target_after, "customerName", "Carol")
-                    && managed_field_present(&target_after, "source", "oracle")
-                    && !managed_field_present(&target_after, "customerName", "Bob")
-                    && !inspect_mentions_email_field(&target_after);
-                if !(derived_ok && target_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after field-ops insert/update/delete.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (addFields/rename/remove Derived + Target Managed outcomes)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::RtEquilookup => {
-                let derived_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        RT_EQUILOOKUP_PIPELINE,
-                    ],
-                )
-                .await?;
-                let target_after = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        RT_EQUILOOKUP_COLLECTION,
-                    ],
-                )
-                .await?;
-                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-                    && derived_after.contains("orders")
-                    && (derived_after.contains("50.00") || derived_after.contains("50"))
-                    && !derived_after.contains("42.50")
-                    && managed_field_present(&derived_after, "NAME", "Bob");
-                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-                    && target_after.contains("orders")
-                    && (target_after.contains("50.00") || target_after.contains("50"))
-                    && managed_field_present(&target_after, "NAME", "Bob");
-                if !(derived_ok && target_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after equiLookup primary/foreign updates.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (equiLookup multi-Base Derived + Target Managed outcomes)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::RtUnion => {
-                let derived_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        RT_UNION_PIPELINE,
-                    ],
-                )
-                .await?;
-                let target_after = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        RT_UNION_COLLECTION,
-                    ],
-                )
-                .await?;
-                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-                    && managed_field_present(&derived_after, "NAME", "Zora")
-                    && managed_field_present(&derived_after, "NAME", "Wade")
-                    && !derived_after.contains("Alice")
-                    && !derived_after.contains("Zoe");
-                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-                    && managed_field_present(&target_after, "NAME", "Zora")
-                    && managed_field_present(&target_after, "NAME", "Wade");
-                if !(derived_ok && target_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after union east/west updates.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (union multi-Base Derived + Target Managed outcomes)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::RtUnwind => {
-                let derived_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        RT_UNWIND_PIPELINE,
-                    ],
-                )
-                .await?;
-                let target_after = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        RT_UNWIND_COLLECTION,
-                    ],
-                )
-                .await?;
-                let derived_ok = managed_field_present(&derived_after, "NAME", "Alicia")
-                    && (derived_after.contains("50.00") || derived_after.contains("50"))
-                    && !derived_after.contains("42.50")
-                    && !derived_after.contains("101")
-                    && managed_field_present(&derived_after, "NAME", "Bob");
-                let target_ok = managed_field_present(&target_after, "NAME", "Alicia")
-                    && (target_after.contains("50.00") || target_after.contains("50"))
-                    && !target_after.contains("101")
-                    && managed_field_present(&target_after, "NAME", "Bob");
-                if !(derived_ok && target_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after unwind primary/foreign updates + order delete.\n\
-Derived:\n{derived_after}\nTarget:\n{target_after}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (unwind Output Identities insert/update/delete)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::RtDistinctAddtoset => {
-                let distinct_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE,
-                    ],
-                )
-                .await?;
-                let add_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        RT_DISTINCT_ADDTOSET_ADD_PIPELINE,
-                    ],
-                )
-                .await?;
-                let distinct_target = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION,
-                    ],
-                )
-                .await?;
-                let add_target = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        RT_DISTINCT_ADDTOSET_ADD_COLLECTION,
-                    ],
-                )
-                .await?;
-                let distinct_ok = distinct_after.contains("\"CUSTOMER_ID\": 1")
-                    && distinct_after.contains("\"CUSTOMER_ID\": 3")
-                    && !distinct_after.contains("\"CUSTOMER_ID\": 2")
-                    && distinct_target.contains("\"CUSTOMER_ID\": 1")
-                    && distinct_target.contains("\"CUSTOMER_ID\": 3")
-                    && !distinct_target.contains("\"CUSTOMER_ID\": 2");
-                let add_ok = add_after.contains("7.00")
-                    && add_after.contains("42.50")
-                    && add_after.contains("10.00")
-                    && add_after.contains("\"CUSTOMER_ID\": 3")
-                    && add_after.contains("5.00")
-                    && !add_after.contains("\"CUSTOMER_ID\": 2")
-                    && add_target.contains("7.00")
-                    && add_target.contains("\"CUSTOMER_ID\": 3");
-                if !(distinct_ok && add_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after distinct/addToSet Source mutations.\n\
-distinct Derived:\n{distinct_after}\ndistinct Target:\n{distinct_target}\n\
-addToSet Derived:\n{add_after}\naddToSet Target:\n{add_target}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (distinct + addToSet Derived/Target outcomes)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::PoisonQuarantine => {
-                let target_out = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        POISON_QUARANTINE_COLLECTION,
-                    ],
-                )
-                .await?;
-                if !(managed_name_present(&target_out, "Alice")
-                    && !managed_name_present(&target_out, "Alicia")
-                    && managed_name_present(&target_out, "Carol")
-                    && !managed_name_present(&target_out, "Bob"))
-                {
-                    return Err(CliError::Failed(format!(
-                        "Target must keep Alice for quarantined identity 1, Deliver Carol, delete Bob:\n{target_out}"
-                    )));
-                }
-                let status_out = run_product_cli(
-                    &bin,
-                    &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
-                )
-                .await?;
-                let status_lower = status_out.to_ascii_lowercase();
-                if !(status_out.contains("Delivery Health: unhealthy")
-                    && status_out.contains(POISON_QUARANTINE_PIPELINE)
-                    && status_lower.contains("quarantine")
-                    && (status_out.contains("identity=1") || status_lower.contains("identity=1")))
-                {
-                    return Err(CliError::Failed(format!(
-                        "status must show Delivery Health unhealthy with quarantined identity=1:\n{status_out}"
-                    )));
-                }
-                if !(status_lower.contains("unhealthy") || status_lower.contains("not aligned")) {
-                    return Err(CliError::Failed(format!(
-                        "quarantined keys must be marked unhealthy/not aligned:\n{status_out}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed \
-                     (poison identity quarantined; Pipeline continued; status unhealthy)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
-            }
-            Self::TransformPipeline => {
-                let customers_base_after = run_product_cli(
-                    &bin,
-                    &[
-                        "base",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--table",
-                        TRANSFORM_CUSTOMERS_TABLE,
-                    ],
-                )
-                .await?;
-                let derived_after = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        TRANSFORM_ORDER_TOTALS_PIPELINE,
-                    ],
-                )
-                .await?;
-                let customers_target = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        TRANSFORM_CUSTOMERS_COLLECTION,
-                    ],
-                )
-                .await?;
-                let totals_target = run_product_cli(
-                    &bin,
-                    &[
-                        "target",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--collection",
-                        TRANSFORM_ORDER_TOTALS_COLLECTION,
-                    ],
-                )
-                .await?;
-                let customers_base_ok = managed_field_present(&customers_base_after, "NAME", "Alicia")
-                    && managed_field_present(&customers_base_after, "NAME", "Carol")
-                    && !managed_field_present(&customers_base_after, "NAME", "Bob");
-                let customers_target_ok = managed_field_present(&customers_target, "NAME", "Alicia")
-                    && managed_field_present(&customers_target, "NAME", "Carol")
-                    && !managed_field_present(&customers_target, "NAME", "Bob");
-                let derived_ok = inspect_mentions_amount(&derived_after, "35")
-                    && inspect_mentions_amount(&derived_after, "50")
-                    && !inspect_mentions_amount(&derived_after, "30")
-                    && managed_field_present(&derived_after, "ORDER_COUNT", "2")
-                    && managed_field_present(&derived_after, "ORDER_COUNT", "1")
-                    && (managed_field_present(&derived_after, "MIN_AMOUNT", "15")
-                        || managed_field_present(&derived_after, "MIN_AMOUNT", "15.00"))
-                    && (managed_field_present(&derived_after, "MAX_AMOUNT", "20")
-                        || managed_field_present(&derived_after, "MAX_AMOUNT", "20.00"))
-                    && (managed_field_present(&derived_after, "AVG_AMOUNT", "17.5")
-                        || managed_field_present(&derived_after, "AVG_AMOUNT", "17.50"));
-                let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
-                    && inspect_mentions_amount(&totals_target, "50")
-                    && !inspect_mentions_amount(&totals_target, "30")
-                    && managed_field_present(&totals_target, "ORDER_COUNT", "2")
-                    && managed_field_present(&totals_target, "ORDER_COUNT", "1")
-                    && (managed_field_present(&totals_target, "MIN_AMOUNT", "15")
-                        || managed_field_present(&totals_target, "MIN_AMOUNT", "15.00"))
-                    && (managed_field_present(&totals_target, "MAX_AMOUNT", "20")
-                        || managed_field_present(&totals_target, "MAX_AMOUNT", "20.00"))
-                    && (managed_field_present(&totals_target, "AVG_AMOUNT", "17.5")
-                        || managed_field_present(&totals_target, "AVG_AMOUNT", "17.50"));
-                if !(customers_base_ok && customers_target_ok && derived_ok && totals_target_ok) {
-                    return Err(CliError::Failed(format!(
-                        "correctness checks failed after multi-table insert/update/delete.\n\
-Customers Base:\n{customers_base_after}\nCustomers Target:\n{customers_target}\n\
-Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
-                    )));
-                }
-                println!(
-                    "Lab Scenario: correctness checks passed (Base + Derived + Target Managed outcomes)"
-                );
-                if !ctx.sync_out.trim().is_empty() {
-                    println!(
-                        "Lab Scenario: Incremental Capture ({}) and Delivery complete",
-                        ctx.capture_path_note
-                    );
-                }
-                Ok(adapter_ok(rows_applied, ctx.capture_path_note.clone()))
+                .await
             }
             Self::ConcurrentSourceWorkload => {
                     let max_settle_ms = recipe.thresholds.max_settle_ms.ok_or_else(|| {
@@ -2905,74 +2407,15 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                             )));
                         }
 
-                        let customers_base_after = run_product_cli(
-                            &bin,
-                            &[
-                                "base",
-                                "--platform-store-url",
-                                LAB_PLATFORM_STORE_URL,
-                                "--table",
-                                CONCURRENT_CUSTOMERS_TABLE,
-                            ],
-                        )
-                        .await?;
-                        let derived_after = run_product_cli(
-                            &bin,
-                            &[
-                                "derived",
-                                "--platform-store-url",
-                                LAB_PLATFORM_STORE_URL,
-                                "--pipeline",
-                                CONCURRENT_ORDER_TOTALS_PIPELINE,
-                            ],
-                        )
-                        .await?;
-                        let customers_target = run_product_cli(
-                            &bin,
-                            &[
-                                "target",
-                                "--platform-store-url",
-                                LAB_PLATFORM_STORE_URL,
-                                "--collection",
-                                CONCURRENT_CUSTOMERS_COLLECTION,
-                            ],
-                        )
-                        .await?;
-                        let totals_target = run_product_cli(
-                            &bin,
-                            &[
-                                "target",
-                                "--platform-store-url",
-                                LAB_PLATFORM_STORE_URL,
-                                "--collection",
-                                CONCURRENT_ORDER_TOTALS_COLLECTION,
-                            ],
-                        )
-                        .await?;
-
-                        // Customers Direct: Alicia + Carol present, Bob deleted.
-                        let customers_base_ok = managed_field_present(&customers_base_after, "NAME", "Alicia")
-                            && managed_field_present(&customers_base_after, "NAME", "Carol")
-                            && !managed_field_present(&customers_base_after, "NAME", "Bob");
-                        let customers_target_ok = managed_field_present(&customers_target, "NAME", "Alicia")
-                            && managed_field_present(&customers_target, "NAME", "Carol")
-                            && !managed_field_present(&customers_target, "NAME", "Bob");
-                        // After concurrent mutate: cust1=20+5+10=35, cust2=5+15+30=50.
-                        let derived_ok = inspect_mentions_amount(&derived_after, "35")
-                            && inspect_mentions_amount(&derived_after, "50")
-                            && !inspect_mentions_amount(&derived_after, "30");
-                        let totals_target_ok = inspect_mentions_amount(&totals_target, "35")
-                            && inspect_mentions_amount(&totals_target, "50")
-                            && !inspect_mentions_amount(&totals_target, "30");
-
-                        if customers_base_ok && customers_target_ok && derived_ok && totals_target_ok {
+                        // Settle until recipe checks.correctness pass (#205).
+                        let fetched = fetch_all(&recipe.checks.correctness).await?;
+                        if fetched_satisfies(&recipe.checks.correctness, &fetched) {
                             break;
                         }
 
                         last_detail = format!(
-                            "correctness not yet settled.\n\
-                Customers Base:\n{customers_base_after}\nCustomers Target:\n{customers_target}\n\
-                Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
+                            "correctness not yet settled against recipe checks.correctness                              ({} inspect surfaces).",
+                            fetched.len()
                         );
                         tokio::time::sleep(CONCURRENT_SETTLE_POLL).await;
                     }
@@ -3067,7 +2510,8 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                             ))
                         })?;
 
-                        let rows_ok = base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
+                        let fetched = fetch_all(&recipe.checks.correctness).await?;
+                        let rows_ok = fetched_satisfies(&recipe.checks.correctness, &fetched);
                         let lag_ok = lag <= max_lag;
                         if rows_ok && lag_ok {
                             settled = true;
@@ -3093,9 +2537,11 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     };
 
                     let rows_applied = count_delivery_ops(&ctx.apply_out).max(base_rows);
-                    // Correctness is row-level Managed outcomes; runner evaluates lag/duration/throughput.
-                    let correctness =
-                        base_rows == BULK_LOAD_ROW_COUNT && target_rows == BULK_LOAD_ROW_COUNT;
+                    // Correctness is recipe checks.correctness; runner evaluates lag/duration/throughput.
+                    let correctness = match fetch_all(&recipe.checks.correctness).await {
+                        Ok(fetched) => fetched_satisfies(&recipe.checks.correctness, &fetched),
+                        Err(_) => false,
+                    };
                     let mut detail = if correctness {
                         String::new()
                     } else {
@@ -3257,27 +2703,21 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                         ))
                     })?;
 
-                    let base_ok = managed_name_present(&base_after, "Alicia")
-                        && managed_name_present(&base_after, "Carol")
-                        && !managed_name_present(&base_after, "Bob");
-                    let target_ok = managed_name_present(&target_after, "Alicia")
-                        && managed_name_present(&target_after, "Carol")
-                        && !managed_name_present(&target_after, "Bob");
-                    let count_ok = docs_after == docs_before && docs_after == 2;
-                    let note_ok = target_after.contains(IDEMPOTENT_REDELIVERY_OPERATOR_NOTE);
+                    if docs_after != docs_before {
+                        return Err(CliError::Failed(format!(
+                            "document count changed across re-Delivery                              (docs_before={docs_before} docs_after={docs_after}).
+                             Base:
+{base_after}
+Target:
+{target_after}"
+                        )));
+                    }
 
                     let rows_applied = count_delivery_ops(&ctx.apply_out)
                         + count_delivery_ops(&ctx.sync_out)
                         + count_delivery_ops(&reapply_out);
 
-                    if !(base_ok && target_ok && count_ok && note_ok) {
-                        return Err(CliError::Failed(format!(
-                            "correctness checks failed after duplicate-safe re-Delivery \
-                             (base_ok={base_ok} target_ok={target_ok} count_ok={count_ok} \
-                             docs_before={docs_before} docs_after={docs_after} note_ok={note_ok}).\n\
-                             Base:\n{base_after}\nTarget:\n{target_after}"
-                        )));
-                    }
+                    execute_recipe_correctness(lab_dir, recipe).await?;
 
                     println!(
                         "Lab Scenario: correctness checks passed \
@@ -3327,25 +2767,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                         )));
                     }
 
-                    let customers_target = run_product_cli(
-                        &bin,
-                        &[
-                            "target",
-                            "--platform-store-url",
-                            LAB_PLATFORM_STORE_URL,
-                            "--collection",
-                            PAUSE_RESUME_CUSTOMERS_COLLECTION,
-                        ],
-                    )
-                    .await?;
-                    let customers_ok = managed_name_present(&customers_target, "Alicia")
-                        && managed_name_present(&customers_target, "Carol")
-                        && !managed_name_present(&customers_target, "Bob");
-                    if !customers_ok {
-                        return Err(CliError::Failed(format!(
-                            "after resume, customers Target must match durable Base (Alicia+Carol, Bob absent):\n{customers_target}"
-                        )));
-                    }
+                    execute_recipe_correctness(lab_dir, recipe).await?;
 
                     let status_out = run_product_cli(
                         &bin,
@@ -3460,6 +2882,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     let rows_applied = count_delivery_ops(&ctx.apply_out)
                         + count_delivery_ops(&ctx.sync_out)
                         + count_delivery_ops(&catch_out);
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: correctness checks passed \
                          (bounded backpressure; visible lag; catch-up; Pipeline not paused)"
@@ -3546,6 +2969,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     } else {
                         "Initial Load (chunked)".to_string()
                     };
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: {INITIAL_LOAD_THROTTLED_ID} checks passed \
                          (chunked progress; pause/resume; rate_limit; backoff; watermark retained)"
@@ -3604,6 +3028,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     let rows_applied = count_delivery_ops(&ctx.apply_out)
                         + count_delivery_ops(&ctx.sync_out)
                         + count_delivery_ops(&catch_out);
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: correctness checks passed \
                          (structured logs; Sync/Delivery Health; Prometheus lag/failures)"
@@ -3706,6 +3131,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     }
 
                     let rows_applied = count_delivery_ops(&ctx.apply_out);
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: correctness checks passed \
                          (Guardrails minimums ok; disk warn-only; Pipeline not paused)"
@@ -3829,6 +3255,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     }
 
                     let rows_applied = count_delivery_ops(&ctx.apply_out);
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: correctness checks passed \
                          (migrate preserved Deployment; older v1.0.0 config applies without rebuild)"
@@ -3877,6 +3304,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     }
 
                     let rows_applied = count_delivery_ops(&ctx.apply_out) + count_delivery_ops(&ctx.sync_out);
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: correctness checks passed \
                          (blocking DDL warn+pause; distinct from poison quarantine)"
@@ -4044,6 +3472,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     }
 
                     let rows_applied = count_delivery_ops(&ctx.apply_out);
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: correctness checks passed \
                          (detect + repair Base from Source; resource-gated max-rows; Source not written)"
@@ -4202,6 +3631,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     }
 
                     let rows_applied = count_delivery_ops(&ctx.apply_out);
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: correctness checks passed \
                          (detect + Managed auto-repair; non-Managed preserved; resource-gated max-rows)"
@@ -4224,22 +3654,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
             Self::RemovePipeline => {
 
 
-                    let base_out = run_product_cli(
-                        &bin,
-                        &[
-                            "base",
-                            "--platform-store-url",
-                            LAB_PLATFORM_STORE_URL,
-                            "--table",
-                            REMOVE_PIPELINE_CUSTOMERS_TABLE,
-                        ],
-                    )
-                    .await?;
-                    if !(managed_name_present(&base_out, "Alicia") && managed_name_present(&base_out, "Carol")) {
-                        return Err(CliError::Failed(format!(
-                            "Shared Base must continue Incremental Capture for remaining Pipeline:\n{base_out}"
-                        )));
-                    }
+                    execute_recipe_correctness(lab_dir, recipe).await?;
 
                     let rows_applied = count_delivery_ops(&ctx.apply_out)
                         + count_delivery_ops(&ctx.sync_out);
@@ -4338,6 +3753,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                         + count_delivery_ops(&ctx.sync_out)
                         + count_delivery_ops(&apply_meta);
 
+                    execute_recipe_correctness(lab_dir, recipe).await?;
                     println!(
                         "Lab Scenario: correctness checks passed \
                          (semantic revision rebuilt Derived/re-Delivered; incremental continued; \
@@ -4432,11 +3848,6 @@ async fn run_product_path_scenario(
         "Lab Scenario `{}` product_path completed without an `assert` step",
         recipe.id
     )))
-}
-
-/// Managed NAME field presence in Base/Target JSON inspect output.
-fn managed_name_present(inspect: &str, name: &str) -> bool {
-    managed_field_present(inspect, "NAME", name)
 }
 
 /// Sum Delivery document ops reported on the product CLI path.
@@ -4606,65 +4017,6 @@ fn ensure_lab_fixture_engines_for_scenario(
 }
 
 
-/// Managed field presence in Base/Target/Derived JSON inspect output.
-fn managed_field_present(inspect: &str, field: &str, value: &str) -> bool {
-    let lower_field = field.to_ascii_lowercase();
-    let patterns = [
-        format!("\"{field}\": \"{value}\""),
-        format!("\"{field}\":\"{value}\""),
-        format!("\"{lower_field}\": \"{value}\""),
-        format!("\"{lower_field}\":\"{value}\""),
-    ];
-    if patterns.iter().any(|p| inspect.contains(p.as_str())) {
-        return true;
-    }
-    // Numeric JSON without quotes — require a non-digit boundary so "5" ≠ "50".
-    numeric_field_present(inspect, field, value)
-        || numeric_field_present(inspect, &lower_field, value)
-}
-
-fn numeric_field_present(inspect: &str, field: &str, value: &str) -> bool {
-    for spaced in [format!("\"{field}\": {value}"), format!("\"{field}\":{value}")] {
-        let mut start = 0;
-        while let Some(rel) = inspect[start..].find(&spaced) {
-            let abs = start + rel;
-            let after = abs + spaced.len();
-            let boundary_ok = inspect
-                .as_bytes()
-                .get(after)
-                .map(|b| !b.is_ascii_digit())
-                .unwrap_or(true);
-            if boundary_ok {
-                return true;
-            }
-            start = abs + 1;
-        }
-    }
-    false
-}
-
-/// Amount-like values may appear as integers or decimal strings in inspect output.
-fn inspect_mentions_amount(inspect: &str, amount: &str) -> bool {
-    managed_field_present(inspect, "TOTAL_AMOUNT", amount)
-        || managed_field_present(inspect, "TOTAL_AMOUNT", &format!("{amount}.00"))
-        || managed_field_present(inspect, "TOTAL_AMOUNT", &format!("{amount}.0"))
-}
-
-/// Fully remove Transform Pipeline Scenario Namespace (Source tables, Target
-/// collections, Platform Store Deployment + cascaded Bases/Derived/Pipelines).
-/// Idempotent.
-
-
-
-/// True when inspect output exposes an EMAIL Managed field key (not merely the substring).
-fn inspect_mentions_email_field(inspect: &str) -> bool {
-    inspect.contains("\"EMAIL\"")
-        || inspect.contains("\"email\"")
-        || inspect.contains("'EMAIL'")
-        || inspect.contains("'email'")
-}
-
-
 
 
 
@@ -4750,35 +4102,6 @@ EXIT;\n"
     })?;
 
     Ok(())
-}
-
-
-/// Fully remove bulk-load Scenario Namespace. Idempotent.
-
-
-fn parse_inspect_row_count(inspect: &str) -> Option<u64> {
-    for line in inspect.lines() {
-        if let Some(idx) = line.find("rows=") {
-            let digits: String = line[idx + "rows=".len()..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if !digits.is_empty() {
-                return digits.parse().ok();
-            }
-        }
-    }
-    None
-}
-
-fn parse_target_document_count(inspect: &str) -> Option<u64> {
-    for line in inspect.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("documents:") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
 }
 
 /// Parse `Sync Health: ... lag=N ...` for the Base Dataset line matching `table`.
@@ -5177,7 +4500,7 @@ if (r.matchedCount !== 1) {{ throw new Error('expected to match Output Identity 
     Ok(())
 }
 
-async fn run_product_cli(bin: &Path, args: &[&str]) -> Result<String, CliError> {
+pub(super) async fn run_product_cli(bin: &Path, args: &[&str]) -> Result<String, CliError> {
     run_product_cli_with_env(bin, args, &[]).await
 }
 
@@ -5577,7 +4900,7 @@ mod tests {
         let path = dir.join("recipe.yaml");
         fs::write(
             &path,
-            "id: demo\nsummary: demo\nnamespace:\n  source_tables: []\n  target_collections: [c]\n  deployment: d\nworkload:\n  concurrency: serial\n  steps: [prepare]\nchecks:\n  correctness: [ok]\n",
+            "id: demo\nsummary: demo\nnamespace:\n  source_tables: []\n  target_collections: [c]\n  deployment: d\nworkload:\n  concurrency: serial\n  steps: [prepare]\nchecks:\n  correctness:\n    - surface: base\n      table: T\n      present:\n        - { field: NAME, value: A }\n",
         )
         .expect("write");
         let err = load_recipe(&path).expect_err("empty source_tables must fail");
@@ -5633,7 +4956,12 @@ mod tests {
                 product_path: None,
             },
             checks: ScenarioRecipeChecks {
-                correctness: vec!["rows".to_string()],
+                correctness: vec![crate::lab_scenario::correctness::CorrectnessCheck {
+                    surface: crate::lab_scenario::correctness::CorrectnessSurface::Base,
+                    table: Some(BULK_LOAD_TABLE.to_string()),
+                    row_count: Some(BULK_LOAD_ROW_COUNT),
+                    ..Default::default()
+                }],
             },
             thresholds,
         };
@@ -5700,7 +5028,12 @@ mod tests {
                 product_path: None,
             },
             checks: ScenarioRecipeChecks {
-                correctness: vec!["rows".to_string()],
+                correctness: vec![crate::lab_scenario::correctness::CorrectnessCheck {
+                    surface: crate::lab_scenario::correctness::CorrectnessSurface::Base,
+                    table: Some(BULK_LOAD_TABLE.to_string()),
+                    row_count: Some(BULK_LOAD_ROW_COUNT),
+                    ..Default::default()
+                }],
             },
             thresholds,
         };
@@ -5844,6 +5177,92 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn recipe_correctness_surfaces_match_scenario_identities() {
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab/scenarios");
+        let direct = load_recipe(&lab.join(DIRECT_PIPELINE_ID).join("recipe.yaml")).unwrap();
+        assert!(direct.checks.correctness.iter().any(|c| {
+            c.table.as_deref() == Some(DIRECT_PIPELINE_TABLE)
+        }));
+        assert!(direct.checks.correctness.iter().any(|c| {
+            c.collection.as_deref() == Some(DIRECT_PIPELINE_COLLECTION)
+        }));
+        let project = load_recipe(&lab.join(RT_PROJECT_ID).join("recipe.yaml")).unwrap();
+        assert!(project
+            .checks
+            .correctness
+            .iter()
+            .any(|c| c.pipeline.as_deref() == Some(RT_PROJECT_PIPELINE)));
+        assert!(project
+            .checks
+            .correctness
+            .iter()
+            .any(|c| c.collection.as_deref() == Some(RT_PROJECT_COLLECTION)));
+        let poison = load_recipe(&lab.join(POISON_QUARANTINE_ID).join("recipe.yaml")).unwrap();
+        assert!(poison.checks.correctness.iter().any(|c| {
+            c.collection.as_deref() == Some(POISON_QUARANTINE_COLLECTION)
+        }));
+        let equi = load_recipe(&lab.join(RT_EQUILOOKUP_ID).join("recipe.yaml")).unwrap();
+        assert!(equi.checks.correctness.iter().any(|c| {
+            c.collection.as_deref() == Some(RT_EQUILOOKUP_COLLECTION)
+        }));
+        let union = load_recipe(&lab.join(RT_UNION_ID).join("recipe.yaml")).unwrap();
+        assert!(union.checks.correctness.iter().any(|c| {
+            c.collection.as_deref() == Some(RT_UNION_COLLECTION)
+        }));
+        let unwind = load_recipe(&lab.join(RT_UNWIND_ID).join("recipe.yaml")).unwrap();
+        assert!(unwind.checks.correctness.iter().any(|c| {
+            c.collection.as_deref() == Some(RT_UNWIND_COLLECTION)
+        }));
+        let distinct = load_recipe(&lab.join(RT_DISTINCT_ADDTOSET_ID).join("recipe.yaml")).unwrap();
+        assert!(distinct.checks.correctness.iter().any(|c| {
+            c.collection.as_deref() == Some(RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION)
+        }));
+        assert!(distinct.checks.correctness.iter().any(|c| {
+            c.collection.as_deref() == Some(RT_DISTINCT_ADDTOSET_ADD_COLLECTION)
+        }));
+        for (id, collection) in [
+            (RT_FILTER_ID, RT_FILTER_COLLECTION),
+            (RT_FIELD_OPS_ID, RT_FIELD_OPS_COLLECTION),
+            (TRANSFORM_PIPELINE_ID, TRANSFORM_CUSTOMERS_COLLECTION),
+            (TRANSFORM_PIPELINE_ID, TRANSFORM_ORDER_TOTALS_COLLECTION),
+            (CONCURRENT_SOURCE_WORKLOAD_ID, CONCURRENT_CUSTOMERS_COLLECTION),
+            (CONCURRENT_SOURCE_WORKLOAD_ID, CONCURRENT_ORDER_TOTALS_COLLECTION),
+        ] {
+            let recipe = load_recipe(&lab.join(id).join("recipe.yaml")).unwrap();
+            assert!(
+                recipe
+                    .checks
+                    .correctness
+                    .iter()
+                    .any(|c| c.collection.as_deref() == Some(collection)),
+                "{id} must declare collection {collection} in checks.correctness"
+            );
+        }
+    }
+
+    #[test]
+    fn product_path_recipes_declare_runnable_correctness() {
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab/scenarios");
+        for id in registered_scenario_ids() {
+            let path = lab.join(id).join("recipe.yaml");
+            let recipe = load_recipe(&path).unwrap_or_else(|err| panic!("load {id}: {err}"));
+            assert!(
+                recipe.workload.product_path.is_some(),
+                "{id} must declare product_path"
+            );
+            assert!(
+                !recipe.checks.correctness.is_empty(),
+                "{id} must declare runnable checks.correctness (#205)"
+            );
+            assert!(
+                recipe.namespace.lifecycle.is_some(),
+                "{id} must declare namespace.lifecycle"
+            );
+        }
+    }
+
     #[test]
     fn product_path_recipes_drive_shared_steps_for_migrated_batch() {
         let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lab/scenarios");
@@ -5973,7 +5392,7 @@ mod tests {
         let path = dir.join("recipe.yaml");
         fs::write(
             &path,
-            "id: demo\nsummary: demo\nnamespace:\n  source_tables: [LAB_X]\n  target_collections: [lab_x]\n  deployment: lab-x\nworkload:\n  concurrency: serial\n  steps: [prepare, apply, assert]\n  product_path:\n    steps: [prepare_namespace, product_apply, assert]\n    sync:\n      require_logminer: true\nchecks:\n  correctness: [ok]\n",
+            "id: demo\nsummary: demo\nnamespace:\n  source_tables: [LAB_X]\n  target_collections: [lab_x]\n  deployment: lab-x\nworkload:\n  concurrency: serial\n  steps: [prepare, apply, assert]\n  product_path:\n    steps: [prepare_namespace, product_apply, assert]\n    sync:\n      require_logminer: true\nchecks:\n  correctness:\n    - surface: base\n      table: T\n      present:\n        - { field: NAME, value: A }\n",
         )
         .expect("write");
         let err = load_recipe(&path).expect_err("lifecycle required for prepare_namespace");

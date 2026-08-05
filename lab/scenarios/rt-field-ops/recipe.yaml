@@ -48,6 +48,24 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Derived/Target Managed customerName/displayName/source present; EMAIL absent"
-    - "ACTIVE filter: Alicia and Carol present; Bob absent after delete"
+    - surface: derived
+      pipeline: lab-rfo-customers
+      present:
+        - { field: customerName, value: Alicia }
+        - { field: displayName, value: Alicia }
+        - { field: customerName, value: Carol }
+        - { field: source, value: oracle }
+      absent:
+        - { field: customerName, value: Bob }
+      field_absent: [EMAIL]
+    - surface: target
+      collection: lab_rfo_customers
+      present:
+        - { field: customerName, value: Alicia }
+        - { field: displayName, value: Alicia }
+        - { field: customerName, value: Carol }
+        - { field: source, value: oracle }
+      absent:
+        - { field: customerName, value: Bob }
+      field_absent: [EMAIL]
 thresholds: {}

@@ -38,8 +38,10 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Initial Load progress emits multiple bounded chunks (not one unbounded slam)"
-    - "Pause mid-load persists rows + low-watermark; resume completes without Deployment teardown"
-    - "Operator-visible rate_limit and backoff under store pressure"
-    - "Cutover low-watermark remains set after chunked load"
+    - surface: base
+      table: LAB_IL_ITEMS
+      row_count: 500
+    - surface: status
+      contains:
+        - Initial Load
 thresholds: {}

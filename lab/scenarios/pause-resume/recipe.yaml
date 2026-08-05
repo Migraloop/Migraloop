@@ -55,7 +55,11 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "While paused: customers Target retains Initial Load (Alice/Bob); orders Target receives Incremental update"
-    - "After resume: customers Target matches durable Base (Alicia + Carol; Bob deleted)"
-    - "Other Pipeline (orders) remains Delivered throughout"
+    - surface: target
+      collection: lab_pr_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Bob }
 thresholds: {}

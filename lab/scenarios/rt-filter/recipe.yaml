@@ -48,6 +48,20 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "After Initial Load: only ACTIVE=1 seed row (Alice) in Derived/Target"
-    - "After mutate+sync: Alicia, Bob, Carol present; inactive Dana absent"
+    - surface: derived
+      pipeline: lab-rf-customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Dana }
+    - surface: target
+      collection: lab_rf_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+        - { field: NAME, value: Carol }
+      absent:
+        - { field: NAME, value: Dana }
 thresholds: {}

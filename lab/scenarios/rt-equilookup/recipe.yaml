@@ -54,6 +54,17 @@ workload:
       require_logminer: true
 checks:
   correctness:
-    - "Derived/Target embed matching ORDERS under orders for each customer Output Identity"
-    - "Primary NAME and foreign AMOUNT incremental updates both refresh Derived/Target"
+    - surface: derived
+      pipeline: lab-rel-customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+      contains: [orders, "50"]
+      not_contains: ["42.50"]
+    - surface: target
+      collection: lab_rel_customers
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+      contains: [orders, "50"]
 thresholds: {}
