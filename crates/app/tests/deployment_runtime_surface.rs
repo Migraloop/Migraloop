@@ -48,10 +48,10 @@ async fn ephemeral_database_url() -> String {
     format!("{base}/{db_name}")
 }
 
-/// Continuous Incremental Sync entry takes an open Platform Store session (#172).
-/// One-shot Sync uses the same verb + [`SyncInvocation::OneShot`] (#208).
+/// Continuous Incremental Sync prefers an open Platform Store session (#172);
+/// one-shot Sync uses the same verb + [`SyncInvocation::OneShot`] (#208).
 #[tokio::test]
-async fn continuous_incremental_sync_prefers_open_store_session() {
+async fn incremental_sync_entries_use_open_session_and_oneshot_invocation() {
     let url = ephemeral_database_url().await;
     let store = PlatformStore::open(&url)
         .await

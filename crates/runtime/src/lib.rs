@@ -1,10 +1,11 @@
 //! Deployment runtime public interface: Operator Deployment verbs plus necessary
 //! session / factory entry points (issue #172 / #208).
 //!
-//! Apply / Initial Load / Delivery start live in [`apply`]; Incremental Sync lives in
-//! [`incremental`] — split by concept for navigability without widening this seam.
+//! Apply / Initial Load / Delivery start live in the [`apply`] module; Incremental
+//! Sync lives in [`incremental`] — split by concept for navigability without
+//! widening this seam.
 //!
-//! **Verbs:** [`apply`] / [`apply_with_options`] / [`apply_with_engines`] (typed
+//! **Verbs:** [`apply()`] / [`apply_with_options`] / [`apply_with_engines`] (typed
 //! [`ApplyOptions`]), Incremental Sync ([`run_incremental_sync`],
 //! [`run_incremental_sync_with_engines`], [`run_continuous_incremental_sync`],
 //! [`supervise_continuous_incremental_sync`] with typed [`SyncOptions`]), Pipeline
