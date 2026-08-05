@@ -1041,10 +1041,10 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             // prefers that session handle over URL reopen (issue #172).
             let sync_store = open_store(&platform_store_url).await?;
             // Continuous `run`: Operator env knobs + optional typed poll override (#200).
-            // One-shot Lab/RQG fault injection uses typed `sync` flags (#180).
+            // One-shot Lab/RQG fault injection uses typed `sync` flags (#180); do not
+            // fold poll typing into omit_env_fault_shim — poll is an Operator knob.
             let sync_options = SyncOptions::for_cli(SyncOptionsOverrides {
                 poll_interval_ms: sync_poll_interval_ms,
-                omit_env_fault_shim: sync_poll_interval_ms.is_some(),
                 ..SyncOptionsOverrides::default()
             });
             tokio::spawn(async move {
