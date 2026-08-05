@@ -96,14 +96,18 @@ fn write_scenario_package_with_deployment(lab: &Path, id: &str, summary: &str, d
     } else {
         ""
     };
-    // First-batch Scenarios require typed product_path (issue #173).
-    let product_path = if matches!(
+    // First-batch Scenarios require typed product_path (issue #173) and
+    // namespace.lifecycle for shared Namespace prepare (#201).
+    let (lifecycle, product_path) = if matches!(
         id,
         "direct-pipeline" | "rt-project" | "poison-quarantine"
     ) {
-        "  product_path:\n    steps:\n      - prepare_namespace\n      - product_apply\n      - mutate\n      - product_sync\n      - assert\n    apply:\n      require_initial_load: true\n    sync:\n      require_logminer: true\n"
+        (
+            "  lifecycle:\n    tables:\n      - name: LAB_TEST\n        columns: |\n          ID NUMBER(10) PRIMARY KEY,\n          NAME VARCHAR2(100) NOT NULL\n    seed_sql: |\n      INSERT INTO LAB_TEST (ID, NAME) VALUES (1, 'Alice');\n",
+            "  product_path:\n    steps:\n      - prepare_namespace\n      - product_apply\n      - mutate\n      - product_sync\n      - assert\n    apply:\n      require_initial_load: true\n    sync:\n      require_logminer: true\n",
+        )
     } else {
-        ""
+        ("", "")
     };
     fs::write(
         scenario_dir.join("recipe.yaml"),
@@ -115,7 +119,7 @@ namespace:
   target_collections: [lab_test]
   deployment: lab-{id}
   pipelines: [lab-test]
-deployment_config: deployment.yaml
+{lifecycle}deployment_config: deployment.yaml
 workload:
   concurrency: serial
   steps:

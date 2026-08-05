@@ -10,6 +10,22 @@ namespace:
   deployment: lab-rt-field-ops
   pipelines:
     - lab-rfo-customers
+  lifecycle:
+    tables:
+      - name: LAB_RFO_CUSTOMERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200),
+          ACTIVE NUMBER(1) NOT NULL
+    seed_sql: |
+      INSERT INTO LAB_RFO_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);
+      INSERT INTO LAB_RFO_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);
+    mutate_sql: |
+      UPDATE LAB_RFO_CUSTOMERS SET EMAIL = 'alice-only@example.com' WHERE ID = 1;
+      UPDATE LAB_RFO_CUSTOMERS SET NAME = 'Alicia' WHERE ID = 1;
+      INSERT INTO LAB_RFO_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);
+      DELETE FROM LAB_RFO_CUSTOMERS WHERE ID = 2;
 deployment_config: deployment.yaml
 workload:
   concurrency: serial

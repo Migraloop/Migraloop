@@ -1,10 +1,12 @@
-//! Recipe-driven Lab Scenario runner (issues #157, #173 / ADR-0025).
+//! Recipe-driven Lab Scenario runner (issues #157, #173, #201 / ADR-0025).
 //!
 //! When `workload.product_path` is set, the runner executes shared product-path
-//! steps from recipe data (prepare / apply / mutate / sync / assert). Scenario
-//! hooks supply Namespace seeds, rare escapes, and correctness asserts.
-//! Adapters return measured metrics + correctness; the runner evaluates
-//! `recipe.yaml` thresholds as equal-weight fail axes and builds the report.
+//! steps from recipe data (prepare / apply / mutate / sync / assert).
+//! `namespace.lifecycle` owns isomorphic Namespace wipe / CREATE / seed / optional
+//! mutate SQL (`namespace.rs`). Scenario hooks supply only rare escapes and
+//! correctness asserts. Adapters return measured metrics + correctness; the
+//! runner evaluates `recipe.yaml` thresholds as equal-weight fail axes and
+//! builds the report.
 
 use crate::CliError;
 

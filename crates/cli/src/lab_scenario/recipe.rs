@@ -1,9 +1,11 @@
-//! Lab Scenario recipe types and on-disk loaders (ADR-0025 / issues #157, #173).
+//! Lab Scenario recipe types and on-disk loaders (ADR-0025 / issues #157, #173, #201).
 //!
 //! `recipe.yaml` is the runner interface for workload steps, optional typed
-//! `product_path` steps, checks, and equal-weight metric thresholds. Adapters
-//! implement seeds/escapes/asserts; they must not duplicate threshold constants
-//! or the common prepare→apply→mutate→sync path when `product_path` is set.
+//! `product_path` steps, Scenario Namespace lifecycle (tables / seed / mutate),
+//! checks, and equal-weight metric thresholds. Thin adapters keep only rare
+//! escapes and correctness asserts; they must not duplicate threshold constants,
+//! Namespace wipe/prepare triples, or the common prepare→apply→mutate→sync path
+//! when `product_path` is set.
 
 use std::fs;
 use std::path::Path;
@@ -44,6 +46,31 @@ pub(crate) struct ScenarioRecipeNamespace {
     /// Pipeline identities inside the Scenario Namespace (authoring metadata).
     #[serde(default)]
     pub(crate) pipelines: Vec<String>,
+    /// Shared Namespace lifecycle (wipe / prepare / optional mutate SQL) (#201).
+    /// Required when `workload.product_path` includes `prepare_namespace`.
+    #[serde(default)]
+    pub(crate) lifecycle: Option<ScenarioRecipeNamespaceLifecycle>,
+}
+
+/// Recipe-declared table shape + seed/mutate SQL for the shared Namespace runner.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ScenarioRecipeNamespaceLifecycle {
+    pub(crate) tables: Vec<ScenarioRecipeNamespaceTable>,
+    /// SQL body after CREATE/ALTER (no sqlplus preamble / COMMIT / EXIT).
+    pub(crate) seed_sql: String,
+    /// Optional Source mutate SQL body (omit for thin adapter escapes).
+    #[serde(default)]
+    pub(crate) mutate_sql: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ScenarioRecipeNamespaceTable {
+    pub(crate) name: String,
+    /// Column DDL inside `CREATE TABLE ( ... )` (comma-separated lines).
+    pub(crate) columns: String,
+    /// Table-level supplemental logging for LogMiner (default true).
+    #[serde(default = "default_true")]
+    pub(crate) supplemental_logging: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,7 +257,22 @@ pub(crate) fn load_recipe(path: &Path) -> Result<ScenarioRecipe, CliError> {
         )));
     }
     if let Some(product_path) = &recipe.workload.product_path {
-        validate_product_path(&path.display().to_string(), product_path)?;
+        let path_display = path.display().to_string();
+        validate_product_path(&path_display, product_path)?;
+        let has_prepare = product_path
+            .steps
+            .iter()
+            .any(|s| *s == ProductPathStepKind::PrepareNamespace);
+        let has_mutate = product_path
+            .steps
+            .iter()
+            .any(|s| *s == ProductPathStepKind::Mutate);
+        super::namespace::validate_namespace_lifecycle(
+            &path_display,
+            &recipe.namespace,
+            has_prepare,
+            has_mutate,
+        )?;
     }
     Ok(recipe)
 }

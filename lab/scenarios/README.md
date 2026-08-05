@@ -23,6 +23,17 @@ namespace:
   target_collections: [lab_my_collection]
   deployment: lab-my-scenario
   pipelines: [lab-my-pipeline]
+  lifecycle:                    # required with product_path prepare_namespace (#201)
+    tables:
+      - name: LAB_MY_TABLE      # must match source_tables
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL
+        # supplemental_logging: true  # default
+    seed_sql: |
+      INSERT INTO LAB_MY_TABLE (ID, NAME) VALUES (1, 'Alice');
+    # mutate_sql: |             # optional; omit for thin mutate escapes
+    #   UPDATE LAB_MY_TABLE SET NAME = 'Alicia' WHERE ID = 1;
 deployment_config: deployment.yaml
 workload:
   concurrency: serial           # or parallel (intra-Scenario only)
@@ -55,20 +66,23 @@ thresholds:                     # optional; equal weight with correctness
   min_rows_per_s: 50.0
 ```
 
-Typed `workload.product_path` steps (issues #173 / #178 / #179): `prepare_namespace`,
-`product_apply`, `mutate`, `product_sync`, `assert`. The shared runner owns apply/sync on
-the real product CLI path; Scenario hooks only supply Namespace seed SQL, rare escapes
+Typed `workload.product_path` steps (issues #173 / #178 / #179 / #201): `prepare_namespace`,
+`product_apply`, `mutate`, `product_sync`, `assert`. The shared runner owns Namespace
+lifecycle (wipe / CREATE / supplemental logging / seed, and optional `mutate_sql`) plus
+apply/sync on the real product CLI path. Scenario hooks only supply rare escapes
 (e.g. typed SyncOptions CLI flags for poison / delay / fail-after / queue capacity,
-schema-change inject env for the DDL file bridge, `sync.allow_fail` mid-window stops), and
-correctness asserts. All selectable catalog Scenarios declare `product_path`.
+schema-change inject env for the DDL file bridge, parallel Source sessions, CLI pause /
+remove / revision verbs, generated backlog inserts, `sync.allow_fail` mid-window stops)
+and correctness asserts. All selectable catalog Scenarios declare `product_path` and
+`namespace.lifecycle`.
 
 Optional `sync.allow_fail: true` keeps going after a non-zero sync exit so ops Scenarios
 (backpressure / observability) can observe mid-window stops, then finish in hooks.
 
 ## Adding a Scenario while building a feature
 
-1. Create `lab/scenarios/<id>/recipe.yaml` + `deployment.yaml` (reuse the operator Deployment format). Prefer `workload.product_path` for the common prepare→apply→mutate→sync→assert path.
-2. Register the Scenario id and implement thin hooks (Namespace prepare / mutate / assert / remove). Recipe `workload` / `checks` / `thresholds` are the recipe-driven runner interface — do not duplicate threshold values or the common product-path sequence as Rust constants.
+1. Create `lab/scenarios/<id>/recipe.yaml` + `deployment.yaml` (reuse the operator Deployment format). Prefer `workload.product_path` for the common prepare→apply→mutate→sync→assert path, and declare `namespace.lifecycle` (tables + `seed_sql`, optional `mutate_sql`) so the shared runner owns Namespace wipe/prepare.
+2. Register the Scenario id and implement thin hooks only for rare escapes + correctness assert (not copy-paste prepare/remove triples). Recipe `workload` / `namespace.lifecycle` / `checks` / `thresholds` are the recipe-driven runner interface — do not duplicate threshold values, Namespace wipe/prepare SQL, or the common product-path sequence as Rust constants.
 3. Confirm `migraloop lab scenario list` shows the new summary from the recipe.
 4. Manually verify with `migraloop lab scenario run <id>` on a Lab Fixture (`lab up`). Keep ignored CLI-seam coverage for the happy path; do **not** add a CI Release Quality Gate that runs the full catalog (ADR-0025 / ADR-0011).
 

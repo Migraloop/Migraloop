@@ -1,11 +1,13 @@
 //! Lab Scenario catalog, recipe-driven run orchestration, and Namespace cleanup
-//! (issues #60–#66, #63, #85, #86, #157, #173 / ADR-0025).
+//! (issues #60–#66, #63, #85, #86, #157, #173, #201 / ADR-0025).
 //!
-//! Recipe-driven runner (`runner.rs`): `recipe.yaml` workload / optional
-//! `product_path` / checks / thresholds are the live interface. Scenarios with
-//! `workload.product_path` use shared prepare→apply→mutate→sync→assert steps;
-//! thin hooks supply Namespace seeds, rare escapes, and correctness asserts.
-//! All shipped Scenarios use shared product-path steps with thin hooks.
+//! Recipe-driven runner (`runner.rs` + `namespace.rs`): `recipe.yaml` workload /
+//! optional `product_path` / Namespace lifecycle / checks / thresholds are the
+//! live interface. Scenarios with `workload.product_path` use shared
+//! prepare→apply→mutate→sync→assert steps; `namespace.lifecycle` drives wipe /
+//! CREATE / supplemental logging / seed (and optional mutate SQL). Thin hooks
+//! keep only rare escapes and correctness asserts. All shipped Scenarios use
+//! shared product-path steps with thin hooks.
 //! Lab-specific machinery: catalog listing from on-disk recipes, Scenario
 //! Namespace lifecycle (prepare / re-run wipe / manual remove / opt-in
 //! auto-remove), one-at-a-time lock, refusal of non-Lab / production engine
@@ -15,6 +17,7 @@
 //! (#86) resets Pipeline Delivery status in Platform Store so a second real
 //! `apply` re-Delivers the same Output Identities (at-least-once / upsert).
 
+mod namespace;
 mod recipe;
 mod runner;
 
@@ -38,9 +41,10 @@ use crate::lab::{
 use crate::CliError;
 use migraloop_platform_store::PlatformStore;
 
+use self::namespace::{mutate_namespace_from_recipe, prepare_namespace, wipe_namespace};
 use self::recipe::{
-    load_selectable_catalog, load_selectable_recipes, ProductPathApplyOpts, ProductPathStepKind,
-    ProductPathSyncOpts, ScenarioRecipe,
+    load_recipe, load_selectable_catalog, load_selectable_recipes, ProductPathApplyOpts,
+    ProductPathStepKind, ProductPathSyncOpts, ScenarioRecipe,
 };
 use self::runner::{
     product_path_plan, report_from_adapter_outcome, run_recipe_driven, AdapterOutcome,
@@ -108,7 +112,6 @@ const CONCURRENT_ORDERS_TABLE: &str = "LAB_CW_ORDERS";
 const CONCURRENT_CUSTOMERS_COLLECTION: &str = "lab_cw_customers";
 const CONCURRENT_ORDER_TOTALS_COLLECTION: &str = "lab_cw_order_totals";
 const CONCURRENT_ORDER_TOTALS_PIPELINE: &str = "lab-cw-order-totals";
-const CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT: &str = "lab-concurrent-source-workload";
 const CONCURRENT_SETTLE_POLL: Duration = Duration::from_secs(2);
 
 const BULK_LOAD_ID: &str = "bulk-load";
@@ -117,51 +120,40 @@ const BULK_LOAD_COLLECTION: &str = "lab_bl_items";
 const BULK_LOAD_DEPLOYMENT: &str = "lab-bulk-load";
 
 const RT_PROJECT_ID: &str = "rt-project";
-const RT_PROJECT_TABLE: &str = "LAB_RP_CUSTOMERS";
 const RT_PROJECT_COLLECTION: &str = "lab_rp_customers";
 const RT_PROJECT_PIPELINE: &str = "lab-rp-customers";
-const RT_PROJECT_DEPLOYMENT: &str = "lab-rt-project";
 
 const RT_FILTER_ID: &str = "rt-filter";
-const RT_FILTER_TABLE: &str = "LAB_RF_CUSTOMERS";
 const RT_FILTER_COLLECTION: &str = "lab_rf_customers";
 const RT_FILTER_PIPELINE: &str = "lab-rf-customers";
-const RT_FILTER_DEPLOYMENT: &str = "lab-rt-filter";
 
 const RT_FIELD_OPS_ID: &str = "rt-field-ops";
-const RT_FIELD_OPS_TABLE: &str = "LAB_RFO_CUSTOMERS";
 const RT_FIELD_OPS_COLLECTION: &str = "lab_rfo_customers";
 const RT_FIELD_OPS_PIPELINE: &str = "lab-rfo-customers";
-const RT_FIELD_OPS_DEPLOYMENT: &str = "lab-rt-field-ops";
 
 const RT_EQUILOOKUP_ID: &str = "rt-equilookup";
 const RT_EQUILOOKUP_CUSTOMERS_TABLE: &str = "LAB_REL_CUSTOMERS";
 const RT_EQUILOOKUP_ORDERS_TABLE: &str = "LAB_REL_ORDERS";
 const RT_EQUILOOKUP_COLLECTION: &str = "lab_rel_customers";
 const RT_EQUILOOKUP_PIPELINE: &str = "lab-rel-customers";
-const RT_EQUILOOKUP_DEPLOYMENT: &str = "lab-rt-equilookup";
 
 const RT_UNION_ID: &str = "rt-union";
 const RT_UNION_EAST_TABLE: &str = "LAB_RNU_EAST";
 const RT_UNION_WEST_TABLE: &str = "LAB_RNU_WEST";
 const RT_UNION_COLLECTION: &str = "lab_rnu_customers";
 const RT_UNION_PIPELINE: &str = "lab-rnu-customers";
-const RT_UNION_DEPLOYMENT: &str = "lab-rt-union";
 
 const RT_UNWIND_ID: &str = "rt-unwind";
 const RT_UNWIND_CUSTOMERS_TABLE: &str = "LAB_RU_CUSTOMERS";
 const RT_UNWIND_ORDERS_TABLE: &str = "LAB_RU_ORDERS";
 const RT_UNWIND_COLLECTION: &str = "lab_ru_orders";
 const RT_UNWIND_PIPELINE: &str = "lab-ru-orders";
-const RT_UNWIND_DEPLOYMENT: &str = "lab-rt-unwind";
 
 const RT_DISTINCT_ADDTOSET_ID: &str = "rt-distinct-addtoset";
-const RT_DISTINCT_ADDTOSET_TABLE: &str = "LAB_RDA_ORDERS";
 const RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION: &str = "lab_rda_distinct_customers";
 const RT_DISTINCT_ADDTOSET_ADD_COLLECTION: &str = "lab_rda_amounts_by_customer";
 const RT_DISTINCT_ADDTOSET_DISTINCT_PIPELINE: &str = "lab-rda-distinct-customers";
 const RT_DISTINCT_ADDTOSET_ADD_PIPELINE: &str = "lab-rda-amounts-by-customer";
-const RT_DISTINCT_ADDTOSET_DEPLOYMENT: &str = "lab-rt-distinct-addtoset";
 
 const IDEMPOTENT_REDELIVERY_ID: &str = "idempotent-redelivery";
 const IDEMPOTENT_REDELIVERY_TABLE: &str = "LAB_IR_CUSTOMERS";
@@ -194,42 +186,33 @@ const CHANGE_PIPELINE_ACTIVE_COLLECTION: &str = "lab_cp_active_customers";
 const CHANGE_PIPELINE_REPORTING_COLLECTION: &str = "lab_cp_customers_reporting";
 const CHANGE_PIPELINE_ACTIVE_PIPELINE: &str = "lab-cp-active-customers";
 const CHANGE_PIPELINE_REPORTING_PIPELINE: &str = "lab-cp-customers-reporting";
-const CHANGE_PIPELINE_DEPLOYMENT: &str = "lab-change-pipeline";
 const CHANGE_PIPELINE_SEMANTIC_CONFIG: &str = "deployment-semantic.yaml";
 const CHANGE_PIPELINE_METADATA_CONFIG: &str = "deployment-metadata.yaml";
 
 const POISON_QUARANTINE_ID: &str = "poison-quarantine";
-const POISON_QUARANTINE_TABLE: &str = "LAB_PQ_CUSTOMERS";
 const POISON_QUARANTINE_COLLECTION: &str = "lab_pq_customers";
 const POISON_QUARANTINE_PIPELINE: &str = "lab-pq-customers";
-const POISON_QUARANTINE_DEPLOYMENT: &str = "lab-poison-quarantine";
 /// Lab orchestration: force Delivery failure for Output Identity 1 so quarantine runs.
 const POISON_QUARANTINE_IDENTITY: &str = "1";
 const POISON_QUARANTINE_MAX_ATTEMPTS: &str = "2";
 
 const SCHEMA_CHANGE_PAUSE_ID: &str = "schema-change-pause";
 const SCHEMA_CHANGE_PAUSE_TABLE: &str = "LAB_SC_CUSTOMERS";
-const SCHEMA_CHANGE_PAUSE_COLLECTION: &str = "lab_sc_customers";
 const SCHEMA_CHANGE_PAUSE_PIPELINE: &str = "lab-sc-customers";
-const SCHEMA_CHANGE_PAUSE_DEPLOYMENT: &str = "lab-schema-change-pause";
 
 const SOURCE_ALIGNMENT_ID: &str = "source-alignment";
 const SOURCE_ALIGNMENT_TABLE: &str = "LAB_SA_CUSTOMERS";
-const SOURCE_ALIGNMENT_COLLECTION: &str = "lab_sa_customers";
-const SOURCE_ALIGNMENT_DEPLOYMENT: &str = "lab-source-alignment";
 
 const DRIFT_CHECK_ID: &str = "drift-check";
 const DRIFT_CHECK_TABLE: &str = "LAB_DC_CUSTOMERS";
 const DRIFT_CHECK_COLLECTION: &str = "lab_dc_customers";
 const DRIFT_CHECK_PIPELINE: &str = "lab-dc-customers";
-const DRIFT_CHECK_DEPLOYMENT: &str = "lab-drift-check";
 const DRIFT_CHECK_EXTRA_FIELD: &str = "keep-me-non-managed";
 
 const BOUNDED_BACKPRESSURE_ID: &str = "bounded-backpressure";
 const BOUNDED_BACKPRESSURE_TABLE: &str = "LAB_BP_CUSTOMERS";
 const BOUNDED_BACKPRESSURE_COLLECTION: &str = "lab_bp_customers";
 const BOUNDED_BACKPRESSURE_PIPELINE: &str = "lab-bp-customers";
-const BOUNDED_BACKPRESSURE_DEPLOYMENT: &str = "lab-bounded-backpressure";
 /// Lab orchestration: tiny Incremental window + Downstream Delivery delay.
 const BOUNDED_BACKPRESSURE_CAPACITY: &str = "2";
 const BOUNDED_BACKPRESSURE_DELAY_MS: &str = "80";
@@ -238,31 +221,22 @@ const BOUNDED_BACKPRESSURE_BACKLOG: i64 = 20;
 
 const OBSERVABILITY_SURFACE_ID: &str = "observability-surface";
 const OBSERVABILITY_SURFACE_TABLE: &str = "LAB_OBS_CUSTOMERS";
-const OBSERVABILITY_SURFACE_COLLECTION: &str = "lab_obs_customers";
 const OBSERVABILITY_SURFACE_PIPELINE: &str = "lab-obs-customers";
-const OBSERVABILITY_SURFACE_DEPLOYMENT: &str = "lab-observability-surface";
 const OBSERVABILITY_SURFACE_CAPACITY: &str = "2";
 const OBSERVABILITY_SURFACE_DELAY_MS: &str = "80";
 const OBSERVABILITY_SURFACE_FAIL_AFTER: &str = "1";
 const OBSERVABILITY_SURFACE_BACKLOG: i64 = 20;
 
 const PLATFORM_STORE_GUARDRAILS_ID: &str = "platform-store-guardrails";
-const PLATFORM_STORE_GUARDRAILS_TABLE: &str = "LAB_GUARD_CUSTOMERS";
-const PLATFORM_STORE_GUARDRAILS_COLLECTION: &str = "lab_guard_customers";
-const PLATFORM_STORE_GUARDRAILS_DEPLOYMENT: &str = "lab-platform-store-guardrails";
 /// 512 MiB — below the 1 GiB product warn threshold (ADR-0010).
 const PLATFORM_STORE_GUARDRAILS_LOW_DISK_BYTES: &str = "536870912";
 
 const BACKWARD_COMPATIBLE_UPGRADES_ID: &str = "backward-compatible-upgrades";
 const BACKWARD_COMPATIBLE_UPGRADES_TABLE: &str = "LAB_UPG_CUSTOMERS";
-const BACKWARD_COMPATIBLE_UPGRADES_COLLECTION: &str = "lab_upg_customers";
 const BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT: &str = "lab-backward-compatible-upgrades";
 const BACKWARD_COMPATIBLE_UPGRADES_OLDER_CONFIG: &str = "deployment-v1.0.0.yaml";
 
 const INITIAL_LOAD_THROTTLED_ID: &str = "initial-load-throttled";
-const INITIAL_LOAD_THROTTLED_TABLE: &str = "LAB_IL_ITEMS";
-const INITIAL_LOAD_THROTTLED_COLLECTION: &str = "lab_il_items";
-const INITIAL_LOAD_THROTTLED_DEPLOYMENT: &str = "lab-initial-load-throttled";
 /// Non-trivial Source volume for chunked Initial Load (issue #124).
 const INITIAL_LOAD_THROTTLED_ROW_COUNT: i64 = 500;
 const INITIAL_LOAD_THROTTLED_CHUNK_SIZE: &str = "50";
@@ -690,37 +664,14 @@ async fn scenario_remove(scenario: &str, lab_dir: &Path) -> Result<(), CliError>
 }
 
 async fn remove_scenario_namespace(scenario: &str, lab_dir: &Path) -> Result<(), CliError> {
-    match scenario {
-        DIRECT_PIPELINE_ID => remove_direct_pipeline_namespace(lab_dir).await,
-        TRANSFORM_PIPELINE_ID => remove_transform_pipeline_namespace(lab_dir).await,
-        RT_PROJECT_ID => remove_rt_project_namespace(lab_dir).await,
-        RT_FILTER_ID => remove_rt_filter_namespace(lab_dir).await,
-        RT_FIELD_OPS_ID => remove_rt_field_ops_namespace(lab_dir).await,
-        RT_EQUILOOKUP_ID => remove_rt_equilookup_namespace(lab_dir).await,
-        RT_UNION_ID => remove_rt_union_namespace(lab_dir).await,
-        RT_UNWIND_ID => remove_rt_unwind_namespace(lab_dir).await,
-        RT_DISTINCT_ADDTOSET_ID => remove_rt_distinct_addtoset_namespace(lab_dir).await,
-        CONCURRENT_SOURCE_WORKLOAD_ID => remove_concurrent_source_namespace(lab_dir).await,
-        BULK_LOAD_ID => remove_bulk_load_namespace(lab_dir).await,
-        IDEMPOTENT_REDELIVERY_ID => remove_idempotent_redelivery_namespace(lab_dir).await,
-        PAUSE_RESUME_ID => remove_pause_resume_namespace(lab_dir).await,
-        REMOVE_PIPELINE_ID => remove_remove_pipeline_namespace(lab_dir).await,
-        CHANGE_PIPELINE_ID => remove_change_pipeline_namespace(lab_dir).await,
-        POISON_QUARANTINE_ID => remove_poison_quarantine_namespace(lab_dir).await,
-        SCHEMA_CHANGE_PAUSE_ID => remove_schema_change_pause_namespace(lab_dir).await,
-        SOURCE_ALIGNMENT_ID => remove_source_alignment_namespace(lab_dir).await,
-        DRIFT_CHECK_ID => remove_drift_check_namespace(lab_dir).await,
-        BOUNDED_BACKPRESSURE_ID => remove_bounded_backpressure_namespace(lab_dir).await,
-        OBSERVABILITY_SURFACE_ID => remove_observability_surface_namespace(lab_dir).await,
-        PLATFORM_STORE_GUARDRAILS_ID => remove_platform_store_guardrails_namespace(lab_dir).await,
-        BACKWARD_COMPATIBLE_UPGRADES_ID => {
-            remove_backward_compatible_upgrades_namespace(lab_dir).await
-        }
-        INITIAL_LOAD_THROTTLED_ID => remove_initial_load_throttled_namespace(lab_dir).await,
-        _ => Err(CliError::Failed(format!(
-            "Lab Scenario `{scenario}` is listed but has no Namespace remove path"
-        ))),
+    let recipe_path = lab_dir.join("scenarios").join(scenario).join("recipe.yaml");
+    if !recipe_path.is_file() {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario `{scenario}` is listed but has no recipe.yaml for Namespace remove"
+        )));
     }
+    let recipe = load_recipe(&recipe_path)?;
+    wipe_namespace(lab_dir, &recipe.namespace).await
 }
 
 fn scenario_failure_kind(correctness: bool, thresholds_ok: bool) -> &'static str {
@@ -1025,7 +976,8 @@ struct ProductPathRunContext {
     apply_started: Option<Instant>,
 }
 
-/// Thin Scenario hooks for seed SQL, rare escapes, and correctness (#173 / #178).
+/// Thin Scenario hooks for rare escapes and correctness (#173 / #178 / #201).
+/// Namespace wipe/prepare/seed (and optional mutate SQL) live in `namespace.lifecycle`.
 enum ProductPathHooks {
     DirectPipeline,
     RtProject,
@@ -1102,37 +1054,6 @@ impl ProductPathHooks {
                 vec![],
             ),
             _ => (vec![], vec![]),
-        }
-    }
-
-    async fn prepare(&self, lab_dir: &Path) -> Result<(), CliError> {
-        match self {
-            Self::DirectPipeline => prepare_direct_pipeline_namespace(lab_dir).await,
-            Self::RtProject => prepare_rt_project_namespace(lab_dir).await,
-            Self::RtFilter => prepare_rt_filter_namespace(lab_dir).await,
-            Self::RtFieldOps => prepare_rt_field_ops_namespace(lab_dir).await,
-            Self::RtEquilookup => prepare_rt_equilookup_namespace(lab_dir).await,
-            Self::RtUnion => prepare_rt_union_namespace(lab_dir).await,
-            Self::RtUnwind => prepare_rt_unwind_namespace(lab_dir).await,
-            Self::RtDistinctAddtoset => prepare_rt_distinct_addtoset_namespace(lab_dir).await,
-            Self::PoisonQuarantine => prepare_poison_quarantine_namespace(lab_dir).await,
-            Self::TransformPipeline => prepare_transform_pipeline_namespace(lab_dir).await,
-            Self::ConcurrentSourceWorkload => prepare_concurrent_source_namespace(lab_dir).await,
-            Self::BulkLoad => prepare_bulk_load_namespace(lab_dir).await,
-            Self::IdempotentRedelivery => prepare_idempotent_redelivery_namespace(lab_dir).await,
-            Self::PauseResume => prepare_pause_resume_namespace(lab_dir).await,
-            Self::RemovePipeline => prepare_remove_pipeline_namespace(lab_dir).await,
-            Self::ChangePipeline => prepare_change_pipeline_namespace(lab_dir).await,
-            Self::SchemaChangePause => prepare_schema_change_pause_namespace(lab_dir).await,
-            Self::SourceAlignment => prepare_source_alignment_namespace(lab_dir).await,
-            Self::DriftCheck => prepare_drift_check_namespace(lab_dir).await,
-            Self::BoundedBackpressure => prepare_bounded_backpressure_namespace(lab_dir).await,
-            Self::ObservabilitySurface => prepare_observability_surface_namespace(lab_dir).await,
-            Self::PlatformStoreGuardrails => prepare_platform_store_guardrails_namespace(lab_dir).await,
-            Self::BackwardCompatibleUpgrades => {
-                prepare_backward_compatible_upgrades_namespace(lab_dir).await
-            }
-            Self::InitialLoadThrottled => prepare_initial_load_throttled_namespace(lab_dir).await,
         }
     }
 
@@ -1623,89 +1544,50 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
         }
     }
 
+    /// Rare mutate escapes after shared `namespace.lifecycle.mutate_sql` (when set).
+    /// Isomorphic SQL mutates are recipe-driven; this stays for CLI verbs, parallel
+    /// sessions, generated backlog, and other non-recipe patterns.
     async fn mutate(&self, lab_dir: &Path) -> Result<(), CliError> {
         match self {
-            Self::DirectPipeline | Self::RtProject | Self::RtFilter | Self::RtFieldOps => {
-                println!("Lab Scenario: driving Source insert/update/delete...");
-            }
-            Self::RtEquilookup | Self::RtUnwind => {
-                println!("Lab Scenario: driving Source primary + foreign mutations...");
-            }
-            Self::RtUnion => {
-                println!("Lab Scenario: driving Source east + west mutations...");
-            }
-            Self::RtDistinctAddtoset => {
-                println!("Lab Scenario: driving Source mutations (unused/duplicate/new/key-move)...");
-            }
-            Self::PoisonQuarantine => {
-                println!("Lab Scenario: driving Source mutations (update/insert/delete)...");
-            }
-            Self::TransformPipeline => {
-                println!("Lab Scenario: driving multi-table Source insert/update/delete...");
-            }
+            // Recipe-driven mutate_sql already applied by the shared Namespace lifecycle.
+            Self::DirectPipeline
+            | Self::RtProject
+            | Self::RtFilter
+            | Self::RtFieldOps
+            | Self::RtEquilookup
+            | Self::RtUnion
+            | Self::RtUnwind
+            | Self::RtDistinctAddtoset
+            | Self::PoisonQuarantine
+            | Self::TransformPipeline
+            | Self::IdempotentRedelivery
+            | Self::SchemaChangePause
+            | Self::SourceAlignment
+            | Self::BulkLoad
+            | Self::PlatformStoreGuardrails
+            | Self::BackwardCompatibleUpgrades
+            | Self::InitialLoadThrottled => Ok(()),
             Self::ConcurrentSourceWorkload => {
                 println!(
                     "Lab Scenario: driving concurrent Source workload \
 (parallel customers + orders sessions)..."
                 );
+                mutate_concurrent_source_workload(lab_dir).await
             }
             Self::BoundedBackpressure => {
                 println!(
                     "Lab Scenario: inserting Source backlog ({BOUNDED_BACKPRESSURE_BACKLOG} rows)..."
                 );
+                insert_bounded_backpressure_backlog(lab_dir).await
             }
             Self::ObservabilitySurface => {
                 println!(
                     "Lab Scenario: inserting Source backlog ({OBSERVABILITY_SURFACE_BACKLOG} rows)..."
                 );
+                insert_observability_surface_backlog(lab_dir).await
             }
             Self::PauseResume => {
                 println!("Lab Scenario: pause Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE} via CLI...");
-            }
-            Self::RemovePipeline => {
-                println!("Lab Scenario: remove Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} via CLI...");
-            }
-            Self::ChangePipeline => {
-                println!(
-                    "Lab Scenario: apply semantic Transform revision (ACTIVE==0) via real product path..."
-                );
-            }
-            Self::SchemaChangePause => {
-                println!(
-                    "Lab Scenario: driving Source DDL (DROP COLUMN NAME on {SCHEMA_CHANGE_PAUSE_TABLE})..."
-                );
-            }
-            Self::SourceAlignment => {
-                println!(
-                    "Lab Scenario: mutating Source ID=1 → AlignedAlice (controlled Base≠Source; no sync)..."
-                );
-            }
-            Self::DriftCheck => {
-                println!("Lab Scenario: align Base as trusted Drift baseline...");
-            }
-            Self::IdempotentRedelivery => {
-                println!("Lab Scenario: driving Source insert/update/delete...");
-            }
-            Self::BulkLoad
-            | Self::PlatformStoreGuardrails
-            | Self::BackwardCompatibleUpgrades
-            | Self::InitialLoadThrottled => {}
-        }
-        match self {
-            Self::DirectPipeline => mutate_direct_pipeline_source(lab_dir).await,
-            Self::RtProject => mutate_rt_project_source(lab_dir).await,
-            Self::RtFilter => mutate_rt_filter_source(lab_dir).await,
-            Self::RtFieldOps => mutate_rt_field_ops_source(lab_dir).await,
-            Self::RtEquilookup => mutate_rt_equilookup_source(lab_dir).await,
-            Self::RtUnion => mutate_rt_union_source(lab_dir).await,
-            Self::RtUnwind => mutate_rt_unwind_source(lab_dir).await,
-            Self::RtDistinctAddtoset => mutate_rt_distinct_addtoset_source(lab_dir).await,
-            Self::PoisonQuarantine => mutate_poison_quarantine_source(lab_dir).await,
-            Self::TransformPipeline => mutate_transform_pipeline_source(lab_dir).await,
-            Self::ConcurrentSourceWorkload => mutate_concurrent_source_workload(lab_dir).await,
-            Self::BulkLoad => Ok(()),
-            Self::IdempotentRedelivery => mutate_idempotent_redelivery_source(lab_dir).await,
-            Self::PauseResume => {
                 let bin = lab_migraloop_bin();
                 let pause_out = run_product_cli(
                     &bin,
@@ -1729,6 +1611,9 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 mutate_pause_resume_source(lab_dir).await
             }
             Self::RemovePipeline => {
+                println!(
+                    "Lab Scenario: remove Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} via CLI..."
+                );
                 let bin = lab_migraloop_bin();
                 let remove_out = run_product_cli(
                     &bin,
@@ -1753,7 +1638,9 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                     &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
                 )
                 .await?;
-                if status_after_remove.contains(&format!("Pipeline: {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} (")) {
+                if status_after_remove
+                    .contains(&format!("Pipeline: {REMOVE_PIPELINE_CUSTOMERS_PIPELINE} ("))
+                {
                     return Err(CliError::Failed(format!(
                         "status must no longer list removed Pipeline as active:\n{status_after_remove}"
                     )));
@@ -1765,7 +1652,8 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                         "status must still list remaining Pipeline:\n{status_after_remove}"
                     )));
                 }
-                if !status_after_remove.contains(&format!("Base Dataset: {REMOVE_PIPELINE_CUSTOMERS_TABLE}"))
+                if !status_after_remove
+                    .contains(&format!("Base Dataset: {REMOVE_PIPELINE_CUSTOMERS_TABLE}"))
                 {
                     return Err(CliError::Failed(format!(
                         "Shared Base must remain after remove:\n{status_after_remove}"
@@ -1780,9 +1668,15 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 mutate_remove_pipeline_source(lab_dir).await
             }
             Self::ChangePipeline => {
+                println!(
+                    "Lab Scenario: apply semantic Transform revision (ACTIVE==0) via real product path..."
+                );
                 let bin = lab_migraloop_bin();
-                let semantic_config =
-                    scenario_config_path(lab_dir, CHANGE_PIPELINE_ID, CHANGE_PIPELINE_SEMANTIC_CONFIG)?;
+                let semantic_config = scenario_config_path(
+                    lab_dir,
+                    CHANGE_PIPELINE_ID,
+                    CHANGE_PIPELINE_SEMANTIC_CONFIG,
+                )?;
                 let apply_v2 = run_product_cli(
                     &bin,
                     &[
@@ -1906,9 +1800,8 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 }
                 Ok(())
             }
-            Self::SchemaChangePause => mutate_schema_change_pause_source_ddl(lab_dir).await,
-            Self::SourceAlignment => mutate_source_alignment_name(lab_dir, 1, "AlignedAlice").await,
             Self::DriftCheck => {
+                println!("Lab Scenario: align Base as trusted Drift baseline...");
                 let bin = lab_migraloop_bin();
                 let align_out = run_product_cli(
                     &bin,
@@ -1930,11 +1823,6 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                     "Lab Scenario: mutating Target Managed NAME→DRIFTED + planting non-Managed EXTRA..."
                 );
                 plant_drift_check_target_drift(lab_dir, 1, "DRIFTED", true).await
-            }
-            Self::BoundedBackpressure => insert_bounded_backpressure_backlog(lab_dir).await,
-            Self::ObservabilitySurface => insert_observability_surface_backlog(lab_dir).await,
-            Self::PlatformStoreGuardrails | Self::BackwardCompatibleUpgrades | Self::InitialLoadThrottled => {
-                Ok(())
             }
         }
     }
@@ -4500,7 +4388,7 @@ async fn run_product_path_scenario(
     for step in steps {
         match step {
             ProductPathStepKind::PrepareNamespace => {
-                hooks.prepare(lab_dir).await?;
+                prepare_namespace(lab_dir, recipe).await?;
                 println!(
                     "Lab Scenario: Scenario Namespace prepared (schema + seed + supplemental logging)"
                 );
@@ -4519,6 +4407,9 @@ async fn run_product_path_scenario(
                 hooks.after_apply(lab_dir, &ctx.apply_out).await?;
             }
             ProductPathStepKind::Mutate => {
+                if mutate_namespace_from_recipe(lab_dir, recipe).await? {
+                    println!("Lab Scenario: driving Source mutations from recipe lifecycle...");
+                }
                 hooks.mutate(lab_dir).await?;
             }
             ProductPathStepKind::ProductSync => {
@@ -4762,133 +4653,8 @@ fn inspect_mentions_amount(inspect: &str, amount: &str) -> bool {
 /// Fully remove Transform Pipeline Scenario Namespace (Source tables, Target
 /// collections, Platform Store Deployment + cascaded Bases/Derived/Pipelines).
 /// Idempotent.
-async fn remove_transform_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (tables={TRANSFORM_CUSTOMERS_TABLE},{TRANSFORM_ORDERS_TABLE}, \
-          collections={TRANSFORM_CUSTOMERS_COLLECTION},{TRANSFORM_ORDER_TOTALS_COLLECTION}, \
-          deployment={TRANSFORM_PIPELINE_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {TRANSFORM_ORDERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {TRANSFORM_CUSTOMERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace tables \
-                 {TRANSFORM_CUSTOMERS_TABLE}/{TRANSFORM_ORDERS_TABLE}:\n{err}"
-            ))
-        })?;
 
-    for collection in [
-        TRANSFORM_CUSTOMERS_COLLECTION,
-        TRANSFORM_ORDER_TOTALS_COLLECTION,
-    ] {
-        let js = format!("db.getCollection('{collection}').drop()");
-        mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Mongo Scenario Namespace collection {collection}:\n{err}"
-            ))
-        })?;
-    }
-
-    lab_delete_deployment(TRANSFORM_PIPELINE_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{TRANSFORM_PIPELINE_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_transform_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    // Re-run wipe-before-recreate: fully remove leftovers, then create fresh Namespace.
-    remove_transform_pipeline_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {TRANSFORM_CUSTOMERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {TRANSFORM_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-CREATE TABLE {TRANSFORM_ORDERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
-  AMOUNT NUMBER(10) NOT NULL,\n\
-  NOTE VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {TRANSFORM_ORDERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {TRANSFORM_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
-INSERT INTO {TRANSFORM_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
-INSERT INTO {TRANSFORM_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (1, 1, 10, 'seed-a');\n\
-INSERT INTO {TRANSFORM_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (2, 1, 20, 'seed-b');\n\
-INSERT INTO {TRANSFORM_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (3, 2, 5, 'seed-c');\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare Transform Pipeline Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn mutate_transform_pipeline_source(lab_dir: &Path) -> Result<(), CliError> {
-    // Multi-table Source workload:
-    // - customers: UPDATE Alice→Alicia, INSERT Carol, DELETE Bob
-    // - orders: INSERT amount 15 for cust 1, UPDATE cust 2 amount 5→50, DELETE order 1
-    // Expected order totals after sync: cust1=35 (20+15), cust2=50
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {TRANSFORM_CUSTOMERS_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
-INSERT INTO {TRANSFORM_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (3, 'Carol', 'carol@example.com');\n\
-DELETE FROM {TRANSFORM_CUSTOMERS_TABLE} WHERE ID = 2;\n\
-INSERT INTO {TRANSFORM_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (4, 1, 15, 'new');\n\
-UPDATE {TRANSFORM_ORDERS_TABLE} SET AMOUNT = 50, NOTE = 'bumped' WHERE ID = 3;\n\
-DELETE FROM {TRANSFORM_ORDERS_TABLE} WHERE ID = 1;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive multi-table Source insert/update/delete for Lab Scenario:\n{err}"
-            ))
-        })
-}
 
 /// True when inspect output exposes an EMAIL Managed field key (not merely the substring).
 fn inspect_mentions_email_field(inspect: &str) -> bool {
@@ -4898,850 +4664,30 @@ fn inspect_mentions_email_field(inspect: &str) -> bool {
         || inspect.contains("'email'")
 }
 
-async fn remove_rt_project_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={RT_PROJECT_TABLE}, collection={RT_PROJECT_COLLECTION}, \
-          deployment={RT_PROJECT_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_PROJECT_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table {RT_PROJECT_TABLE}:\n{err}"
-            ))
-        })?;
 
-    let js = format!("db.getCollection('{RT_PROJECT_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {RT_PROJECT_COLLECTION}:\n{err}"
-        ))
-    })?;
 
-    lab_delete_deployment(RT_PROJECT_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{RT_PROJECT_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
 
-    Ok(())
-}
 
-async fn prepare_rt_project_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_rt_project_namespace(lab_dir).await?;
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {RT_PROJECT_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {RT_PROJECT_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {RT_PROJECT_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
-INSERT INTO {RT_PROJECT_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare rt-project Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
-async fn mutate_rt_project_source(lab_dir: &Path) -> Result<(), CliError> {
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {RT_PROJECT_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
-INSERT INTO {RT_PROJECT_TABLE} (ID, NAME, EMAIL) VALUES (3, 'Carol', 'carol@example.com');\n\
-DELETE FROM {RT_PROJECT_TABLE} WHERE ID = 2;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source insert/update/delete for rt-project Lab Scenario:\n{err}"
-            ))
-        })
-}
 
-async fn remove_rt_filter_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={RT_FILTER_TABLE}, collection={RT_FILTER_COLLECTION}, \
-          deployment={RT_FILTER_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_FILTER_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table {RT_FILTER_TABLE}:\n{err}"
-            ))
-        })?;
 
-    let js = format!("db.getCollection('{RT_FILTER_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {RT_FILTER_COLLECTION}:\n{err}"
-        ))
-    })?;
 
-    lab_delete_deployment(RT_FILTER_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{RT_FILTER_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
 
-    Ok(())
-}
 
-async fn prepare_rt_filter_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_rt_filter_namespace(lab_dir).await?;
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {RT_FILTER_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1) NOT NULL\n\
-);\n\
-ALTER TABLE {RT_FILTER_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare rt-filter Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
-async fn mutate_rt_filter_source(lab_dir: &Path) -> Result<(), CliError> {
-    // Alicia stays ACTIVE=1; Bob flips 0→1 (must enter Derived); Carol ACTIVE=1;
-    // Dana ACTIVE=0 must stay filtered out.
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {RT_FILTER_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
-UPDATE {RT_FILTER_TABLE} SET ACTIVE = 1 WHERE ID = 2;\n\
-INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
-INSERT INTO {RT_FILTER_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (4, 'Dana', 'dana@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source insert/update/delete for rt-filter Lab Scenario:\n{err}"
-            ))
-        })
-}
 
 
-async fn remove_rt_field_ops_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={RT_FIELD_OPS_TABLE}, collection={RT_FIELD_OPS_COLLECTION}, \
-          deployment={RT_FIELD_OPS_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_FIELD_OPS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table {RT_FIELD_OPS_TABLE}:\n{err}"
-            ))
-        })?;
 
-    let js = format!("db.getCollection('{RT_FIELD_OPS_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {RT_FIELD_OPS_COLLECTION}:\n{err}"
-        ))
-    })?;
 
-    lab_delete_deployment(RT_FIELD_OPS_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{RT_FIELD_OPS_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
 
-    Ok(())
-}
 
-async fn prepare_rt_field_ops_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_rt_field_ops_namespace(lab_dir).await?;
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {RT_FIELD_OPS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1) NOT NULL\n\
-);\n\
-ALTER TABLE {RT_FIELD_OPS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {RT_FIELD_OPS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {RT_FIELD_OPS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare rt-field-ops Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
-async fn mutate_rt_field_ops_source(lab_dir: &Path) -> Result<(), CliError> {
-    // EMAIL-only update is unused after remove; NAME rename path must still update;
-    // Carol ACTIVE=1 enters; Bob deleted.
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {RT_FIELD_OPS_TABLE} SET EMAIL = 'alice-only@example.com' WHERE ID = 1;\n\
-UPDATE {RT_FIELD_OPS_TABLE} SET NAME = 'Alicia' WHERE ID = 1;\n\
-INSERT INTO {RT_FIELD_OPS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
-DELETE FROM {RT_FIELD_OPS_TABLE} WHERE ID = 2;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source insert/update/delete for rt-field-ops Lab Scenario:\n{err}"
-            ))
-        })
-}
-
-async fn remove_rt_equilookup_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (tables={RT_EQUILOOKUP_CUSTOMERS_TABLE},{RT_EQUILOOKUP_ORDERS_TABLE}, \
-          collection={RT_EQUILOOKUP_COLLECTION}, deployment={RT_EQUILOOKUP_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_EQUILOOKUP_ORDERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_EQUILOOKUP_CUSTOMERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace tables for rt-equilookup:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{RT_EQUILOOKUP_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {RT_EQUILOOKUP_COLLECTION}:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(RT_EQUILOOKUP_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{RT_EQUILOOKUP_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_rt_equilookup_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_rt_equilookup_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {RT_EQUILOOKUP_CUSTOMERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {RT_EQUILOOKUP_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-CREATE TABLE {RT_EQUILOOKUP_ORDERS_TABLE} (\n\
-  ORDER_ID NUMBER(10) PRIMARY KEY,\n\
-  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
-  AMOUNT NUMBER(12,2) NOT NULL\n\
-);\n\
-ALTER TABLE {RT_EQUILOOKUP_ORDERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {RT_EQUILOOKUP_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
-INSERT INTO {RT_EQUILOOKUP_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
-INSERT INTO {RT_EQUILOOKUP_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (100, 1, 42.50);\n\
-INSERT INTO {RT_EQUILOOKUP_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (101, 1, 10.00);\n\
-INSERT INTO {RT_EQUILOOKUP_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (200, 2, 5.00);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare rt-equilookup Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn mutate_rt_equilookup_source(lab_dir: &Path) -> Result<(), CliError> {
-    // Primary NAME change + foreign AMOUNT change must both refresh the joined Derived.
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {RT_EQUILOOKUP_CUSTOMERS_TABLE} SET NAME = 'Alicia' WHERE ID = 1;\n\
-UPDATE {RT_EQUILOOKUP_ORDERS_TABLE} SET AMOUNT = 50.00 WHERE ORDER_ID = 100;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source mutations for rt-equilookup Lab Scenario:\n{err}"
-            ))
-        })
-}
-
-async fn remove_rt_union_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (tables={RT_UNION_EAST_TABLE},{RT_UNION_WEST_TABLE}, \
-          collection={RT_UNION_COLLECTION}, deployment={RT_UNION_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_UNION_WEST_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_UNION_EAST_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace tables for rt-union:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{RT_UNION_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {RT_UNION_COLLECTION}:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(RT_UNION_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{RT_UNION_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_rt_union_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_rt_union_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {RT_UNION_EAST_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {RT_UNION_EAST_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-CREATE TABLE {RT_UNION_WEST_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {RT_UNION_WEST_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {RT_UNION_EAST_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
-INSERT INTO {RT_UNION_EAST_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
-INSERT INTO {RT_UNION_WEST_TABLE} (ID, NAME, EMAIL) VALUES (10, 'Zoe', 'zoe@example.com');\n\
-INSERT INTO {RT_UNION_WEST_TABLE} (ID, NAME, EMAIL) VALUES (11, 'Wade', 'wade@example.com');\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare rt-union Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn mutate_rt_union_source(lab_dir: &Path) -> Result<(), CliError> {
-    // East + west NAME changes must both refresh the concatenated Derived.
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {RT_UNION_EAST_TABLE} SET NAME = 'Alicia' WHERE ID = 1;\n\
-UPDATE {RT_UNION_WEST_TABLE} SET NAME = 'Zora' WHERE ID = 10;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source mutations for rt-union Lab Scenario:\n{err}"
-            ))
-        })
-}
-
-async fn remove_rt_unwind_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (tables={RT_UNWIND_CUSTOMERS_TABLE},{RT_UNWIND_ORDERS_TABLE}, \
-          collection={RT_UNWIND_COLLECTION}, deployment={RT_UNWIND_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_UNWIND_ORDERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_UNWIND_CUSTOMERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace tables for rt-unwind:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{RT_UNWIND_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {RT_UNWIND_COLLECTION}:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(RT_UNWIND_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{RT_UNWIND_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_rt_unwind_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_rt_unwind_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {RT_UNWIND_CUSTOMERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {RT_UNWIND_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-CREATE TABLE {RT_UNWIND_ORDERS_TABLE} (\n\
-  ORDER_ID NUMBER(10) PRIMARY KEY,\n\
-  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
-  AMOUNT NUMBER(12,2) NOT NULL\n\
-);\n\
-ALTER TABLE {RT_UNWIND_ORDERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {RT_UNWIND_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
-INSERT INTO {RT_UNWIND_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
-INSERT INTO {RT_UNWIND_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (100, 1, 42.50);\n\
-INSERT INTO {RT_UNWIND_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (101, 1, 10.00);\n\
-INSERT INTO {RT_UNWIND_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (200, 2, 5.00);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare rt-unwind Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn mutate_rt_unwind_source(lab_dir: &Path) -> Result<(), CliError> {
-    // Primary NAME change, foreign AMOUNT change, and delete of order 101 (identity delete).
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {RT_UNWIND_CUSTOMERS_TABLE} SET NAME = 'Alicia' WHERE ID = 1;\n\
-UPDATE {RT_UNWIND_ORDERS_TABLE} SET AMOUNT = 50.00 WHERE ORDER_ID = 100;\n\
-DELETE FROM {RT_UNWIND_ORDERS_TABLE} WHERE ORDER_ID = 101;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source mutations for rt-unwind Lab Scenario:\n{err}"
-            ))
-        })
-}
-
-async fn remove_rt_distinct_addtoset_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={RT_DISTINCT_ADDTOSET_TABLE}, \
-          collections={RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION},{RT_DISTINCT_ADDTOSET_ADD_COLLECTION}, \
-          deployment={RT_DISTINCT_ADDTOSET_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {RT_DISTINCT_ADDTOSET_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for rt-distinct-addtoset:\n{err}"
-            ))
-        })?;
-
-    for collection in [
-        RT_DISTINCT_ADDTOSET_DISTINCT_COLLECTION,
-        RT_DISTINCT_ADDTOSET_ADD_COLLECTION,
-    ] {
-        let js = format!("db.getCollection('{collection}').drop()");
-        mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Mongo Scenario Namespace collection {collection}:\n{err}"
-            ))
-        })?;
-    }
-
-    lab_delete_deployment(RT_DISTINCT_ADDTOSET_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{RT_DISTINCT_ADDTOSET_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_rt_distinct_addtoset_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_rt_distinct_addtoset_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {RT_DISTINCT_ADDTOSET_TABLE} (\n\
-  ORDER_ID NUMBER(10) PRIMARY KEY,\n\
-  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
-  AMOUNT NUMBER(12,2) NOT NULL,\n\
-  ADDRESS VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {RT_DISTINCT_ADDTOSET_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
-VALUES (100, 1, 42.50, '1 Main St');\n\
-INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
-VALUES (101, 1, 10.00, '1 Main St');\n\
-INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
-VALUES (200, 2, 5.00, '2 Side Rd');\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare rt-distinct-addtoset Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn mutate_rt_distinct_addtoset_source(lab_dir: &Path) -> Result<(), CliError> {
-    // Unused ADDRESS; duplicate CUSTOMER_ID+AMOUNT; new AMOUNT; last-row key move 2→3.
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {RT_DISTINCT_ADDTOSET_TABLE} SET ADDRESS = '1 Main Ave' WHERE ORDER_ID = 100;\n\
-INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
-VALUES (102, 1, 42.50, '1 Main Ave');\n\
-INSERT INTO {RT_DISTINCT_ADDTOSET_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
-VALUES (103, 1, 7.00, '1 Main Ave');\n\
-UPDATE {RT_DISTINCT_ADDTOSET_TABLE} SET CUSTOMER_ID = 3 WHERE ORDER_ID = 200;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source mutations for rt-distinct-addtoset Lab Scenario:\n{err}"
-            ))
-        })
-}
-
-
-/// Fully remove concurrent-source-workload Scenario Namespace. Idempotent.
-async fn remove_concurrent_source_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (tables={CONCURRENT_CUSTOMERS_TABLE},{CONCURRENT_ORDERS_TABLE}, \
-          collections={CONCURRENT_CUSTOMERS_COLLECTION},{CONCURRENT_ORDER_TOTALS_COLLECTION}, \
-          deployment={CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {CONCURRENT_ORDERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {CONCURRENT_CUSTOMERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace tables \
-                 {CONCURRENT_CUSTOMERS_TABLE}/{CONCURRENT_ORDERS_TABLE}:\n{err}"
-            ))
-        })?;
-
-    for collection in [
-        CONCURRENT_CUSTOMERS_COLLECTION,
-        CONCURRENT_ORDER_TOTALS_COLLECTION,
-    ] {
-        let js = format!("db.getCollection('{collection}').drop()");
-        mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Mongo Scenario Namespace collection {collection}:\n{err}"
-            ))
-        })?;
-    }
-
-    lab_delete_deployment(CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{CONCURRENT_SOURCE_WORKLOAD_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_concurrent_source_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_concurrent_source_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {CONCURRENT_CUSTOMERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {CONCURRENT_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-CREATE TABLE {CONCURRENT_ORDERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
-  AMOUNT NUMBER(10) NOT NULL,\n\
-  NOTE VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {CONCURRENT_ORDERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {CONCURRENT_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');\n\
-INSERT INTO {CONCURRENT_CUSTOMERS_TABLE} (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');\n\
-INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (1, 1, 10, 'seed-a');\n\
-INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (2, 1, 20, 'seed-b');\n\
-INSERT INTO {CONCURRENT_ORDERS_TABLE} (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (3, 2, 5, 'seed-c');\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare concurrent Source workload Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 /// Intra-Scenario concurrent Source workload: three parallel sqlplus sessions.
 ///
@@ -5808,84 +4754,7 @@ EXIT;\n"
 
 
 /// Fully remove bulk-load Scenario Namespace. Idempotent.
-async fn remove_bulk_load_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={BULK_LOAD_TABLE}, collection={BULK_LOAD_COLLECTION}, \
-          deployment={BULK_LOAD_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {BULK_LOAD_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table {BULK_LOAD_TABLE}:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{BULK_LOAD_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {BULK_LOAD_COLLECTION}:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(BULK_LOAD_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{BULK_LOAD_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_bulk_load_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    // Re-run wipe-before-recreate: fully remove leftovers, then create fresh Namespace.
-    remove_bulk_load_namespace(lab_dir).await?;
-
-    // Bulk insert via CONNECT BY before apply so Initial Load exercises ~100k volume (US17).
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {BULK_LOAD_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  VALUE NUMBER(10) NOT NULL\n\
-);\n\
-ALTER TABLE {BULK_LOAD_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {BULK_LOAD_TABLE} (ID, NAME, VALUE)\n\
-SELECT LEVEL, 'item-' || LEVEL, MOD(LEVEL, 100)\n\
-FROM dual\n\
-CONNECT BY LEVEL <= {BULK_LOAD_ROW_COUNT};\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare bulk-load Scenario Namespace (~{BULK_LOAD_ROW_COUNT} inserts):\n{err}"
-            ))
-        })
-}
 
 fn parse_inspect_row_count(inspect: &str) -> Option<u64> {
     for line in inspect.lines() {
@@ -5947,207 +4816,11 @@ fn parse_labeled_i32(line: &str, label: &str) -> Option<i32> {
     digits.parse().ok()
 }
 
-/// Fully remove Direct Pipeline Scenario Namespace (Source table, Target collection,
 /// Platform Store Deployment + cascaded Bases/Pipelines). Idempotent.
-async fn remove_direct_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={DIRECT_PIPELINE_TABLE}, collection={DIRECT_PIPELINE_COLLECTION}, \
-          deployment={DIRECT_PIPELINE_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {DIRECT_PIPELINE_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table {DIRECT_PIPELINE_TABLE}:\n{err}"
-            ))
-        })?;
 
-    let js = format!("db.getCollection('{DIRECT_PIPELINE_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {DIRECT_PIPELINE_COLLECTION}:\n{err}"
-        ))
-    })?;
 
-    lab_delete_deployment(DIRECT_PIPELINE_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{DIRECT_PIPELINE_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
 
-    Ok(())
-}
-
-async fn prepare_direct_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    // Re-run wipe-before-recreate: fully remove leftovers, then create fresh Namespace.
-    remove_direct_pipeline_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {DIRECT_PIPELINE_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {DIRECT_PIPELINE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {DIRECT_PIPELINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {DIRECT_PIPELINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare Direct Pipeline Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn mutate_direct_pipeline_source(lab_dir: &Path) -> Result<(), CliError> {
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {DIRECT_PIPELINE_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
-INSERT INTO {DIRECT_PIPELINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
-DELETE FROM {DIRECT_PIPELINE_TABLE} WHERE ID = 2;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source insert/update/delete for Lab Scenario:\n{err}"
-            ))
-        })
-}
-
-/// Issue #86 / PRD #55 US49: exercise at-least-once Delivery via duplicate-safe re-Delivery
-/// on the real product apply path inside a Scenario Namespace.
-
-/// Issue #19 / ADR-0007: pause stops Delivery for one Pipeline; resume catch-up
-/// from durable Base; other Pipelines keep Delivering on the real product path.
-
-async fn remove_pause_resume_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (tables={PAUSE_RESUME_CUSTOMERS_TABLE},{PAUSE_RESUME_ORDERS_TABLE}, \
-          collections={PAUSE_RESUME_CUSTOMERS_COLLECTION},{PAUSE_RESUME_ORDERS_COLLECTION}, \
-          deployment={PAUSE_RESUME_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {PAUSE_RESUME_CUSTOMERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {PAUSE_RESUME_ORDERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace tables for pause-resume:\n{err}"
-            ))
-        })?;
-
-    let js = format!(
-        "db.getCollection('{PAUSE_RESUME_CUSTOMERS_COLLECTION}').drop();\n\
-db.getCollection('{PAUSE_RESUME_ORDERS_COLLECTION}').drop();"
-    );
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collections for pause-resume:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(PAUSE_RESUME_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{PAUSE_RESUME_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_pause_resume_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_pause_resume_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {PAUSE_RESUME_CUSTOMERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {PAUSE_RESUME_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {PAUSE_RESUME_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {PAUSE_RESUME_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-CREATE TABLE {PAUSE_RESUME_ORDERS_TABLE} (\n\
-  ORDER_ID NUMBER(10) PRIMARY KEY,\n\
-  CUSTOMER_ID NUMBER(10) NOT NULL,\n\
-  AMOUNT NUMBER(12,2) NOT NULL,\n\
-  ADDRESS VARCHAR2(200)\n\
-);\n\
-ALTER TABLE {PAUSE_RESUME_ORDERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {PAUSE_RESUME_ORDERS_TABLE} (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) \
-VALUES (100, 1, 42.50, '1 Main St');\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare pause-resume Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 async fn mutate_pause_resume_source(lab_dir: &Path) -> Result<(), CliError> {
     let sql = format!(
@@ -6171,255 +4844,15 @@ EXIT;\n"
         })
 }
 
-async fn remove_poison_quarantine_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={POISON_QUARANTINE_TABLE}, collection={POISON_QUARANTINE_COLLECTION}, \
-          deployment={POISON_QUARANTINE_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {POISON_QUARANTINE_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for poison-quarantine:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{POISON_QUARANTINE_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for poison-quarantine:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(POISON_QUARANTINE_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{POISON_QUARANTINE_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_poison_quarantine_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_poison_quarantine_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {POISON_QUARANTINE_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {POISON_QUARANTINE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {POISON_QUARANTINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {POISON_QUARANTINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare poison-quarantine Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn mutate_poison_quarantine_source(lab_dir: &Path) -> Result<(), CliError> {
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {POISON_QUARANTINE_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
-INSERT INTO {POISON_QUARANTINE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
-DELETE FROM {POISON_QUARANTINE_TABLE} WHERE ID = 2;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source mutations for poison-quarantine:\n{err}"
-            ))
-        })
-}
 
 
 
 
-async fn remove_initial_load_throttled_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={INITIAL_LOAD_THROTTLED_TABLE}, collection={INITIAL_LOAD_THROTTLED_COLLECTION}, \
-          deployment={INITIAL_LOAD_THROTTLED_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {INITIAL_LOAD_THROTTLED_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for initial-load-throttled:\n{err}"
-            ))
-        })?;
 
-    let js = format!("db.getCollection('{INITIAL_LOAD_THROTTLED_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for initial-load-throttled:\n{err}"
-        ))
-    })?;
 
-    lab_delete_deployment(INITIAL_LOAD_THROTTLED_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{INITIAL_LOAD_THROTTLED_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
 
-    Ok(())
-}
 
-async fn prepare_initial_load_throttled_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_initial_load_throttled_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {INITIAL_LOAD_THROTTLED_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  LABEL VARCHAR2(100) NOT NULL\n\
-);\n\
-ALTER TABLE {INITIAL_LOAD_THROTTLED_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {INITIAL_LOAD_THROTTLED_TABLE} (ID, LABEL)\n\
-SELECT LEVEL, 'item' || LEVEL FROM DUAL CONNECT BY LEVEL <= {INITIAL_LOAD_THROTTLED_ROW_COUNT};\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare initial-load-throttled Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn remove_bounded_backpressure_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={BOUNDED_BACKPRESSURE_TABLE}, collection={BOUNDED_BACKPRESSURE_COLLECTION}, \
-          deployment={BOUNDED_BACKPRESSURE_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {BOUNDED_BACKPRESSURE_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for bounded-backpressure:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{BOUNDED_BACKPRESSURE_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for bounded-backpressure:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(BOUNDED_BACKPRESSURE_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{BOUNDED_BACKPRESSURE_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_bounded_backpressure_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_bounded_backpressure_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {BOUNDED_BACKPRESSURE_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {BOUNDED_BACKPRESSURE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {BOUNDED_BACKPRESSURE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {BOUNDED_BACKPRESSURE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare bounded-backpressure Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 async fn insert_bounded_backpressure_backlog(lab_dir: &Path) -> Result<(), CliError> {
     let mut inserts = String::new();
@@ -6449,81 +4882,7 @@ EXIT;\n"
 }
 
 
-async fn remove_observability_surface_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={OBSERVABILITY_SURFACE_TABLE}, collection={OBSERVABILITY_SURFACE_COLLECTION}, \
-          deployment={OBSERVABILITY_SURFACE_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {OBSERVABILITY_SURFACE_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for observability-surface:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{OBSERVABILITY_SURFACE_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for observability-surface:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(OBSERVABILITY_SURFACE_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{OBSERVABILITY_SURFACE_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_observability_surface_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_observability_surface_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {OBSERVABILITY_SURFACE_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {OBSERVABILITY_SURFACE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {OBSERVABILITY_SURFACE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {OBSERVABILITY_SURFACE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare observability-surface Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 async fn insert_observability_surface_backlog(lab_dir: &Path) -> Result<(), CliError> {
     let mut inserts = String::new();
@@ -6553,159 +4912,10 @@ EXIT;\n"
 }
 
 
-async fn remove_platform_store_guardrails_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={PLATFORM_STORE_GUARDRAILS_TABLE}, collection={PLATFORM_STORE_GUARDRAILS_COLLECTION}, \
-          deployment={PLATFORM_STORE_GUARDRAILS_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {PLATFORM_STORE_GUARDRAILS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for platform-store-guardrails:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{PLATFORM_STORE_GUARDRAILS_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for platform-store-guardrails:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(PLATFORM_STORE_GUARDRAILS_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{PLATFORM_STORE_GUARDRAILS_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_platform_store_guardrails_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_platform_store_guardrails_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {PLATFORM_STORE_GUARDRAILS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {PLATFORM_STORE_GUARDRAILS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {PLATFORM_STORE_GUARDRAILS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {PLATFORM_STORE_GUARDRAILS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare platform-store-guardrails Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 
-async fn remove_backward_compatible_upgrades_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={BACKWARD_COMPATIBLE_UPGRADES_TABLE}, \
-collection={BACKWARD_COMPATIBLE_UPGRADES_COLLECTION}, \
-deployment={BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {BACKWARD_COMPATIBLE_UPGRADES_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for backward-compatible-upgrades:\n{err}"
-            ))
-        })?;
 
-    let js = format!("db.getCollection('{BACKWARD_COMPATIBLE_UPGRADES_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for backward-compatible-upgrades:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT)
-    .await
-    .map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to delete Platform Store Deployment `{BACKWARD_COMPATIBLE_UPGRADES_DEPLOYMENT}` \
-             for Scenario Namespace cleanup:\n{err}"
-        ))
-    })?;
-
-    Ok(())
-}
-
-async fn prepare_backward_compatible_upgrades_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_backward_compatible_upgrades_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {BACKWARD_COMPATIBLE_UPGRADES_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {BACKWARD_COMPATIBLE_UPGRADES_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {BACKWARD_COMPATIBLE_UPGRADES_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {BACKWARD_COMPATIBLE_UPGRADES_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare backward-compatible-upgrades Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 /// Start `migraloop run --metrics-addr`, scrape `/metrics`, then stop the process.
 async fn scrape_run_metrics(bin: &Path, platform_store_url: &str) -> Result<String, CliError> {
@@ -6837,226 +5047,13 @@ fn parse_capture_checkpoint(status_out: &str) -> Option<i64> {
 }
 
 
-async fn remove_schema_change_pause_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={SCHEMA_CHANGE_PAUSE_TABLE}, collection={SCHEMA_CHANGE_PAUSE_COLLECTION}, \
-          deployment={SCHEMA_CHANGE_PAUSE_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {SCHEMA_CHANGE_PAUSE_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for schema-change-pause:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{SCHEMA_CHANGE_PAUSE_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for schema-change-pause:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(SCHEMA_CHANGE_PAUSE_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{SCHEMA_CHANGE_PAUSE_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_schema_change_pause_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_schema_change_pause_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {SCHEMA_CHANGE_PAUSE_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {SCHEMA_CHANGE_PAUSE_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {SCHEMA_CHANGE_PAUSE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {SCHEMA_CHANGE_PAUSE_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare schema-change-pause Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-/// Drive real blocking Source DDL for the Lab Scenario Namespace table.
-async fn mutate_schema_change_pause_source_ddl(lab_dir: &Path) -> Result<(), CliError> {
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-ALTER TABLE {SCHEMA_CHANGE_PAUSE_TABLE} DROP COLUMN NAME;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source DDL for schema-change-pause:\n{err}"
-            ))
-        })
-}
 
 
-async fn remove_source_alignment_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={SOURCE_ALIGNMENT_TABLE}, collection={SOURCE_ALIGNMENT_COLLECTION}, \
-          deployment={SOURCE_ALIGNMENT_DEPLOYMENT})"
-    );
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {SOURCE_ALIGNMENT_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for source-alignment:\n{err}"
-            ))
-        })?;
-
-    let js = format!("db.getCollection('{SOURCE_ALIGNMENT_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for source-alignment:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(SOURCE_ALIGNMENT_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{SOURCE_ALIGNMENT_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
 
 
-async fn remove_drift_check_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={DRIFT_CHECK_TABLE}, collection={DRIFT_CHECK_COLLECTION}, \
-          deployment={DRIFT_CHECK_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {DRIFT_CHECK_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for drift-check:\n{err}"
-            ))
-        })?;
 
-    let js = format!("db.getCollection('{DRIFT_CHECK_COLLECTION}').drop();");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection for drift-check:\n{err}"
-        ))
-    })?;
 
-    lab_delete_deployment(DRIFT_CHECK_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{DRIFT_CHECK_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_drift_check_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_drift_check_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {DRIFT_CHECK_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {DRIFT_CHECK_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {DRIFT_CHECK_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {DRIFT_CHECK_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare drift-check Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 async fn plant_drift_check_target_drift(
     lab_dir: &Path,
@@ -7084,34 +5081,6 @@ if (r.matchedCount !== 1) {{ throw new Error('expected to match Output Identity 
     Ok(())
 }
 
-async fn prepare_source_alignment_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_source_alignment_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {SOURCE_ALIGNMENT_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {SOURCE_ALIGNMENT_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {SOURCE_ALIGNMENT_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {SOURCE_ALIGNMENT_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare source-alignment Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 async fn mutate_source_alignment_name(
     lab_dir: &Path,
@@ -7166,85 +5135,7 @@ EXIT;\n"
 }
 
 
-async fn remove_remove_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={REMOVE_PIPELINE_CUSTOMERS_TABLE}, \
-          collections={REMOVE_PIPELINE_CUSTOMERS_COLLECTION},{REMOVE_PIPELINE_REPORTING_COLLECTION}, \
-          deployment={REMOVE_PIPELINE_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {REMOVE_PIPELINE_CUSTOMERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for remove-pipeline:\n{err}"
-            ))
-        })?;
-
-    let js = format!(
-        "db.getCollection('{REMOVE_PIPELINE_CUSTOMERS_COLLECTION}').drop();\n\
-db.getCollection('{REMOVE_PIPELINE_REPORTING_COLLECTION}').drop();"
-    );
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collections for remove-pipeline:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(REMOVE_PIPELINE_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{REMOVE_PIPELINE_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_remove_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_remove_pipeline_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {REMOVE_PIPELINE_CUSTOMERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {REMOVE_PIPELINE_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {REMOVE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {REMOVE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare remove-pipeline Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 async fn mutate_remove_pipeline_source(lab_dir: &Path) -> Result<(), CliError> {
     let sql = format!(
@@ -7267,102 +5158,8 @@ EXIT;\n"
         })
 }
 
-async fn remove_idempotent_redelivery_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={IDEMPOTENT_REDELIVERY_TABLE}, collection={IDEMPOTENT_REDELIVERY_COLLECTION}, \
-          deployment={IDEMPOTENT_REDELIVERY_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {IDEMPOTENT_REDELIVERY_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table {IDEMPOTENT_REDELIVERY_TABLE}:\n{err}"
-            ))
-        })?;
 
-    let js = format!("db.getCollection('{IDEMPOTENT_REDELIVERY_COLLECTION}').drop()");
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collection {IDEMPOTENT_REDELIVERY_COLLECTION}:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(IDEMPOTENT_REDELIVERY_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{IDEMPOTENT_REDELIVERY_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_idempotent_redelivery_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_idempotent_redelivery_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {IDEMPOTENT_REDELIVERY_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {IDEMPOTENT_REDELIVERY_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {IDEMPOTENT_REDELIVERY_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {IDEMPOTENT_REDELIVERY_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare idempotent-redelivery Scenario Namespace:\n{err}"
-            ))
-        })
-}
-
-async fn mutate_idempotent_redelivery_source(lab_dir: &Path) -> Result<(), CliError> {
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-UPDATE {IDEMPOTENT_REDELIVERY_TABLE} SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;\n\
-INSERT INTO {IDEMPOTENT_REDELIVERY_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
-DELETE FROM {IDEMPOTENT_REDELIVERY_TABLE} WHERE ID = 2;\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drive Source insert/update/delete for idempotent-redelivery:\n{err}"
-            ))
-        })
-}
 
 async fn plant_idempotent_redelivery_operator_note(lab_dir: &Path) -> Result<(), CliError> {
     let js = format!(
@@ -7569,86 +5366,7 @@ impl Drop for ScenarioLock {
 }
 
 
-async fn remove_change_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    println!(
-        "Lab Scenario: removing Namespace \
-         (table={CHANGE_PIPELINE_CUSTOMERS_TABLE}, \
-          collections={CHANGE_PIPELINE_ACTIVE_COLLECTION},{CHANGE_PIPELINE_REPORTING_COLLECTION}, \
-          deployment={CHANGE_PIPELINE_DEPLOYMENT})"
-    );
 
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-BEGIN\n\
-  EXECUTE IMMEDIATE 'DROP TABLE {CHANGE_PIPELINE_CUSTOMERS_TABLE} PURGE';\n\
-EXCEPTION\n\
-  WHEN OTHERS THEN\n\
-    IF SQLCODE != -942 THEN RAISE; END IF;\n\
-END;\n\
-/\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to drop Oracle Scenario Namespace table for change-pipeline:\n{err}"
-            ))
-        })?;
-
-    let js = format!(
-        "db.getCollection('{CHANGE_PIPELINE_ACTIVE_COLLECTION}').drop();\n\
-db.getCollection('{CHANGE_PIPELINE_REPORTING_COLLECTION}').drop();"
-    );
-    mongosh_in_mongo(lab_dir, &js).await.map_err(|err| {
-        CliError::Failed(format!(
-            "Failed to drop Mongo Scenario Namespace collections for change-pipeline:\n{err}"
-        ))
-    })?;
-
-    lab_delete_deployment(CHANGE_PIPELINE_DEPLOYMENT)
-        .await
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to delete Platform Store Deployment `{CHANGE_PIPELINE_DEPLOYMENT}` \
-                 for Scenario Namespace cleanup:\n{err}"
-            ))
-        })?;
-
-    Ok(())
-}
-
-async fn prepare_change_pipeline_namespace(lab_dir: &Path) -> Result<(), CliError> {
-    remove_change_pipeline_namespace(lab_dir).await?;
-
-    let sql = format!(
-        "SET HEADING OFF FEEDBACK OFF PAGES 0\n\
-WHENEVER SQLERROR EXIT SQL.SQLCODE\n\
-CREATE TABLE {CHANGE_PIPELINE_CUSTOMERS_TABLE} (\n\
-  ID NUMBER(10) PRIMARY KEY,\n\
-  NAME VARCHAR2(100) NOT NULL,\n\
-  EMAIL VARCHAR2(200),\n\
-  ACTIVE NUMBER(1)\n\
-);\n\
-ALTER TABLE {CHANGE_PIPELINE_CUSTOMERS_TABLE} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;\n\
-INSERT INTO {CHANGE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);\n\
-INSERT INTO {CHANGE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);\n\
-INSERT INTO {CHANGE_PIPELINE_CUSTOMERS_TABLE} (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);\n\
-COMMIT;\n\
-EXIT;\n"
-    );
-    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
-    sqlplus_in_oracle(lab_dir, &connect, &sql)
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            CliError::Failed(format!(
-                "Failed to prepare change-pipeline Scenario Namespace:\n{err}"
-            ))
-        })
-}
 
 #[cfg(test)]
 mod tests {
@@ -7906,6 +5624,7 @@ mod tests {
                 target_collections: vec![BULK_LOAD_COLLECTION.to_string()],
                 deployment: BULK_LOAD_DEPLOYMENT.to_string(),
                 pipelines: vec![],
+                lifecycle: None,
             },
             deployment_config: "deployment.yaml".to_string(),
             workload: ScenarioRecipeWorkload {
@@ -7972,6 +5691,7 @@ mod tests {
                 target_collections: vec![BULK_LOAD_COLLECTION.to_string()],
                 deployment: BULK_LOAD_DEPLOYMENT.to_string(),
                 pipelines: vec![],
+                lifecycle: None,
             },
             deployment_config: "deployment.yaml".to_string(),
             workload: ScenarioRecipeWorkload {
@@ -8217,7 +5937,51 @@ mod tests {
             ProductPathHooks::for_recipe(&recipe).unwrap_or_else(|err| {
                 panic!("{id} must have product-path hooks: {err}")
             });
+            let lifecycle = recipe.namespace.lifecycle.as_ref().unwrap_or_else(|| {
+                panic!("{id} must declare namespace.lifecycle for shared Namespace prepare (#201)")
+            });
+            let lifecycle_names: Vec<&str> =
+                lifecycle.tables.iter().map(|t| t.name.as_str()).collect();
+            let source_names: Vec<&str> = recipe
+                .namespace
+                .source_tables
+                .iter()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                lifecycle_names, source_names,
+                "{id} lifecycle.tables must match namespace.source_tables"
+            );
+            assert!(
+                !lifecycle.seed_sql.trim().is_empty(),
+                "{id} lifecycle.seed_sql must be non-empty"
+            );
         }
+    }
+
+    #[test]
+    fn product_path_validation_rejects_missing_namespace_lifecycle() {
+        let dir = std::env::temp_dir().join(format!(
+            "migraloop-recipe-lifecycle-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("temp recipe dir");
+        let path = dir.join("recipe.yaml");
+        fs::write(
+            &path,
+            "id: demo\nsummary: demo\nnamespace:\n  source_tables: [LAB_X]\n  target_collections: [lab_x]\n  deployment: lab-x\nworkload:\n  concurrency: serial\n  steps: [prepare, apply, assert]\n  product_path:\n    steps: [prepare_namespace, product_apply, assert]\n    sync:\n      require_logminer: true\nchecks:\n  correctness: [ok]\n",
+        )
+        .expect("write");
+        let err = load_recipe(&path).expect_err("lifecycle required for prepare_namespace");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            err.to_string().contains("namespace.lifecycle"),
+            "err={err}"
+        );
     }
 
     #[test]

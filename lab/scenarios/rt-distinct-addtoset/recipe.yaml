@@ -12,6 +12,23 @@ namespace:
   pipelines:
     - lab-rda-distinct-customers
     - lab-rda-amounts-by-customer
+  lifecycle:
+    tables:
+      - name: LAB_RDA_ORDERS
+        columns: |
+          ORDER_ID NUMBER(10) PRIMARY KEY,
+          CUSTOMER_ID NUMBER(10) NOT NULL,
+          AMOUNT NUMBER(12,2) NOT NULL,
+          ADDRESS VARCHAR2(200)
+    seed_sql: |
+      INSERT INTO LAB_RDA_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (100, 1, 42.50, '1 Main St');
+      INSERT INTO LAB_RDA_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (101, 1, 10.00, '1 Main St');
+      INSERT INTO LAB_RDA_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (200, 2, 5.00, '2 Side Rd');
+    mutate_sql: |
+      UPDATE LAB_RDA_ORDERS SET ADDRESS = '1 Main Ave' WHERE ORDER_ID = 100;
+      INSERT INTO LAB_RDA_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (102, 1, 42.50, '1 Main Ave');
+      INSERT INTO LAB_RDA_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (103, 1, 7.00, '1 Main Ave');
+      UPDATE LAB_RDA_ORDERS SET CUSTOMER_ID = 3 WHERE ORDER_ID = 200;
 deployment_config: deployment.yaml
 workload:
   concurrency: serial

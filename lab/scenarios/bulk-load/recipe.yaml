@@ -10,6 +10,18 @@ namespace:
   deployment: lab-bulk-load
   pipelines:
     - lab-bl-items
+  lifecycle:
+    tables:
+      - name: LAB_BL_ITEMS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          VALUE NUMBER(10) NOT NULL
+    seed_sql: |
+      INSERT INTO LAB_BL_ITEMS (ID, NAME, VALUE)
+      SELECT LEVEL, 'item-' || LEVEL, MOD(LEVEL, 100)
+      FROM dual
+      CONNECT BY LEVEL <= 100000;
 deployment_config: deployment.yaml
 workload:
   concurrency: serial

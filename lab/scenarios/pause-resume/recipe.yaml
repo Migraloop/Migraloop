@@ -13,6 +13,24 @@ namespace:
   pipelines:
     - lab-pr-customers
     - lab-pr-orders
+  lifecycle:
+    tables:
+      - name: LAB_PR_CUSTOMERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200),
+          ACTIVE NUMBER(1)
+      - name: LAB_PR_ORDERS
+        columns: |
+          ORDER_ID NUMBER(10) PRIMARY KEY,
+          CUSTOMER_ID NUMBER(10) NOT NULL,
+          AMOUNT NUMBER(12,2) NOT NULL,
+          ADDRESS VARCHAR2(200)
+    seed_sql: |
+      INSERT INTO LAB_PR_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);
+      INSERT INTO LAB_PR_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);
+      INSERT INTO LAB_PR_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (100, 1, 42.50, '1 Main St');
 deployment_config: deployment.yaml
 workload:
   concurrency: serial
