@@ -133,3 +133,35 @@ impl SyncCliOptions {
         cmd
     }
 }
+
+/// Typed ApplyOptions CLI flags for `migraloop apply` (issue #200).
+///
+/// Prefer these over process env Initial Load knobs so RQG twins do not mutate
+/// global process state and Lab/CLI share one typed adapter.
+#[allow(dead_code)]
+pub struct ApplyCliOptions {
+    pub chunk_size: Option<usize>,
+    pub rows_per_sec: Option<u64>,
+    pub pause_after_chunks: Option<u64>,
+    pub store_delay_ms: Option<u64>,
+}
+
+#[allow(dead_code)]
+impl ApplyCliOptions {
+    pub fn append_to<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        if let Some(n) = self.chunk_size {
+            cmd.arg("--initial-load-chunk-size").arg(n.to_string());
+        }
+        if let Some(n) = self.rows_per_sec {
+            cmd.arg("--initial-load-rows-per-sec").arg(n.to_string());
+        }
+        if let Some(n) = self.pause_after_chunks {
+            cmd.arg("--initial-load-pause-after-chunks")
+                .arg(n.to_string());
+        }
+        if let Some(ms) = self.store_delay_ms {
+            cmd.arg("--initial-load-store-delay-ms").arg(ms.to_string());
+        }
+        cmd
+    }
+}

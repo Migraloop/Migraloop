@@ -11,11 +11,8 @@
 //! This is the non-ignored contract/stub CI twin of Lab Scenario
 //! `initial-load-throttled`. It must not run Lab Fixture / live Oracle.
 //!
-//! Knobs / inject:
-//! - `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` — bounded Source read window
-//! - `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` — Operator-visible throttle
-//! - `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` — mid-load pause inject
-//! - `MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS` — Downstream/store pressure inject
+//! Typed ApplyOptions CLI flags are the primary adapter (#200). Legacy
+//! `MIGRALOOP_INITIAL_LOAD_*` env vars remain a thin temporary compat shim only.
 
 mod common;
 
@@ -165,12 +162,13 @@ fn migrate(url: &str) {
     );
 }
 
-fn apply_with_env(
+fn apply_with_options(
     url: &str,
     config: &Path,
     catalog_path: &Path,
-    extra_env: &[(&str, &str)],
+    options: common::ApplyCliOptions,
 ) -> (bool, String, String) {
+    // Ensure leftover process env cannot satisfy typed-option tests (#200).
     let mut apply = Command::new(bin());
     apply
         .env("ORACLE_PASSWORD", "oracle-secret-value")
@@ -179,20 +177,20 @@ fn apply_with_env(
             "MIGRALOOP_CONTRACT_SOURCE_CATALOG",
             catalog_path.to_str().unwrap(),
         )
-        .env("MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING", "all");
-    for (k, v) in extra_env {
-        apply.env(k, v);
-    }
-    let output = apply
-        .args([
-            "apply",
-            "--platform-store-url",
-            url,
-            "--file",
-            config.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run apply");
+        .env("MIGRALOOP_STUB_TABLE_SUPPLEMENTAL_LOGGING", "all")
+        .env_remove("MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE")
+        .env_remove("MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC")
+        .env_remove("MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS")
+        .env_remove("MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS");
+    apply.args([
+        "apply",
+        "--platform-store-url",
+        url,
+        "--file",
+        config.to_str().unwrap(),
+    ]);
+    options.append_to(&mut apply);
+    let output = apply.output().expect("run apply");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -245,14 +243,16 @@ async fn initial_load_reads_in_bounded_chunks_with_progress() {
     let config = write_config(&dir, "deployment.yaml", &deployment_widgets(&mongo_database));
     migrate(&url);
 
-    let (ok, stdout, stderr) = apply_with_env(
+    let (ok, stdout, stderr) = apply_with_options(
         &url,
         &config,
         &catalog,
-        &[
-            ("MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE", "50"),
-            ("MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC", "0"),
-        ],
+        common::ApplyCliOptions {
+            chunk_size: Some(50),
+            rows_per_sec: Some(0),
+            pause_after_chunks: None,
+            store_delay_ms: None,
+        },
     );
     assert!(ok, "apply failed: stdout={stdout} stderr={stderr}");
 
@@ -299,14 +299,16 @@ async fn initial_load_rate_limit_is_observable_and_slows_apply() {
     migrate(&url);
 
     let started = Instant::now();
-    let (ok, stdout, stderr) = apply_with_env(
+    let (ok, stdout, stderr) = apply_with_options(
         &url,
         &config,
         &catalog,
-        &[
-            ("MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE", "25"),
-            ("MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC", "50"),
-        ],
+        common::ApplyCliOptions {
+            chunk_size: Some(25),
+            rows_per_sec: Some(50),
+            pause_after_chunks: None,
+            store_delay_ms: None,
+        },
     );
     let elapsed = started.elapsed();
     assert!(ok, "apply failed: stdout={stdout} stderr={stderr}");
@@ -337,14 +339,16 @@ async fn initial_load_pause_and_resume_preserves_cutover_watermark() {
     let config = write_config(&dir, "deployment.yaml", &deployment_widgets(&mongo_database));
     migrate(&url);
 
-    let (ok, stdout, stderr) = apply_with_env(
+    let (ok, stdout, stderr) = apply_with_options(
         &url,
         &config,
         &catalog,
-        &[
-            ("MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE", "40"),
-            ("MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS", "2"),
-        ],
+        common::ApplyCliOptions {
+            chunk_size: Some(40),
+            rows_per_sec: None,
+            pause_after_chunks: Some(2),
+            store_delay_ms: None,
+        },
     );
     assert!(
         ok,
@@ -376,11 +380,16 @@ async fn initial_load_pause_and_resume_preserves_cutover_watermark() {
     );
 
     // Resume: re-apply without pause inject continues from durable cursor.
-    let (ok2, stdout2, stderr2) = apply_with_env(
+    let (ok2, stdout2, stderr2) = apply_with_options(
         &url,
         &config,
         &catalog,
-        &[("MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE", "40")],
+        common::ApplyCliOptions {
+            chunk_size: Some(40),
+            rows_per_sec: None,
+            pause_after_chunks: None,
+            store_delay_ms: None,
+        },
     );
     assert!(ok2, "resume apply failed: stdout={stdout2} stderr={stderr2}");
     assert!(
@@ -408,14 +417,16 @@ async fn initial_load_backs_off_under_store_pressure() {
     let config = write_config(&dir, "deployment.yaml", &deployment_widgets(&mongo_database));
     migrate(&url);
 
-    let (ok, stdout, stderr) = apply_with_env(
+    let (ok, stdout, stderr) = apply_with_options(
         &url,
         &config,
         &catalog,
-        &[
-            ("MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE", "30"),
-            ("MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS", "40"),
-        ],
+        common::ApplyCliOptions {
+            chunk_size: Some(30),
+            rows_per_sec: None,
+            pause_after_chunks: None,
+            store_delay_ms: Some(40),
+        },
     );
     assert!(ok, "apply failed: stdout={stdout} stderr={stderr}");
 

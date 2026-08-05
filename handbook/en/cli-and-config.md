@@ -30,7 +30,7 @@ Apply a declarative Deployment config (YAML or JSON). Validates secrets-by-refer
 
 On a real Oracle Source host (not `contract`/`stub`), apply discovers columns and Initial Loads from the live Source over OCI (requires Instant Client; see [Source System](source-system.md)). Contract/stub hosts use an **injected** in-process **contract Source catalog** for CI slices only (`MIGRALOOP_CONTRACT_SOURCE_CATALOG` for discovery/Initial Load; `MIGRALOOP_INJECT_LOGMINER_CONTENTS` for Incremental Capture)—not a shipped business-table catalog and not a supported production Source mechanism.
 
-Initial Load reads Source data in **bounded chunks** (default `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE=1000`), prints `Initial Load progress` / structured `initial_load_progress` events, and can be throttled with `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC`. Mid-load pause (Operator `migraloop pause` on a referencing Pipeline, or Lab inject `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS`) persists durable progress (`status=initial_load_paused`) and the cutover low-watermark; re-run `migraloop apply` to resume without tearing down the Deployment. Under Downstream/store pressure, apply prints `Initial Load backoff` rather than growing an unbounded in-memory buffer (see [Operations](operations.md)).
+Initial Load reads Source data in **bounded chunks** (default chunk size `1000`, Operator env `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE`), prints `Initial Load progress` / structured `initial_load_progress` events, and can be throttled with `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC`. Mid-load pause (Operator `migraloop pause` on a referencing Pipeline, or Test/Lab typed ApplyOptions inject) persists durable progress (`status=initial_load_paused`) and the cutover low-watermark; re-run `migraloop apply` to resume without tearing down the Deployment. Under Downstream/store pressure, apply prints `Initial Load backoff` rather than growing an unbounded in-memory buffer (see [Operations](operations.md)). Lab / RQG prefer typed ApplyOptions on `apply` (`--initial-load-*` hidden flags) over process env as the primary adapter.
 
 ```bash
 migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployment.yaml
@@ -39,6 +39,10 @@ migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployme
 | Flag | Meaning |
 | --- | --- |
 | `-f`, `--file` | Path to Deployment config |
+| `--initial-load-chunk-size` | Hidden Test/Lab / override: typed ApplyOptions chunk size (Operator env also applies) |
+| `--initial-load-rows-per-sec` | Hidden Test/Lab / override: typed ApplyOptions throttle (Operator env also applies) |
+| `--initial-load-pause-after-chunks` | Hidden Test/Lab: typed ApplyOptions pause inject after N chunks |
+| `--initial-load-store-delay-ms` | Hidden Test/Lab: typed ApplyOptions store-pressure inject |
 
 ### `status`
 
@@ -178,7 +182,7 @@ migraloop remove --pipeline customers [--deployment oracle-to-mongo]
 
 ### `run`
 
-Migrate on startup, continuously run Incremental Capture → Affect Analysis → Delivery for applied (non-paused) Pipelines, serve the Observability Surface Prometheus scrape endpoint on the same single active instance, then keep the process alive (compose default command). No external sync scheduler is required for steady-state Sync. Idle-polls when caught up or when no Deployment is applied yet (`MIGRALOOP_SYNC_POLL_INTERVAL_MS`). Source/Target secret refs must be present in this process environment.
+Migrate on startup, continuously run Incremental Capture → Affect Analysis → Delivery for applied (non-paused) Pipelines, serve the Observability Surface Prometheus scrape endpoint on the same single active instance, then keep the process alive (compose default command). No external sync scheduler is required for steady-state Sync. Idle-polls when caught up or when no Deployment is applied yet (typed SyncOptions `poll_interval_ms`; Operator env `MIGRALOOP_SYNC_POLL_INTERVAL_MS` or hidden `--sync-poll-interval-ms`). Source/Target secret refs must be present in this process environment.
 
 ```bash
 migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" \
@@ -188,6 +192,7 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" \
 | Flag / env | Meaning |
 | --- | --- |
 | `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` | Listen address for Prometheus `/metrics` (default `0.0.0.0:9090`). Compose maps host `9090`. See [Observability](observability.md). |
+| `--sync-poll-interval-ms` | Hidden Test/Lab / override: typed SyncOptions idle poll interval (Operator env `MIGRALOOP_SYNC_POLL_INTERVAL_MS` also applies) |
 
 ### `lab`
 
@@ -226,7 +231,7 @@ Lab is manual verification—not the Release Quality Gate and not the contract/s
 | `MIGRALOOP_PLATFORM_STORE_DATA_DIR` | Path on the app filesystem to observe Platform Store free disk (compose mounts the store data volume read-only at `/var/lib/migraloop/platform-store-data`) |
 | `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES` | Optional Operator/orchestrator-supplied free-disk bytes when a filesystem probe is unavailable (overrides directory probe for the warn threshold) |
 | `MIGRALOOP_METRICS_ADDR` | Prometheus scrape listen address for `migraloop run` (default `0.0.0.0:9090`) |
-| `MIGRALOOP_SYNC_POLL_INTERVAL_MS` | Idle poll interval between continuous Incremental Capture cycles inside `migraloop run` (default `1000`; must be > 0) |
+| `MIGRALOOP_SYNC_POLL_INTERVAL_MS` | Idle poll interval between continuous Incremental Capture cycles inside `migraloop run` (default `1000`; must be > 0). Typed on SyncOptions; Test/Lab may also set `--sync-poll-interval-ms` on `migraloop run` |
 | Secret env names referenced from config | Any names you put in `password.fromEnv` (for example `ORACLE_PASSWORD`, `MONGO_PASSWORD`) must be present in the process environment at apply / one-shot `sync` / continuous `run` time |
 | `LD_LIBRARY_PATH` | For real Oracle hosts: directory of Oracle Instant Client libraries (required at apply/sync/`run` runtime; not used by `contract`/`stub`) |
 | `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | Contract/stub hosts only: path to a JSON file of harness catalog tables for schema discovery + Initial Load (CI / local slices; empty when unset; not a production Source mechanism) |
@@ -234,10 +239,10 @@ Lab is manual verification—not the Release Quality Gate and not the contract/s
 | `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | Deprecated thin temporary compat shim only: comma-separated Output Identity keys that always fail Delivery. Prefer typed SyncOptions on `migraloop sync` (`--sync-poison-identity`, hidden Test/Lab flags) or in-process `SyncOptions` (not a production Operator control) |
 | `MIGRALOOP_INJECT_SCHEMA_CHANGES` | Test/Lab injection only: path to a JSON file of Schema Change events (`scn`, `table`, `kind`, `columns`, …) so blocking DDL warn+pause can be exercised without LogMiner DDL capture (not a production Operator control) |
 | `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window size (default `256`; must be > 0). Stages never materialize more pending changes than this capacity under one-shot `sync` or continuous `run` (ADR-0020). Test/Lab may also set `--sync-queue-capacity` on `migraloop sync` |
-| `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` | Bounded Initial Load Source read window (default `1000`; must be > 0). Apply never slams an unbounded full-table read into memory as the normal path |
-| `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` | Optional Initial Load throttle in rows/second (`0` / unset = no artificial cap beyond chunking). Visible on progress lines / `initial_load_progress` as `rate_limit` |
-| `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` | Test/Lab inject only: pause Initial Load after N successful chunks so durable pause/resume can be exercised (not a production Operator control; Operators use `migraloop pause` between chunks) |
-| `MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS` | Test/Lab inject only: artificial Platform Store / Downstream delay during Initial Load so backoff can be exercised (not a production Operator control) |
+| `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` | Bounded Initial Load Source read window (default `1000`; must be > 0). Apply never slams an unbounded full-table read into memory as the normal path. Test/Lab may also set `--initial-load-chunk-size` on `migraloop apply` |
+| `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` | Optional Initial Load throttle in rows/second (`0` / unset = no artificial cap beyond chunking). Visible on progress lines / `initial_load_progress` as `rate_limit`. Test/Lab may also set `--initial-load-rows-per-sec` on `migraloop apply` |
+| `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` | Deprecated thin temporary compat shim only: pause Initial Load after N successful chunks. Prefer typed ApplyOptions on `migraloop apply` (`--initial-load-pause-after-chunks`, hidden Test/Lab flag) or in-process `ApplyOptions` (not a production Operator control; Operators use `migraloop pause` between chunks) |
+| `MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS` | Deprecated thin temporary compat shim only: artificial Platform Store / Downstream delay during Initial Load. Prefer typed ApplyOptions on `migraloop apply` (`--initial-load-store-delay-ms`, hidden Test/Lab flag) or in-process `ApplyOptions` (not a production Operator control) |
 | `MIGRALOOP_DELIVERY_DELAY_MS` | Deprecated thin temporary compat shim only: artificial Downstream Delivery delay in milliseconds. Prefer typed SyncOptions on `migraloop sync` (`--sync-delivery-delay-ms`, `--sync-fail-after-changes`; hidden Test/Lab flags) or in-process `SyncOptions` (not a production Operator control) |
 | `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | Test/Lab injection only: path to a JSON file of contract LogMiner contents (`contents: [{scn, operation, table_name, identity, after_image, rs_id?, ssn?}, …]`) for Incremental Capture on `contract`/`stub` hosts. Optional `rs_id` / `ssn` are LogMiner ordering keys so multiple rows at one SCN stay distinct for dedupe and resume-safe catch-up (the full harness Incremental stream when unset is empty; not a production Operator control) |
 | Lab disposable defaults | After `migraloop lab up`: `ORACLE_PASSWORD=lab_oracle`, `MONGO_PASSWORD=lab_mongo`, Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin` (local Lab only) |

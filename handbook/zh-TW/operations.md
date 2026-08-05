@@ -50,9 +50,9 @@ migraloop drift [--pipeline customers] [--max-rows 1000]
 
 新需要的 Base Dataset 做 Initial Load 時，不得以 unbounded full-table slam 壓垮 Oracle：
 
-- Source reads 使用有界 chunk window（`MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE`，預設 `1000`）；`apply` 會印出 `Initial Load progress` 與 structured `initial_load_progress` events
-- 可選 throttle：`MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC`（以 `rate_limit=`／`rate_limit_rows_per_sec` 可見）
-- Load 中途 pause 且不拆除 Deployment：chunks 之間會遵守 `migraloop pause --pipeline <name>`，或 Lab inject `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS`。耐久 Base status 變為 `initial_load_paused`，並保留 rows + cutover low-watermark；再跑 `migraloop apply` 即可 resume
+- Source reads 使用有界 chunk window（預設 `1000`；Operator env `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` 或 typed ApplyOptions）；`apply` 會印出 `Initial Load progress` 與 structured `initial_load_progress` events
+- 可選 throttle：`MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC`／typed ApplyOptions（以 `rate_limit=`／`rate_limit_rows_per_sec` 可見）
+- Load 中途 pause 且不拆除 Deployment：chunks 之間會遵守 `migraloop pause --pipeline <name>`，或 Lab typed ApplyOptions pause inject。耐久 Base status 變為 `initial_load_paused`，並保留 rows + cutover low-watermark；再跑 `migraloop apply` 即可 resume
 - 在 Downstream／Platform Store 壓力下，Initial Load 會印出 `Initial Load backoff`／`initial_load_backoff`，記憶體只保留一個 chunk，而不是無界成長
 - No-gap cutover（ADR-0004）仍在第一個 chunk 之前建立 low-watermark；Incremental Capture overlap／dedupe 不變
 

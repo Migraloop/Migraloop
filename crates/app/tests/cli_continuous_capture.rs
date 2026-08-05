@@ -175,8 +175,8 @@ fn start_continuous_run(
     let mut cmd = Command::new(bin());
     cmd.env("ORACLE_PASSWORD", "oracle-secret-value")
         .env("MONGO_PASSWORD", "mongo-secret-value")
-        // Fast idle poll so the CI twin observes continuous catch-up quickly.
-        .env("MIGRALOOP_SYNC_POLL_INTERVAL_MS", "50");
+        // Typed SyncOptions poll (#200); do not rely on process env as primary.
+        .env_remove("MIGRALOOP_SYNC_POLL_INTERVAL_MS");
     doubles.apply_env(&mut cmd);
     let child = cmd
         .args([
@@ -185,6 +185,9 @@ fn start_continuous_run(
             url,
             "--metrics-addr",
             metrics_addr,
+            // Fast idle poll so the CI twin observes continuous catch-up quickly.
+            "--sync-poll-interval-ms",
+            "50",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
