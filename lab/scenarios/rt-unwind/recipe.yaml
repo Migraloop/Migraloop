@@ -11,6 +11,28 @@ namespace:
   deployment: lab-rt-unwind
   pipelines:
     - lab-ru-orders
+  lifecycle:
+    tables:
+      - name: LAB_RU_CUSTOMERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200)
+      - name: LAB_RU_ORDERS
+        columns: |
+          ORDER_ID NUMBER(10) PRIMARY KEY,
+          CUSTOMER_ID NUMBER(10) NOT NULL,
+          AMOUNT NUMBER(12,2) NOT NULL
+    seed_sql: |
+      INSERT INTO LAB_RU_CUSTOMERS (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');
+      INSERT INTO LAB_RU_CUSTOMERS (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');
+      INSERT INTO LAB_RU_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (100, 1, 42.50);
+      INSERT INTO LAB_RU_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (101, 1, 10.00);
+      INSERT INTO LAB_RU_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (200, 2, 5.00);
+    mutate_sql: |
+      UPDATE LAB_RU_CUSTOMERS SET NAME = 'Alicia' WHERE ID = 1;
+      UPDATE LAB_RU_ORDERS SET AMOUNT = 50.00 WHERE ORDER_ID = 100;
+      DELETE FROM LAB_RU_ORDERS WHERE ORDER_ID = 101;
 deployment_config: deployment.yaml
 workload:
   concurrency: serial

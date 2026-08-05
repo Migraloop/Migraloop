@@ -10,6 +10,22 @@ namespace:
   deployment: lab-rt-filter
   pipelines:
     - lab-rf-customers
+  lifecycle:
+    tables:
+      - name: LAB_RF_CUSTOMERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200),
+          ACTIVE NUMBER(1) NOT NULL
+    seed_sql: |
+      INSERT INTO LAB_RF_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);
+      INSERT INTO LAB_RF_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);
+    mutate_sql: |
+      UPDATE LAB_RF_CUSTOMERS SET NAME = 'Alicia', EMAIL = 'alicia@example.com' WHERE ID = 1;
+      UPDATE LAB_RF_CUSTOMERS SET ACTIVE = 1 WHERE ID = 2;
+      INSERT INTO LAB_RF_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);
+      INSERT INTO LAB_RF_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (4, 'Dana', 'dana@example.com', 0);
 deployment_config: deployment.yaml
 workload:
   concurrency: serial

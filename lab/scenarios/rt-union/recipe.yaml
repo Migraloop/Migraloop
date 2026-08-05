@@ -11,6 +11,26 @@ namespace:
   deployment: lab-rt-union
   pipelines:
     - lab-rnu-customers
+  lifecycle:
+    tables:
+      - name: LAB_RNU_EAST
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200)
+      - name: LAB_RNU_WEST
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200)
+    seed_sql: |
+      INSERT INTO LAB_RNU_EAST (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');
+      INSERT INTO LAB_RNU_EAST (ID, NAME, EMAIL) VALUES (2, 'Bob', 'bob@example.com');
+      INSERT INTO LAB_RNU_WEST (ID, NAME, EMAIL) VALUES (10, 'Zoe', 'zoe@example.com');
+      INSERT INTO LAB_RNU_WEST (ID, NAME, EMAIL) VALUES (11, 'Wade', 'wade@example.com');
+    mutate_sql: |
+      UPDATE LAB_RNU_EAST SET NAME = 'Alicia' WHERE ID = 1;
+      UPDATE LAB_RNU_WEST SET NAME = 'Zora' WHERE ID = 10;
 deployment_config: deployment.yaml
 workload:
   concurrency: serial
