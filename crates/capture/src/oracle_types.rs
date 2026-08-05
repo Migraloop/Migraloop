@@ -1,18 +1,11 @@
-//! Schema-driven Oracle type allow-list, NUMBER precision, and temporal rules.
+//! Schema-driven Oracle type allow-list and temporal rules (ADR-0018 / ADR-0022).
 //!
-//! ADR-0018 / ADR-0022 / ADR-0023.
-//!
-//! NUMBER→Mongo classification is owned next to [`migraloop_types::ColumnShape`]
-//! (issue #202). This module re-exports / calls through so existing capture callers
-//! stay green until contract (#207) deletes the twin surface.
+//! NUMBER→Mongo classification lives next to [`migraloop_types::ColumnShape`] only
+//! (ADR-0023 / issue #207) — this module no longer re-exports a twin surface.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use thiserror::Error;
-
-pub use migraloop_types::{
-    classify_number, NumberMongoMapping, DECIMAL128_MAX_PRECISION, INT64_SAFE_PRECISION,
-};
 
 /// Maximum RAW byte length accepted in v1 (cap from ADR-0018 intent).
 pub const RAW_SIZE_CAP_BYTES: i32 = 2000;
@@ -198,23 +191,6 @@ mod tests {
         assert!(!is_allow_listed_oracle_type("BLOB", None));
         assert!(!is_allow_listed_oracle_type("CLOB", None));
         assert!(!is_allow_listed_oracle_type("RAW(4000)", Some(4000)));
-    }
-
-    #[test]
-    fn number_mapping_never_defaults_to_double() {
-        assert_eq!(
-            classify_number(Some(10), Some(0)),
-            NumberMongoMapping::Long
-        );
-        assert_eq!(
-            classify_number(Some(12), Some(2)),
-            NumberMongoMapping::Decimal128
-        );
-        assert_eq!(classify_number(None, None), NumberMongoMapping::Unsafe);
-        assert_eq!(
-            classify_number(Some(38), Some(10)),
-            NumberMongoMapping::Unsafe
-        );
     }
 
     #[test]

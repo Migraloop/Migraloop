@@ -182,7 +182,7 @@ cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocaptu
 
 ## 新增另一個 Source engine（Developers）
 
-v1 僅出貨 Oracle LogMiner。新的 Source kind 實作 `SourceEngine`（外加 prerequisites／文件、Lab Scenario，以及 CI contract twin），且不重塑 Sync／Rich Transform／Delivery／runtime 概念——見 [Developer 本機設定 — 新增 Source 或 Target engine](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist)。
+v1 僅出貨 Oracle LogMiner。新的 Source kind 實作 `SourceEngine`，discovered columns 使用 engine-agnostic `data_type`／shared `ColumnShape`；Oracle allow-list、size caps、與 type-brand 命名留在 adapter-private（ADR-0018）。NUMBER→Mongo classification 只放在 `migraloop-types` 的 `ColumnShape` 旁（ADR-0023）——不要在 capture／delivery 再留 twin helpers。另需補 prerequisites／文件、Lab Scenario，以及 CI contract twin，且不重塑 Sync／Rich Transform／Delivery／runtime 概念——見 [Developer 本機設定 — 新增 Source 或 Target engine](developer-local-setup.md#新增-source-或-target-enginedeveloper-checklist)。
 
 ## 相關章節
 

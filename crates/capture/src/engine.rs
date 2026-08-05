@@ -4,8 +4,9 @@
 //! not Oracle concrete call sites. v1 adapters: Oracle LogMiner contract harness and
 //! OCI, plus [`FakeSource`] for in-process seam tests — no second production Source.
 //!
-//! Discovered columns expose engine-agnostic [`migraloop_types::ColumnShape`] beside the
-//! Oracle-branded `oracle_type` field (expand #202; contract #207 removes the brand).
+//! Discovered columns expose engine-agnostic [`migraloop_types::ColumnShape`] /
+//! [`crate::SourceColumn::data_type`] at the seam (contract #207). Oracle allow-list
+//! and type-brand rules stay adapter-private (ADR-0018).
 
 use std::collections::BTreeMap;
 
@@ -80,8 +81,8 @@ pub trait SourceEngine: Send {
 
     /// Schema discovery for a Pipeline-referenced table.
     ///
-    /// Returned [`SourceColumn`] values expose [`migraloop_types::ColumnShape`] /
-    /// [`SourceColumn::data_type`] alongside Oracle-branded fields (issue #202).
+    /// Returned [`SourceColumn`] values use engine-agnostic [`SourceColumn::data_type`] /
+    /// [`migraloop_types::ColumnShape`] as the domain default (issue #207).
     fn discover_schema(&self, schema: &str, table: &str) -> Result<Vec<SourceColumn>, CaptureError>;
 
     /// Bounded Initial Load chunk (ADR-0004 / issue #124).
@@ -454,7 +455,7 @@ mod tests {
             FakeSourceTable {
                 columns: vec![SourceColumn {
                     name: "ID".into(),
-                    oracle_type: "NUMBER".into(),
+                    data_type: "NUMBER".into(),
                     supported: true,
                     precision: Some(10),
                     scale: Some(0),
@@ -484,15 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn source_engine_discover_exposes_column_shape_beside_oracle_type() {
+    fn source_engine_discover_uses_data_type_as_domain_default() {
         use migraloop_types::ColumnShape;
 
         let source = sample_fake_source();
         let columns = source.discover_schema("", "CUSTOMERS").unwrap();
         let col = &columns[0];
-        // Oracle-branded form still present (expand — contract deletes later).
-        assert_eq!(col.oracle_type, "NUMBER");
-        // Engine-agnostic shape is available at the SourceEngine seam.
+        assert_eq!(col.data_type, "NUMBER");
         assert_eq!(
             ColumnShape::from(col.clone()),
             ColumnShape {
@@ -502,7 +501,6 @@ mod tests {
                 scale: Some(0),
             }
         );
-        assert_eq!(col.data_type(), "NUMBER");
     }
 
     #[test]

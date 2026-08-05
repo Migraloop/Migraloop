@@ -317,7 +317,7 @@ pub(crate) fn validate_pipeline_managed_fields(
                         "Pipeline {}: unsupported type {} cannot be used as a \
                          Managed/transform input (column {field})",
                         pipeline.name,
-                        col.data_type(),
+                        col.data_type,
                     )));
                 }
             }

@@ -41,9 +41,8 @@ pub use oracle_source::{
     initial_load_for_source,
 };
 pub use oracle_types::{
-    aware_temporal_to_utc, classify_number, is_allow_listed_oracle_type, naive_temporal_to_utc,
-    normalize_oracle_type, resolve_temporal_timezone, NumberMongoMapping, ResolvedTimezone,
-    TypeError, DECIMAL128_MAX_PRECISION, INT64_SAFE_PRECISION, RAW_SIZE_CAP_BYTES,
+    aware_temporal_to_utc, is_allow_listed_oracle_type, naive_temporal_to_utc, normalize_oracle_type,
+    resolve_temporal_timezone, ResolvedTimezone, TypeError, RAW_SIZE_CAP_BYTES,
 };
 pub use schema_change::{
     classify_schema_impact, load_injected_schema_changes, load_schema_changes_file,
@@ -135,15 +134,15 @@ pub struct ChangeEvent {
 
 /// Column metadata discovered from the Source schema.
 ///
-/// Expand (#202): engine-agnostic [`ColumnShape`] / [`Self::data_type`] sits beside the
-/// Oracle-branded [`Self::oracle_type`] field. Contract (#207) removes the Oracle-named
-/// default once callers migrate. Allow-list / size caps remain adapter-private (ADR-0018).
+/// Domain default is engine-agnostic [`Self::data_type`] / [`ColumnShape`] (contract #207).
+/// Prior-release wire may still carry `oracle_type` on read (ADR-0014 alias). Allow-list /
+/// size caps remain adapter-private on [`Self::supported`] / [`Self::size`] (ADR-0018).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceColumn {
     pub name: String,
-    /// Oracle-branded type name retained during expand; also accepts `data_type` on read.
-    #[serde(alias = "data_type")]
-    pub oracle_type: String,
+    /// Source-declared type name at the SourceEngine seam (engine brand stays on adapters).
+    #[serde(alias = "oracle_type")]
+    pub data_type: String,
     /// True when the column is on the v1 allow-list (ADR-0018).
     pub supported: bool,
     /// Declared precision for NUMBER (None = unconstrained / unknown).
@@ -158,39 +157,34 @@ pub struct SourceColumn {
 }
 
 impl SourceColumn {
-    /// Engine-agnostic Source-declared type name ([`ColumnShape::data_type`]).
-    pub fn data_type(&self) -> &str {
-        &self.oracle_type
-    }
-
     pub fn is_temporal_naive(&self) -> bool {
         // DATE, TIMESTAMP, and TIMESTAMP WITH LOCAL TIME ZONE are wall-clock /
         // session-local and need DB or configured timezone (ADR-0022).
         matches!(
-            normalize_oracle_type(self.data_type()).as_str(),
+            normalize_oracle_type(&self.data_type).as_str(),
             "DATE" | "TIMESTAMP" | "TIMESTAMP WITH LOCAL TIME ZONE"
         )
     }
 
     pub fn is_temporal_aware(&self) -> bool {
         matches!(
-            normalize_oracle_type(self.data_type()).as_str(),
+            normalize_oracle_type(&self.data_type).as_str(),
             "TIMESTAMP WITH TIME ZONE"
         )
     }
 
     pub fn is_number(&self) -> bool {
-        normalize_oracle_type(self.data_type()) == "NUMBER"
+        normalize_oracle_type(&self.data_type) == "NUMBER"
     }
 
     /// Map this Source-discovered column into the shared Managed/Base column shape.
     ///
-    /// Engine-specific fields (`oracle_type`, allow-list `supported`, size caps) stay
-    /// on [`SourceColumn`]; Platform Store / Delivery consume [`ColumnShape`] (issue #182).
+    /// Allow-list `supported` and size caps stay on [`SourceColumn`]; Platform Store /
+    /// Delivery consume [`ColumnShape`] (issue #182 / #207).
     pub fn column_shape(&self) -> ColumnShape {
         ColumnShape {
             name: self.name.clone(),
-            data_type: self.oracle_type.clone(),
+            data_type: self.data_type.clone(),
             precision: self.precision,
             scale: self.scale,
         }
@@ -476,7 +470,7 @@ pub(crate) fn accounts_fixture() -> InitialLoadSnapshot {
             // Unconstrained NUMBER — unsafe (never default IEEE double).
             SourceColumn {
                 name: "LEGACY_NUM".to_string(),
-                oracle_type: "NUMBER".to_string(),
+                data_type: "NUMBER".to_string(),
                 supported: true,
                 precision: None,
                 scale: None,
@@ -494,12 +488,12 @@ pub(crate) fn accounts_fixture() -> InitialLoadSnapshot {
     }
 }
 
-pub(crate) fn col(name: &str, oracle_type: &str, supported: bool) -> SourceColumn {
+pub(crate) fn col(name: &str, data_type: &str, supported: bool) -> SourceColumn {
     let size = None;
-    let supported = supported && is_allow_listed_oracle_type(oracle_type, size);
+    let supported = supported && is_allow_listed_oracle_type(data_type, size);
     SourceColumn {
         name: name.to_string(),
-        oracle_type: oracle_type.to_string(),
+        data_type: data_type.to_string(),
         supported,
         precision: None,
         scale: None,
@@ -510,7 +504,7 @@ pub(crate) fn col(name: &str, oracle_type: &str, supported: bool) -> SourceColum
 pub(crate) fn number_col(name: &str, precision: i32, scale: i32, supported: bool) -> SourceColumn {
     SourceColumn {
         name: name.to_string(),
-        oracle_type: "NUMBER".to_string(),
+        data_type: "NUMBER".to_string(),
         supported: supported && is_allow_listed_oracle_type("NUMBER", None),
         precision: Some(precision),
         scale: Some(scale),
@@ -640,7 +634,7 @@ mod tests {
     fn source_column_populates_shared_column_shape() {
         let column = SourceColumn {
             name: "BALANCE_CENTS".into(),
-            oracle_type: "NUMBER".into(),
+            data_type: "NUMBER".into(),
             supported: true,
             precision: Some(18),
             scale: Some(0),
@@ -656,24 +650,23 @@ mod tests {
                 scale: Some(0),
             }
         );
-        // Engine brand / discovery extras stay on SourceColumn; shared shape omits them.
+        // Discovery extras stay on SourceColumn; shared shape omits them.
         assert!(column.supported);
         assert_eq!(column.size, None);
     }
 
     #[test]
-    fn source_column_exposes_engine_agnostic_shape_beside_oracle_brand() {
-        // Expand (#202): agnostic shape sits beside Oracle-branded fields.
+    fn source_column_domain_default_is_data_type_with_legacy_oracle_type_alias() {
+        // Contract (#207): domain field is data_type; legacy oracle_type still reads.
         let column = SourceColumn {
             name: "AMOUNT".into(),
-            oracle_type: "NUMBER".into(),
+            data_type: "NUMBER".into(),
             supported: true,
             precision: Some(12),
             scale: Some(2),
             size: None,
         };
-        assert_eq!(column.oracle_type, "NUMBER");
-        assert_eq!(column.data_type(), "NUMBER");
+        assert_eq!(column.data_type, "NUMBER");
         assert_eq!(
             ColumnShape::from(column.clone()),
             ColumnShape {
@@ -684,12 +677,15 @@ mod tests {
             }
         );
 
-        // Wire accepts engine-agnostic data_type while oracle_type remains the field.
-        let from_agnostic: SourceColumn =
-            serde_json::from_str(r#"{"name":"ID","data_type":"NUMBER","precision":10,"scale":0,"supported":true}"#)
-                .unwrap();
-        assert_eq!(from_agnostic.oracle_type, "NUMBER");
-        assert_eq!(from_agnostic.data_type(), "NUMBER");
-        assert_eq!(from_agnostic.precision, Some(10));
+        let written = serde_json::to_string(&column).unwrap();
+        assert!(written.contains(r#""data_type":"NUMBER""#));
+        assert!(!written.contains(r#""oracle_type""#));
+
+        let from_legacy: SourceColumn = serde_json::from_str(
+            r#"{"name":"ID","oracle_type":"NUMBER","precision":10,"scale":0,"supported":true}"#,
+        )
+        .unwrap();
+        assert_eq!(from_legacy.data_type, "NUMBER");
+        assert_eq!(from_legacy.precision, Some(10));
     }
 }

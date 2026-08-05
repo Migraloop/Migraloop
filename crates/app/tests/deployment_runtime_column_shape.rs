@@ -1,14 +1,15 @@
-//! Behaviour seam: store/delivery domain columns use shared ColumnShape (#182);
-//! SourceEngine discovered columns expose ColumnShape beside oracle_type (#202).
+//! Behaviour seam: store/delivery/SourceEngine column metadata use shared
+//! engine-agnostic `data_type` (#182 / #207 contract).
 //!
-//! Agreed seams (#168 / #199 Testing Decisions / #182 / #202 AC):
-//! - Platform Store / Delivery domain column types no longer expose Oracle-named
-//!   fields as the default shape (`data_type` via ColumnShape).
-//! - Source adapters still carry engine-specific type metadata (`oracle_type`)
-//!   while exposing engine-agnostic ColumnShape / data_type at the seam (expand).
-//! - Shared NUMBER classification lives next to ColumnShape (ADR-0023).
-//! - Prior-release Platform Store JSON with `oracle_type` still deserializes
-//!   (ADR-0014); new writes use `data_type`.
+//! Agreed seams (#168 / #199 Testing Decisions / #182 / #202 / #207 AC):
+//! - Platform Store / Delivery / SourceEngine discovered columns no longer expose
+//!   Oracle-named fields as the domain default (`data_type` via ColumnShape /
+//!   SourceColumn).
+//! - Shared NUMBER classification has one behavioral home next to ColumnShape
+//!   (ADR-0023); capture/delivery do not keep twin helpers.
+//! - Prior-release JSON with `oracle_type` still deserializes (ADR-0014);
+//!   new writes use `data_type`.
+//! - Oracle allow-list / size caps remain adapter-private (ADR-0018).
 //! - No platform business catalog (ADR-0026); shapes come from Source discovery.
 
 use migraloop_capture::{FakeSource, FakeSourceTable, SourceColumn, SourceEngine};
@@ -28,15 +29,14 @@ fn managed_base_metadata_round_trips_source_store_delivery_through_column_shape(
 
     let source = SourceColumn {
         name: "AMOUNT".into(),
-        oracle_type: "NUMBER".into(),
+        data_type: "NUMBER".into(),
         supported: true,
         precision: Some(12),
         scale: Some(2),
         size: None,
     };
-    // Engine brand stays on the Source adapter beside the agnostic shape.
-    assert_eq!(source.oracle_type, "NUMBER");
-    assert_eq!(source.data_type(), "NUMBER");
+    // Domain default is engine-agnostic data_type (contract #207).
+    assert_eq!(source.data_type, "NUMBER");
     assert_eq!(source.column_shape(), shape);
     assert_eq!(ColumnShape::from(source.clone()), shape);
 
@@ -50,7 +50,7 @@ fn managed_base_metadata_round_trips_source_store_delivery_through_column_shape(
 }
 
 #[test]
-fn source_engine_discovered_columns_expose_column_shape_beside_oracle_type() {
+fn source_engine_discovered_columns_use_data_type_as_domain_default() {
     use migraloop_capture::CapturePosition;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -60,7 +60,7 @@ fn source_engine_discovered_columns_expose_column_shape_beside_oracle_type() {
         FakeSourceTable {
             columns: vec![SourceColumn {
                 name: "AMOUNT".into(),
-                oracle_type: "NUMBER".into(),
+                data_type: "NUMBER".into(),
                 supported: true,
                 precision: Some(12),
                 scale: Some(2),
@@ -78,7 +78,7 @@ fn source_engine_discovered_columns_expose_column_shape_beside_oracle_type() {
     );
     let columns = source.discover_schema("", "CUSTOMERS").unwrap();
     let col = &columns[0];
-    assert_eq!(col.oracle_type, "NUMBER");
+    assert_eq!(col.data_type, "NUMBER");
     assert_eq!(
         ColumnShape::from(col.clone()),
         ColumnShape {
@@ -93,6 +93,16 @@ fn source_engine_discovered_columns_expose_column_shape_beside_oracle_type() {
         classify_number(col.precision, col.scale),
         NumberMongoMapping::Decimal128
     );
+
+    // Wire default for SourceColumn is data_type; legacy oracle_type still reads.
+    let written = serde_json::to_string(col).unwrap();
+    assert!(written.contains(r#""data_type":"NUMBER""#));
+    assert!(!written.contains(r#""oracle_type""#));
+
+    let legacy = r#"{"name":"ID","oracle_type":"NUMBER","precision":10,"scale":0,"supported":true}"#;
+    let from_legacy: SourceColumn = serde_json::from_str(legacy).unwrap();
+    assert_eq!(from_legacy.data_type, "NUMBER");
+    assert_eq!(from_legacy.precision, Some(10));
 }
 
 #[test]

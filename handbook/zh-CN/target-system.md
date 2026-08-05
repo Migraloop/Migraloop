@@ -121,7 +121,7 @@ v1 连接字符串以 `authSource=admin` 验证（见 Delivery URI 构建）。�
 
 ## Mapping 注意事项
 
-Source allow-list 与 NUMBER/时间规则会影响 Managed 输出能出现什么—见 [Source System](source-system.md)。不安全的 NUMBER 字段必须先用 Pipeline `fields` 映射，`apply` 才会成功。
+Source allow-list 与 NUMBER/时间规则会影响 Managed 输出能出现什么—见 [Source System](source-system.md)。不安全的 NUMBER 字段必须先用 Pipeline `fields` 映射，`apply` 才会成功。NUMBER→Mongo classification 只有一个 shared home，位于 `ColumnShape` 旁（ADR-0023）；Operator 可见的 mapping 规则不变。
 
 ## 新增另一个 Target engine（Developers）
 

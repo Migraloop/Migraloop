@@ -181,7 +181,7 @@ async fn typed_sync_options_quarantine_poison_identity_without_env() {
             columns: vec![
                 SourceColumn {
                     name: "ID".into(),
-                    oracle_type: "NUMBER".into(),
+                    data_type: "NUMBER".into(),
                     supported: true,
                     precision: Some(10),
                     scale: Some(0),
@@ -189,7 +189,7 @@ async fn typed_sync_options_quarantine_poison_identity_without_env() {
                 },
                 SourceColumn {
                     name: "NAME".into(),
-                    oracle_type: "VARCHAR2".into(),
+                    data_type: "VARCHAR2".into(),
                     supported: true,
                     precision: None,
                     scale: None,
@@ -409,7 +409,7 @@ async fn typed_sync_options_bounded_window_applies_without_pipeline_pause() {
             columns: vec![
                 SourceColumn {
                     name: "ID".into(),
-                    oracle_type: "NUMBER".into(),
+                    data_type: "NUMBER".into(),
                     supported: true,
                     precision: Some(10),
                     scale: Some(0),
@@ -417,7 +417,7 @@ async fn typed_sync_options_bounded_window_applies_without_pipeline_pause() {
                 },
                 SourceColumn {
                     name: "NAME".into(),
-                    oracle_type: "VARCHAR2".into(),
+                    data_type: "VARCHAR2".into(),
                     supported: true,
                     precision: None,
                     scale: None,

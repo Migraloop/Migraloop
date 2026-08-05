@@ -48,7 +48,7 @@ Validation rules enforced on `apply`:
 - `mode` is `direct` or `transform`
 - Direct Pipelines must not declare `transform`
 - Transform Pipelines require `outputIdentity` and a non-empty declarative `transform`
-- `fields` keys map source/Managed field names to `{ as: string }` or `{ as: omit }` (ADR-0023)
+- `fields` keys map source/Managed field names to `{ as: string }` or `{ as: omit }` (ADR-0023; NUMBER classification lives next to shared `ColumnShape`)
 
 See [Rich Transform](rich-transform.md) for operator shapes (`project`, `addFields`, `rename`, `remove`, `filter`, `equiLookup`, `unwind`, `union`, `groupBy` with sum/count/min/max/avg, `distinct`, `addToSet`).
 
