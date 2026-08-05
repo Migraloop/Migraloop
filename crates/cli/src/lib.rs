@@ -462,7 +462,12 @@ async fn sync_incremental(
     options: SyncOptions,
 ) -> Result<(), CliError> {
     let store = open_store(platform_store_url).await?;
-    migraloop_runtime::sync_incremental_with_options(&store, options).await?;
+    migraloop_runtime::run_incremental_sync(
+        &store,
+        migraloop_runtime::SyncInvocation::OneShot,
+        options,
+    )
+    .await?;
     Ok(())
 }
 

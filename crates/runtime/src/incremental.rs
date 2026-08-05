@@ -8,8 +8,9 @@
 //! the sync invocation. Bounded-window queue policy (capacity / fetch sizing /
 //! full-window slowdown signals) lives in [`crate::backpressure`], not only emit
 //! helpers. Cutover watermark / checkpoint / readiness live in [`crate::cutover`]
-//! (ADR-0004 / #175). The Operator CLI is a thin adapter over [`sync_incremental`]
-//! / [`supervise_continuous_incremental_sync`].
+//! (ADR-0004 / #175). Apply / Initial Load live in [`crate::apply`]. The Operator
+//! CLI is a thin adapter over [`run_incremental_sync`] /
+//! [`supervise_continuous_incremental_sync`] (#208).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -457,24 +458,6 @@ fn base_with_sync_progress(
         source_alignment_mismatched_rows: dataset.source_alignment_mismatched_rows,
         initial_load_cursor: dataset.initial_load_cursor.clone(),
     }
-}
-
-/// One-shot Incremental Capture → Delivery (`migraloop sync`).
-///
-/// Uses [`SyncOptions::from_env_compat`] (thin temporary shim). Prefer
-/// [`sync_incremental_with_options`] with typed options (#180).
-pub async fn sync_incremental(store: &PlatformStore) -> Result<(), RuntimeError> {
-    sync_incremental_with_options(store, SyncOptions::from_env_compat()).await
-}
-
-/// One-shot Incremental Capture → Delivery with typed [`SyncOptions`].
-pub async fn sync_incremental_with_options(
-    store: &PlatformStore,
-    options: SyncOptions,
-) -> Result<(), RuntimeError> {
-    run_incremental_sync(store, SyncInvocation::OneShot, options)
-        .await
-        .map(|_| ())
 }
 
 /// Continuous Incremental Capture → Affect Analysis → Delivery inside `migraloop run`.

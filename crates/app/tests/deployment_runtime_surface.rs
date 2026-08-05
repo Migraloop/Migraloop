@@ -1,12 +1,14 @@
-//! Deployment runtime public surface seam (issue #172).
+//! Deployment runtime public surface seam (issue #172 / #208).
 //!
-//! Agreed seams (#168 Testing Decisions / #172 AC):
+//! Agreed seams (#168 / #199 Testing Decisions / #172 / #208 AC):
 //! 1. Operator CLI / RQG contract-path twins remain the Release Quality Gate.
 //! 2. Deployment runtime public interface — Operator Deployment verbs plus
-//!    necessary session / factory entry points only.
+//!    necessary session / factory entry points only (no parallel orchestration
+//!    seam after apply / Incremental locality split).
 //!
 //! This file proves continuous Sync prefers an open Platform Store session,
-//! and exercises the narrowed verb surface without reaching demoted helpers.
+//! one-shot Sync uses `run_incremental_sync` + `SyncInvocation::OneShot` (collapsed
+//! Sync aliases), and the narrowed verb surface without reaching demoted helpers.
 
 mod common;
 
@@ -46,14 +48,27 @@ async fn ephemeral_database_url() -> String {
     format!("{base}/{db_name}")
 }
 
-/// Continuous Incremental Sync entry takes an open Platform Store session (#172).
+/// Continuous Incremental Sync prefers an open Platform Store session (#172);
+/// one-shot Sync uses the same verb + [`SyncInvocation::OneShot`] (#208).
 #[tokio::test]
-async fn continuous_incremental_sync_prefers_open_store_session() {
+async fn incremental_sync_entries_use_open_session_and_oneshot_invocation() {
     let url = ephemeral_database_url().await;
     let store = PlatformStore::open(&url)
         .await
         .expect("open Platform Store session");
     store.migrate().await.expect("migrate via session");
+
+    // OneShot on empty store errors (no Deployments) — proves collapsed alias entry.
+    let one_shot = migraloop_runtime::run_incremental_sync(
+        &store,
+        SyncInvocation::OneShot,
+        SyncOptions::default(),
+    )
+    .await;
+    assert!(
+        one_shot.is_err(),
+        "OneShot Incremental Sync should fail when no Deployments are applied"
+    );
 
     // Empty store: ContinuousCycle idles — prove the session-shaped entry runs.
     let outcome = migraloop_runtime::run_incremental_sync(
