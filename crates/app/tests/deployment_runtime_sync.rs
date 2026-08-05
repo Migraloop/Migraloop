@@ -185,9 +185,13 @@ async fn runtime_sync_quarantines_poison_identity_and_continues_peers() {
         },
         ..SyncOptions::default()
     };
-    migraloop_runtime::sync_incremental_with_options(&store, options)
-        .await
-        .expect("runtime Incremental Sync should succeed after quarantine");
+    migraloop_runtime::run_incremental_sync(
+        &store,
+        migraloop_runtime::SyncInvocation::OneShot,
+        options,
+    )
+    .await
+    .expect("runtime Incremental Sync should succeed after quarantine");
 
     let quarantined = store
         .list_quarantined_changes(Some("runtime-sync"))
