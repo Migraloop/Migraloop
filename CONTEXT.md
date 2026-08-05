@@ -45,8 +45,8 @@ Ongoing change capture into Base Datasets after Initial Load, driving Affect Ana
 _Avoid_: Initial Load (different phase), hard-wiring the domain to a single vendor capture product, discovering missing Oracle logging only after silent data loss
 
 **Change Ordering**:
-Within one Base Dataset, Incremental Capture must apply changes for the same source key in capture order. Across different source keys, reordering or parallelism is allowed only when maintenance still converges to the correct eventual state—including per-Output-Identity recompute from Base when a running aggregate lacks enough information.
-_Avoid_: Requiring a global Deployment total order by default, treating every Rich Transform as order-insensitive, fixing normal-path reorder bugs primarily via later checks
+Within one Base Dataset, Incremental Capture must apply changes for the same source key in capture order. Across different source keys, reordering or parallelism is allowed only when maintenance still converges to the correct eventual state—including per-Output-Identity recompute from Base when a running aggregate lacks enough information (see ADR-0029).
+_Avoid_: Requiring a global Deployment total order by default, treating every Rich Transform as order-insensitive, fixing normal-path reorder bugs primarily via later checks, accelerating only Direct Pipelines while leaving Transform out of throughput work
 
 **Eventual Consistency**:
 When Sync and Delivery are healthy, Managed Columns/fields on the Target System converge to the platform's expected dataset; lag is allowed; at-least-once duplicate applies remain acceptable. Normal Incremental Capture must process the change stream correctly and must not abandon that duty; Source Alignment Check and Drift Check are edge-case safety nets, not the primary correctness path.
