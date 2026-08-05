@@ -1,20 +1,23 @@
-//! Source / Target engine seam tests for Deployment runtime (issue #156).
+//! Source / Target engine seam tests for Deployment runtime (issue #156 / #206).
 //!
 //! These tests exercise Sync→Delivery slices against [`SourceEngine`] /
 //! [`TargetEngine`] only so contract / Fake Source and Mongo / Fake Target swap
 //! without rewriting orchestration. Helpers here are test-only — not part of the
 //! public Deployment runtime surface (#172).
+//!
+//! #206: Managed validation trusts engine-agnostic column metadata (`supported` +
+//! `data_type()`), not Oracle allow-list helpers at the runtime seam.
 
 use migraloop_capture::{
     CapturePosition, FakeSource, FakeSourceTable, InitialLoadChunk, InitialLoadChunkOptions,
     OracleLogMinerSource, OracleSourceConnect, SourceColumn, SourceEngine,
 };
-use migraloop_delivery::{DeliveryDocument, FakeTarget, TargetEngine};
+use migraloop_delivery::{DeliveryDocument, FakeTarget, ManagedFieldAs, TargetEngine};
 use migraloop_platform_store::{
-    Deployment, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
+    Deployment, Pipeline, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
 };
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::RuntimeError;
 
@@ -252,4 +255,72 @@ async fn engine_seam_swaps_source_and_target_adapters_without_rewrite() {
     assert_eq!(delivered2, 1);
     assert_eq!(listed2.len(), 1);
     assert_eq!(listed2[0]["NAME"], json!("Bob"));
+}
+
+fn sample_pipeline_with_field(field: &str, mapping: ManagedFieldAs) -> Pipeline {
+    let mut field_mappings = BTreeMap::new();
+    field_mappings.insert(field.to_string(), mapping);
+    Pipeline {
+        deployment_name: "seam".into(),
+        name: "customers".into(),
+        mode: "direct".into(),
+        source_table: "CUSTOMERS".into(),
+        source_schema: String::new(),
+        target_collection: "customers".into(),
+        delivery_status: "pending".into(),
+        delivery_applied_changes: 0,
+        delivery_lag: 0,
+        paused: false,
+        description: String::new(),
+        field_mappings,
+        output_identity: vec![],
+        transform_json: None,
+        drift_status: "unknown".into(),
+        drift_checked_rows: 0,
+        drift_mismatched_rows: 0,
+    }
+}
+
+/// #206: runtime Managed validation trusts adapter `supported`, not Oracle allow-list.
+#[test]
+fn managed_validation_trusts_source_supported_flag_not_oracle_allow_list() {
+    let pipeline = sample_pipeline_with_field("BIO", ManagedFieldAs::String);
+    // Adapter-declared supported — even when the type name would fail Oracle allow-list.
+    let columns = vec![SourceColumn {
+        name: "BIO".into(),
+        oracle_type: "BLOB".into(),
+        supported: true,
+        precision: None,
+        scale: None,
+        size: None,
+    }];
+    let managed = BTreeSet::from(["BIO".to_string()]);
+    crate::validate_pipeline_managed_fields(&pipeline, &columns, &managed)
+        .expect("supported=true must pass without Oracle allow-list at runtime seam");
+}
+
+/// #206: unsupported Managed inputs still fail using engine-agnostic type metadata.
+#[test]
+fn managed_validation_rejects_unsupported_via_supported_flag_and_data_type() {
+    let pipeline = sample_pipeline_with_field("BIO", ManagedFieldAs::String);
+    let columns = vec![SourceColumn {
+        name: "BIO".into(),
+        oracle_type: "BLOB".into(),
+        supported: false,
+        precision: None,
+        scale: None,
+        size: None,
+    }];
+    let managed = BTreeSet::from(["BIO".to_string()]);
+    let err = crate::validate_pipeline_managed_fields(&pipeline, &columns, &managed)
+        .expect_err("supported=false Managed input must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsupported") && msg.contains("BIO") && msg.contains("BLOB"),
+        "expected agnostic unsupported message naming field + data_type, got: {msg}"
+    );
+    assert!(
+        !msg.contains("Oracle"),
+        "runtime seam error must not brand Oracle, got: {msg}"
+    );
 }

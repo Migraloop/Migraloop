@@ -569,8 +569,8 @@ pub enum SyncCycleOutcome {
 
 /// Run one Incremental Capture cycle through the Deployment runtime.
 ///
-/// Default Operator path: constructs v1 Oracle LogMiner + MongoDB adapters via
-/// factory helpers (Oracle-kind gate preserved for factory wiring). Typed knobs
+/// Default Operator path: constructs v1 Source/Target adapters via factory
+/// helpers (kind selection stays inside the factories — #206). Typed knobs
 /// come from `options` — CLI / Lab build them via [`SyncOptions::for_cli`];
 /// in-process tests pass explicit values (#180).
 pub async fn run_incremental_sync(
@@ -592,23 +592,11 @@ pub async fn run_incremental_sync(
             continue;
         };
 
-        // Factory path: Oracle-kind gate + v1 concrete adapters behind interfaces.
-        let source_engine = if deployment.source.kind.eq_ignore_ascii_case("oracle") {
-            Some(source_engine_from_connection(&deployment.source)?)
-        } else {
-            None
-        };
+        // Factory path: kind selection lives in the factories (#206); orchestration
+        // does not re-gate on `kind == "oracle"`. Injected engines use
+        // [`run_incremental_sync_with_engines`].
+        let source = source_engine_from_connection(&deployment.source)?;
         let target = target_engine_from_deployment(&deployment)?;
-        let Some(source) = source_engine.as_ref() else {
-            if tables.is_empty() {
-                continue;
-            }
-            return Err(RuntimeError::Failed(format!(
-                "Incremental Capture requires an Oracle Source System (LogMiner); \
-                 got kind={}",
-                deployment.source.kind
-            )));
-        };
 
         sync_deployment_incremental(
             store,
@@ -616,7 +604,7 @@ pub async fn run_incremental_sync(
             &deployment,
             &mut deployment_pipelines,
             tables,
-            source,
+            &source,
             &target,
         )
         .await?;
@@ -628,12 +616,12 @@ pub async fn run_incremental_sync(
 /// Run one Incremental Capture cycle with caller-injected Source/Target engines
 /// and typed [`SyncOptions`].
 ///
-/// Seam for Fake Source/Target (and any pre-built adapters): skips Deployment
-/// `source.kind` / factory Oracle-kind gates — capture capability comes from the
-/// injected [`SourceEngine`]. Fault injection and queue knobs come from
-/// `options` (not process env). Default CLI `apply`/`run`/`sync` keep using
-/// [`run_incremental_sync`] with [`SyncOptions::for_cli`] (typed flags primary;
-/// env fault injection is a thin temporary shim) with no Operator-visible change.
+/// Seam for Fake Source/Target (and any pre-built adapters): skips factory kind
+/// selection — capture capability comes from the injected [`SourceEngine`]
+/// (#206). Fault injection and queue knobs come from `options` (not process
+/// env). Default CLI `apply`/`run`/`sync` keep using [`run_incremental_sync`]
+/// with [`SyncOptions::for_cli`] (typed flags primary; env fault injection is a
+/// thin temporary shim) with no Operator-visible change.
 pub async fn run_incremental_sync_with_engines<S: SourceEngine, T: TargetEngine>(
     store: &PlatformStore,
     invocation: SyncInvocation,

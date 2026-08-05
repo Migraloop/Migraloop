@@ -347,17 +347,26 @@ pub async fn resume_pipeline(
 
     // Catch up Delivery from durable Base/Derived state accumulated while paused.
     if pipeline_has_target(&pipeline) {
+        let source = source_engine_from_connection(&deployment.source)?;
         let target = target_engine_from_deployment(&deployment)?;
         match pipeline.mode.as_str() {
             "direct" => {
-                deliver_direct_pipeline_with_options(store, &deployment, &pipeline, &target, true)
-                    .await?;
+                deliver_direct_pipeline_with_options(
+                    store,
+                    &deployment,
+                    &pipeline,
+                    &source,
+                    &target,
+                    true,
+                )
+                .await?;
             }
             "transform" => {
                 deliver_transform_pipeline_with_options(
                     store,
                     &deployment,
                     &pipeline,
+                    &source,
                     &target,
                     true,
                 )

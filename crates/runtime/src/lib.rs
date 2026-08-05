@@ -1,8 +1,8 @@
 //! Deployment runtime public interface: Operator Deployment verbs plus necessary
 //! session / factory entry points (issue #172).
 //!
-//! **Verbs:** [`apply`] / [`apply_with_options`] (typed [`ApplyOptions`]), Incremental
-//! Sync ([`sync_incremental`], [`run_incremental_sync`],
+//! **Verbs:** [`apply`] / [`apply_with_options`] / [`apply_with_engines`] (typed
+//! [`ApplyOptions`]), Incremental Sync ([`sync_incremental`], [`run_incremental_sync`],
 //! [`run_incremental_sync_with_engines`], [`run_continuous_incremental_sync`],
 //! [`supervise_continuous_incremental_sync`] with typed [`SyncOptions`]), Pipeline
 //! lifecycle ([`pause_pipeline`], [`resume_pipeline`], [`remove_pipeline`]),
@@ -15,7 +15,8 @@
 //!
 //! **Session / factory entry points:** [`source_engine_from_connection`],
 //! [`target_engine_from_deployment`], plus structured observability emit helpers
-//! used by the Operator edge.
+//! used by the Operator edge. Kind selection lives in the factories; apply / Sync
+//! orchestration does not re-gate on `kind == "oracle"` (#206).
 //!
 //! Internal helpers (Base apply crumbs, Delivery orchestration pieces, identity display)
 //! stay `pub(crate)` — they fail the deletion test as a public surface. The Operator CLI
@@ -24,9 +25,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use migraloop_capture::{
-    classify_number, is_allow_listed_oracle_type, CapturePosition, InitialLoadChunkOptions,
-    NumberMongoMapping, OracleLogMinerSource, OracleSourceConnect, SourceColumn, SourceEngine,
-    TypeError,
+    CapturePosition, InitialLoadChunkOptions, OracleLogMinerSource, OracleSourceConnect,
+    SourceColumn, SourceEngine,
 };
 use migraloop_delivery::{
     DeliveryDocument, ManagedFieldAs, MongoTargetConnection, TargetEngine,
@@ -39,7 +39,9 @@ use migraloop_transform::{
     evaluate_transform_with_bases, infer_derived_columns, initial_maintenance_state,
     parse_transform_steps, secondary_base_refs, MaintenanceStateBlob, TransformOp,
 };
-use migraloop_types::{output_identity_key, resolve_secret_ref};
+use migraloop_types::{
+    classify_number, output_identity_key, resolve_secret_ref, NumberMongoMapping,
+};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -288,6 +290,9 @@ pub(crate) fn apply_field_mappings_to_row(
 }
 
 /// Apply-time validation for Managed/transform inputs (ADR-0018 / ADR-0023).
+///
+/// Trusts engine-agnostic Source column metadata (`supported` + [`SourceColumn::data_type`])
+/// at the runtime seam. Oracle allow-list / type brand stay adapter-private (#206).
 pub(crate) fn validate_pipeline_managed_fields(
     pipeline: &Pipeline,
     source_columns: &[SourceColumn],
@@ -306,16 +311,13 @@ pub(crate) fn validate_pipeline_managed_fields(
                     pipeline.name, field
                 )));
             }
-            Some(col)
-                if !col.supported || !is_allow_listed_oracle_type(&col.oracle_type, col.size) =>
-            {
+            Some(col) if !col.supported => {
                 if *mapping != ManagedFieldAs::Omit {
                     return Err(RuntimeError::Failed(format!(
-                        "Pipeline {}: {} (column {field})",
+                        "Pipeline {}: unsupported type {} cannot be used as a \
+                         Managed/transform input (column {field})",
                         pipeline.name,
-                        TypeError::UnsupportedAsManaged {
-                            oracle_type: col.oracle_type.clone(),
-                        }
+                        col.data_type(),
                     )));
                 }
             }
@@ -407,11 +409,12 @@ pub(crate) async fn ensure_store_session_healthy(store: &PlatformStore) -> Resul
     }
 }
 
-async fn sync_base_datasets_for_pipelines(
+async fn sync_base_datasets_for_pipelines<S: SourceEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipelines: &[Pipeline],
     options: &ApplyOptions,
+    source: &S,
 ) -> Result<(), RuntimeError> {
     let deployment_name = &deployment.name;
     let configured_tz = source_timezone_opt(deployment);
@@ -449,7 +452,15 @@ async fn sync_base_datasets_for_pipelines(
                 || dataset.status == "initial_load_paused";
             if !resumable {
                 // Existing Bases stay; do not reload on Pipeline re-apply (ADR-0019).
-                ensure_base_primary_key(store, deployment, &schema, &table, configured_tz).await?;
+                ensure_base_primary_key(
+                    store,
+                    deployment,
+                    &schema,
+                    &table,
+                    configured_tz,
+                    source,
+                )
+                .await?;
                 continue;
             }
         }
@@ -463,6 +474,7 @@ async fn sync_base_datasets_for_pipelines(
             configured_tz,
             existing.as_ref(),
             options,
+            source,
         )
         .await?;
     }
@@ -470,7 +482,7 @@ async fn sync_base_datasets_for_pipelines(
     Ok(())
 }
 
-async fn run_chunked_initial_load(
+async fn run_chunked_initial_load<S: SourceEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipelines: &[Pipeline],
@@ -479,9 +491,9 @@ async fn run_chunked_initial_load(
     configured_tz: Option<&str>,
     existing: Option<&BaseDataset>,
     options: &ApplyOptions,
+    source: &S,
 ) -> Result<(), RuntimeError> {
     let deployment_name = &deployment.name;
-    let source = source_engine_from_connection(&deployment.source)?;
     let chunk_size = options.initial_load.chunk_size;
     let rate_limit = options.initial_load.rows_per_sec;
     let pause_after = options.initial_load.pause_after_chunks;
@@ -801,12 +813,13 @@ async fn persist_initial_load_pause(
     Ok(())
 }
 
-async fn ensure_base_primary_key(
+async fn ensure_base_primary_key<S: SourceEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     source_schema: &str,
     source_table: &str,
     configured_timezone: Option<&str>,
+    source: &S,
 ) -> Result<(), RuntimeError> {
     let deployment_name = &deployment.name;
     let (dataset, _) = store
@@ -818,7 +831,6 @@ async fn ensure_base_primary_key(
     }
 
     // Metadata-only: one bounded chunk for PK — never a full-table Initial Load slam.
-    let source = source_engine_from_connection(&deployment.source)?;
     let chunk = source
         .initial_load_chunk(
             source_schema,
@@ -851,13 +863,12 @@ async fn ensure_base_primary_key(
 
 /// Load Source schema metadata for apply-time Managed field validation.
 ///
-/// Goes through the Source engine interface (contract catalog or OCI discovery).
-pub(crate) fn source_columns_for_pipeline(
-    deployment: &Deployment,
+/// Goes through the Source engine interface (injected or factory-selected).
+pub(crate) fn source_columns_for_pipeline<S: SourceEngine>(
+    source: &S,
     schema: &str,
     table: &str,
 ) -> Result<Vec<SourceColumn>, RuntimeError> {
-    let source = source_engine_from_connection(&deployment.source)?;
     source
         .discover_schema(schema, table)
         .map_err(|err| RuntimeError::Failed(err.to_string()))
@@ -882,14 +893,13 @@ pub(crate) fn oracle_source_connect(
 
 /// Fail-fast Source Prerequisites before capture runs (ADR-0021).
 ///
-/// Delegates to the Source engine adapter (contract or OCI). Read-only; never
-/// auto-alters customer Source configuration.
-pub(crate) fn ensure_source_prerequisites(
-    source: &SystemConnection,
+/// Delegates to the Source engine adapter (injected or factory-selected).
+/// Read-only; never auto-alters customer Source configuration.
+pub(crate) fn ensure_source_prerequisites<S: SourceEngine>(
+    source: &S,
     source_tables: &[String],
 ) -> Result<(), RuntimeError> {
-    let engine = source_engine_from_connection(source)?;
-    engine
+    source
         .check_prerequisites(source_tables)
         .map_err(|err| RuntimeError::Failed(err.to_string()))
 }
@@ -1014,23 +1024,17 @@ fn pipelines_with_metadata_only_change<'a>(
         .collect()
 }
 
-pub(crate) async fn deliver_pipelines(
-    store: &PlatformStore,
-    deployment: &Deployment,
-    pipelines: &[&Pipeline],
-) -> Result<(), RuntimeError> {
-    deliver_pipelines_with_options(store, deployment, pipelines, false, false).await
-}
-
 /// Deliver Pipelines. `reconcile_deletes` removes Target identities that disappeared
 /// (used for revision rebuild and resume catch-up). When `ignore_paused` is true,
 /// Delivery runs even if the Pipeline is still marked paused (revision transition).
-pub(crate) async fn deliver_pipelines_with_options(
+pub(crate) async fn deliver_pipelines_with_options<S: SourceEngine, T: TargetEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipelines: &[&Pipeline],
     reconcile_deletes: bool,
     ignore_paused: bool,
+    source: &S,
+    target: &T,
 ) -> Result<(), RuntimeError> {
     let needs_delivery = pipelines
         .iter()
@@ -1038,8 +1042,6 @@ pub(crate) async fn deliver_pipelines_with_options(
     if !needs_delivery {
         return Ok(());
     }
-
-    let target = target_engine_from_deployment(deployment)?;
 
     for pipeline in pipelines {
         if !pipeline_has_target(pipeline) || (!ignore_paused && pipeline.paused) {
@@ -1052,7 +1054,8 @@ pub(crate) async fn deliver_pipelines_with_options(
                     store,
                     deployment,
                     pipeline,
-                    &target,
+                    source,
+                    target,
                     reconcile_deletes,
                 )
                 .await?;
@@ -1062,7 +1065,8 @@ pub(crate) async fn deliver_pipelines_with_options(
                     store,
                     deployment,
                     pipeline,
-                    &target,
+                    source,
+                    target,
                     reconcile_deletes,
                 )
                 .await?;
@@ -1080,10 +1084,11 @@ pub(crate) async fn deliver_pipelines_with_options(
 
 /// Direct Pipeline Delivery. When `reconcile_deletes` is true (resume / revision),
 /// also remove Target documents whose Output Identity is no longer in Base.
-pub(crate) async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
+pub(crate) async fn deliver_direct_pipeline_with_options<S: SourceEngine, T: TargetEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipeline: &Pipeline,
+    source: &S,
     target: &T,
     reconcile_deletes: bool,
 ) -> Result<(), RuntimeError> {
@@ -1093,7 +1098,7 @@ pub(crate) async fn deliver_direct_pipeline_with_options<T: TargetEngine>(
         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
     let source_columns =
-        source_columns_for_pipeline(deployment, &pipeline.source_schema, &pipeline.source_table)?;
+        source_columns_for_pipeline(source, &pipeline.source_schema, &pipeline.source_table)?;
     let managed_names: BTreeSet<String> = dataset
         .columns
         .iter()
@@ -1217,10 +1222,11 @@ async fn reconcile_target_deletes<T: TargetEngine>(
         .map_err(|err| RuntimeError::Failed(err.to_string()))
 }
 
-pub(crate) async fn deliver_transform_pipeline_with_options<T: TargetEngine>(
+pub(crate) async fn deliver_transform_pipeline_with_options<S: SourceEngine, T: TargetEngine>(
     store: &PlatformStore,
     deployment: &Deployment,
     pipeline: &Pipeline,
+    source: &S,
     target: &T,
     reconcile_deletes: bool,
 ) -> Result<(), RuntimeError> {
@@ -1252,7 +1258,7 @@ pub(crate) async fn deliver_transform_pipeline_with_options<T: TargetEngine>(
         &secondary_columns,
     );
     let source_columns =
-        source_columns_for_pipeline(deployment, &pipeline.source_schema, &pipeline.source_table)?;
+        source_columns_for_pipeline(source, &pipeline.source_schema, &pipeline.source_table)?;
     let managed_names: BTreeSet<String> = derived_columns
         .iter()
         .map(|c| c.name.clone())
@@ -1404,34 +1410,50 @@ pub async fn apply(
 
 /// Apply a Deployment with typed [`ApplyOptions`] (issue #200).
 ///
-/// This is the Deployment runtime's primary Operator verb for the apply path.
-/// Table-level Initial Load and Direct Pipeline Delivery (plus Transform first
-/// Delivery when a Pipeline revision needs rebuild) are sequenced here — not in
-/// the CLI clap adapter.
-///
-/// Callers (CLI adapter, in-process tests) supply an already-open Platform Store
-/// session and resolved Deployment / Pipeline values — config parsing stays outside.
+/// Factory path: constructs v1 Source/Target adapters via
+/// [`source_engine_from_connection`] / [`target_engine_from_deployment`]. Kind
+/// selection stays inside those factories (#206). Prefer
+/// [`apply_with_engines`] for Fake / pre-built adapters.
 pub async fn apply_with_options(
+    store: &PlatformStore,
+    deployment: Deployment,
+    pipelines: Vec<Pipeline>,
+    options: ApplyOptions,
+) -> Result<(), RuntimeError> {
+    let source = source_engine_from_connection(&deployment.source)?;
+    let target = target_engine_from_deployment(&deployment)?;
+    apply_with_engines(store, deployment, pipelines, options, &source, &target).await
+}
+
+/// Apply a Deployment with caller-injected Source/Target engines (issue #206).
+///
+/// Seam for Fake Source/Target (and any pre-built adapters): skips factory kind
+/// selection — Initial Load, Managed validation, prerequisites, and Delivery use
+/// the injected engines. Default CLI `apply` keeps using [`apply_with_options`]
+/// with no Operator-visible change.
+pub async fn apply_with_engines<S: SourceEngine, T: TargetEngine>(
     store: &PlatformStore,
     deployment: Deployment,
     mut pipelines: Vec<Pipeline>,
     options: ApplyOptions,
+    source: &S,
+    target: &T,
 ) -> Result<(), RuntimeError> {
     ensure_store_session_healthy(store).await?;
 
     // ADR-0021: fail-fast Source Prerequisites before discovery / Initial Load.
-    // Deployment-only apply (no Pipeline tables) does not open LogMiner yet.
+    // Deployment-only apply (no Pipeline tables) does not open capture yet.
+    // Capability comes from the engine (factory or injected) — no kind gate (#206).
     let source_tables = pipeline_source_tables(&pipelines);
-    if deployment.source.kind.eq_ignore_ascii_case("oracle") && !source_tables.is_empty() {
-        ensure_source_prerequisites(&deployment.source, &source_tables)?;
+    if !source_tables.is_empty() {
+        ensure_source_prerequisites(source, &source_tables)?;
     }
 
     // Apply-time Managed validation before Initial Load / Delivery so unsafe NUMBER
     // and unsupported Managed inputs fail configure-time (ADR-0018 / ADR-0023).
-    // Real Oracle hosts discover schema via OCI; contract/stub use the contract catalog.
     for pipeline in &pipelines {
         let source_columns = source_columns_for_pipeline(
-            &deployment,
+            source,
             &pipeline.source_schema,
             &pipeline.source_table,
         )?;
@@ -1519,7 +1541,7 @@ pub async fn apply_with_options(
     // Table-level Initial Load only for newly referenced tables; existing Bases stay
     // on their incremental path (ADR-0019). Shared Bases are never rebuilt for a
     // Pipeline revision (ADR-0007 Change).
-    sync_base_datasets_for_pipelines(store, &deployment, &pipelines, &options).await?;
+    sync_base_datasets_for_pipelines(store, &deployment, &pipelines, &options, source).await?;
 
     if !existing_pipelines.is_empty() {
         for (name, source_table) in &added_pipeline_summaries {
@@ -1546,6 +1568,8 @@ pub async fn apply_with_options(
             &to_revise,
             reconcile_deletes,
             ignore_paused,
+            source,
+            target,
         )
         .await?;
         for pipeline in &to_revise {
@@ -1563,7 +1587,16 @@ pub async fn apply_with_options(
     // Start Delivery only for Pipelines that need ordinary first Delivery; do not
     // re-Deliver unchanged already-delivered Pipelines (others keep running — ADR-0007 Add).
     let to_deliver = pipelines_needing_delivery_start(&existing_pipelines, &pipelines);
-    deliver_pipelines(store, &deployment, &to_deliver).await?;
+    deliver_pipelines_with_options(
+        store,
+        &deployment,
+        &to_deliver,
+        false,
+        false,
+        source,
+        target,
+    )
+    .await?;
 
     println!("Deployment applied: {}", deployment.name);
     Ok(())
