@@ -1,10 +1,10 @@
-//! Shared Connection Security, Managed-field, column metadata, and Output Identity key
-//! types for the apply → Direct Delivery path.
+//! Shared Connection Security, Managed-field, column metadata, NUMBER classification,
+//! and Output Identity key types for the apply → Direct Delivery path.
 //!
 //! Config wire shapes, Platform Store persistence, Source adapters, and Target adapters
 //! consume these types (or thin wire adapters from them) so TLS settings, Managed-field
-//! mapping, column metadata, secret-reference resolution, and Output Identity key
-//! encoding do not drift as parallel enums.
+//! mapping, column metadata, NUMBER→Mongo classification (ADR-0023), secret-reference
+//! resolution, and Output Identity key encoding do not drift as parallel enums.
 
 use std::fs;
 use std::path::Path;
@@ -40,6 +40,49 @@ pub struct ColumnShape {
     pub precision: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<i32>,
+}
+
+/// Decimal128 significant digits (IEEE 754 decimal128).
+pub const DECIMAL128_MAX_PRECISION: i32 = 34;
+
+/// Signed Int64 / NumberLong digit budget that always fits.
+pub const INT64_SAFE_PRECISION: i32 = 18;
+
+/// How a declared NUMBER(p,s) maps into Mongo numeric types (ADR-0023).
+///
+/// Lives next to [`ColumnShape`] so capture and Delivery can share one classification
+/// home (issue #202); adapter-private allow-list rules stay elsewhere (ADR-0018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberMongoMapping {
+    /// scale 0 (or absent scale treated as integer) and precision ≤ 18 → NumberLong
+    Long,
+    /// precision ≤ 34 and fits Decimal128 → Decimal128 (never IEEE double)
+    Decimal128,
+    /// declared precision/scale cannot fit safe Mongo numeric types
+    Unsafe,
+}
+
+/// Classify NUMBER(p,s) for precision-preserving Mongo mapping (ADR-0023).
+///
+/// Unconstrained / missing precision is unsafe — never default to IEEE double.
+pub fn classify_number(precision: Option<i32>, scale: Option<i32>) -> NumberMongoMapping {
+    let Some(precision) = precision else {
+        return NumberMongoMapping::Unsafe;
+    };
+    if precision <= 0 || precision > 38 {
+        return NumberMongoMapping::Unsafe;
+    }
+    let scale = scale.unwrap_or(0);
+    if scale < 0 || scale > precision {
+        return NumberMongoMapping::Unsafe;
+    }
+    if scale == 0 && precision <= INT64_SAFE_PRECISION {
+        return NumberMongoMapping::Long;
+    }
+    if precision <= DECIMAL128_MAX_PRECISION {
+        return NumberMongoMapping::Decimal128;
+    }
+    NumberMongoMapping::Unsafe
 }
 
 /// How a secret is referenced (never stored as plaintext) — ADR-0006.
@@ -373,5 +416,25 @@ mod tests {
         let written = serde_json::to_string(&shape).unwrap();
         assert!(written.contains(r#""data_type":"NUMBER""#));
         assert!(!written.contains(r#""oracle_type""#));
+    }
+
+    #[test]
+    fn number_classify_next_to_column_shape_never_defaults_to_double() {
+        // ADR-0023 worked examples — independent literals, not recomputed from helpers.
+        assert_eq!(
+            classify_number(Some(10), Some(0)),
+            NumberMongoMapping::Long
+        );
+        assert_eq!(
+            classify_number(Some(12), Some(2)),
+            NumberMongoMapping::Decimal128
+        );
+        assert_eq!(classify_number(None, None), NumberMongoMapping::Unsafe);
+        assert_eq!(
+            classify_number(Some(38), Some(10)),
+            NumberMongoMapping::Unsafe
+        );
+        assert_eq!(INT64_SAFE_PRECISION, 18);
+        assert_eq!(DECIMAL128_MAX_PRECISION, 34);
     }
 }

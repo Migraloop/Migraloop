@@ -3,6 +3,9 @@
 //! Deployment runtime Sync depends on [`SourceEngine`] / [`IncrementalCaptureSession`],
 //! not Oracle concrete call sites. v1 adapters: Oracle LogMiner contract harness and
 //! OCI, plus [`FakeSource`] for in-process seam tests — no second production Source.
+//!
+//! Discovered columns expose engine-agnostic [`migraloop_types::ColumnShape`] beside the
+//! Oracle-branded `oracle_type` field (expand #202; contract #207 removes the brand).
 
 use std::collections::BTreeMap;
 
@@ -76,6 +79,9 @@ pub trait SourceEngine: Send {
     fn check_prerequisites(&self, required_tables: &[String]) -> Result<(), CaptureError>;
 
     /// Schema discovery for a Pipeline-referenced table.
+    ///
+    /// Returned [`SourceColumn`] values expose [`migraloop_types::ColumnShape`] /
+    /// [`SourceColumn::data_type`] alongside Oracle-branded fields (issue #202).
     fn discover_schema(&self, schema: &str, table: &str) -> Result<Vec<SourceColumn>, CaptureError>;
 
     /// Bounded Initial Load chunk (ADR-0004 / issue #124).
@@ -475,6 +481,28 @@ mod tests {
         assert_eq!(chunk.rows.len(), 1);
         assert_eq!(mechanism, "fake");
         assert_eq!(source.kind_label(), "fake");
+    }
+
+    #[test]
+    fn source_engine_discover_exposes_column_shape_beside_oracle_type() {
+        use migraloop_types::ColumnShape;
+
+        let source = sample_fake_source();
+        let columns = source.discover_schema("", "CUSTOMERS").unwrap();
+        let col = &columns[0];
+        // Oracle-branded form still present (expand — contract deletes later).
+        assert_eq!(col.oracle_type, "NUMBER");
+        // Engine-agnostic shape is available at the SourceEngine seam.
+        assert_eq!(
+            ColumnShape::from(col.clone()),
+            ColumnShape {
+                name: "ID".into(),
+                data_type: "NUMBER".into(),
+                precision: Some(10),
+                scale: Some(0),
+            }
+        );
+        assert_eq!(col.data_type(), "NUMBER");
     }
 
     #[test]
