@@ -21,6 +21,8 @@ namespace:
     seed_sql: |
       INSERT INTO LAB_SA_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);
       INSERT INTO LAB_SA_CUSTOMERS (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);
+    mutate_sql: |
+      UPDATE LAB_SA_CUSTOMERS SET NAME = 'AlignedAlice' WHERE ID = 1;
 deployment_config: deployment.yaml
 workload:
   concurrency: serial

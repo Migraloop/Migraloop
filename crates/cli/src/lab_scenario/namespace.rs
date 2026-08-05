@@ -232,6 +232,8 @@ pub(crate) fn validate_namespace_lifecycle(
     }
     // Mutate SQL is optional: rare escapes (CLI verbs, parallel sessions, backlog
     // generators) omit it and keep a thin adapter. When present it must be non-empty.
+    // `has_mutate_step` documents that product_path mutate without mutate_sql is allowed.
+    let _ = has_mutate_step;
     if let Some(mutate_sql) = &lifecycle.mutate_sql {
         if mutate_sql.trim().is_empty() {
             return Err(CliError::Failed(format!(
@@ -239,9 +241,6 @@ pub(crate) fn validate_namespace_lifecycle(
                  non-empty when set (omit the field for thin mutate escapes)"
             )));
         }
-    } else if has_mutate_step {
-        // Allowed: thin adapter owns mutate. No extra validation here.
-        let _ = has_mutate_step;
     }
     Ok(())
 }

@@ -976,7 +976,8 @@ struct ProductPathRunContext {
     apply_started: Option<Instant>,
 }
 
-/// Thin Scenario hooks for seed SQL, rare escapes, and correctness (#173 / #178).
+/// Thin Scenario hooks for rare escapes and correctness (#173 / #178 / #201).
+/// Namespace wipe/prepare/seed (and optional mutate SQL) live in `namespace.lifecycle`.
 enum ProductPathHooks {
     DirectPipeline,
     RtProject,
@@ -1561,6 +1562,7 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
             | Self::TransformPipeline
             | Self::IdempotentRedelivery
             | Self::SchemaChangePause
+            | Self::SourceAlignment
             | Self::BulkLoad
             | Self::PlatformStoreGuardrails
             | Self::BackwardCompatibleUpgrades
@@ -1797,12 +1799,6 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                     )));
                 }
                 Ok(())
-            }
-            Self::SourceAlignment => {
-                println!(
-                    "Lab Scenario: mutating Source ID=1 → AlignedAlice (controlled Base≠Source; no sync)..."
-                );
-                mutate_source_alignment_name(lab_dir, 1, "AlignedAlice").await
             }
             Self::DriftCheck => {
                 println!("Lab Scenario: align Base as trusted Drift baseline...");
