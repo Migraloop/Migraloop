@@ -235,9 +235,12 @@ pub(crate) async fn connect(database_url: &str) -> Result<PgPool, PlatformStoreE
 ///
 /// Postgres remains the only store engine (ADR-0001). Open once per process flow and
 /// call session verbs instead of reconnecting on every table-shaped CRUD call.
-/// Sync / Delivery progress, quarantine, and schema-impact intents use
+/// Sync / Delivery progress, quarantine, schema-impact, Source Alignment, Drift, and
+/// Pipeline lifecycle intents use
 /// [`PlatformStore::record_sync_window_progress`], [`PlatformStore::record_delivery_progress`],
-/// [`PlatformStore::quarantine_change`], and [`PlatformStore::mark_schema_impact`].
+/// [`PlatformStore::quarantine_change`], [`PlatformStore::mark_schema_impact`],
+/// [`PlatformStore::record_source_alignment_progress`], [`PlatformStore::record_drift_outcome`],
+/// [`PlatformStore::resume_pipeline`], and [`PlatformStore::remove_pipeline`].
 ///
 /// [`Clone`] is cheap (shared [`PgPool`]) so Deployment runtime supervise can hand a
 /// session handle to panic-isolated continuous Sync workers without reopening by URL.
@@ -556,6 +559,25 @@ impl PlatformStore {
         Ok(())
     }
 
+    /// Record Source Alignment Check progress: repaired Base snapshot + alignment fields.
+    ///
+    /// Deployment-intent verb — Runtime Alignment paths call this instead of a
+    /// hand-built [`replace_base_dataset`] for alignment repair persistence.
+    pub async fn record_source_alignment_progress(
+        &self,
+        dataset: &BaseDataset,
+        rows: &[serde_json::Map<String, serde_json::Value>],
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        replace_base_dataset_in_tx(&mut tx, dataset, rows).await?;
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
     /// Append one Initial Load chunk into an existing (or new) Base Dataset.
     ///
     /// Does **not** delete prior rows — used for chunked / pausable Initial Load
@@ -764,8 +786,11 @@ impl PlatformStore {
         Ok(())
     }
 
-    /// Persist Drift Check status for one Pipeline (issue #25).
-    pub async fn update_pipeline_drift_status(
+    /// Record Drift Check outcome for one Pipeline (status + checked/mismatched counts).
+    ///
+    /// Deployment-intent verb — Runtime Drift paths call this instead of a
+    /// table-shaped drift-column update.
+    pub async fn record_drift_outcome(
         &self,
         deployment_name: &str,
         pipeline_name: &str,
@@ -1058,49 +1083,13 @@ impl PlatformStore {
         deployment_name: &str,
         keep_tables: &[(String, String)],
     ) -> Result<(), PlatformStoreError> {
-        let pool = &self.pool;
-        let existing = sqlx::query_as::<_, (String, String)>(
-            r#"
-            SELECT source_schema, source_table
-            FROM base_datasets
-            WHERE deployment_name = $1
-            "#,
-        )
-        .bind(deployment_name)
-        .fetch_all(pool)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
-
-        for (schema, table) in existing {
-            let keep = keep_tables.iter().any(|(s, t)| s == &schema && t == &table);
-            if keep {
-                continue;
-            }
-            sqlx::query(
-                r#"
-                DELETE FROM base_rows
-                WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-                "#,
-            )
-            .bind(deployment_name)
-            .bind(&schema)
-            .bind(&table)
-            .execute(pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(PlatformStoreError::Persist)?;
-            sqlx::query(
-                r#"
-                DELETE FROM base_datasets
-                WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-                "#,
-            )
-            .bind(deployment_name)
-            .bind(&schema)
-            .bind(&table)
-            .execute(pool)
-            .await
-            .map_err(PlatformStoreError::Persist)?;
-        }
+        delete_base_datasets_not_in_tx(&mut tx, deployment_name, keep_tables).await?;
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
         Ok(())
     }
 
@@ -1692,6 +1681,98 @@ impl PlatformStore {
         .map_err(PlatformStoreError::Persist)?;
         Ok(result.rows_affected())
     }
+
+    /// Resume a paused Pipeline's durable pause and clear active schema impacts.
+    ///
+    /// Deployment-intent verb — Runtime Operator resume paths call this instead of
+    /// sequencing [`set_pipeline_paused`]`(false)` + [`clear_schema_change_impacts`].
+    /// Delivery catch-up stays in Runtime.
+    pub async fn resume_pipeline(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+
+        let paused = sqlx::query(
+            r#"
+            UPDATE pipelines
+            SET paused = false
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        if paused.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+            )));
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE schema_change_impacts
+            SET status = 'cleared'
+            WHERE deployment_name = $1
+              AND pipeline_name = $2
+              AND status = 'active'
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Remove one Pipeline and prune Base Datasets outside `keep_tables`.
+    ///
+    /// Deployment-intent verb — Runtime remove paths call this instead of sequencing
+    /// [`delete_pipeline`] + [`delete_base_datasets_not_in`]. Callers compute
+    /// `keep_tables` from remaining Pipeline Base refs (ADR-0007 / ADR-0019).
+    pub async fn remove_pipeline(
+        &self,
+        deployment_name: &str,
+        pipeline_name: &str,
+        keep_tables: &[(String, String)],
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM pipelines
+            WHERE deployment_name = $1 AND name = $2
+            "#,
+        )
+        .bind(deployment_name)
+        .bind(pipeline_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        if deleted.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "Pipeline {pipeline_name} not found in Deployment {deployment_name}"
+            )));
+        }
+
+        delete_base_datasets_not_in_tx(&mut tx, deployment_name, keep_tables).await?;
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
 }
 
 async fn replace_base_dataset_in_tx(
@@ -1790,6 +1871,56 @@ async fn replace_base_dataset_in_tx(
         .bind(&dataset.source_table)
         .bind(ordinal as i32)
         .bind(&row_json)
+        .execute(&mut **tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+    }
+    Ok(())
+}
+
+async fn delete_base_datasets_not_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    deployment_name: &str,
+    keep_tables: &[(String, String)],
+) -> Result<(), PlatformStoreError> {
+    let existing = sqlx::query_as::<_, (String, String)>(
+        r#"
+            SELECT source_schema, source_table
+            FROM base_datasets
+            WHERE deployment_name = $1
+            "#,
+    )
+    .bind(deployment_name)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    for (schema, table) in existing {
+        let keep = keep_tables.iter().any(|(s, t)| s == &schema && t == &table);
+        if keep {
+            continue;
+        }
+        sqlx::query(
+            r#"
+                DELETE FROM base_rows
+                WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+                "#,
+        )
+        .bind(deployment_name)
+        .bind(&schema)
+        .bind(&table)
+        .execute(&mut **tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        sqlx::query(
+            r#"
+                DELETE FROM base_datasets
+                WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+                "#,
+        )
+        .bind(deployment_name)
+        .bind(&schema)
+        .bind(&table)
         .execute(&mut **tx)
         .await
         .map_err(PlatformStoreError::Persist)?;
