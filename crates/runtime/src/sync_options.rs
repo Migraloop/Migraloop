@@ -23,6 +23,9 @@ pub struct SyncOptions {
     pub poison: PoisonOptions,
     /// Bounded Backpressure (ADR-0020): queue capacity + optional delivery delay.
     pub backpressure: BackpressureOptions,
+    /// Idle poll interval between continuous Incremental Capture cycles (`migraloop run`).
+    /// Must be > 0; default 1000ms (#200).
+    pub poll_interval_ms: u64,
     /// Test fault: exit after N durable checkpoints (restart-resume coverage).
     pub fail_after_changes: Option<u32>,
 }
@@ -32,6 +35,7 @@ impl Default for SyncOptions {
         Self {
             poison: PoisonOptions::default(),
             backpressure: BackpressureOptions::default(),
+            poll_interval_ms: 1000,
             fail_after_changes: None,
         }
     }
@@ -96,6 +100,8 @@ pub struct SyncOptionsOverrides {
     /// When `Some`, sets delivery delay (including clearing via callers that pass None? —
     /// use `Some(ms)` to set; leave `None` for env shim / production default).
     pub delivery_delay_ms: Option<u64>,
+    /// Continuous Sync idle poll interval override (`migraloop run`; #200).
+    pub poll_interval_ms: Option<u64>,
     pub fail_after_changes: Option<u32>,
     /// When true, `poison_identity_keys: None` does not read legacy env (typed path only).
     pub omit_env_fault_shim: bool,
@@ -121,6 +127,7 @@ impl SyncOptions {
                 queue_capacity: env_usize_gt0("MIGRALOOP_SYNC_QUEUE_CAPACITY").unwrap_or(256),
                 delivery_delay_ms: None,
             },
+            poll_interval_ms: env_u64_gt0("MIGRALOOP_SYNC_POLL_INTERVAL_MS").unwrap_or(1000),
             fail_after_changes: None,
         }
         .normalized()
@@ -140,6 +147,9 @@ impl SyncOptions {
         }
         if let Some(n) = overrides.queue_capacity {
             opts.backpressure.queue_capacity = n;
+        }
+        if let Some(ms) = overrides.poll_interval_ms {
+            opts.poll_interval_ms = ms;
         }
 
         if let Some(keys) = overrides.poison_identity_keys {
@@ -179,6 +189,9 @@ impl SyncOptions {
         }
         if self.backpressure.queue_capacity == 0 {
             self.backpressure.queue_capacity = 256;
+        }
+        if self.poll_interval_ms == 0 {
+            self.poll_interval_ms = 1000;
         }
         self
     }
@@ -233,11 +246,12 @@ mod tests {
         assert!(opts.poison.poison_identity_keys.is_empty());
         assert_eq!(opts.backpressure.queue_capacity, 256);
         assert_eq!(opts.backpressure.delivery_delay_ms, None);
+        assert_eq!(opts.poll_interval_ms, 1000);
         assert_eq!(opts.fail_after_changes, None);
     }
 
     #[test]
-    fn normalized_clamps_zero_capacity_and_attempts() {
+    fn normalized_clamps_zero_capacity_attempts_and_poll() {
         let opts = SyncOptions {
             poison: PoisonOptions {
                 max_attempts: 0,
@@ -247,11 +261,13 @@ mod tests {
                 queue_capacity: 0,
                 delivery_delay_ms: None,
             },
+            poll_interval_ms: 0,
             fail_after_changes: None,
         }
         .normalized();
         assert_eq!(opts.poison.max_attempts, 3);
         assert_eq!(opts.backpressure.queue_capacity, 256);
+        assert_eq!(opts.poll_interval_ms, 1000);
     }
 
     #[test]
@@ -260,6 +276,7 @@ mod tests {
         std::env::set_var("MIGRALOOP_POISON_MAX_ATTEMPTS", "2");
         std::env::set_var("MIGRALOOP_DELIVERY_POISON_IDENTITIES", "1, 42");
         std::env::set_var("MIGRALOOP_SYNC_QUEUE_CAPACITY", "4");
+        std::env::set_var("MIGRALOOP_SYNC_POLL_INTERVAL_MS", "50");
         std::env::set_var("MIGRALOOP_DELIVERY_DELAY_MS", "80");
         std::env::set_var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "1");
 
@@ -270,12 +287,14 @@ mod tests {
             BTreeSet::from(["1".into(), "42".into()])
         );
         assert_eq!(opts.backpressure.queue_capacity, 4);
+        assert_eq!(opts.poll_interval_ms, 50);
         assert_eq!(opts.backpressure.delivery_delay_ms, Some(80));
         assert_eq!(opts.fail_after_changes, Some(1));
 
         std::env::remove_var("MIGRALOOP_POISON_MAX_ATTEMPTS");
         std::env::remove_var("MIGRALOOP_DELIVERY_POISON_IDENTITIES");
         std::env::remove_var("MIGRALOOP_SYNC_QUEUE_CAPACITY");
+        std::env::remove_var("MIGRALOOP_SYNC_POLL_INTERVAL_MS");
         std::env::remove_var("MIGRALOOP_DELIVERY_DELAY_MS");
         std::env::remove_var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES");
     }
@@ -287,12 +306,14 @@ mod tests {
         std::env::set_var("MIGRALOOP_DELIVERY_DELAY_MS", "999");
         std::env::set_var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "9");
         std::env::set_var("MIGRALOOP_SYNC_QUEUE_CAPACITY", "8");
+        std::env::set_var("MIGRALOOP_SYNC_POLL_INTERVAL_MS", "999");
 
         let opts = SyncOptions::for_cli(SyncOptionsOverrides {
             poison_identity_keys: Some(BTreeSet::from(["typed".into()])),
             poison_max_attempts: Some(2),
             queue_capacity: Some(4),
             delivery_delay_ms: Some(80),
+            poll_interval_ms: Some(50),
             fail_after_changes: Some(1),
             omit_env_fault_shim: false,
         });
@@ -304,12 +325,14 @@ mod tests {
         assert_eq!(opts.poison.max_attempts, 2);
         assert_eq!(opts.backpressure.queue_capacity, 4);
         assert_eq!(opts.backpressure.delivery_delay_ms, Some(80));
+        assert_eq!(opts.poll_interval_ms, 50);
         assert_eq!(opts.fail_after_changes, Some(1));
 
         std::env::remove_var("MIGRALOOP_DELIVERY_POISON_IDENTITIES");
         std::env::remove_var("MIGRALOOP_DELIVERY_DELAY_MS");
         std::env::remove_var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES");
         std::env::remove_var("MIGRALOOP_SYNC_QUEUE_CAPACITY");
+        std::env::remove_var("MIGRALOOP_SYNC_POLL_INTERVAL_MS");
     }
 
     #[test]
@@ -337,6 +360,7 @@ mod tests {
         let _guard = ENV_COMPAT_LOCK.lock().expect("env compat lock");
         std::env::set_var("MIGRALOOP_POISON_MAX_ATTEMPTS", "2");
         std::env::set_var("MIGRALOOP_SYNC_QUEUE_CAPACITY", "4");
+        std::env::set_var("MIGRALOOP_SYNC_POLL_INTERVAL_MS", "50");
         std::env::set_var("MIGRALOOP_DELIVERY_POISON_IDENTITIES", "1");
         std::env::set_var("MIGRALOOP_DELIVERY_DELAY_MS", "80");
         std::env::set_var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES", "1");
@@ -344,12 +368,14 @@ mod tests {
         let opts = SyncOptions::from_operator_env();
         assert_eq!(opts.poison.max_attempts, 2);
         assert_eq!(opts.backpressure.queue_capacity, 4);
+        assert_eq!(opts.poll_interval_ms, 50);
         assert!(opts.poison.poison_identity_keys.is_empty());
         assert_eq!(opts.backpressure.delivery_delay_ms, None);
         assert_eq!(opts.fail_after_changes, None);
 
         std::env::remove_var("MIGRALOOP_POISON_MAX_ATTEMPTS");
         std::env::remove_var("MIGRALOOP_SYNC_QUEUE_CAPACITY");
+        std::env::remove_var("MIGRALOOP_SYNC_POLL_INTERVAL_MS");
         std::env::remove_var("MIGRALOOP_DELIVERY_POISON_IDENTITIES");
         std::env::remove_var("MIGRALOOP_DELIVERY_DELAY_MS");
         std::env::remove_var("MIGRALOOP_SYNC_FAIL_AFTER_CHANGES");

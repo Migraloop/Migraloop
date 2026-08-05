@@ -918,33 +918,37 @@ fn adapter_ok(rows_applied: u64, capture_path_note: impl Into<String>) -> Adapte
 }
 
 /// Apply Scenario deployment via the real product CLI path with recipe apply gates.
+///
+/// Typed ApplyOptions ride on `apply_cli_args` (#200). Optional `extra_env` remains
+/// only for non-ApplyOptions Lab bridges (none today for Initial Load knobs).
 async fn product_apply(
     lab_dir: &Path,
     scenario_id: &str,
     opts: &ProductPathApplyOpts,
-    apply_env: &[(String, String)],
+    apply_cli_args: &[String],
+    extra_env: &[(String, String)],
 ) -> Result<String, CliError> {
     let config_path = deployment_config_path(lab_dir, scenario_id)?;
     let bin = lab_migraloop_bin();
     println!("Lab Scenario: apply Deployment via real product path...");
-    let env_refs: Vec<(&str, &str)> = apply_env
+    let config_str = config_path.to_str().ok_or_else(|| {
+        CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
+    })?;
+    let mut args: Vec<&str> = vec![
+        "apply",
+        "--platform-store-url",
+        LAB_PLATFORM_STORE_URL,
+        "--file",
+        config_str,
+    ];
+    for a in apply_cli_args {
+        args.push(a.as_str());
+    }
+    let env_refs: Vec<(&str, &str)> = extra_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let apply_out = run_product_cli_with_env(
-        &bin,
-        &[
-            "apply",
-            "--platform-store-url",
-            LAB_PLATFORM_STORE_URL,
-            "--file",
-            config_path.to_str().ok_or_else(|| {
-                CliError::Failed("Scenario deployment path is not valid UTF-8".to_string())
-            })?,
-        ],
-        &env_refs,
-    )
-    .await?;
+    let apply_out = run_product_cli_with_env(&bin, &args, &env_refs).await?;
     if opts.require_initial_load
         && !(apply_out.contains("Initial Load")
             || apply_out.to_ascii_lowercase().contains("initial_load"))
@@ -1083,19 +1087,21 @@ impl ProductPathHooks {
         }
     }
 
-    fn apply_env(&self) -> Vec<(String, String)> {
+    /// Typed ApplyOptions CLI flags + optional non-options env bridges (#200).
+    ///
+    /// Prefer CLI flags for Initial Load knobs (same pattern as [`Self::sync_invocation`]).
+    fn apply_invocation(&self) -> (Vec<String>, Vec<(String, String)>) {
         match self {
-            Self::InitialLoadThrottled => vec![
-                (
-                    "MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE".to_string(),
+            Self::InitialLoadThrottled => (
+                vec![
+                    "--initial-load-chunk-size".to_string(),
                     INITIAL_LOAD_THROTTLED_CHUNK_SIZE.to_string(),
-                ),
-                (
-                    "MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS".to_string(),
+                    "--initial-load-pause-after-chunks".to_string(),
                     INITIAL_LOAD_THROTTLED_PAUSE_AFTER.to_string(),
-                ),
-            ],
-            _ => vec![],
+                ],
+                vec![],
+            ),
+            _ => (vec![], vec![]),
         }
     }
 
@@ -3592,7 +3598,7 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                     })?;
                     println!(
                         "Lab Scenario: resume apply with rate_limit={INITIAL_LOAD_THROTTLED_RATE}/s \
-                and store delay for backoff..."
+                and store delay for backoff (typed ApplyOptions)..."
                     );
                     let resume_out = run_product_cli_with_env(
                         &bin,
@@ -3602,21 +3608,14 @@ Derived:\n{derived_after}\nOrder totals Target:\n{totals_target}"
                             LAB_PLATFORM_STORE_URL,
                             "--file",
                             config_str,
+                            "--initial-load-chunk-size",
+                            INITIAL_LOAD_THROTTLED_CHUNK_SIZE,
+                            "--initial-load-rows-per-sec",
+                            INITIAL_LOAD_THROTTLED_RATE,
+                            "--initial-load-store-delay-ms",
+                            INITIAL_LOAD_THROTTLED_STORE_DELAY_MS,
                         ],
-                        &[
-                            (
-                                "MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE",
-                                INITIAL_LOAD_THROTTLED_CHUNK_SIZE,
-                            ),
-                            (
-                                "MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC",
-                                INITIAL_LOAD_THROTTLED_RATE,
-                            ),
-                            (
-                                "MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS",
-                                INITIAL_LOAD_THROTTLED_STORE_DELAY_MS,
-                            ),
-                        ],
+                        &[],
                     )
                     .await?;
                     if !(resume_out.contains("Initial Load complete")
@@ -4507,10 +4506,16 @@ async fn run_product_path_scenario(
                 );
             }
             ProductPathStepKind::ProductApply => {
-                let apply_env = hooks.apply_env();
+                let (apply_cli_args, extra_env) = hooks.apply_invocation();
                 ctx.apply_started = Some(Instant::now());
-                ctx.apply_out =
-                    product_apply(lab_dir, &recipe.id, &product_path.apply, &apply_env).await?;
+                ctx.apply_out = product_apply(
+                    lab_dir,
+                    &recipe.id,
+                    &product_path.apply,
+                    &apply_cli_args,
+                    &extra_env,
+                )
+                .await?;
                 hooks.after_apply(lab_dir, &ctx.apply_out).await?;
             }
             ProductPathStepKind::Mutate => {

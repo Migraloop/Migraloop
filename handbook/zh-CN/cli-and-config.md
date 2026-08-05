@@ -30,7 +30,7 @@ migraloop migrate --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL"
 
 在真实 Oracle Source host（非 `contract`/`stub`）上，apply 会通过 OCI 从 live Source 做 schema discovery 与 Initial Load（需要 Instant Client；见 [Source System](source-system.md)）。contract/stub host 仅使用**注入的**进程内 **contract Source catalog**（CI 切片；`MIGRALOOP_CONTRACT_SOURCE_CATALOG` 供 discovery/Initial Load；`MIGRALOOP_INJECT_LOGMINER_CONTENTS` 供 Incremental Capture）—不是随产品附带的业务表 catalog，也不是受支持的 production Source 机制。
 
-Initial Load 以**有界 chunks**读取 Source（默认 `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE=1000`），会打印 `Initial Load progress`／structured `initial_load_progress` events，并可用 `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` 限速。Load 中途 pause（对引用该表的 Pipeline 执行 Operator `migraloop pause`，或 Lab inject `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS`）会持久化进度（`status=initial_load_paused`）与 cutover low-watermark；再跑 `migraloop apply` 即可 resume，无需拆除 Deployment。在 Downstream／store 压力下，apply 会打印 `Initial Load backoff`，而不是让内存无界增长（见 [Operations](operations.md)）。
+Initial Load 以**有界 chunks**读取 Source（默认 chunk size `1000`，Operator env `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE`），会打印 `Initial Load progress`／structured `initial_load_progress` events，并可用 `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` 限速。Load 中途 pause（对引用该表的 Pipeline 执行 Operator `migraloop pause`，或 Test/Lab typed ApplyOptions inject）会持久化进度（`status=initial_load_paused`）与 cutover low-watermark；再跑 `migraloop apply` 即可 resume，无需拆除 Deployment。在 Downstream／store 压力下，apply 会打印 `Initial Load backoff`，而不是让内存无界增长（见 [Operations](operations.md)）。Lab／RQG 优先通过 `apply` 上的 typed ApplyOptions（`--initial-load-*` hidden flags）传入 knobs，而不是以 process env 作为主要 adapter。
 
 ```bash
 migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployment.yaml
@@ -39,6 +39,10 @@ migraloop apply --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" -f deployme
 | 标志 | 含义 |
 | --- | --- |
 | `-f`, `--file` | Deployment 配置路径 |
+| `--initial-load-chunk-size` | Hidden Test/Lab／override：typed ApplyOptions chunk size（Operator env 也适用） |
+| `--initial-load-rows-per-sec` | Hidden Test/Lab／override：typed ApplyOptions throttle（Operator env 也适用） |
+| `--initial-load-pause-after-chunks` | Hidden Test/Lab：typed ApplyOptions，成功 N 个 chunks 后 pause inject |
+| `--initial-load-store-delay-ms` | Hidden Test/Lab：typed ApplyOptions store-pressure inject |
 
 ### `status`
 
@@ -178,7 +182,7 @@ migraloop remove --pipeline customers [--deployment oracle-to-mongo]
 
 ### `run`
 
-启动时 migrate，对已应用（未 pause）的 Pipelines 持续执行 Incremental Capture → Affect Analysis → Delivery，并在同一个 single active instance 上提供 Observability Surface Prometheus scrape endpoint，然后保持进程运行（compose 默认 command）。Steady-state Sync 不需要外部 sync scheduler。Caught up 或尚未应用 Deployment 时会 idle-poll（`MIGRALOOP_SYNC_POLL_INTERVAL_MS`）。Source/Target secret refs 必须存在于此进程环境。
+启动时 migrate，对已应用（未 pause）的 Pipelines 持续执行 Incremental Capture → Affect Analysis → Delivery，并在同一个 single active instance 上提供 Observability Surface Prometheus scrape endpoint，然后保持进程运行（compose 默认 command）。Steady-state Sync 不需要外部 sync scheduler。Caught up 或尚未应用 Deployment 时会 idle-poll（typed SyncOptions `poll_interval_ms`；Operator env `MIGRALOOP_SYNC_POLL_INTERVAL_MS` 或 hidden `--sync-poll-interval-ms`）。Source/Target secret refs 必须存在于此进程环境。
 
 ```bash
 migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" \
@@ -188,6 +192,7 @@ migraloop run --platform-store-url "$MIGRALOOP_PLATFORM_STORE_URL" \
 | Flag / env | 含义 |
 | --- | --- |
 | `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` | Prometheus `/metrics` listen address（默认 `0.0.0.0:9090`）。Compose 会 map host `9090`。见 [Observability](observability.md)。 |
+| `--sync-poll-interval-ms` | Hidden Test/Lab／override：typed SyncOptions idle poll 间隔（Operator env `MIGRALOOP_SYNC_POLL_INTERVAL_MS` 也适用） |
 
 ### `lab`
 
@@ -226,7 +231,7 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | `MIGRALOOP_PLATFORM_STORE_DATA_DIR` | app filesystem 上用来观测 Platform Store 可用磁盘的路径（compose 会把 store data volume 以 read-only 挂在 `/var/lib/migraloop/platform-store-data`） |
 | `MIGRALOOP_PLATFORM_STORE_FREE_DISK_BYTES` | 选用：当无法做 filesystem probe 时，由 Operator／orchestrator 提供的可用磁盘字节数（覆盖目录探测以供 warn threshold） |
 | `MIGRALOOP_METRICS_ADDR` | `migraloop run` 的 Prometheus scrape listen address（默认 `0.0.0.0:9090`） |
-| `MIGRALOOP_SYNC_POLL_INTERVAL_MS` | `migraloop run` 内 continuous Incremental Capture cycles 之间的 idle poll 间隔（默认 `1000`；必须 > 0） |
+| `MIGRALOOP_SYNC_POLL_INTERVAL_MS` | `migraloop run` 内 continuous Incremental Capture cycles 之间的 idle poll 间隔（默认 `1000`；必须 > 0）。Typed 于 SyncOptions；Test/Lab 也可在 `migraloop run` 设置 `--sync-poll-interval-ms` |
 | 配置中 `fromEnv` 引用的密钥环境变量名 | 你在 `password.fromEnv` 写的任何名称（例如 `ORACLE_PASSWORD`、`MONGO_PASSWORD`）在 apply / one-shot `sync` / continuous `run` 时必须存在于进程环境 |
 | `LD_LIBRARY_PATH` | 真实 Oracle host：Oracle Instant Client libraries 目录（apply/sync/`run` runtime 需要；`contract`/`stub` 不使用） |
 | `MIGRALOOP_CONTRACT_SOURCE_CATALOG` | 仅 contract/stub host：harness catalog 表的 JSON 文件路径，供 schema discovery + Initial Load（CI／本地切片；未设置为空；不是 production Source 机制） |
@@ -234,10 +239,10 @@ Lab 是手动验证—不是 Release Quality Gate，也不是 contract/stub LogM
 | `MIGRALOOP_DELIVERY_POISON_IDENTITIES` | 已弃用、仅薄临时 compat shim：以逗号分隔、一律让 Delivery 失败的 Output Identity keys。请改用 typed SyncOptions（`migraloop sync` 的 `--sync-poison-identity` 等隐藏 Test/Lab flags，或 in-process `SyncOptions`；不是 production Operator 控制） |
 | `MIGRALOOP_INJECT_SCHEMA_CHANGES` | 仅 Test/Lab injection：Schema Change events 的 JSON 文件路径（`scn`、`table`、`kind`、`columns` …），以便在没有 LogMiner DDL capture 时演练 blocking DDL warn+pause（不是 production Operator 控制） |
 | `MIGRALOOP_SYNC_QUEUE_CAPACITY` | Bounded Incremental Capture / Delivery window 大小（默认 `256`；必须 > 0）。one-shot `sync` 或 continuous `run` 下各阶段一次 materialize 的 pending changes 都不超过此容量（ADR-0020）。Test/Lab 也可在 `migraloop sync` 上设 `--sync-queue-capacity` |
-| `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` | Bounded Initial Load Source read window（默认 `1000`；必须 > 0）。apply 的正常路径不会把 unbounded full-table slam 整表灌进内存 |
-| `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` | 可选的 Initial Load throttle（rows/second；`0`／未设置 = 除 chunking 外不再人工限速）。在 progress 行／`initial_load_progress` 以 `rate_limit` 可见 |
-| `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` | 仅供 Test/Lab inject：成功 N 个 chunks 后 pause Initial Load，以便演练 durable pause/resume（不是 production Operator 控制；Operators 请在 chunks 之间使用 `migraloop pause`） |
-| `MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS` | 仅供 Test/Lab inject：Initial Load 期间人工延迟 Platform Store／Downstream，以便演练 backoff（不是 production Operator 控制） |
+| `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` | Bounded Initial Load Source read window（默认 `1000`；必须 > 0）。apply 的正常路径不会把 unbounded full-table slam 整表灌进内存。Test/Lab 也可在 `migraloop apply` 设置 `--initial-load-chunk-size` |
+| `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` | 可选的 Initial Load throttle（rows/second；`0`／未设置 = 除 chunking 外不再人工限速）。在 progress 行／`initial_load_progress` 以 `rate_limit` 可见。Test/Lab 也可在 `migraloop apply` 设置 `--initial-load-rows-per-sec` |
+| `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS` | 仅供 deprecated 薄 compat shim：成功 N 个 chunks 后 pause Initial Load。请优先使用 `migraloop apply` 上的 typed ApplyOptions（`--initial-load-pause-after-chunks`，hidden Test/Lab flag）或 in-process `ApplyOptions`（不是 production Operator 控制；Operators 请在 chunks 之间使用 `migraloop pause`） |
+| `MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS` | 仅供 deprecated 薄 compat shim：Initial Load 期间人工延迟 Platform Store／Downstream。请优先使用 `migraloop apply` 上的 typed ApplyOptions（`--initial-load-store-delay-ms`，hidden Test/Lab flag）或 in-process `ApplyOptions`（不是 production Operator 控制） |
 | `MIGRALOOP_DELIVERY_DELAY_MS` | 已弃用、仅薄临时 compat shim：人工 Downstream Delivery 延迟（毫秒）。请改用 typed SyncOptions（`migraloop sync` 的 `--sync-delivery-delay-ms`、`--sync-fail-after-changes` 等隐藏 Test/Lab flags，或 in-process `SyncOptions`；不是 production Operator 控制） |
 | `MIGRALOOP_INJECT_LOGMINER_CONTENTS` | 仅 Test/Lab injection：contract LogMiner contents 的 JSON 文件路径（`contents: [{scn, operation, table_name, identity, after_image, rs_id?, ssn?}, …]`），供 `contract`/`stub` hosts 的 Incremental Capture。可选的 `rs_id` / `ssn` 是 LogMiner ordering keys，让同一 SCN 的多行在 dedupe 与 resume-safe catch-up 时保持可区分（未设置时 harness Incremental 流为空；不是 production Operator 控制） |
 | Lab disposable defaults | `migraloop lab up` 之后：`ORACLE_PASSWORD=lab_oracle`、`MONGO_PASSWORD=lab_mongo`、Platform Store URL `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Mongo URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`（仅本地 Lab） |

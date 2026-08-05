@@ -377,18 +377,6 @@ pub(crate) fn apply_change_events_to_base_rows(
     Ok(())
 }
 
-/// Idle poll interval between continuous Incremental Capture cycles (`migraloop run`).
-///
-/// Override via `MIGRALOOP_SYNC_POLL_INTERVAL_MS` (must be > 0). Default 1000ms.
-fn sync_poll_interval() -> std::time::Duration {
-    let ms = std::env::var("MIGRALOOP_SYNC_POLL_INTERVAL_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &u64| *n > 0)
-        .unwrap_or(1000);
-    std::time::Duration::from_millis(ms)
-}
-
 async fn set_delivery_lag_for_table(
     store: &PlatformStore,
     pipelines: &[Pipeline],
@@ -495,7 +483,8 @@ pub async fn sync_incremental_with_options(
 /// still apply). Errors are logged and retried — Observability metrics keep serving
 /// on the same single active instance (issue #145).
 pub async fn run_continuous_incremental_sync(store: &PlatformStore, options: SyncOptions) {
-    let poll = sync_poll_interval();
+    // Typed on SyncOptions (#200); Operator env / CLI overrides resolve earlier.
+    let poll = std::time::Duration::from_millis(options.poll_interval_ms);
     println!(
         "Continuous Incremental Capture: poll_interval_ms={}",
         poll.as_millis()

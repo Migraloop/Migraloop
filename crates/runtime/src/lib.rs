@@ -1,7 +1,8 @@
 //! Deployment runtime public interface: Operator Deployment verbs plus necessary
 //! session / factory entry points (issue #172).
 //!
-//! **Verbs:** [`apply`], Incremental Sync ([`sync_incremental`], [`run_incremental_sync`],
+//! **Verbs:** [`apply`] / [`apply_with_options`] (typed [`ApplyOptions`]), Incremental
+//! Sync ([`sync_incremental`], [`run_incremental_sync`],
 //! [`run_incremental_sync_with_engines`], [`run_continuous_incremental_sync`],
 //! [`supervise_continuous_incremental_sync`] with typed [`SyncOptions`]), Pipeline
 //! lifecycle ([`pause_pipeline`], [`resume_pipeline`], [`remove_pipeline`]),
@@ -43,6 +44,7 @@ use thiserror::Error;
 
 #[cfg(test)]
 mod engines;
+mod apply_options;
 mod backpressure;
 mod cutover;
 mod observability;
@@ -67,6 +69,9 @@ pub use incremental::{
     run_incremental_sync, run_incremental_sync_with_engines, run_continuous_incremental_sync,
     supervise_continuous_incremental_sync, sync_incremental, sync_incremental_with_options,
     SyncCycleOutcome, SyncInvocation,
+};
+pub use apply_options::{
+    ApplyOptions, ApplyOptionsOverrides, InitialLoadOptions,
 };
 pub use sync_options::{
     BackpressureOptions, PoisonOptions, SyncOptions, SyncOptionsOverrides,
@@ -406,6 +411,7 @@ async fn sync_base_datasets_for_pipelines(
     store: &PlatformStore,
     deployment: &Deployment,
     pipelines: &[Pipeline],
+    options: &ApplyOptions,
 ) -> Result<(), RuntimeError> {
     let deployment_name = &deployment.name;
     let configured_tz = source_timezone_opt(deployment);
@@ -456,45 +462,12 @@ async fn sync_base_datasets_for_pipelines(
             &table,
             configured_tz,
             existing.as_ref(),
+            options,
         )
         .await?;
     }
 
     Ok(())
-}
-
-/// Default Initial Load Source read window (issue #124). Override via
-/// `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` (must be > 0).
-fn initial_load_chunk_size() -> usize {
-    std::env::var("MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &usize| *n > 0)
-        .unwrap_or(1000)
-}
-
-/// Optional Operator throttle for Initial Load (rows/sec). `0` / unset = no artificial cap.
-fn initial_load_rows_per_sec() -> Option<u64> {
-    std::env::var("MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &u64| *n > 0)
-}
-
-/// Test/Lab inject: pause Initial Load after N successful chunks.
-fn initial_load_pause_after_chunks() -> Option<u64> {
-    std::env::var("MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &u64| *n > 0)
-}
-
-/// Test/Lab inject: artificial Platform Store / Downstream pressure during Initial Load.
-fn initial_load_store_delay_ms() -> Option<u64> {
-    std::env::var("MIGRALOOP_INITIAL_LOAD_STORE_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &u64| *n > 0)
 }
 
 async fn run_chunked_initial_load(
@@ -505,13 +478,14 @@ async fn run_chunked_initial_load(
     table: &str,
     configured_tz: Option<&str>,
     existing: Option<&BaseDataset>,
+    options: &ApplyOptions,
 ) -> Result<(), RuntimeError> {
     let deployment_name = &deployment.name;
     let source = source_engine_from_connection(&deployment.source)?;
-    let chunk_size = initial_load_chunk_size();
-    let rate_limit = initial_load_rows_per_sec();
-    let pause_after = initial_load_pause_after_chunks();
-    let store_delay = initial_load_store_delay_ms();
+    let chunk_size = options.initial_load.chunk_size;
+    let rate_limit = options.initial_load.rows_per_sec;
+    let pause_after = options.initial_load.pause_after_chunks;
+    let store_delay = options.initial_load.store_delay_ms;
 
     let mut offset = existing.map(|d| d.row_count.max(0) as usize).unwrap_or(0);
     let mut established = existing
@@ -1417,6 +1391,19 @@ pub(crate) async fn persist_maintenance_state_blob(
 
 /// Apply a Deployment: persist, table-level Initial Load, and Delivery start.
 ///
+/// Thin wrapper that builds [`ApplyOptions`] from the temporary env compat shim.
+/// Prefer [`apply_with_options`] with typed options for Lab / RQG / in-process
+/// tests (#200).
+pub async fn apply(
+    store: &PlatformStore,
+    deployment: Deployment,
+    pipelines: Vec<Pipeline>,
+) -> Result<(), RuntimeError> {
+    apply_with_options(store, deployment, pipelines, ApplyOptions::from_env_compat()).await
+}
+
+/// Apply a Deployment with typed [`ApplyOptions`] (issue #200).
+///
 /// This is the Deployment runtime's primary Operator verb for the apply path.
 /// Table-level Initial Load and Direct Pipeline Delivery (plus Transform first
 /// Delivery when a Pipeline revision needs rebuild) are sequenced here — not in
@@ -1424,10 +1411,11 @@ pub(crate) async fn persist_maintenance_state_blob(
 ///
 /// Callers (CLI adapter, in-process tests) supply an already-open Platform Store
 /// session and resolved Deployment / Pipeline values — config parsing stays outside.
-pub async fn apply(
+pub async fn apply_with_options(
     store: &PlatformStore,
     deployment: Deployment,
     mut pipelines: Vec<Pipeline>,
+    options: ApplyOptions,
 ) -> Result<(), RuntimeError> {
     ensure_store_session_healthy(store).await?;
 
@@ -1531,7 +1519,7 @@ pub async fn apply(
     // Table-level Initial Load only for newly referenced tables; existing Bases stay
     // on their incremental path (ADR-0019). Shared Bases are never rebuilt for a
     // Pipeline revision (ADR-0007 Change).
-    sync_base_datasets_for_pipelines(store, &deployment, &pipelines).await?;
+    sync_base_datasets_for_pipelines(store, &deployment, &pipelines, &options).await?;
 
     if !existing_pipelines.is_empty() {
         for (name, source_table) in &added_pipeline_summaries {

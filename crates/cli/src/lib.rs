@@ -17,8 +17,8 @@ use migraloop_platform_store::{
 };
 use migraloop_runtime::{
     assemble_observability_surface, cutover_facts_from_base, inspect_base_rows,
-    inspect_derived_rows, inspect_target_documents, status_inventory_from_url, CutoverFacts,
-    SyncOptions, SyncOptionsOverrides,
+    inspect_derived_rows, inspect_target_documents, status_inventory_from_url, ApplyOptions,
+    ApplyOptionsOverrides, CutoverFacts, SyncOptions, SyncOptionsOverrides,
 };
 use thiserror::Error;
 
@@ -63,6 +63,18 @@ pub enum Command {
         /// Path to Deployment config (YAML or JSON)
         #[arg(long, short = 'f')]
         file: PathBuf,
+        /// Override Initial Load Source read window (typed ApplyOptions; Operator env also applies)
+        #[arg(long = "initial-load-chunk-size", hide = true)]
+        initial_load_chunk_size: Option<usize>,
+        /// Override Initial Load throttle in rows/sec (typed ApplyOptions; Operator env also applies)
+        #[arg(long = "initial-load-rows-per-sec", hide = true)]
+        initial_load_rows_per_sec: Option<u64>,
+        /// Test/Lab: pause Initial Load after N successful chunks (typed ApplyOptions; #200)
+        #[arg(long = "initial-load-pause-after-chunks", hide = true)]
+        initial_load_pause_after_chunks: Option<u64>,
+        /// Test/Lab: artificial Platform Store / Downstream delay in ms (typed ApplyOptions; #200)
+        #[arg(long = "initial-load-store-delay-ms", hide = true)]
+        initial_load_store_delay_ms: Option<u64>,
     },
     /// Report Platform Store reachability, health, Deployments, Pipelines, and Base Datasets
     Status {
@@ -201,6 +213,9 @@ pub enum Command {
         /// Prometheus scrape listen address (host:port) for Observability Surface
         #[arg(long, env = "MIGRALOOP_METRICS_ADDR", default_value = "0.0.0.0:9090")]
         metrics_addr: String,
+        /// Override continuous Sync idle poll interval in ms (typed SyncOptions; #200)
+        #[arg(long = "sync-poll-interval-ms", hide = true)]
+        sync_poll_interval_ms: Option<u64>,
     },
     /// Local Sync Lab Fixture and Lab Scenarios (disposable Oracle, MongoDB, Platform Store, app)
     Lab {
@@ -401,16 +416,45 @@ fn oracle_incremental_capture_label(source: &SystemConnection) -> &'static str {
     }
 }
 
-async fn apply_deployment(platform_store_url: &str, file: &Path) -> Result<(), CliError> {
+async fn apply_deployment(
+    platform_store_url: &str,
+    file: &Path,
+    options: ApplyOptions,
+) -> Result<(), CliError> {
     let store = PlatformStore::open(platform_store_url)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))?;
     let doc = load_deployment_config(file)?;
     let deployment = document_to_deployment(&doc)?;
     let pipelines = pipelines_from_document(&doc);
-    migraloop_runtime::apply(&store, deployment, pipelines)
+    migraloop_runtime::apply_with_options(&store, deployment, pipelines, options)
         .await
         .map_err(|err| CliError::Failed(err.to_string()))
+}
+
+/// Build typed [`ApplyOptions`] for `migraloop apply` (#200).
+///
+/// Hidden CLI flags are the primary Lab / RQG path for Initial Load knobs. Legacy
+/// Initial Load env vars remain a thin temporary shim when flags are unset.
+fn apply_options_from_cli_flags(
+    initial_load_chunk_size: Option<usize>,
+    initial_load_rows_per_sec: Option<u64>,
+    initial_load_pause_after_chunks: Option<u64>,
+    initial_load_store_delay_ms: Option<u64>,
+) -> ApplyOptions {
+    // When any typed apply flag is present, omit the legacy Lab-inject env shim
+    // so RQG / Lab cannot accidentally depend on leftover process env (#200).
+    let any_typed_override = initial_load_chunk_size.is_some()
+        || initial_load_rows_per_sec.is_some()
+        || initial_load_pause_after_chunks.is_some()
+        || initial_load_store_delay_ms.is_some();
+    ApplyOptions::for_cli(ApplyOptionsOverrides {
+        chunk_size: initial_load_chunk_size,
+        rows_per_sec: initial_load_rows_per_sec,
+        pause_after_chunks: initial_load_pause_after_chunks,
+        store_delay_ms: initial_load_store_delay_ms,
+        omit_env_shim: any_typed_override,
+    })
 }
 
 async fn sync_incremental(
@@ -450,6 +494,7 @@ fn sync_options_from_cli_flags(
         poison_max_attempts: sync_poison_max_attempts,
         queue_capacity: sync_queue_capacity,
         delivery_delay_ms: sync_delivery_delay_ms,
+        poll_interval_ms: None,
         fail_after_changes: sync_fail_after_changes,
         omit_env_fault_shim: any_typed_override,
     })
@@ -887,7 +932,19 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Apply {
             platform_store_url,
             file,
-        } => apply_deployment(&platform_store_url, &file).await,
+            initial_load_chunk_size,
+            initial_load_rows_per_sec,
+            initial_load_pause_after_chunks,
+            initial_load_store_delay_ms,
+        } => {
+            let options = apply_options_from_cli_flags(
+                initial_load_chunk_size,
+                initial_load_rows_per_sec,
+                initial_load_pause_after_chunks,
+                initial_load_store_delay_ms,
+            );
+            apply_deployment(&platform_store_url, &file, options).await
+        }
         Command::Status { platform_store_url } => print_status(&platform_store_url).await,
         Command::Base {
             platform_store_url,
@@ -967,6 +1024,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Run {
             platform_store_url,
             metrics_addr,
+            sync_poll_interval_ms,
         } => {
             apply_migrations(&platform_store_url).await?;
             // Warn-only disk threshold at process start (never auto-pauses Pipelines).
@@ -982,9 +1040,13 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             // Open the Platform Store session at the Operator edge; runtime supervise
             // prefers that session handle over URL reopen (issue #172).
             let sync_store = open_store(&platform_store_url).await?;
-            // Continuous `run`: Operator env knobs via thin compat; fault injection
-            // for one-shot Lab/RQG paths uses typed `sync` flags (#180).
-            let sync_options = SyncOptions::from_env_compat();
+            // Continuous `run`: Operator env knobs + optional typed poll override (#200).
+            // One-shot Lab/RQG fault injection uses typed `sync` flags (#180); do not
+            // fold poll typing into omit_env_fault_shim — poll is an Operator knob.
+            let sync_options = SyncOptions::for_cli(SyncOptionsOverrides {
+                poll_interval_ms: sync_poll_interval_ms,
+                ..SyncOptionsOverrides::default()
+            });
             tokio::spawn(async move {
                 migraloop_runtime::supervise_continuous_incremental_sync(sync_store, sync_options)
                     .await;

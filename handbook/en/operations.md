@@ -49,9 +49,9 @@ The check reads at most `--max-rows` expected Output Identities (default `1000` 
 
 Initial Load for a newly needed Base Dataset must not overwhelm Oracle with an unbounded full-table slam:
 
-- Source reads use a bounded chunk window (`MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE`, default `1000`); `apply` prints `Initial Load progress` and structured `initial_load_progress` events
-- Optional throttle: `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` (visible as `rate_limit=` / `rate_limit_rows_per_sec`)
-- Pause mid-load without tearing down the Deployment: `migraloop pause --pipeline <name>` is honored between chunks, or Lab inject `MIGRALOOP_INITIAL_LOAD_PAUSE_AFTER_CHUNKS`. Durable Base status becomes `initial_load_paused` with rows + cutover low-watermark retained; re-run `migraloop apply` to resume
+- Source reads use a bounded chunk window (default `1000`; Operator env `MIGRALOOP_INITIAL_LOAD_CHUNK_SIZE` or typed ApplyOptions); `apply` prints `Initial Load progress` and structured `initial_load_progress` events
+- Optional throttle: `MIGRALOOP_INITIAL_LOAD_ROWS_PER_SEC` / typed ApplyOptions (visible as `rate_limit=` / `rate_limit_rows_per_sec`)
+- Pause mid-load without tearing down the Deployment: `migraloop pause --pipeline <name>` is honored between chunks, or Lab typed ApplyOptions pause inject. Durable Base status becomes `initial_load_paused` with rows + cutover low-watermark retained; re-run `migraloop apply` to resume
 - Under Downstream / Platform Store pressure, Initial Load prints `Initial Load backoff` / `initial_load_backoff` and keeps only one chunk in memory rather than growing without bound
 - No-gap cutover (ADR-0004) still establishes the low-watermark before the first chunk; Incremental Capture overlap/dedupe is unchanged
 
