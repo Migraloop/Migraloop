@@ -121,7 +121,7 @@ Connection strings in v1 authenticate with `authSource=admin` (see Delivery URI 
 
 ## Supported mapping notes
 
-Source allow-list and NUMBER/temporal rules affect what can appear in Managed output—see [Source System](source-system.md). Unsafe NUMBER columns must be mapped with Pipeline `fields` before apply succeeds.
+Source allow-list and NUMBER/temporal rules affect what can appear in Managed output—see [Source System](source-system.md). Unsafe NUMBER columns must be mapped with Pipeline `fields` before apply succeeds. NUMBER→Mongo classification has one shared home next to `ColumnShape` (ADR-0023); Operator-visible mapping rules are unchanged.
 
 ## Adding another Target engine (Developers)
 

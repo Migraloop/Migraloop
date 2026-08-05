@@ -182,7 +182,7 @@ cargo test -p migraloop-app --test cli_live_oracle_direct -- --ignored --nocaptu
 
 ## Adding another Source engine (Developers)
 
-v1 ships Oracle LogMiner only. A new Source kind implements `SourceEngine` (plus prerequisites/docs, a Lab Scenario, and a CI contract twin) without reshaping Sync / Rich Transform / Delivery / runtime concepts—see [Developer local setup — Adding a Source or Target engine](developer-local-setup.md#adding-a-source-or-target-engine-developer-checklist).
+v1 ships Oracle LogMiner only. A new Source kind implements `SourceEngine` with engine-agnostic discovered column metadata (`data_type` / shared `ColumnShape`); Oracle allow-list, size caps, and type-brand naming stay adapter-private (ADR-0018). NUMBER→Mongo classification lives next to `ColumnShape` in `migraloop-types` (ADR-0023)—not as twin helpers in capture or delivery. Also add prerequisites/docs, a Lab Scenario, and a CI contract twin without reshaping Sync / Rich Transform / Delivery / runtime concepts—see [Developer local setup — Adding a Source or Target engine](developer-local-setup.md#adding-a-source-or-target-engine-developer-checklist).
 
 ## Related chapters
 
