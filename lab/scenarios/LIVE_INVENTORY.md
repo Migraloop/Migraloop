@@ -3,11 +3,19 @@
 **Issue:** [#222](https://github.com/Migraloop/Migraloop/issues/222) (child of epic [#221](https://github.com/Migraloop/Migraloop/issues/221))  
 **Fixture:** Local Sync Lab (`migraloop lab up` / `lab status` → ready: platform-store, oracle, mongo, app)  
 **Method:** `migraloop lab scenario run <id> --auto-remove` against live Base/Target (host CLI + Instant Client; Fixture `app` paused for exclusive host apply/sync). Not contract/stub alone.  
-**Catalog:** selectable ids from `migraloop lab scenario list` / [`COVERAGE.md`](./COVERAGE.md) (24 shipped Scenarios).
+**Catalog:** selectable ids from `migraloop lab scenario list` / [`COVERAGE.md`](./COVERAGE.md) (25 shipped Scenarios).
 
-**Tally:** **24 PASS / 0 FAIL**
+**Tally:** **25 PASS / 0 FAIL**
 
 **Basic-complete go/no-go (epic #221):** **go** — every shipped Scenario id in `COVERAGE.md` is live-green on the Lab Scenario seam (`lab scenario run` / real product apply+sync). Lab pauses Fixture continuous `run` only for the duration of each Scenario so host Sync is the sole Incremental Capture consumer (then resumes `app`); this is Fixture coordination, not a stub Sync/Delivery path. Direct+Transform performance work and Rich Transform DX (epic post-gate children) may open without re-litigating catalog completeness.
+
+## Change Ordering / confluence ([#225](https://github.com/Migraloop/Migraloop/issues/225))
+
+Ran new Scenario `change-ordering` on a ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts; no Source Alignment Check / Drift Check on the path). **PASS** — same-key A→B→C finals (`NameC`), cross-key interleave finals (`Key2Final`), min extreme delete → Base recompute (`MIN_AMOUNT=20`, stale `10` gone). Matching RQG twin: `cli_change_ordering`.
+
+| Scenario id | Result | Notes |
+|-------------|--------|-------|
+| `change-ordering` | PASS | ADR-0029; LogMiner OCI; same SCN multi-row order via RS_ID preserved |
 
 ## Direct Sync cluster re-verify ([#223](https://github.com/Migraloop/Migraloop/issues/223))
 
@@ -50,6 +58,7 @@ Re-ran the Transform Sync Lab Scenario cluster on a ready Fixture (host Instant 
 | `rt-unwind` | PASS | |
 | `rt-distinct-addtoset` | PASS | Requires scale-preserving NUMBER JSON; host exclusive Sync (see below). |
 | `concurrent-source-workload` | PASS | |
+| `change-ordering` | PASS | Same-key order + cross-key interleave + min Base recompute (ADR-0029 / #225). |
 | `bulk-load` | PASS | ~100k rows; thresholds met with exclusive host Initial Load (no Fixture `run` race). |
 | `idempotent-redelivery` | PASS | |
 | `pause-resume` | PASS | |
