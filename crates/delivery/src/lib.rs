@@ -12,15 +12,26 @@ mod engine;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use bson::{doc, Bson, Document};
 use chrono::{DateTime, Utc};
 use migraloop_types::{classify_number, ColumnShape, NumberMongoMapping, TlsSettings};
-use mongodb::options::{ClientOptions, Tls, TlsOptions, UpdateOptions};
-use mongodb::{Client, Collection};
+use mongodb::options::{ClientOptions, Tls, TlsOptions};
+use mongodb::Client;
 use serde_json::Value;
 use thiserror::Error;
+
+/// Process-wide Mongo clients keyed by Target URI (Direct Sync/IL throughput — #230).
+///
+/// `Client` is cheap to clone (internally pooled). Reusing avoids reconnect+handshake
+/// on every Managed upsert/delete. TLS targets still ping once on first connect.
+static MONGO_CLIENTS: LazyLock<Mutex<BTreeMap<String, Client>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Max ops per Mongo `update` / `delete` command batch (wire-friendly; MongoDB 7 OK).
+const MONGO_WRITE_BATCH_SIZE: usize = 500;
 
 pub use migraloop_types::ManagedFieldAs;
 pub use engine::{
@@ -125,11 +136,14 @@ fn map_mongo_connect_error(target: &MongoTargetConnection, err: impl ToString) -
     }
 }
 
-async fn collection(
-    target: &MongoTargetConnection,
-    collection_name: &str,
-) -> Result<Collection<Document>, DeliveryError> {
+async fn cached_client(target: &MongoTargetConnection) -> Result<Client, DeliveryError> {
     let uri = build_uri(target);
+    if let Ok(guard) = MONGO_CLIENTS.lock() {
+        if let Some(client) = guard.get(&uri) {
+            return Ok(client.clone());
+        }
+    }
+
     let mut options = ClientOptions::parse(&uri)
         .await
         .map_err(|err| map_mongo_connect_error(target, err))?;
@@ -148,9 +162,13 @@ async fn collection(
             .await
             .map_err(|err| map_mongo_connect_error(target, err))?;
     }
-    Ok(client
-        .database(&target.database)
-        .collection::<Document>(collection_name))
+
+    if let Ok(mut guard) = MONGO_CLIENTS.lock() {
+        // Another task may have inserted first; prefer the existing pooled client.
+        Ok(guard.entry(uri).or_insert_with(|| client.clone()).clone())
+    } else {
+        Ok(client)
+    }
 }
 
 fn column_map(columns: &[DeliveryColumn]) -> BTreeMap<&str, &DeliveryColumn> {
@@ -380,46 +398,75 @@ fn managed_fields_to_set_doc(doc_row: &DeliveryDocument) -> Result<Document, Del
     Ok(set_doc)
 }
 
+fn primary_hint_for_document(doc_row: &DeliveryDocument) -> Option<&DeliveryColumn> {
+    // Scalar Output Identity must use the matching Managed column's Oracle type
+    // (e.g. unwind ORDER_ID as NUMBER), not columns.first() alphabetical luck.
+    match &doc_row.identity {
+        Value::Object(_) => doc_row.columns.first(),
+        identity_value => doc_row
+            .columns
+            .iter()
+            .find(|col| {
+                doc_row
+                    .managed_fields
+                    .get(&col.name)
+                    .is_some_and(|v| v == identity_value)
+            })
+            .or_else(|| doc_row.columns.first()),
+    }
+}
+
 /// Upsert Managed fields for each Output Identity.
 ///
 /// Uses `$set` of Managed keys only so non-Managed Target fields are not cleared.
 /// On insert, the document is identity (`_id`) + Managed fields only.
+///
+/// Batches via the MongoDB `update` command (works on MongoDB 7; avoids per-doc
+/// reconnect storms when paired with [`cached_client`] — issue #230).
 pub async fn upsert_managed_documents(
     target: &MongoTargetConnection,
     collection_name: &str,
     documents: &[DeliveryDocument],
 ) -> Result<usize, DeliveryError> {
-    let coll = collection(target, collection_name).await?;
+    if documents.is_empty() {
+        return Ok(0);
+    }
+    let client = cached_client(target).await?;
     let mut delivered = 0usize;
 
-    for doc_row in documents {
-        // Scalar Output Identity must use the matching Managed column's Oracle type
-        // (e.g. unwind ORDER_ID as NUMBER), not columns.first() alphabetical luck.
-        let primary_hint = match &doc_row.identity {
-            Value::Object(_) => doc_row.columns.first(),
-            identity_value => doc_row
-                .columns
-                .iter()
-                .find(|col| {
-                    doc_row
-                        .managed_fields
-                        .get(&col.name)
-                        .is_some_and(|v| v == identity_value)
-                })
-                .or_else(|| doc_row.columns.first()),
-        };
-        let identity = json_identity_to_bson(&doc_row.identity, &doc_row.columns, primary_hint)?;
-        let set_doc = managed_fields_to_set_doc(doc_row)?;
-
-        let filter = doc! { "_id": identity };
-        let update = doc! { "$set": set_doc };
-        let options = UpdateOptions::builder().upsert(true).build();
-
-        coll.update_one(filter, update)
-            .with_options(options)
+    for chunk in documents.chunks(MONGO_WRITE_BATCH_SIZE) {
+        let mut updates = Vec::with_capacity(chunk.len());
+        for doc_row in chunk {
+            let primary_hint = primary_hint_for_document(doc_row);
+            let identity =
+                json_identity_to_bson(&doc_row.identity, &doc_row.columns, primary_hint)?;
+            let set_doc = managed_fields_to_set_doc(doc_row)?;
+            updates.push(doc! {
+                "q": { "_id": identity },
+                "u": { "$set": set_doc },
+                "upsert": true,
+                "multi": false,
+            });
+        }
+        let result = client
+            .database(&target.database)
+            .run_command(doc! {
+                "update": collection_name,
+                "updates": updates,
+                // Preserve submit order within a batch (same-key Change Ordering).
+                "ordered": true,
+            })
             .await
             .map_err(|err| DeliveryError::Apply(err.to_string()))?;
-        delivered += 1;
+        if let Some(write_errors) = result.get("writeErrors").and_then(Bson::as_array) {
+            if !write_errors.is_empty() {
+                return Err(DeliveryError::Apply(format!(
+                    "Mongo update batch writeErrors: {write_errors:?}"
+                )));
+            }
+        }
+        // Count submitted identities (matches prior per-doc update_one success tally).
+        delivered += chunk.len();
     }
 
     Ok(delivered)
@@ -434,20 +481,45 @@ pub async fn delete_documents_by_identity(
     collection_name: &str,
     identities: &[Value],
 ) -> Result<usize, DeliveryError> {
-    let coll = collection(target, collection_name).await?;
+    if identities.is_empty() {
+        return Ok(0);
+    }
+    let client = cached_client(target).await?;
     let mut deleted = 0usize;
 
-    for identity_value in identities {
-        let identity = match identity_value {
-            Value::Number(n) if n.as_i64().is_some() => Bson::Int64(n.as_i64().unwrap()),
-            other => bson::to_bson(other).map_err(|err| DeliveryError::Identity(err.to_string()))?,
-        };
-        let filter = doc! { "_id": identity };
-        let result = coll
-            .delete_one(filter)
+    for chunk in identities.chunks(MONGO_WRITE_BATCH_SIZE) {
+        let mut deletes = Vec::with_capacity(chunk.len());
+        for identity_value in chunk {
+            let identity = match identity_value {
+                Value::Number(n) if n.as_i64().is_some() => Bson::Int64(n.as_i64().unwrap()),
+                other => {
+                    bson::to_bson(other).map_err(|err| DeliveryError::Identity(err.to_string()))?
+                }
+            };
+            deletes.push(doc! {
+                "q": { "_id": identity },
+                "limit": 1,
+            });
+        }
+        let result = client
+            .database(&target.database)
+            .run_command(doc! {
+                "delete": collection_name,
+                "deletes": deletes,
+                "ordered": true,
+            })
             .await
             .map_err(|err| DeliveryError::Apply(err.to_string()))?;
-        deleted += result.deleted_count as usize;
+        if let Some(n) = result.get("n").and_then(Bson::as_i32) {
+            deleted += n as usize;
+        }
+        if let Some(write_errors) = result.get("writeErrors").and_then(Bson::as_array) {
+            if !write_errors.is_empty() {
+                return Err(DeliveryError::Apply(format!(
+                    "Mongo delete batch writeErrors: {write_errors:?}"
+                )));
+            }
+        }
     }
 
     Ok(deleted)
@@ -460,7 +532,10 @@ pub async fn list_target_documents(
     target: &MongoTargetConnection,
     collection_name: &str,
 ) -> Result<Vec<Value>, DeliveryError> {
-    let coll = collection(target, collection_name).await?;
+    let client = cached_client(target).await?;
+    let coll = client
+        .database(&target.database)
+        .collection::<Document>(collection_name);
     let mut cursor = coll
         .find(Document::new())
         .await

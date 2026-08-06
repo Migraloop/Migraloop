@@ -8,8 +8,9 @@
 mod common;
 
 use migraloop_platform_store::{
-    BaseColumn, BaseDataset, Deployment, Pipeline, PlatformStore, QuarantinedChange,
-    SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection, TlsSettings,
+    BaseColumn, BaseDataset, BaseRowMutation, Deployment, Pipeline, PlatformStore,
+    QuarantinedChange, SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection,
+    TlsSettings,
 };
 
 fn admin_url() -> String {
@@ -214,6 +215,154 @@ async fn record_sync_window_progress_persists_base_and_applied_change_ids() {
         .await
         .expect("filter applied");
     assert_eq!(unapplied, vec!["chg-121".to_string()]);
+}
+
+/// Direct Sync throughput seam (#230): one Base mutation must not DELETE+rewrite peers.
+#[tokio::test]
+async fn record_sync_row_progress_upserts_one_row_without_dropping_peers() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-sync-row"))
+        .await
+        .expect("upsert Deployment");
+
+    let mut seed_rows = Vec::new();
+    for id in 1..=100 {
+        let mut row = serde_json::Map::new();
+        row.insert("ID".to_string(), serde_json::json!(id));
+        row.insert("NAME".to_string(), serde_json::json!(format!("name-{id}")));
+        seed_rows.push(row);
+    }
+    let mut dataset = sample_base("intent-sync-row");
+    dataset.row_count = 100;
+    dataset.status = "incremental".to_string();
+    dataset.sync_applied_changes = 0;
+    dataset.capture_checkpoint = Some(100);
+    dataset.columns = vec![
+        BaseColumn {
+            name: "ID".to_string(),
+            data_type: "NUMBER".to_string(),
+            precision: Some(10),
+            scale: Some(0),
+        },
+        BaseColumn {
+            name: "NAME".to_string(),
+            data_type: "VARCHAR2".to_string(),
+            precision: Some(100),
+            scale: None,
+        },
+    ];
+    store
+        .replace_base_dataset(&dataset, &seed_rows)
+        .await
+        .expect("seed 100 Base rows");
+
+    let mut identity = serde_json::Map::new();
+    identity.insert("ID".to_string(), serde_json::json!(50));
+    let mut updated = serde_json::Map::new();
+    updated.insert("ID".to_string(), serde_json::json!(50));
+    updated.insert("NAME".to_string(), serde_json::json!("name-50-updated"));
+
+    dataset.sync_applied_changes = 1;
+    dataset.capture_checkpoint = Some(150);
+    dataset.sync_lag = 0;
+    store
+        .record_sync_row_progress(
+            &dataset,
+            BaseRowMutation::Upsert {
+                identity: &identity,
+                row: &updated,
+            },
+            &[("chg-150".to_string(), 150)],
+        )
+        .await
+        .expect("delta upsert Base row");
+
+    let mut insert_identity = serde_json::Map::new();
+    insert_identity.insert("ID".to_string(), serde_json::json!(101));
+    let mut inserted = insert_identity.clone();
+    inserted.insert("NAME".to_string(), serde_json::json!("name-101"));
+    dataset.row_count = 101;
+    dataset.sync_applied_changes = 2;
+    dataset.capture_checkpoint = Some(151);
+    store
+        .record_sync_row_progress(
+            &dataset,
+            BaseRowMutation::Upsert {
+                identity: &insert_identity,
+                row: &inserted,
+            },
+            &[("chg-151".to_string(), 151)],
+        )
+        .await
+        .expect("delta insert Base row");
+
+    let mut delete_identity = serde_json::Map::new();
+    delete_identity.insert("ID".to_string(), serde_json::json!(1));
+    dataset.row_count = 100;
+    dataset.sync_applied_changes = 3;
+    dataset.capture_checkpoint = Some(152);
+    store
+        .record_sync_row_progress(
+            &dataset,
+            BaseRowMutation::Delete {
+                identity: &delete_identity,
+            },
+            &[("chg-152".to_string(), 152)],
+        )
+        .await
+        .expect("delta delete Base row");
+
+    let (loaded, rows) = store
+        .get_base_rows("CUSTOMERS", Some("intent-sync-row"))
+        .await
+        .expect("load Base after delta mutations");
+    assert_eq!(loaded.row_count, 100);
+    assert_eq!(loaded.sync_applied_changes, 3);
+    assert_eq!(loaded.capture_checkpoint, Some(152));
+    assert_eq!(rows.len(), 100, "peers must survive delta Sync persist");
+
+    let row_50 = rows
+        .iter()
+        .find(|r| r.data.get("ID") == Some(&serde_json::json!(50)))
+        .expect("row 50 present");
+    assert_eq!(
+        row_50.data.get("NAME"),
+        Some(&serde_json::json!("name-50-updated"))
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.data.get("ID") == Some(&serde_json::json!(101))),
+        "inserted row 101 must be present"
+    );
+    assert!(
+        rows
+            .iter()
+            .all(|r| r.data.get("ID") != Some(&serde_json::json!(1))),
+        "deleted row 1 must be gone"
+    );
+    assert!(
+        rows
+            .iter()
+            .any(|r| r.data.get("ID") == Some(&serde_json::json!(2))),
+        "untouched peer row 2 must remain"
+    );
+
+    let unapplied = store
+        .filter_unapplied_change_ids(
+            "intent-sync-row",
+            "APP",
+            "CUSTOMERS",
+            &[
+                "chg-150".to_string(),
+                "chg-151".to_string(),
+                "chg-152".to_string(),
+                "chg-153".to_string(),
+            ],
+        )
+        .await
+        .expect("filter applied");
+    assert_eq!(unapplied, vec!["chg-153".to_string()]);
 }
 
 #[tokio::test]

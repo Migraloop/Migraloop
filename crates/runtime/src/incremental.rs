@@ -19,7 +19,9 @@ use migraloop_capture::{
     IncrementalCaptureSession, SchemaChangeEvent, SourceColumn, SourceEngine,
 };
 use migraloop_delivery::TargetEngine;
-use migraloop_platform_store::{BaseColumn, BaseDataset, Pipeline, PlatformStore};
+use migraloop_platform_store::{
+    BaseColumn, BaseDataset, BaseRowMutation, Pipeline, PlatformStore,
+};
 use migraloop_transform::{
     analyze_base_change, evaluate_transform_for_identities_with_bases, identity_matches_row,
     secondary_base_refs, AffectOutcome, BaseChangeContext, BaseChangeKind, MaintenanceStateBlob,
@@ -1322,10 +1324,38 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                 lag,
                             );
 
+                            // Per-identity Base persist: do not DELETE+rewrite untouched peers
+                            // (issue #230 Direct Sync throughput). Same-key order already applied
+                            // in-memory above; Deliver-before-checkpoint is unchanged.
+                            let identity_map: serde_json::Map<String, serde_json::Value> = change
+                                .identity
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            let mutation = match change.op {
+                                ChangeOp::Insert | ChangeOp::Update => {
+                                    let Some(base_row) = rows
+                                        .iter()
+                                        .find(|row| row_matches_identity(row, &change.identity))
+                                    else {
+                                        return Err(RuntimeError::Failed(format!(
+                                            "Base Dataset {table} missing row for identity {:?}",
+                                            change.identity
+                                        )));
+                                    };
+                                    BaseRowMutation::Upsert {
+                                        identity: &identity_map,
+                                        row: base_row,
+                                    }
+                                }
+                                ChangeOp::Delete => BaseRowMutation::Delete {
+                                    identity: &identity_map,
+                                },
+                            };
                             store
-                                .record_sync_window_progress(
+                                .record_sync_row_progress(
                                     &updated,
-                                    &rows,
+                                    mutation,
                                     &[(change.change_id.clone(), change.position.as_i64())],
                                 )
                                 .await
