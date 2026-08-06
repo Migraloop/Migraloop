@@ -247,38 +247,71 @@ async fn recompute_and_deliver_affected_identities<T: TargetEngine>(
 
     // Persist only touched Output Identities / group keys — do not DELETE+rewrite
     // untouched Derived peers (issue #231 / ADR-0029 Transform throughput).
-    let remove_identities: Vec<serde_json::Map<String, serde_json::Value>> = identities
-        .iter()
-        .map(|identity| {
-            if grouped {
-                identity.clone()
-            } else {
-                let mut keys = serde_json::Map::new();
-                for key in &pipeline.output_identity {
-                    if let Some(value) = identity.get(key) {
-                        keys.insert(key.clone(), value.clone());
-                    }
+    // Row-grain deletes require the full Output Identity key set so JSON `@>`
+    // containment cannot over-delete peers when Affect maps omit a key.
+    let mut remove_identities = Vec::with_capacity(identities.len());
+    let mut identity_keys_complete = true;
+    for identity in identities {
+        if grouped {
+            remove_identities.push(identity.clone());
+            continue;
+        }
+        let mut keys = serde_json::Map::new();
+        for key in &pipeline.output_identity {
+            match identity.get(key) {
+                Some(value) => {
+                    keys.insert(key.clone(), value.clone());
                 }
-                keys
+                None => {
+                    identity_keys_complete = false;
+                    break;
+                }
             }
-        })
-        .filter(|identity| !identity.is_empty())
-        .collect();
+        }
+        if !identity_keys_complete {
+            break;
+        }
+        if !keys.is_empty() {
+            remove_identities.push(keys);
+        }
+    }
 
     let derived_columns =
         derived_columns_for_ops(base_columns, ops, &recomputed, secondary_columns);
-    let dataset = DerivedDataset {
-        deployment_name: pipeline.deployment_name.clone(),
-        pipeline_name: pipeline.name.clone(),
-        status: "materialized".to_string(),
-        output_identity: pipeline.output_identity.clone(),
-        columns: derived_columns.clone(),
-        row_count: 0, // store recounts after identity mutations
-    };
-    store
-        .apply_derived_identity_changes(&dataset, &remove_identities, &recomputed)
-        .await
-        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    if identity_keys_complete {
+        let dataset = DerivedDataset {
+            deployment_name: pipeline.deployment_name.clone(),
+            pipeline_name: pipeline.name.clone(),
+            status: "materialized".to_string(),
+            output_identity: pipeline.output_identity.clone(),
+            columns: derived_columns.clone(),
+            row_count: 0, // store recounts after identity mutations
+        };
+        store
+            .apply_derived_identity_changes(&dataset, &remove_identities, &recomputed)
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    } else {
+        // Incomplete Output Identity on an Affect map: fall back to full merge so
+        // partial containment cannot drop unrelated Derived peers.
+        let (mut existing_dataset, existing_rows) = store
+            .get_derived_rows(&pipeline.name, Some(&pipeline.deployment_name))
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        let mut merged: Vec<serde_json::Map<String, serde_json::Value>> = existing_rows
+            .into_iter()
+            .map(|r| r.data)
+            .filter(|row| !identities.iter().any(|id| identity_targets_row(id, row)))
+            .collect();
+        merged.extend(recomputed.clone());
+        existing_dataset.status = "materialized".to_string();
+        existing_dataset.columns = derived_columns.clone();
+        existing_dataset.row_count = merged.len() as i32;
+        store
+            .replace_derived_dataset(&existing_dataset, &merged)
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    }
 
     let mut upserts = Vec::new();
     for row in &recomputed {

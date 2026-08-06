@@ -44,12 +44,6 @@ pub enum BaseRowMutation<'a> {
     },
 }
 
-/// Derived Dataset identity changes for Incremental Transform maintenance.
-///
-/// Used by [`PlatformStore::apply_derived_identity_changes`] so Affect Analysis
-/// recompute can replace only touched Output Identities (or group keys) without
-/// DELETE+reinsert of all `derived_rows` (issue #231 / ADR-0029 Transform path).
-
 /// Prior-release Platform Store schema cut for upgrade-smoke verification.
 ///
 /// Migrations `1..=4` cover bootstrap through Delivery binding — a store shape
