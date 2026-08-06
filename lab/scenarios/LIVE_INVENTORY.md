@@ -9,6 +9,17 @@
 
 **Basic-complete go/no-go (epic #221):** **go** — every shipped Scenario id in `COVERAGE.md` is live-green on the Lab Scenario seam (`lab scenario run` / real product apply+sync). Lab pauses Fixture continuous `run` only for the duration of each Scenario so host Sync is the sole Incremental Capture consumer (then resumes `app`); this is Fixture coordination, not a stub Sync/Delivery path. Direct+Transform performance work and Rich Transform DX (epic post-gate children) may open without re-litigating catalog completeness.
 
+## Direct Sync cluster re-verify ([#223](https://github.com/Migraloop/Migraloop/issues/223))
+
+Re-ran the Direct Sync Lab Scenario cluster on a fresh ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts). All four acceptance Scenarios **PASS**; no additional product-path fixes required beyond the inventory fixes already on `main`. Relevant Direct Sync RQG contract twins stay green (`cli_direct_pipeline_*`, `cli_idempotent_redelivery`, `cli_initial_load_chunked`, `cli_stub_incremental`, `cli_logminer_incremental`, `cli_contract_catalog_initial_load`, `cli_cutover_no_gap`).
+
+| Scenario id | Result | Notes |
+|-------------|--------|-------|
+| `direct-pipeline` | PASS | Initial Load → mutate → LogMiner Incremental + Delivery |
+| `idempotent-redelivery` | PASS | Duplicate-safe re-Delivery; non-Managed Target field preserved |
+| `initial-load-throttled` | PASS | Chunked progress, pause/resume, rate_limit, backoff, watermark retained |
+| `bulk-load` | PASS | 100000 rows; lag=0; thresholds pass (`duration_ms` ≪ `max_duration_ms`, `rows_per_s` ≫ `min_rows_per_s`) |
+
 ## Matrix
 
 | Scenario id | Result | Notes |
