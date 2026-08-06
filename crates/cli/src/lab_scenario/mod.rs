@@ -1326,11 +1326,20 @@ impl ProductPathHooks {
                     ],
                 )
                 .await?;
+                // Amount inspect may be integer JSON (10), trimmed decimal ("42.5"),
+                // or fixed-scale (42.50) depending on Base NUMBER scale materialization.
+                let amounts_ok = (add_after_apply.contains("42.50")
+                    || add_after_apply.contains("42.5"))
+                    && (add_after_apply.contains("10.00")
+                        || add_after_apply.contains("10,")
+                        || add_after_apply.contains("\"10\""))
+                    && (add_after_apply.contains("5.00")
+                        || add_after_apply.contains("[\n    5\n")
+                        || add_after_apply.contains("\"5\"")
+                        || add_after_apply.contains("  5\n"));
                 if !(distinct_after_apply.contains("\"CUSTOMER_ID\": 1")
                     && distinct_after_apply.contains("\"CUSTOMER_ID\": 2")
-                    && add_after_apply.contains("42.50")
-                    && add_after_apply.contains("10.00")
-                    && add_after_apply.contains("5.00"))
+                    && amounts_ok)
                 {
                     return Err(CliError::Failed(format!(
                         "Initial Load distinct/addToSet Derived check failed.\n\
@@ -1980,13 +1989,13 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 Ok(())
             }
             Self::PauseResume => {
-                if sync_out.contains(&format!("Delivery complete: Pipeline {PAUSE_RESUME_CUSTOMERS_PIPELINE}"))
+                if sync_mentions_pipeline_delivery(&sync_out, PAUSE_RESUME_CUSTOMERS_PIPELINE)
                 {
                     return Err(CliError::Failed(format!(
                         "paused Pipeline must not Deliver during sync:\n{sync_out}"
                     )));
                 }
-                if !(sync_out.contains(&format!("Delivery complete: Pipeline {PAUSE_RESUME_ORDERS_PIPELINE}"))
+                if !(sync_mentions_pipeline_delivery(&sync_out, PAUSE_RESUME_ORDERS_PIPELINE)
                     || sync_out.contains(PAUSE_RESUME_ORDERS_PIPELINE))
                 {
                     return Err(CliError::Failed(format!(
@@ -2031,16 +2040,20 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 Ok(())
             }
             Self::RemovePipeline => {
-                if sync_out.contains(&format!(
-                    "Delivery complete: Pipeline {REMOVE_PIPELINE_CUSTOMERS_PIPELINE}"
-                )) {
+                // Match pipeline name with a token boundary so
+                // `lab-rp-customers-reporting` is not mistaken for `lab-rp-customers`.
+                if sync_mentions_pipeline_delivery(
+                    &sync_out,
+                    REMOVE_PIPELINE_CUSTOMERS_PIPELINE,
+                ) {
                     return Err(CliError::Failed(format!(
                         "removed Pipeline must not Deliver during sync:\n{sync_out}"
                     )));
                 }
-                if !(sync_out.contains(&format!(
-                    "Delivery complete: Pipeline {REMOVE_PIPELINE_REPORTING_PIPELINE}"
-                )) || sync_out.contains(REMOVE_PIPELINE_REPORTING_PIPELINE))
+                if !(sync_mentions_pipeline_delivery(
+                    &sync_out,
+                    REMOVE_PIPELINE_REPORTING_PIPELINE,
+                ) || sync_out.contains(REMOVE_PIPELINE_REPORTING_PIPELINE))
                 {
                     return Err(CliError::Failed(format!(
                         "remaining Pipeline must still Deliver from Shared Base during sync:\n{sync_out}"
@@ -4688,6 +4701,27 @@ impl Drop for ScenarioLock {
     }
 }
 
+/// True when sync output reports Delivery for exactly `pipeline` (not a longer
+/// name that shares the same prefix, e.g. `lab-rp-customers` vs
+/// `lab-rp-customers-reporting`).
+fn sync_mentions_pipeline_delivery(sync_out: &str, pipeline: &str) -> bool {
+    let needle = format!("Delivery complete: Pipeline {pipeline}");
+    let mut start = 0;
+    while let Some(rel) = sync_out[start..].find(&needle) {
+        let abs = start + rel;
+        let after = abs + needle.len();
+        let boundary_ok = match sync_out.as_bytes().get(after) {
+            None => true,
+            Some(b) => !b.is_ascii_alphanumeric() && *b != b'-' && *b != b'_',
+        };
+        if boundary_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
 
 
 
@@ -4703,6 +4737,23 @@ mod tests {
         evaluate_recipe_thresholds, product_path_plan, recipe_interface_summary,
     };
     use std::time::Duration;
+
+    #[test]
+    fn sync_pipeline_delivery_match_uses_name_boundary() {
+        let reporting = "Delivery complete: Pipeline lab-rp-customers-reporting upserts=1";
+        assert!(
+            !sync_mentions_pipeline_delivery(reporting, "lab-rp-customers"),
+            "reporting pipeline must not count as removed customers pipeline"
+        );
+        assert!(sync_mentions_pipeline_delivery(
+            reporting,
+            "lab-rp-customers-reporting"
+        ));
+        assert!(sync_mentions_pipeline_delivery(
+            "Delivery complete: Pipeline lab-rp-customers upserts=1 deletes=0",
+            "lab-rp-customers"
+        ));
+    }
 
     trait ProductPathStepSink {
         fn on_step(&mut self, step: ProductPathStepKind) -> Result<(), String>;
