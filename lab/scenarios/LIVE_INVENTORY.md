@@ -46,7 +46,7 @@ Re-ran the Transform Sync Lab Scenario cluster on a ready Fixture (host Instant 
 
 ## Correctness safety nets re-verify ([#226](https://github.com/Migraloop/Migraloop/issues/226))
 
-Re-ran the correctness safety-net Lab Scenario cluster on a fresh ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts). All four acceptance Scenarios **PASS**; no additional product-path fixes required beyond the inventory fixes already on `main`. These checks remain edge-case remediation (Operator-visible Align / Drift / quarantine / Schema Change pause)—not a substitute for correct Incremental Capture. Relevant RQG contract twins stay green (`cli_source_alignment`, `cli_drift_check`, `cli_poison_quarantine`, `cli_schema_change_pause`).
+Re-ran the correctness safety-net Lab Scenario cluster on a fresh ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts). All four acceptance Scenarios **PASS**; no additional product-path fixes required beyond the inventory fixes already on `main`. These checks remain edge-case remediation (Operator-visible Source Alignment Check / Drift Check / quarantine / Schema Change pause)—not a substitute for correct Incremental Capture. Relevant RQG contract twins stay green (`cli_source_alignment`, `cli_drift_check`, `cli_poison_quarantine`, `cli_schema_change_pause`).
 
 | Scenario id | Result | Notes |
 |-------------|--------|-------|
