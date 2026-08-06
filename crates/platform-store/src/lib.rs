@@ -25,6 +25,24 @@ use thiserror::Error;
 /// app instance do not multi-write Base/Delivery state concurrently.
 const INCREMENTAL_SYNC_ADVISORY_LOCK_KEY: i64 = 0x4D47_5F53_594E_4301; // "MG_SYNC\x01"
 
+/// One Base Dataset row mutation for Incremental Sync persist without rewriting peers.
+///
+/// Used by [`PlatformStore::record_sync_row_progress`] so Direct/Transform Sync can
+/// advance one Output Identity / source key without DELETE+reinsert of all `base_rows`
+/// (issue #230 / ADR-0029 throughput path).
+#[derive(Debug, Clone, Copy)]
+pub enum BaseRowMutation<'a> {
+    /// Insert or replace the Base row matching `identity` (JSON containment on PK fields).
+    Upsert {
+        identity: &'a serde_json::Map<String, serde_json::Value>,
+        row: &'a serde_json::Map<String, serde_json::Value>,
+    },
+    /// Delete the Base row matching `identity`.
+    Delete {
+        identity: &'a serde_json::Map<String, serde_json::Value>,
+    },
+}
+
 /// Prior-release Platform Store schema cut for upgrade-smoke verification.
 ///
 /// Migrations `1..=4` cover bootstrap through Delivery binding — a store shape
@@ -237,7 +255,8 @@ pub(crate) async fn connect(database_url: &str) -> Result<PgPool, PlatformStoreE
 /// call session verbs instead of reconnecting on every table-shaped CRUD call.
 /// Sync / Delivery progress, quarantine, schema-impact, Source Alignment, Drift, and
 /// Pipeline lifecycle intents use
-/// [`PlatformStore::record_sync_window_progress`], [`PlatformStore::record_delivery_progress`],
+/// [`PlatformStore::record_sync_window_progress`], [`PlatformStore::record_sync_row_progress`],
+/// [`PlatformStore::record_delivery_progress`],
 /// [`PlatformStore::quarantine_change`], [`PlatformStore::mark_schema_impact`],
 /// [`PlatformStore::record_source_alignment_progress`], [`PlatformStore::record_drift_outcome`],
 /// [`PlatformStore::resume_pipeline`], and [`PlatformStore::remove_pipeline`].
@@ -542,7 +561,9 @@ impl PlatformStore {
     /// Record Incremental Sync window progress: Base snapshot + applied change ids.
     ///
     /// Deployment-intent verb — Runtime Sync paths call this instead of sequencing
-    /// [`replace_base_dataset`] and [`record_applied_source_changes`].
+    /// [`replace_base_dataset`] and [`record_applied_source_changes`]. Prefer
+    /// [`record_sync_row_progress`] for ordinary per-change Incremental Capture so
+    /// untouched Base rows are not rewritten (issue #230).
     pub async fn record_sync_window_progress(
         &self,
         dataset: &BaseDataset,
@@ -555,6 +576,58 @@ impl PlatformStore {
             .await
             .map_err(PlatformStoreError::Persist)?;
         replace_base_dataset_in_tx(&mut tx, dataset, rows).await?;
+        record_applied_source_changes_in_tx(
+            &mut tx,
+            &dataset.deployment_name,
+            &dataset.source_schema,
+            &dataset.source_table,
+            applied_changes,
+        )
+        .await?;
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Record one Incremental Capture Base mutation + applied change ids.
+    ///
+    /// Updates `base_datasets` Sync fields and upserts/deletes only the touched
+    /// `base_rows` identity — peers stay durable. Preserves Deliver-before-checkpoint
+    /// semantics when Runtime calls this after Target Delivery (issue #230).
+    pub async fn record_sync_row_progress(
+        &self,
+        dataset: &BaseDataset,
+        mutation: BaseRowMutation<'_>,
+        applied_changes: &[(String, i64)],
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+        upsert_base_dataset_metadata_in_tx(&mut tx, dataset).await?;
+        match mutation {
+            BaseRowMutation::Upsert { identity, row } => {
+                upsert_base_row_by_identity_in_tx(
+                    &mut tx,
+                    &dataset.deployment_name,
+                    &dataset.source_schema,
+                    &dataset.source_table,
+                    identity,
+                    row,
+                )
+                .await?;
+            }
+            BaseRowMutation::Delete { identity } => {
+                delete_base_row_by_identity_in_tx(
+                    &mut tx,
+                    &dataset.deployment_name,
+                    &dataset.source_schema,
+                    &dataset.source_table,
+                    identity,
+                )
+                .await?;
+            }
+        }
         record_applied_source_changes_in_tx(
             &mut tx,
             &dataset.deployment_name,
@@ -739,24 +812,15 @@ impl PlatformStore {
         .await
         .map_err(PlatformStoreError::Persist)?;
 
-        for (offset, row) in rows.iter().enumerate() {
-            let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
-            sqlx::query(
-                r#"
-                INSERT INTO base_rows (
-                    deployment_name, source_schema, source_table, row_ordinal, row_json
-                ) VALUES ($1, $2, $3, $4, $5)
-                "#,
-            )
-            .bind(&dataset.deployment_name)
-            .bind(&dataset.source_schema)
-            .bind(&dataset.source_table)
-            .bind(start_ordinal + offset as i32)
-            .bind(&row_json)
-            .execute(&mut *tx)
-            .await
-            .map_err(PlatformStoreError::Persist)?;
-        }
+        insert_base_rows_bulk_in_tx(
+            &mut tx,
+            &dataset.deployment_name,
+            &dataset.source_schema,
+            &dataset.source_table,
+            rows,
+            start_ordinal,
+        )
+        .await?;
 
         tx.commit().await.map_err(PlatformStoreError::Persist)?;
         Ok(())
@@ -1855,24 +1919,10 @@ impl PlatformStore {
     }
 }
 
-async fn replace_base_dataset_in_tx(
+async fn upsert_base_dataset_metadata_in_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     dataset: &BaseDataset,
-    rows: &[serde_json::Map<String, serde_json::Value>],
 ) -> Result<(), PlatformStoreError> {
-    sqlx::query(
-        r#"
-            DELETE FROM base_rows
-            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
-            "#,
-    )
-    .bind(&dataset.deployment_name)
-    .bind(&dataset.source_schema)
-    .bind(&dataset.source_table)
-    .execute(&mut **tx)
-    .await
-    .map_err(PlatformStoreError::Persist)?;
-
     let columns_json =
         serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
     let omitted_json = serde_json::to_string(&dataset.omitted_columns)
@@ -1936,25 +1986,174 @@ async fn replace_base_dataset_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
 
-    for (ordinal, row) in rows.iter().enumerate() {
-        let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
-        sqlx::query(
-            r#"
-                INSERT INTO base_rows (
-                    deployment_name, source_schema, source_table, row_ordinal, row_json
-                ) VALUES ($1, $2, $3, $4, $5)
-                "#,
-        )
-        .bind(&dataset.deployment_name)
-        .bind(&dataset.source_schema)
-        .bind(&dataset.source_table)
-        .bind(ordinal as i32)
-        .bind(&row_json)
-        .execute(&mut **tx)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
+/// Insert `base_rows` in one statement via UNNEST (IL + full-snapshot Sync paths).
+async fn insert_base_rows_bulk_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    start_ordinal: i32,
+) -> Result<(), PlatformStoreError> {
+    if rows.is_empty() {
+        return Ok(());
     }
+    let mut ordinals = Vec::with_capacity(rows.len());
+    let mut row_jsons = Vec::with_capacity(rows.len());
+    for (offset, row) in rows.iter().enumerate() {
+        ordinals.push(start_ordinal + offset as i32);
+        row_jsons.push(serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?);
+    }
+    let deployments = vec![deployment_name.to_string(); rows.len()];
+    let schemas = vec![source_schema.to_string(); rows.len()];
+    let tables = vec![source_table.to_string(); rows.len()];
+    sqlx::query(
+        r#"
+            INSERT INTO base_rows (
+                deployment_name, source_schema, source_table, row_ordinal, row_json
+            )
+            SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::int4[], $5::text[]
+            )
+            "#,
+    )
+    .bind(&deployments)
+    .bind(&schemas)
+    .bind(&tables)
+    .bind(&ordinals)
+    .bind(&row_jsons)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+fn identity_json_for_containment(
+    identity: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, PlatformStoreError> {
+    serde_json::to_string(identity).map_err(PlatformStoreError::InvalidJson)
+}
+
+async fn upsert_base_row_by_identity_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    identity: &serde_json::Map<String, serde_json::Value>,
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), PlatformStoreError> {
+    let identity_json = identity_json_for_containment(identity)?;
+    let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
+    let updated = sqlx::query(
+        r#"
+            UPDATE base_rows
+            SET row_json = $5
+            WHERE deployment_name = $1
+              AND source_schema = $2
+              AND source_table = $3
+              AND row_json::jsonb @> $4::jsonb
+            "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(&identity_json)
+    .bind(&row_json)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    if updated.rows_affected() > 0 {
+        return Ok(());
+    }
+    let next_ordinal: i32 = sqlx::query_scalar(
+        r#"
+            SELECT COALESCE(MAX(row_ordinal), -1) + 1
+            FROM base_rows
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    sqlx::query(
+        r#"
+            INSERT INTO base_rows (
+                deployment_name, source_schema, source_table, row_ordinal, row_json
+            ) VALUES ($1, $2, $3, $4, $5)
+            "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(next_ordinal)
+    .bind(&row_json)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+async fn delete_base_row_by_identity_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    identity: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), PlatformStoreError> {
+    let identity_json = identity_json_for_containment(identity)?;
+    sqlx::query(
+        r#"
+            DELETE FROM base_rows
+            WHERE deployment_name = $1
+              AND source_schema = $2
+              AND source_table = $3
+              AND row_json::jsonb @> $4::jsonb
+            "#,
+    )
+    .bind(deployment_name)
+    .bind(source_schema)
+    .bind(source_table)
+    .bind(&identity_json)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+async fn replace_base_dataset_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    dataset: &BaseDataset,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+) -> Result<(), PlatformStoreError> {
+    sqlx::query(
+        r#"
+            DELETE FROM base_rows
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.source_schema)
+    .bind(&dataset.source_table)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+
+    upsert_base_dataset_metadata_in_tx(tx, dataset).await?;
+    insert_base_rows_bulk_in_tx(
+        tx,
+        &dataset.deployment_name,
+        &dataset.source_schema,
+        &dataset.source_table,
+        rows,
+        0,
+    )
+    .await?;
     Ok(())
 }
 
