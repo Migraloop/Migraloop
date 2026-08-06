@@ -1,0 +1,6 @@
+{
+  "seed_rows": 1000,
+  "duration_ms": 550,
+  "rows_per_s": 1700,
+  "allowed_regression_pct": 55
+}

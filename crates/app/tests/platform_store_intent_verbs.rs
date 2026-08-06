@@ -8,7 +8,7 @@
 mod common;
 
 use migraloop_platform_store::{
-    BaseColumn, BaseDataset, BaseRowMutation, Deployment, Pipeline, PlatformStore,
+    BaseColumn, BaseDataset, BaseRowMutation, Deployment, DerivedDataset, Pipeline, PlatformStore,
     QuarantinedChange, SchemaChangeImpact, SecretRef, SecretRefKind, SystemConnection,
     TlsSettings,
 };
@@ -363,6 +363,116 @@ async fn record_sync_row_progress_upserts_one_row_without_dropping_peers() {
         .await
         .expect("filter applied");
     assert_eq!(unapplied, vec!["chg-153".to_string()]);
+}
+
+/// Transform Sync throughput seam (#231): Affect recompute must not DELETE+rewrite
+/// untouched Derived peers (ADR-0029 Transform path, mirrors Base #230).
+#[tokio::test]
+async fn apply_derived_identity_changes_upserts_without_dropping_peers() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-derived-row"))
+        .await
+        .expect("upsert Deployment");
+    let mut pipeline = sample_pipeline("intent-derived-row", "active-customers");
+    pipeline.mode = "transform".to_string();
+    pipeline.target_collection = "active_customers".to_string();
+    pipeline.output_identity = vec!["ID".to_string()];
+    store
+        .replace_pipelines("intent-derived-row", &[pipeline])
+        .await
+        .expect("upsert Transform Pipeline");
+
+    let mut seed_rows = Vec::new();
+    for id in 1..=100 {
+        let mut row = serde_json::Map::new();
+        row.insert("ID".to_string(), serde_json::json!(id));
+        row.insert(
+            "NAME".to_string(),
+            serde_json::json!(format!("customer-{id}")),
+        );
+        seed_rows.push(row);
+    }
+    let mut dataset = DerivedDataset {
+        deployment_name: "intent-derived-row".to_string(),
+        pipeline_name: "active-customers".to_string(),
+        status: "materialized".to_string(),
+        output_identity: vec!["ID".to_string()],
+        columns: vec![
+            BaseColumn {
+                name: "ID".to_string(),
+                data_type: "NUMBER".to_string(),
+                precision: Some(10),
+                scale: Some(0),
+            },
+            BaseColumn {
+                name: "NAME".to_string(),
+                data_type: "VARCHAR2".to_string(),
+                precision: Some(100),
+                scale: None,
+            },
+        ],
+        row_count: 100,
+    };
+    store
+        .replace_derived_dataset(&dataset, &seed_rows)
+        .await
+        .expect("seed 100 Derived rows");
+
+    let mut remove_id = serde_json::Map::new();
+    remove_id.insert("ID".to_string(), serde_json::json!(50));
+    let mut updated = serde_json::Map::new();
+    updated.insert("ID".to_string(), serde_json::json!(50));
+    updated.insert("NAME".to_string(), serde_json::json!("customer-50-updated"));
+
+    let mut insert_id = serde_json::Map::new();
+    insert_id.insert("ID".to_string(), serde_json::json!(101));
+    let mut inserted = insert_id.clone();
+    inserted.insert("NAME".to_string(), serde_json::json!("customer-101"));
+
+    let mut delete_id = serde_json::Map::new();
+    delete_id.insert("ID".to_string(), serde_json::json!(1));
+
+    dataset.row_count = 100; // -1 delete +1 insert; update in place
+    store
+        .apply_derived_identity_changes(
+            &dataset,
+            &[remove_id, insert_id.clone(), delete_id],
+            &[updated, inserted],
+        )
+        .await
+        .expect("delta Derived identity mutations");
+
+    let (loaded, rows) = store
+        .get_derived_rows("active-customers", Some("intent-derived-row"))
+        .await
+        .expect("load Derived after delta mutations");
+    assert_eq!(loaded.row_count, 100);
+    assert_eq!(rows.len(), 100, "peers must survive delta Derived persist");
+
+    let row_50 = rows
+        .iter()
+        .find(|r| r.data.get("ID") == Some(&serde_json::json!(50)))
+        .expect("row 50 present");
+    assert_eq!(
+        row_50.data.get("NAME"),
+        Some(&serde_json::json!("customer-50-updated"))
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.data.get("ID") == Some(&serde_json::json!(101))),
+        "inserted Derived row 101 must be present"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r.data.get("ID") != Some(&serde_json::json!(1))),
+        "deleted Derived row 1 must be gone"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.data.get("ID") == Some(&serde_json::json!(2))),
+        "untouched peer Derived row 2 must remain"
+    );
 }
 
 #[tokio::test]

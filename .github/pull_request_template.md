@@ -16,6 +16,6 @@ Release Quality Gate (every PR): Handbook guard + `rqg-unit` + `rqg-integration`
 
 - [ ] `cargo test --workspace --exclude migraloop-app --exclude handbook-guard` (`rqg-unit`)
 - [ ] With CI-parity Postgres/Mongo (`MIGRALOOP_TEST_ADMIN_URL`, `MIGRALOOP_TEST_MONGO_HOST` / `PORT`): `cargo test -p migraloop-app` (`rqg-integration`)
-- [ ] When touching Sync→Delivery / perf-sensitive paths: `bash ci/rqg/run_direct_pipeline_microbench.sh` (`rqg-perf`)
+- [ ] When touching Sync→Delivery / perf-sensitive paths: `bash ci/rqg/run_direct_pipeline_microbench.sh` and `bash ci/rqg/run_transform_pipeline_microbench.sh` (`rqg-perf`)
 - [ ] `cargo test -p handbook-guard`
 - [ ] `git diff --name-only origin/main...HEAD > /tmp/changed.txt && cargo run -p handbook-guard -- check --handbook handbook --changed-paths-file /tmp/changed.txt`

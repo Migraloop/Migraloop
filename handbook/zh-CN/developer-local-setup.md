@@ -148,7 +148,7 @@ Seam 测试可用 in-memory `FakeSource`／`FakeTarget`（含 injected apply／I
 | **Handbook guard** | `cargo test -p handbook-guard` 加上 handbook check entrypoint | 见下方「Handbook guard」一节 |
 | **rqg-unit** | workspace crate 测试，排除 `migraloop-app` 与 `handbook-guard`（不需要 Postgres/Mongo） | `cargo test --workspace --exclude migraloop-app --exclude handbook-guard` |
 | **rqg-integration** | 非 ignored 的 `migraloop-app` 测试（正确性、contract、fault、capability CI twins） | 下方 CI 对齐 env，再 `cargo test -p migraloop-app` |
-| **rqg-perf** | contract/stub 上固定 Direct Pipeline microbench，对照 committed baseline（`allowed_regression_pct` 约 55，应对 hosted runner 噪声；最多 3 次 attempts） | 下方 CI 对齐 env，再 `bash ci/rqg/run_direct_pipeline_microbench.sh` |
+| **rqg-perf** | contract/stub 上固定 Direct + Transform Pipeline microbench，对照 committed baselines（`allowed_regression_pct` 约 55，应对 hosted runner 噪声；各最多 3 次 attempts） | 下方 CI 对齐 env，再 `bash ci/rqg/run_direct_pipeline_microbench.sh` 与 `bash ci/rqg/run_transform_pipeline_microbench.sh` |
 
 `rqg-integration` 与 `rqg-perf` 使用与 CI 相同的 service 凭据。执行那些 cargo／bash 命令前请设置：
 

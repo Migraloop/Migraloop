@@ -20,7 +20,7 @@ use migraloop_capture::{
 };
 use migraloop_delivery::TargetEngine;
 use migraloop_platform_store::{
-    BaseColumn, BaseDataset, BaseRowMutation, Pipeline, PlatformStore,
+    BaseColumn, BaseDataset, BaseRowMutation, DerivedDataset, Pipeline, PlatformStore,
 };
 use migraloop_transform::{
     analyze_base_change, evaluate_transform_for_identities_with_bases, identity_matches_row,
@@ -74,6 +74,8 @@ fn base_change_kind(op: ChangeOp) -> BaseChangeKind {
 ///
 /// `changed_table` / `changed_base_rows` are the Base that just received the change
 /// (primary `source.table` or an `equiLookup.from` / `union.from` secondary).
+/// `primary_base_columns` are the primary Base Dataset column metadata already loaded
+/// for this Incremental window (avoids a store round-trip for columns alone).
 ///
 /// Returns the next opaque Maintenance State blob when the transform uses one. Callers
 /// persist it only after durable Base/checkpoint progress so a Sync retry cannot
@@ -84,6 +86,7 @@ async fn maintain_transform_pipeline_for_change<T: TargetEngine>(
     target: &T,
     changed_table: &str,
     changed_base_rows: &[serde_json::Map<String, serde_json::Value>],
+    primary_base_columns: &[BaseColumn],
     change: &ChangeEvent,
     pre_apply: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Option<MaintenanceStateBlob>, RuntimeError> {
@@ -106,13 +109,15 @@ async fn maintain_transform_pipeline_for_change<T: TargetEngine>(
         ChangeOp::Delete => None,
     };
 
-    let (primary_columns, primary_rows) =
+    // Primary Base change: use the Incremental in-memory after-image (full Base rows
+    // for this window) + caller-supplied column metadata — no second Base row load.
+    // Secondary Base change: primary rows still come from the store for recompute.
+    let (primary_columns, primary_rows): (Vec<BaseColumn>, Vec<_>) =
         if changed_table.eq_ignore_ascii_case(&pipeline.source_table) {
-            let (base, _) = store
-                .get_base_rows(&pipeline.source_table, Some(&pipeline.deployment_name))
-                .await
-                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-            (base.columns, changed_base_rows.to_vec())
+            (
+                primary_base_columns.to_vec(),
+                changed_base_rows.to_vec(),
+            )
         } else {
             let (base, rows) = store
                 .get_base_rows(&pipeline.source_table, Some(&pipeline.deployment_name))
@@ -212,14 +217,6 @@ async fn recompute_and_deliver_affected_identities<T: TargetEngine>(
     )
     .map_err(|err| RuntimeError::Failed(format!("Transform Pipeline {}: {err}", pipeline.name)))?;
 
-    let (mut dataset, existing_rows) = store
-        .get_derived_rows(
-            &pipeline.name,
-            Some(&pipeline.deployment_name),
-        )
-        .await
-        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-
     // Grouped transforms (groupBy/distinct/addToSet): match by grouping keys.
     // Row-grain transforms: match Derived rows by Pipeline Output Identity only.
     // Affect Analysis identities may include shaped Managed fields (rename/addFields)
@@ -248,21 +245,73 @@ async fn recompute_and_deliver_affected_identities<T: TargetEngine>(
             }
         };
 
-    let mut merged: Vec<serde_json::Map<String, serde_json::Value>> = existing_rows
-        .into_iter()
-        .map(|r| r.data)
-        .filter(|row| !identities.iter().any(|id| identity_targets_row(id, row)))
-        .collect();
-    merged.extend(recomputed.clone());
+    // Persist only touched Output Identities / group keys — do not DELETE+rewrite
+    // untouched Derived peers (issue #231 / ADR-0029 Transform throughput).
+    // Row-grain deletes require the full Output Identity key set so JSON `@>`
+    // containment cannot over-delete peers when Affect maps omit a key.
+    let mut remove_identities = Vec::with_capacity(identities.len());
+    let mut identity_keys_complete = true;
+    for identity in identities {
+        if grouped {
+            remove_identities.push(identity.clone());
+            continue;
+        }
+        let mut keys = serde_json::Map::new();
+        for key in &pipeline.output_identity {
+            match identity.get(key) {
+                Some(value) => {
+                    keys.insert(key.clone(), value.clone());
+                }
+                None => {
+                    identity_keys_complete = false;
+                    break;
+                }
+            }
+        }
+        if !identity_keys_complete {
+            break;
+        }
+        if !keys.is_empty() {
+            remove_identities.push(keys);
+        }
+    }
 
-    let derived_columns = derived_columns_for_ops(base_columns, ops, &merged, secondary_columns);
-    dataset.status = "materialized".to_string();
-    dataset.columns = derived_columns.clone();
-    dataset.row_count = merged.len() as i32;
-    store
-        .replace_derived_dataset(&dataset, &merged)
-        .await
-        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    let derived_columns =
+        derived_columns_for_ops(base_columns, ops, &recomputed, secondary_columns);
+    if identity_keys_complete {
+        let dataset = DerivedDataset {
+            deployment_name: pipeline.deployment_name.clone(),
+            pipeline_name: pipeline.name.clone(),
+            status: "materialized".to_string(),
+            output_identity: pipeline.output_identity.clone(),
+            columns: derived_columns.clone(),
+            row_count: 0, // store recounts after identity mutations
+        };
+        store
+            .apply_derived_identity_changes(&dataset, &remove_identities, &recomputed)
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    } else {
+        // Incomplete Output Identity on an Affect map: fall back to full merge so
+        // partial containment cannot drop unrelated Derived peers.
+        let (mut existing_dataset, existing_rows) = store
+            .get_derived_rows(&pipeline.name, Some(&pipeline.deployment_name))
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        let mut merged: Vec<serde_json::Map<String, serde_json::Value>> = existing_rows
+            .into_iter()
+            .map(|r| r.data)
+            .filter(|row| !identities.iter().any(|id| identity_targets_row(id, row)))
+            .collect();
+        merged.extend(recomputed.clone());
+        existing_dataset.status = "materialized".to_string();
+        existing_dataset.columns = derived_columns.clone();
+        existing_dataset.row_count = merged.len() as i32;
+        store
+            .replace_derived_dataset(&existing_dataset, &merged)
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    }
 
     let mut upserts = Vec::new();
     for row in &recomputed {
@@ -1249,6 +1298,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                                                     target,
                                                     &table,
                                                     &rows,
+                                                    &dataset.columns,
                                                     change,
                                                     pre_apply.as_ref(),
                                                 )
