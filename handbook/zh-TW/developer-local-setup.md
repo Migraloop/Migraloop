@@ -40,7 +40,7 @@ Compose 預設憑證（`migraloop` / `migraloop`）僅供本機開發。
 
 ## Local Sync Lab Fixture
 
-可拋棄的 Oracle + MongoDB + Platform Store + app，供**手動** Sync→Delivery 驗證（ADR-0025）。與 **Release Quality Gate**／CI contract-stub harness 不同：由 operator 選擇 Lab Scenarios；**不要**把 Scenario catalog 當成 CI suite，也不要新增會跑完整 catalog 的 release-gate job。
+可拋棄的 Oracle + MongoDB + Platform Store + app，供**手動** Sync→Delivery 驗證（ADR-0025）。與 **Release Quality Gate**／CI contract-stub harness 不同：由 operator 選擇 Lab Scenarios；**不要**把 Scenario catalog 當成 CI suite，也不要新增會跑完整 catalog 的 release-gate job。Scenario 執行期間 Lab 會暫停 Fixture `app`（`migraloop run`），讓 host `apply`/`sync` 成為唯一的 Incremental Capture 消費者，結束後再恢復 `app`——仍是真實 product CLI Sync／Delivery，不是 Lab stub。
 
 ```bash
 cargo build -p migraloop-app

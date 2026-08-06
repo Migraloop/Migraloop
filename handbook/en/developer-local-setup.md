@@ -40,7 +40,7 @@ Default compose credentials (`migraloop` / `migraloop`) are for local developmen
 
 ## Local Sync Lab Fixture
 
-Disposable Oracle + MongoDB + Platform Store + app for **manual** Sync→Delivery verification (ADR-0025). Distinct from the **Release Quality Gate** / CI contract-stub harness: operators choose Lab Scenarios; do **not** treat the Scenario catalog as a CI suite or add a job that runs the entire catalog as a release gate.
+Disposable Oracle + MongoDB + Platform Store + app for **manual** Sync→Delivery verification (ADR-0025). Distinct from the **Release Quality Gate** / CI contract-stub harness: operators choose Lab Scenarios; do **not** treat the Scenario catalog as a CI suite or add a job that runs the entire catalog as a release gate. While a Scenario runs, Lab pauses Fixture `app` (`migraloop run`) so host `apply`/`sync` is the sole Incremental Capture consumer, then resumes `app` afterward—still real product CLI Sync/Delivery, not a Lab stub.
 
 ```bash
 cargo build -p migraloop-app
