@@ -25,6 +25,7 @@ Live Lab pass/fail evidence (Oracle → Mongo Fixture): [LIVE_INVENTORY.md](./LI
 | Rich Transform `distinct` / `addToSet` (Maintenance State) | `rt-distinct-addtoset` |
 | Rich Transform `groupBy` / `sum` (also under contention) | `transform-pipeline`, `concurrent-source-workload` |
 | Rich Transform `groupBy` `count` / `min` / `max` / `avg` | `transform-pipeline` |
+| Change Ordering / confluence (same-key order, cross-key interleave, min Base recompute) | `change-ordering` |
 | Intra-Scenario concurrent Source workload | `concurrent-source-workload` |
 | Bulk load (~100k) with fail-able metric thresholds | `bulk-load` |
 | Idempotent re-delivery / duplicate-safe Delivery | `idempotent-redelivery` |

@@ -222,6 +222,24 @@ async fn lab_scenario_list_includes_concurrent_source_workload() {
 }
 
 #[tokio::test]
+async fn lab_scenario_list_includes_change_ordering() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("change-ordering"),
+        "catalog must list Change Ordering / confluence Scenario, got:\n{out}"
+    );
+}
+
+#[tokio::test]
 async fn lab_scenario_list_includes_bulk_load() {
     let list = Command::new(bin())
         .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
@@ -1967,6 +1985,108 @@ async fn lab_scenario_concurrent_source_workload_run_and_inspect() {
     assert!(
         remove.status.success(),
         "lab scenario remove concurrent-source-workload failed:\n{remove_out}"
+    );
+
+    let _ = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output();
+}
+
+/// Change Ordering / confluence Lab Scenario against Docker Lab Fixture + Instant Client
+/// (ADR-0029 / issue #225).
+///
+/// ```bash
+/// export LD_LIBRARY_PATH=/path/to/instantclient
+/// cargo test -p migraloop-app --test cli_lab_scenario -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "requires Docker Compose Lab Fixture + Oracle Instant Client; not part of Release Quality Gate"]
+async fn lab_scenario_change_ordering_run_and_inspect() {
+    let lab = lab_dir();
+    let store_url = "postgres://migraloop:migraloop@127.0.0.1:5432/migraloop";
+
+    let down_first = Command::new(bin())
+        .args(["lab", "down", "--lab-dir", &lab])
+        .output()
+        .expect("lab down cleanup");
+    assert!(
+        down_first.status.success(),
+        "lab down (cleanup) failed: {}",
+        String::from_utf8_lossy(&down_first.stderr)
+    );
+
+    let up = Command::new(bin())
+        .args(["lab", "up", "--lab-dir", &lab])
+        .output()
+        .expect("lab up");
+    let up_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert!(up.status.success(), "lab up failed:\n{up_out}");
+
+    let run = Command::new(bin())
+        .env("ORACLE_PASSWORD", "lab_oracle")
+        .env("MONGO_PASSWORD", "lab_mongo")
+        .args([
+            "lab",
+            "scenario",
+            "run",
+            "change-ordering",
+            "--lab-dir",
+            &lab,
+            "--auto-remove",
+        ])
+        .output()
+        .expect("lab scenario run change-ordering");
+    let run_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "lab scenario run change-ordering failed:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("Lab Scenario: PASS"),
+        "expected Scenario PASS, got:\n{run_out}"
+    );
+    assert!(
+        run_out.contains("correctness=pass"),
+        "expected correctness metric, got:\n{run_out}"
+    );
+    assert!(
+        run_out.to_ascii_lowercase().contains("logminer")
+            || run_out.contains("Incremental Capture"),
+        "Scenario must use real capture path (not Alignment/Drift repair), got:\n{run_out}"
+    );
+    assert!(
+        !run_out.to_ascii_lowercase().contains("source alignment")
+            && !run_out.to_ascii_lowercase().contains("drift check"),
+        "normal Incremental path must not invoke Alignment/Drift, got:\n{run_out}"
+    );
+
+    let base = Command::new(bin())
+        .args([
+            "base",
+            "--platform-store-url",
+            store_url,
+            "--table",
+            "LAB_CO_CUSTOMERS",
+        ])
+        .output()
+        .expect("base after auto-remove");
+    let base_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&base.stdout),
+        String::from_utf8_lossy(&base.stderr)
+    );
+    assert!(
+        !base.status.success()
+            || (!base_out.contains("NameC") && !base_out.contains("Key2Final")),
+        "Base Namespace rows should be gone after --auto-remove, got:\n{base_out}"
     );
 
     let _ = Command::new(bin())

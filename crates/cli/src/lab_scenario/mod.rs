@@ -124,6 +124,13 @@ const CONCURRENT_ORDER_TOTALS_COLLECTION: &str = "lab_cw_order_totals";
 const CONCURRENT_ORDER_TOTALS_PIPELINE: &str = "lab-cw-order-totals";
 const CONCURRENT_SETTLE_POLL: Duration = Duration::from_secs(2);
 
+const CHANGE_ORDERING_ID: &str = "change-ordering";
+const CHANGE_ORDERING_CUSTOMERS_TABLE: &str = "LAB_CO_CUSTOMERS";
+const CHANGE_ORDERING_ORDERS_TABLE: &str = "LAB_CO_ORDERS";
+const CHANGE_ORDERING_CUSTOMERS_COLLECTION: &str = "lab_co_customers";
+const CHANGE_ORDERING_ORDER_STATS_COLLECTION: &str = "lab_co_order_stats";
+const CHANGE_ORDERING_ORDER_STATS_PIPELINE: &str = "lab-co-order-stats";
+
 const BULK_LOAD_ID: &str = "bulk-load";
 const BULK_LOAD_TABLE: &str = "LAB_BL_ITEMS";
 const BULK_LOAD_COLLECTION: &str = "lab_bl_items";
@@ -330,6 +337,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         RT_UNWIND_ID,
         RT_DISTINCT_ADDTOSET_ID,
         CONCURRENT_SOURCE_WORKLOAD_ID,
+        CHANGE_ORDERING_ID,
         BULK_LOAD_ID,
         IDEMPOTENT_REDELIVERY_ID,
         PAUSE_RESUME_ID,
@@ -373,6 +381,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             CONCURRENT_SOURCE_WORKLOAD_ID,
             "intra-Scenario concurrent Source workload",
+        ),
+        (
+            CHANGE_ORDERING_ID,
+            "Change Ordering / confluence (same-key order, cross-key interleave, min Base recompute)",
         ),
         (BULK_LOAD_ID, "bulk load (~100k) with metric thresholds"),
         (
@@ -571,6 +583,7 @@ async fn scenario_run(
             DIRECT_PIPELINE_ID
             | TRANSFORM_PIPELINE_ID
             | CONCURRENT_SOURCE_WORKLOAD_ID
+            | CHANGE_ORDERING_ID
             | BULK_LOAD_ID
             | IDEMPOTENT_REDELIVERY_ID
             | PAUSE_RESUME_ID
@@ -1008,6 +1021,7 @@ enum ProductPathHooks {
     PoisonQuarantine,
     TransformPipeline,
     ConcurrentSourceWorkload,
+    ChangeOrdering,
     BulkLoad,
     IdempotentRedelivery,
     PauseResume,
@@ -1037,6 +1051,7 @@ impl ProductPathHooks {
             POISON_QUARANTINE_ID => Ok(Self::PoisonQuarantine),
             TRANSFORM_PIPELINE_ID => Ok(Self::TransformPipeline),
             CONCURRENT_SOURCE_WORKLOAD_ID => Ok(Self::ConcurrentSourceWorkload),
+            CHANGE_ORDERING_ID => Ok(Self::ChangeOrdering),
             BULK_LOAD_ID => Ok(Self::BulkLoad),
             IDEMPOTENT_REDELIVERY_ID => Ok(Self::IdempotentRedelivery),
             PAUSE_RESUME_ID => Ok(Self::PauseResume),
@@ -1487,6 +1502,72 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 }
                 Ok(())
             }
+            Self::ChangeOrdering => {
+                if !(apply_out.to_ascii_lowercase().contains("derived")
+                    || apply_out.contains(CHANGE_ORDERING_ORDER_STATS_PIPELINE))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
+                    )));
+                }
+                let customers_base = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        CHANGE_ORDERING_CUSTOMERS_TABLE,
+                    ],
+                )
+                .await?;
+                let orders_base = run_product_cli(
+                    &bin,
+                    &[
+                        "base",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--table",
+                        CHANGE_ORDERING_ORDERS_TABLE,
+                    ],
+                )
+                .await?;
+                if !(managed_field_present(&customers_base, "NAME", "NameA")
+                    && managed_field_present(&customers_base, "NAME", "Key2Start"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load customers Base check failed (expected NameA and Key2Start):\n{customers_base}"
+                    )));
+                }
+                if !(managed_field_present(&orders_base, "AMOUNT", "10")
+                    && managed_field_present(&orders_base, "AMOUNT", "20")
+                    && managed_field_present(&orders_base, "AMOUNT", "5"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load orders Base check failed (expected amounts 10/20/5):\n{orders_base}"
+                    )));
+                }
+                let derived_after_apply = run_product_cli(
+                    &bin,
+                    &[
+                        "derived",
+                        "--platform-store-url",
+                        LAB_PLATFORM_STORE_URL,
+                        "--pipeline",
+                        CHANGE_ORDERING_ORDER_STATS_PIPELINE,
+                    ],
+                )
+                .await?;
+                if !(managed_field_present(&derived_after_apply, "MIN_AMOUNT", "10")
+                    && managed_field_present(&derived_after_apply, "MAX_AMOUNT", "20")
+                    && inspect_mentions_amount(&derived_after_apply, "5"))
+                {
+                    return Err(CliError::Failed(format!(
+                        "Initial Load Derived check failed (expected min/max 10/20 and key2=5):\n{derived_after_apply}"
+                    )));
+                }
+                Ok(())
+            }
             Self::ObservabilitySurface => {
                 if !(apply_out.contains("\"event\":\"initial_load_complete\"")
                     || apply_out.contains("\"event\": \"initial_load_complete\"")
@@ -1587,6 +1668,7 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
             | Self::RtDistinctAddtoset
             | Self::PoisonQuarantine
             | Self::TransformPipeline
+            | Self::ChangeOrdering
             | Self::IdempotentRedelivery
             | Self::SchemaChangePause
             | Self::SourceAlignment
@@ -2352,7 +2434,8 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
             | Self::RtUnwind
             | Self::RtDistinctAddtoset
             | Self::PoisonQuarantine
-            | Self::TransformPipeline => {
+            | Self::TransformPipeline
+            | Self::ChangeOrdering => {
                 let passed_msg = match self {
                     Self::DirectPipeline => "Base + Target Managed outcomes",
                     Self::RtProject => "projected Derived + Target Managed outcomes",
@@ -2370,6 +2453,9 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                         "poison identity quarantined; Pipeline continued; status unhealthy"
                     }
                     Self::TransformPipeline => "Base + Derived + Target Managed outcomes",
+                    Self::ChangeOrdering => {
+                        "Change Ordering same-key / cross-key / min Base recompute outcomes"
+                    }
                     _ => unreachable!("recipe-driven assert variants only"),
                 };
                 Self::assert_via_recipe_correctness(
@@ -4836,6 +4922,10 @@ mod tests {
             "catalog must include rt-distinct-addtoset for shipped Rich Transform distinct/addToSet"
         );
         assert!(
+            ids.iter().any(|id| id == CHANGE_ORDERING_ID),
+            "catalog must include change-ordering for Change Ordering / confluence (ADR-0029)"
+        );
+        assert!(
             ids.iter().any(|id| id == IDEMPOTENT_REDELIVERY_ID),
             "catalog must include idempotent-redelivery for duplicate-safe Delivery"
         );
@@ -5288,6 +5378,8 @@ mod tests {
             (TRANSFORM_PIPELINE_ID, TRANSFORM_ORDER_TOTALS_COLLECTION),
             (CONCURRENT_SOURCE_WORKLOAD_ID, CONCURRENT_CUSTOMERS_COLLECTION),
             (CONCURRENT_SOURCE_WORKLOAD_ID, CONCURRENT_ORDER_TOTALS_COLLECTION),
+            (CHANGE_ORDERING_ID, CHANGE_ORDERING_CUSTOMERS_COLLECTION),
+            (CHANGE_ORDERING_ID, CHANGE_ORDERING_ORDER_STATS_COLLECTION),
         ] {
             let recipe = load_recipe(&lab.join(id).join("recipe.yaml")).unwrap();
             assert!(
@@ -5355,6 +5447,7 @@ mod tests {
             (RT_DISTINCT_ADDTOSET_ID, five_step.as_slice(), false, true, false),
             (POISON_QUARANTINE_ID, five_step.as_slice(), true, false, false),
             (TRANSFORM_PIPELINE_ID, five_step.as_slice(), false, true, false),
+            (CHANGE_ORDERING_ID, five_step.as_slice(), false, true, false),
             (IDEMPOTENT_REDELIVERY_ID, five_step.as_slice(), true, false, false),
             (PAUSE_RESUME_ID, five_step.as_slice(), true, false, false),
             (REMOVE_PIPELINE_ID, five_step.as_slice(), true, false, false),
