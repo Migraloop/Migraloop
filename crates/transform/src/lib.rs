@@ -2,9 +2,9 @@
 //!
 //! Declarative project, addFields, rename, remove, filter (eq), equiLookup,
 //! unwind, union, groupBy (sum/count/min/max/avg), distinct, and addToSet over
-//! Base Dataset rows. Operators may be authored in the classic step form or in
-//! an Aggregation / SQL-like expand DX (`$project`, `$match`, `$group`, …);
-//! both normalize to the same analyzable IR. Free-form scripts and unanalyzable
+//! Base Dataset rows. Preferred authoring is Aggregation / SQL-like DX
+//! (`$project`, `$match`, `$group`, …); classic steps remain Upgrade Compatible.
+//! Both normalize to the same analyzable IR. Free-form scripts and unanalyzable
 //! Aggregation extensions (`pipeline`, `let`, expression `$project`, …) are
 //! rejected at parse time. Affect Analysis skips Derived recompute when only
 //! unused Base fields change, and (with Maintenance State) when distinct/addToSet
@@ -245,7 +245,18 @@ pub type OutputColumn = migraloop_types::ColumnShape;
 
 /// Parse one declarative transform step JSON object into an analyzable operator.
 ///
-/// Accepted shapes (classic form — still fully supported):
+/// Accepted Aggregation / SQL-like DX (preferred; normalizes to the same IR):
+/// - `{ "$project": { "FIELD": 1, ... } }` / `{ "select": { "fields": [...] } }`
+/// - `{ "$match": { "FIELD": value } }` / `{ "where": { "field", "eq" } }`
+/// - `{ "$addFields"|"$set": { "as": "$field"|{"$literal": ...}|literal } }`
+/// - `{ "$unset": "FIELD"|["FIELD", ...] }`
+/// - `{ "$rename": { "FROM": "TO" } }`
+/// - `{ "$lookup"|"join": { "from", "localField", "foreignField", "as" } }` (equijoin only)
+/// - `{ "$unwind": "$path"|{ "path" } }`
+/// - `{ "$unionWith": "COLL"|{ "coll"|"from" } }`
+/// - `{ "$group": { "_id": "$KEY", "OUT": { "$sum"|"$count"|…: "$FIELD" } } }`
+///
+/// Accepted classic steps (Upgrade Compatibility):
 /// - `{ "project": { "fields": [...] } }`
 /// - `{ "addFields": { "fields": [{ "as": "...", "value": ... } | { "as": "...", "field": "..." }] } }`
 /// - `{ "rename": { "fields": [{ "from": "...", "to": "..." }] } }`
@@ -257,17 +268,6 @@ pub type OutputColumn = migraloop_types::ColumnShape;
 /// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum"|"count"|"min"|"max"|"avg", "field": "...", "as": "..." }] } }`
 /// - `{ "distinct": { "fields": [...] } }`
 /// - `{ "addToSet": { "keys": [...], "field": "...", "as": "..." } }`
-///
-/// Accepted Aggregation / SQL-like expand DX (normalizes to the same IR):
-/// - `{ "$project": { "FIELD": 1, ... } }` / `{ "select": { "fields": [...] } }`
-/// - `{ "$match": { "FIELD": value } }` / `{ "where": { "field", "eq" } }`
-/// - `{ "$addFields"|"$set": { "as": "$field"|{"$literal": ...}|literal } }`
-/// - `{ "$unset": "FIELD"|["FIELD", ...] }`
-/// - `{ "$rename": { "FROM": "TO" } }`
-/// - `{ "$lookup"|"join": { "from", "localField", "foreignField", "as" } }` (equijoin only)
-/// - `{ "$unwind": "$path"|{ "path" } }`
-/// - `{ "$unionWith": "COLL"|{ "coll"|"from" } }`
-/// - `{ "$group": { "_id": "$KEY", "OUT": { "$sum"|"$count"|…: "$FIELD" } } }`
 ///
 /// Rejected shapes (clear errors):
 /// - `{ "script": "..." }` / `{ "function": "..." }`

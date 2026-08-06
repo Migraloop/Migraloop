@@ -59,7 +59,7 @@ transform:
 
 ### Migration notes
 
-- **保留 classic YAML 不需 wipe。** 升級 app 不會強制 Operator 改寫 classic `project`／`filter`／`groupBy`／… Deployments（Upgrade Compatibility／ADR-0014）。Classic steps 仍可解析並 Sync。
+- **保留 classic YAML 不需 wipe。** 升級 app 不會強制 Operator 改寫 classic `project`／`filter`／`groupBy`／… Deployments（Upgrade Compatibility／ADR-0014）。Classic steps 仍可解析；既有 Deployments 可持續 Sync。
 - **新撰寫應使用 Aggregation DX。** Lab Scenarios 與 handbook 範例以 `$project`／`$match`／`$group`／… 為支援風格。
 - **在設定中改寫形式屬於 Pipeline revision。** 撰寫的 `transform` JSON 會原樣儲存。以 IR 等效的 Aggregation YAML 取代 classic steps（或反向）會改變已儲存的宣告，因此 `migraloop apply` 會視為 **語意 Pipeline revision**：暫停該 Pipeline 舊的 Delivery、重建 Derived Dataset、重新 Deliver（含 delete reconciliation），再 resume。建議在已規劃 revision 視窗時遷移—或讓 classic Deployments 維持不變。
 - **目錄中的能力名稱仍用 classic。** Coverage 列與 glossary 仍以 `project`／`equiLookup`／`groupBy` 稱呼可分析 surface；撰寫可用任一形式。

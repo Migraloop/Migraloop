@@ -362,14 +362,14 @@ async fn transform_pipeline_unsupported_operator_fails_apply_clearly() {
 
 #[tokio::test]
 async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_mongo() {
-    // Issue #233: classic step form remains Upgrade Compatible (still applies on the
-    // product path). Preferred authoring for new Pipelines is Aggregation DX — see
-    // transform_pipeline_aggregation_dx_project_match_matches_classic_outcomes.
+    // Issue #233: preferred Aggregation DX on the product path (matches Lab `rt-project` /
+    // `rt-filter`). Classic Upgrade Compatibility: see
+    // transform_pipeline_classic_project_filter_still_applies_upgrade_compatible.
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
     let doubles = common::NamedScenarioDoubles::install(dir.path());
-    // Classic project keeps ID/NAME/ACTIVE; filter keeps ACTIVE==1 → Alice + Carol (not Bob).
+    // $project keeps ID/NAME/ACTIVE; $match keeps ACTIVE==1 → Alice + Carol (not Bob).
     let pipeline = r#"
     - name: active-customers
       mode: transform
@@ -379,11 +379,12 @@ async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_
         collection: active_customers
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME, ACTIVE]
-        - filter:
-            field: ACTIVE
-            eq: 1
+        - $project:
+            ID: 1
+            NAME: 1
+            ACTIVE: 1
+        - $match:
+            ACTIVE: 1
 "#;
     let config = write_config(
         &dir,
@@ -491,28 +492,26 @@ async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_
 }
 
 #[tokio::test]
-async fn transform_pipeline_aggregation_dx_project_match_matches_classic_outcomes() {
-    // Issue #233: Aggregation `$project` / `$match` is the preferred Lab/twin authoring
-    // form (expand #232); outcomes match classic project/filter on the product path.
+async fn transform_pipeline_classic_project_filter_still_applies_upgrade_compatible() {
+    // Issue #233: classic project/filter Deployments still apply (Upgrade Compatibility).
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
     let doubles = common::NamedScenarioDoubles::install(dir.path());
     let pipeline = r#"
-    - name: active-customers-agg
+    - name: active-customers-classic
       mode: transform
       source:
         table: CUSTOMERS
       target:
-        collection: active_customers_agg
+        collection: active_customers_classic
       outputIdentity: [ID]
       transform:
-        - $project:
-            ID: 1
-            NAME: 1
-            ACTIVE: 1
-        - $match:
-            ACTIVE: 1
+        - project:
+            fields: [ID, NAME, ACTIVE]
+        - filter:
+            field: ACTIVE
+            eq: 1
 "#;
     let config = write_config(
         &dir,
@@ -528,7 +527,7 @@ async fn transform_pipeline_aggregation_dx_project_match_matches_classic_outcome
             "--platform-store-url",
             &url,
             "--pipeline",
-            "active-customers-agg",
+            "active-customers-classic",
         ])
         .output()
         .expect("run derived");
@@ -541,11 +540,11 @@ async fn transform_pipeline_aggregation_dx_project_match_matches_classic_outcome
     let derived_out = String::from_utf8_lossy(&derived.stdout);
     assert!(
         derived_out.contains("Alice") && derived_out.contains("Carol"),
-        "Aggregation DX Derived must include ACTIVE=1 Alice/Carol, got:\n{derived_out}"
+        "classic Upgrade Compatibility Derived must include ACTIVE=1 Alice/Carol, got:\n{derived_out}"
     );
     assert!(
         !derived_out.contains("Bob"),
-        "Aggregation DX Derived must filter out Bob, got:\n{derived_out}"
+        "classic Upgrade Compatibility Derived must filter out Bob, got:\n{derived_out}"
     );
 
     let target = Command::new(bin())
@@ -555,7 +554,7 @@ async fn transform_pipeline_aggregation_dx_project_match_matches_classic_outcome
             "--platform-store-url",
             &url,
             "--collection",
-            "active_customers_agg",
+            "active_customers_classic",
         ])
         .output()
         .expect("run target");
@@ -568,6 +567,6 @@ async fn transform_pipeline_aggregation_dx_project_match_matches_classic_outcome
     let target_out = String::from_utf8_lossy(&target.stdout);
     assert!(
         target_out.contains("Alice") && target_out.contains("Carol") && !target_out.contains("Bob"),
-        "Aggregation DX Delivery must match classic project/filter outcomes, got:\n{target_out}"
+        "classic Upgrade Compatibility Delivery must keep project/filter outcomes, got:\n{target_out}"
     );
 }

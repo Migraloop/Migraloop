@@ -16,8 +16,8 @@ When shipping a new first-class capability: add a Lab Scenario (ADR-0025), add a
 | --- | --- | --- | --- |
 | Direct Pipeline Initial Load + insert/update/delete | `direct-pipeline` | `cli_direct_pipeline_initial_load.rs`, `cli_direct_pipeline_delivery.rs`, `cli_stub_incremental.rs`, `cli_logminer_incremental.rs`, `cli_contract_catalog_initial_load.rs` | Contract/stub + delivery outcomes |
 | Multi-table Transform Pipeline (`groupBy` sum/count/min/max/avg) | `transform-pipeline` | `cli_groupby_sum_affect.rs`, `cli_groupby_rich_aggs_affect.rs`, `cli_multi_table_incremental.rs` | Lab + twins author `$group` (#233); Affect Analysis + multi-table Direct/Transform settle; classic `groupBy` still parses (Upgrade Compatibility) |
-| Rich Transform `project` | `rt-project` | `cli_transform_pipeline.rs` (Aggregation `$project`/`$match` happy path + classic Upgrade Compatibility path) | #233 preferred Aggregation authoring; unit IR/Affect equivalence in `migraloop-transform` |
-| Rich Transform `filter` | `rt-filter` | `cli_transform_pipeline.rs` (Aggregation `$match` + classic `filter` Upgrade Compatibility) | |
+| Rich Transform `project` | `rt-project` | `cli_transform_pipeline.rs` (Aggregation `$project`/`$match` primary happy path + classic Upgrade Compatibility path) | #233 preferred Aggregation authoring; unit IR/Affect equivalence in `migraloop-transform` |
+| Rich Transform `filter` | `rt-filter` | `cli_transform_pipeline.rs` (Aggregation `$match` primary + classic `filter` Upgrade Compatibility) | |
 | Rich Transform `addFields` / `rename` / `remove` | `rt-field-ops` | `cli_transform_field_ops.rs` | Lab + twin happy/Affect paths use `$addFields`/`$unset`/`$rename`; classic still Upgrade Compatible |
 | Rich Transform `equiLookup` (multi-Base Transform Pipeline) | `rt-equilookup` | `cli_equilookup_affect.rs` | Happy path `$lookup`; Affect Analysis on primary/foreign Bases; `pipeline`/`let`/script reject |
 | Rich Transform `union` (multi-Base Transform Pipeline) | `rt-union` | `cli_union_affect.rs` | Happy path `$unionWith`; Affect Analysis on both Bases; nested `pipeline`/script reject |

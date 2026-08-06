@@ -59,7 +59,7 @@ Prefer one form per Pipeline for readability; mixing classic and Aggregation ste
 
 ### Migration notes
 
-- **No wipe required to keep classic YAML.** Upgrading the app does not force Operators to rewrite classic `project` / `filter` / `groupBy` / … Deployments (Upgrade Compatibility / ADR-0014). Classic steps still parse and Sync.
+- **No wipe required to keep classic YAML.** Upgrading the app does not force Operators to rewrite classic `project` / `filter` / `groupBy` / … Deployments (Upgrade Compatibility / ADR-0014). Classic steps still parse; existing Deployments keep Syncing.
 - **New authoring should use Aggregation DX.** Lab Scenarios and handbook examples use `$project` / `$match` / `$group` / … as the supported style.
 - **Rewriting form in config is a Pipeline revision.** Authored `transform` JSON is stored as written. Replacing classic steps with IR-equivalent Aggregation YAML (or the reverse) changes the stored declaration, so `migraloop apply` treats it as a **semantic Pipeline revision**: pause that Pipeline’s old Delivery, rebuild its Derived Dataset, re-Deliver (including delete reconciliation), then resume. Prefer migrating when you already intend a revision window—or leave classic Deployments unchanged.
 - **Capability names in catalogs stay classic.** Coverage rows and glossary still say `project` / `equiLookup` / `groupBy` for the analyzable surface; authoring may use either form.
