@@ -1,6 +1,6 @@
 # Lab Scenario: transform-pipeline
 # Multi-table Scenario Namespace: customers (Direct) + orders (Transform
-# groupBy sum/count/min/max/avg). Applied via the real product `migraloop apply`
+# $group sum/count/min/max/avg (#233)). Applied via the real product `migraloop apply`
 # path — not contract/stub.
 apiVersion: migraloop.dev/v1
 kind: Deployment
@@ -38,21 +38,15 @@ spec:
         collection: lab_tp_order_totals
       outputIdentity: [CUSTOMER_ID]
       transform:
-        - groupBy:
-            keys: [CUSTOMER_ID]
-            aggregates:
-              - op: count
-                field: ID
-                as: ORDER_COUNT
-              - op: min
-                field: AMOUNT
-                as: MIN_AMOUNT
-              - op: max
-                field: AMOUNT
-                as: MAX_AMOUNT
-              - op: avg
-                field: AMOUNT
-                as: AVG_AMOUNT
-              - op: sum
-                field: AMOUNT
-                as: TOTAL_AMOUNT
+        - $group:
+            _id: "$CUSTOMER_ID"
+            ORDER_COUNT:
+              $count: "$ID"
+            MIN_AMOUNT:
+              $min: "$AMOUNT"
+            MAX_AMOUNT:
+              $max: "$AMOUNT"
+            AVG_AMOUNT:
+              $avg: "$AMOUNT"
+            TOTAL_AMOUNT:
+              $sum: "$AMOUNT"

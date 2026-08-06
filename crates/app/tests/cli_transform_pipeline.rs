@@ -362,11 +362,14 @@ async fn transform_pipeline_unsupported_operator_fails_apply_clearly() {
 
 #[tokio::test]
 async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_mongo() {
+    // Issue #233: classic step form remains Upgrade Compatible (still applies on the
+    // product path). Preferred authoring for new Pipelines is Aggregation DX — see
+    // transform_pipeline_aggregation_dx_project_match_matches_classic_outcomes.
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
     let doubles = common::NamedScenarioDoubles::install(dir.path());
-    // project keeps ID/NAME/ACTIVE; filter keeps ACTIVE==1 → Alice + Carol (not Bob).
+    // Classic project keeps ID/NAME/ACTIVE; filter keeps ACTIVE==1 → Alice + Carol (not Bob).
     let pipeline = r#"
     - name: active-customers
       mode: transform
@@ -489,7 +492,8 @@ async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_
 
 #[tokio::test]
 async fn transform_pipeline_aggregation_dx_project_match_matches_classic_outcomes() {
-    // Issue #232: Aggregation-like `$project` / `$match` beside classic form.
+    // Issue #233: Aggregation `$project` / `$match` is the preferred Lab/twin authoring
+    // form (expand #232); outcomes match classic project/filter on the product path.
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");

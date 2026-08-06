@@ -290,23 +290,19 @@ async fn transform_field_ops_materialize_derived_and_deliver_to_mongo() {
         collection: shaped_customers
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME, EMAIL, ACTIVE]
-        - remove:
-            fields: [EMAIL]
-        - rename:
-            fields:
-              - from: NAME
-                to: customerName
-        - addFields:
-            fields:
-              - as: source
-                value: oracle
-              - as: displayName
-                field: customerName
-        - filter:
-            field: ACTIVE
-            eq: 1
+        - $project:
+            ID: 1
+            NAME: 1
+            EMAIL: 1
+            ACTIVE: 1
+        - $unset: EMAIL
+        - $rename:
+            NAME: customerName
+        - $addFields:
+            source: oracle
+            displayName: "$customerName"
+        - $match:
+            ACTIVE: 1
 "#;
     let config = write_config(
         &dir,
@@ -370,16 +366,11 @@ async fn transform_remove_affect_analysis_skips_unused_address_only_update() {
         collection: order_shaped
       outputIdentity: [ORDER_ID]
       transform:
-        - remove:
-            fields: [ADDRESS]
-        - rename:
-            fields:
-              - from: AMOUNT
-                to: orderAmount
-        - addFields:
-            fields:
-              - as: currency
-                value: USD
+        - $unset: ADDRESS
+        - $rename:
+            AMOUNT: orderAmount
+        - $addFields:
+            currency: USD
 "#;
     let config = write_config(
         &dir,
@@ -545,10 +536,12 @@ async fn transform_email_only_update_skips_when_removed() {
         collection: no_email
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME, EMAIL, ACTIVE]
-        - remove:
-            fields: [EMAIL]
+        - $project:
+            ID: 1
+            NAME: 1
+            EMAIL: 1
+            ACTIVE: 1
+        - $unset: EMAIL
 "#;
     let config = write_config(
         &dir,

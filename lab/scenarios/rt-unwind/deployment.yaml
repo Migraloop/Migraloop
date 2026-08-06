@@ -31,12 +31,12 @@ spec:
         collection: lab_ru_orders
       outputIdentity: [ORDER_ID]
       transform:
-        - project:
-            fields: [ID, NAME]
-        - equiLookup:
+        - $project:
+            ID: 1
+            NAME: 1
+        - $lookup:
             from: LAB_RU_ORDERS
             localField: ID
             foreignField: CUSTOMER_ID
             as: orders
-        - unwind:
-            path: orders
+        - $unwind: "$orders"

@@ -1,5 +1,5 @@
 # Lab Scenario: rt-project
-# Operator-specific Rich Transform `project` coverage (ADR-0025 / issue #66).
+# Operator-specific Rich Transform `$project` coverage (ADR-0025 / issue #66 / #233).
 # Applied via the real product `migraloop apply` path — not contract/stub.
 apiVersion: migraloop.dev/v1
 kind: Deployment
@@ -31,5 +31,6 @@ spec:
         collection: lab_rp_customers
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME]
+        - $project:
+            ID: 1
+            NAME: 1

@@ -247,8 +247,8 @@ spec:
         collection: distinct_customers
       outputIdentity: [CUSTOMER_ID]
       transform:
-        - distinct:
-            fields: [CUSTOMER_ID]
+        - $group:
+            _id: "$CUSTOMER_ID"
     - name: amounts-by-customer
       mode: transform
       source:
@@ -257,10 +257,10 @@ spec:
         collection: amounts_by_customer
       outputIdentity: [CUSTOMER_ID]
       transform:
-        - addToSet:
-            keys: [CUSTOMER_ID]
-            field: AMOUNT
-            as: AMOUNTS
+        - $group:
+            _id: "$CUSTOMER_ID"
+            AMOUNTS:
+              $addToSet: "$AMOUNT"
 "#,
         host = mongo_host(),
         port = mongo_port(),

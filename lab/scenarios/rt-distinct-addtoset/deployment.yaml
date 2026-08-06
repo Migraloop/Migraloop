@@ -31,8 +31,8 @@ spec:
         collection: lab_rda_distinct_customers
       outputIdentity: [CUSTOMER_ID]
       transform:
-        - distinct:
-            fields: [CUSTOMER_ID]
+        - $group:
+            _id: "$CUSTOMER_ID"
     - name: lab-rda-amounts-by-customer
       mode: transform
       source:
@@ -41,7 +41,7 @@ spec:
         collection: lab_rda_amounts_by_customer
       outputIdentity: [CUSTOMER_ID]
       transform:
-        - addToSet:
-            keys: [CUSTOMER_ID]
-            field: AMOUNT
-            as: AMOUNTS
+        - $group:
+            _id: "$CUSTOMER_ID"
+            AMOUNTS:
+              $addToSet: "$AMOUNT"

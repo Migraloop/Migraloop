@@ -113,12 +113,10 @@ spec:
         collection: order_totals
       outputIdentity: [CUSTOMER_ID]
       transform:
-        - groupBy:
-            keys: [CUSTOMER_ID]
-            aggregates:
-              - op: sum
-                field: AMOUNT
-                as: TOTAL_AMOUNT
+        - $group:
+            _id: "$CUSTOMER_ID"
+            TOTAL_AMOUNT:
+              $sum: "$AMOUNT"
 "#,
         host = mongo_host(),
         port = mongo_port(),

@@ -28,7 +28,7 @@ migraloop apply -f deployment.yaml
 migraloop status
 ```
 
-Transform Pipelines in `deployment.yaml` may use classic Rich Transform steps or Aggregation/SQL-like DX (`$project`, `$match`, `$group`, …)—see [Rich Transform](rich-transform.md) and [Pipeline](pipeline.md).
+Transform Pipelines in `deployment.yaml` should prefer Aggregation/SQL-like DX (`$project`, `$match`, `$group`, …); classic steps remain Upgrade Compatible—see [Rich Transform](rich-transform.md) and [Pipeline](pipeline.md).
 
 ## Local Sync Lab Fixture
 

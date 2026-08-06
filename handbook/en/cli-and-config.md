@@ -299,7 +299,7 @@ Docker secrets resolve from `/run/secrets/<name>`.
 | `target.collection` | Target Binding; omit only for Base-only experiments |
 | `fields` | Map of field → `{ as: string \| omit }` |
 | `outputIdentity` | Required for `transform` |
-| `transform` | Declarative steps (classic and/or Aggregation/SQL-like DX); required for `transform`; forbidden for `direct` |
+| `transform` | Declarative steps (preferred Aggregation/SQL-like DX; classic still Upgrade Compatible); required for `transform`; forbidden for `direct` |
 
 Minimal Direct example:
 

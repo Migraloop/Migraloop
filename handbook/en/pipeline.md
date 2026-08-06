@@ -35,12 +35,10 @@ pipelines:
       collection: orders_by_customer
     outputIdentity: [CUSTOMER_ID]
     transform:
-      - groupBy:
-          keys: [CUSTOMER_ID]
-          aggregates:
-            - op: sum
-              field: AMOUNT
-              as: TOTAL_AMOUNT
+      - $group:
+          _id: "$CUSTOMER_ID"
+          TOTAL_AMOUNT:
+            $sum: "$AMOUNT"
 ```
 
 Validation rules enforced on `apply`:
@@ -50,7 +48,7 @@ Validation rules enforced on `apply`:
 - Transform Pipelines require `outputIdentity` and a non-empty declarative `transform`
 - `fields` keys map source/Managed field names to `{ as: string }` or `{ as: omit }` (ADR-0023; NUMBER classification lives next to shared `ColumnShape`)
 
-See [Rich Transform](rich-transform.md) for operator shapes (classic `project` / `filter` / `equiLookup` / … and Aggregation/SQL-like DX such as `$project` / `$match` / `$lookup` / `$group`).
+See [Rich Transform](rich-transform.md) for operator shapes (preferred Aggregation/SQL-like DX such as `$project` / `$match` / `$lookup` / `$group`; classic steps remain Upgrade Compatible).
 
 ## Lifecycle (control plane)
 

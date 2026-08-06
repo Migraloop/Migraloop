@@ -279,10 +279,10 @@ fn union_pipeline() -> &'static str {
         collection: all_customers
       outputIdentity: [ID]
       transform:
-        - union:
-            from: WEST_CUSTOMERS
-        - project:
-            fields: [ID, NAME]
+        - $unionWith: WEST_CUSTOMERS
+        - $project:
+            ID: 1
+            NAME: 1
 "#
 }
 

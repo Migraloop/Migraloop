@@ -31,7 +31,7 @@ spec:
         collection: lab_rnu_customers
       outputIdentity: [ID]
       transform:
-        - union:
-            from: LAB_RNU_WEST
-        - project:
-            fields: [ID, NAME]
+        - $unionWith: LAB_RNU_WEST
+        - $project:
+            ID: 1
+            NAME: 1

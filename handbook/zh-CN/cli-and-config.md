@@ -299,7 +299,7 @@ Docker secrets 从 `/run/secrets/<name>` 解析。
 | `target.collection` | Target Binding；仅 Base-only 实验可省略 |
 | `fields` | 字段 → `{ as: string \| omit }` 的映射 |
 | `outputIdentity` | `transform` 必要 |
-| `transform` | 声明式步骤（classic 与／或 Aggregation／SQL-like DX）；`transform` mode 必要；`direct` 禁止 |
+| `transform` | 声明式步骤（建议 Aggregation／SQL-like DX；classic 仍 Upgrade Compatible）；`transform` mode 必要；`direct` 禁止 |
 
 最小 Direct 示例：
 

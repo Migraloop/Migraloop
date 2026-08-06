@@ -35,12 +35,10 @@ pipelines:
       collection: orders_by_customer
     outputIdentity: [CUSTOMER_ID]
     transform:
-      - groupBy:
-          keys: [CUSTOMER_ID]
-          aggregates:
-            - op: sum
-              field: AMOUNT
-              as: TOTAL_AMOUNT
+      - $group:
+          _id: "$CUSTOMER_ID"
+          TOTAL_AMOUNT:
+            $sum: "$AMOUNT"
 ```
 
 `apply` 会强制的验证规则：
@@ -50,7 +48,7 @@ pipelines:
 - Transform Pipelines 需要 `outputIdentity` 与非空的声明式 `transform`
 - `fields` 的 key 把 source/Managed 字段映射到 `{ as: string }` 或 `{ as: omit }`（ADR-0023；NUMBER classification 位于 shared `ColumnShape` 旁）
 
-Operator 形状见 [Rich Transform](rich-transform.md)（classic `project`／`filter`／`equiLookup`／…，以及 Aggregation／SQL-like DX 如 `$project`／`$match`／`$lookup`／`$group`）。
+Operator 形状见 [Rich Transform](rich-transform.md)（建议 Aggregation／SQL-like DX 如 `$project`／`$match`／`$lookup`／`$group`；classic steps 仍 Upgrade Compatible）。
 
 ## Lifecycle（control plane）
 
