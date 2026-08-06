@@ -20,6 +20,22 @@ Re-ran the Direct Sync Lab Scenario cluster on a fresh ready Fixture (host Insta
 | `initial-load-throttled` | PASS | Chunked progress, pause/resume, rate_limit, backoff, watermark retained |
 | `bulk-load` | PASS | 100000 rows; lag=0; thresholds pass (`duration_ms` ≪ `max_duration_ms`, `rows_per_s` ≫ `min_rows_per_s`) |
 
+## Transform Sync cluster re-verify ([#224](https://github.com/Migraloop/Migraloop/issues/224))
+
+Re-ran the Transform Sync Lab Scenario cluster on a ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts). All nine acceptance Scenarios **PASS**; no additional product-path fixes required beyond the inventory fixes already on `main`. Relevant Transform Sync RQG contract twins stay green (`cli_groupby_sum_affect`, `cli_groupby_rich_aggs_affect`, `cli_multi_table_incremental`, `cli_transform_pipeline`, `cli_transform_field_ops`, `cli_equilookup_affect`, `cli_union_affect`, `cli_unwind_affect`, `cli_distinct_addtoset_affect`).
+
+| Scenario id | Result | Notes |
+|-------------|--------|-------|
+| `transform-pipeline` | PASS | Multi-table Direct + `groupBy` sum/count/min/max/avg → Derived → Delivery |
+| `rt-project` | PASS | |
+| `rt-filter` | PASS | |
+| `rt-field-ops` | PASS | |
+| `rt-equilookup` | PASS | |
+| `rt-union` | PASS | |
+| `rt-unwind` | PASS | |
+| `rt-distinct-addtoset` | PASS | |
+| `concurrent-source-workload` | PASS | Parallel sqlplus settle; `settle_ms=744` ≪ `max_settle_ms=300000` |
+
 ## Matrix
 
 | Scenario id | Result | Notes |
