@@ -11,9 +11,55 @@ Transform Pipelines 必須宣告：
 - `outputIdentity` — Delivery insert/update/delete 用的穩定 key 欄位
 - `transform` — 宣告式 operator 步驟的有序列表
 
+## Authoring forms（expand）
+
+Operator 可用下列任一形式撰寫同一組可分析 surface—兩者都正規化成同一 IR，供 **Affect Analysis** 使用：
+
+1. **Classic steps** — `project`、`filter`、`equiLookup`、`groupBy`…（下方範例；仍完全支援）。
+2. **Aggregation / SQL-like DX** — 接近 MongoDB Aggregation 的 stages（`$project`、`$match`、`$lookup`、`$group`…），以及精簡 SQL 別名（`select`、`where`、`join`）。
+
+範例（等同 classic `project` + `filter`）：
+
+```yaml
+transform:
+  - $project:
+      ID: 1
+      NAME: 1
+      ACTIVE: 1
+  - $match:
+      ACTIVE: 1
+```
+
+等效 SQL 別名：
+
+```yaml
+transform:
+  - select:
+      fields: [ID, NAME, ACTIVE]
+  - where:
+      field: ACTIVE
+      eq: 1
+```
+
+受限 Aggregation stages 對應如下（無法分析的擴充仍會被拒絕）：
+
+| Aggregation / SQL-like | Classic 等效 | 說明 |
+| --- | --- | --- |
+| `$project` / `select` | `project` | inclusion map（`FIELD: 1`）或 `{ fields: [...] }` |
+| `$match` / `where` | `filter` | 僅單欄 equality |
+| `$addFields` / `$set` | `addFields` | `"$field"` 複製或 `{ $literal: ... }`／JSON literal |
+| `$unset` | `remove` | 欄位名或名稱陣列 |
+| `$rename` | `rename` | `{ FROM: TO }` map |
+| `$lookup` / `join` | `equiLookup` | 僅 equijoin—不可用 `pipeline` / `let` |
+| `$unwind` | `unwind` | path 字串或 `{ path }`—不可用 `preserveNullAndEmptyArrays` |
+| `$unionWith` | `union` | `coll` / `from` / 字串—不可用 nested `pipeline` |
+| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`；accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet`。`$count` 需欄位 ref（`{ $count: "$ORDER_ID" }` = SQL `COUNT(field)`），不是 Mongo 空的 `{ $count: {} }` |
+
+使用 classic steps 的既有 Deployments 可持續運作（Upgrade Compatibility）。為可讀性，每個 Pipeline 建議只用一種形式；同一列表混用 classic 與 Aggregation 步驟在各自合法時也被允許。
+
 ## v1 operator surface（已實作）
 
-目前出貨的 parser 接受這些可分析 operators（Oracle → MongoDB 切片）：
+目前出貨的 parser 接受這些可分析 operators（Oracle → MongoDB 切片）—以下以 classic 形式說明；Aggregation 等效見 **Authoring forms**：
 
 ### `project`
 
@@ -143,10 +189,11 @@ Base；`from` 命名 secondary Base（Initial Load 與 Incremental Capture 都�
     as: orders
 ```
 
-自由形式的 Mongo `$lookup`（含 `pipeline` / `let` 擴充）會被拒絕—請用此宣告式
-形式，以便 **Affect Analysis** 保持正確。任一側 Base 變更只更新受影響的 primary
-Output Identities；未使用的 primary 欄位（例如 `project` 之後的 EMAIL）仍會略過重算。
-嵌入的 foreign rows 包含完整 Base 欄位，因此 foreign 側欄位變更會重算相符的 identities。
+請用 classic `equiLookup`，或帶相同 equijoin 欄位的受限 Aggregation `$lookup` / `join`。
+自由形式的 Mongo `$lookup` 擴充（`pipeline` / `let`）會被拒絕，以便 **Affect Analysis**
+保持正確。任一側 Base 變更只更新受影響的 primary Output Identities；未使用的 primary
+欄位（例如 `project` 之後的 EMAIL）仍會略過重算。嵌入的 foreign rows 包含完整 Base
+欄位，因此 foreign 側欄位變更會重算相符的 identities。
 
 ### `unwind`
 
@@ -159,9 +206,10 @@ Output Identities；未使用的 primary 欄位（例如 `project` 之後的 EMA
 ```
 
 當陣列元素是物件時，其欄位會**合併進 parent 列**，並移除陣列 path（利於 Delivery 的 flatten）。
-純量元素則替換該 path 的值（Mongo 風格）。缺失、null 或空陣列不產生列。自由形式的
-`$unwind` 以及 `preserveNullAndEmptyArrays` / `includeArrayIndex` 等選項會被拒絕，以便
-**Affect Analysis** 只展開受影響的 Output Identities—包括陣列成員消失時的 deletes。
+純量元素則替換該 path 的值（Mongo 風格）。缺失、null 或空陣列不產生列。請用 classic
+`unwind` 或 Aggregation `$unwind`（`"$path"` 或 `{ path }`）。`preserveNullAndEmptyArrays` /
+`includeArrayIndex` 等選項會被拒絕，以便 **Affect Analysis** 只展開受影響的 Output
+Identities—包括陣列成員消失時的 deletes。
 
 ### `union`
 
@@ -178,12 +226,12 @@ secondary schema（預設為 Pipeline source schema）。
     fields: [ID, NAME]
 ```
 
-自由形式的 Mongo `$unionWith`（含 `pipeline` / `coll` 擴充）會被拒絕—請用此宣告式形狀，
-以便 **Affect Analysis** 保持正確。任一貢獻 Base 的變更只更新受影響的 Output Identities；
-後續 `project` 未使用的欄位（例如 EMAIL）仍會 skip 重算。v1 不允許 `union` 與
-`distinct` / `addToSet` 併用。請選擇跨貢獻 Bases 仍唯一的 **Output Identity**—Delivery
-對每個 identity upsert 一份 Target 文件（SQL `UNION ALL` 的列多重性不會為同一 key 建立多份
-Mongo 文件）。
+請用 classic `union`，或受限 Aggregation `$unionWith`（`coll` / `from` / 字串名稱）。
+巢狀 `$unionWith` `pipeline` 擴充會被拒絕，以便 **Affect Analysis** 保持正確。任一貢獻
+Base 的變更只更新受影響的 Output Identities；後續 `project` 未使用的欄位（例如 EMAIL）仍會
+skip 重算。v1 不允許 `union` 與 `distinct` / `addToSet` 併用。請選擇跨貢獻 Bases 仍唯一的
+**Output Identity**—Delivery 對每個 identity upsert 一份 Target 文件（SQL `UNION ALL` 的列
+多重性不會為同一 key 建立多份 Mongo 文件）。
 
 ## Output Identity
 

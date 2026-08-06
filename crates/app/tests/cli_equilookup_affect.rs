@@ -2,7 +2,7 @@
 //!
 //! Agreed seams: CLI config apply → Initial Load of primary + equiLookup.from Bases;
 //! Derived join array + Mongo Delivery by Output Identity; Affect Analysis on both
-//! Base sides; `$lookup` / free-form scripts fail apply clearly.
+//! Base sides; free-form `$lookup` extensions (`pipeline`/`let`) and scripts fail apply.
 
 mod common;
 
@@ -430,12 +430,13 @@ async fn equilookup_affect_analysis_updates_on_either_base_side() {
 }
 
 #[tokio::test]
-async fn equilookup_rejects_dollar_lookup_and_scripts_on_apply() {
+async fn equilookup_rejects_pipeline_lookup_and_scripts_on_apply() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
     let doubles = common::NamedScenarioDoubles::install(dir.path());
 
+    // Issue #232: constrained Aggregation `$lookup` is accepted; nested `pipeline` is not.
     let lookup_pipeline = r#"
     - name: bad-lookup
       mode: transform
@@ -450,6 +451,8 @@ async fn equilookup_rejects_dollar_lookup_and_scripts_on_apply() {
             localField: ID
             foreignField: CUSTOMER_ID
             as: orders
+            pipeline:
+              - $match: {}
 "#;
     let lookup_config = write_config(
         &dir,
@@ -459,8 +462,8 @@ async fn equilookup_rejects_dollar_lookup_and_scripts_on_apply() {
     let err = apply_expect_failure(&url, &lookup_config, &doubles);
     let lower = err.to_ascii_lowercase();
     assert!(
-        lower.contains("$lookup") && lower.contains("equilookup"),
-        "expected clear $lookup → equiLookup guidance, got:\n{err}"
+        lower.contains("pipeline"),
+        "expected clear rejection of $lookup pipeline extension, got:\n{err}"
     );
 
     let url2 = ephemeral_database_url().await;

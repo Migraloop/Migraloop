@@ -2,11 +2,15 @@
 //!
 //! Declarative project, addFields, rename, remove, filter (eq), equiLookup,
 //! unwind, union, groupBy (sum/count/min/max/avg), distinct, and addToSet over
-//! Base Dataset rows. Free-form scripts and unanalyzable operators (including
-//! `$lookup` / `$unwind` / `$unionWith` shorthands) are rejected at parse time.
-//! Affect Analysis skips Derived recompute when only unused Base fields change,
-//! and (with Maintenance State) when distinct/addToSet value-level semantics
-//! prove no Derived change.
+//! Base Dataset rows. Operators may be authored in the classic step form or in
+//! an Aggregation / SQL-like expand DX (`$project`, `$match`, `$group`, …);
+//! both normalize to the same analyzable IR. Free-form scripts and unanalyzable
+//! Aggregation extensions (`pipeline`, `let`, expression `$project`, …) are
+//! rejected at parse time. Affect Analysis skips Derived recompute when only
+//! unused Base fields change, and (with Maintenance State) when distinct/addToSet
+//! value-level semantics prove no Derived change.
+
+mod aggregation_dx;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -18,9 +22,9 @@ pub const SEAM: &str = "transform";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransformError {
-    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (project/addFields/rename/remove/filter/equiLookup/unwind/union/groupBy/distinct/addToSet)")]
+    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (classic steps or Aggregation/SQL-like $project/$match/$group/… forms)")]
     FreeFormScript,
-    #[error("unsupported Rich Transform operator: {0}; v1 allows project, addFields, rename, remove, filter, equiLookup, unwind, union, groupBy, distinct, and addToSet")]
+    #[error("unsupported Rich Transform operator: {0}; v1 allows classic steps (project/addFields/rename/remove/filter/equiLookup/unwind/union/groupBy/distinct/addToSet) and Aggregation/SQL-like aliases ($project/$match/$addFields/$set/$unset/$rename/$lookup/$unwind/$unionWith/$group, select/where/join)")]
     UnsupportedOperator(String),
     #[error("invalid Rich Transform: {0}")]
     Invalid(String),
@@ -241,7 +245,7 @@ pub type OutputColumn = migraloop_types::ColumnShape;
 
 /// Parse one declarative transform step JSON object into an analyzable operator.
 ///
-/// Accepted shapes:
+/// Accepted shapes (classic form — still fully supported):
 /// - `{ "project": { "fields": [...] } }`
 /// - `{ "addFields": { "fields": [{ "as": "...", "value": ... } | { "as": "...", "field": "..." }] } }`
 /// - `{ "rename": { "fields": [{ "from": "...", "to": "..." }] } }`
@@ -253,11 +257,21 @@ pub type OutputColumn = migraloop_types::ColumnShape;
 /// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum"|"count"|"min"|"max"|"avg", "field": "...", "as": "..." }] } }`
 /// - `{ "distinct": { "fields": [...] } }`
 /// - `{ "addToSet": { "keys": [...], "field": "...", "as": "..." } }`
+///
+/// Accepted Aggregation / SQL-like expand DX (normalizes to the same IR):
+/// - `{ "$project": { "FIELD": 1, ... } }` / `{ "select": { "fields": [...] } }`
+/// - `{ "$match": { "FIELD": value } }` / `{ "where": { "field", "eq" } }`
+/// - `{ "$addFields"|"$set": { "as": "$field"|{"$literal": ...}|literal } }`
+/// - `{ "$unset": "FIELD"|["FIELD", ...] }`
+/// - `{ "$rename": { "FROM": "TO" } }`
+/// - `{ "$lookup"|"join": { "from", "localField", "foreignField", "as" } }` (equijoin only)
+/// - `{ "$unwind": "$path"|{ "path" } }`
+/// - `{ "$unionWith": "COLL"|{ "coll"|"from" } }`
+/// - `{ "$group": { "_id": "$KEY", "OUT": { "$sum"|"$count"|…: "$FIELD" } } }`
+///
 /// Rejected shapes (clear errors):
 /// - `{ "script": "..." }` / `{ "function": "..." }`
-/// - `{ "$lookup": ... }` (use declarative `equiLookup`)
-/// - `{ "$unwind": ... }` (use declarative `unwind`)
-/// - `{ "$unionWith": ... }` (use declarative `union`)
+/// - Aggregation extensions that break Affect Analysis (`pipeline`, `let`, …)
 /// - any other operator object
 /// - malformed operators (reported as invalid, not unsupported)
 pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, TransformError> {
@@ -270,22 +284,8 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
         return Err(TransformError::FreeFormScript);
     }
 
-    if obj.contains_key("$lookup") {
-        return Err(TransformError::Invalid(
-            "$lookup is not supported; use declarative equiLookup (from/localField/foreignField/as) so Affect Analysis stays correct".to_string(),
-        ));
-    }
-
-    if obj.contains_key("$unwind") {
-        return Err(TransformError::Invalid(
-            "$unwind is not supported; use declarative unwind ({ path }) so Affect Analysis stays correct".to_string(),
-        ));
-    }
-
-    if obj.contains_key("$unionWith") {
-        return Err(TransformError::Invalid(
-            "$unionWith is not supported; use declarative union ({ from }) so Affect Analysis stays correct".to_string(),
-        ));
+    if let Some(op) = aggregation_dx::try_parse_aggregation_step(obj)? {
+        return Ok(op);
     }
 
     if obj.contains_key("project") {
@@ -395,7 +395,7 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
     Err(TransformError::UnsupportedOperator(name))
 }
 
-fn parse_union(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_union(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("union must be an object with from".to_string())
     })?;
@@ -450,7 +450,7 @@ fn parse_union(value: &Value) -> Result<TransformOp, TransformError> {
     })
 }
 
-fn parse_unwind(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_unwind(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("unwind must be an object with path".to_string())
     })?;
@@ -500,7 +500,7 @@ fn parse_unwind(value: &Value) -> Result<TransformOp, TransformError> {
     Ok(TransformOp::Unwind { path })
 }
 
-fn parse_equi_lookup(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_equi_lookup(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid(
             "equiLookup must be an object with from, localField, foreignField, and as".to_string(),
@@ -596,7 +596,7 @@ fn parse_equi_lookup(value: &Value) -> Result<TransformOp, TransformError> {
     })
 }
 
-fn parse_project(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_project(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("project must be an object with fields".to_string())
     })?;
@@ -631,7 +631,7 @@ fn parse_project(value: &Value) -> Result<TransformOp, TransformError> {
     Ok(TransformOp::Project { fields })
 }
 
-fn parse_add_fields(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_add_fields(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("addFields must be an object with fields".to_string())
     })?;
@@ -718,7 +718,7 @@ fn parse_add_field_spec(value: &Value, index: usize) -> Result<AddFieldSpec, Tra
     })
 }
 
-fn parse_rename(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_rename(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("rename must be an object with fields".to_string())
     })?;
@@ -778,7 +778,7 @@ fn parse_rename(value: &Value) -> Result<TransformOp, TransformError> {
     Ok(TransformOp::Rename { fields })
 }
 
-fn parse_remove(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_remove(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("remove must be an object with fields".to_string())
     })?;
@@ -813,7 +813,7 @@ fn parse_remove(value: &Value) -> Result<TransformOp, TransformError> {
     Ok(TransformOp::Remove { fields })
 }
 
-fn parse_filter(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_filter(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("filter must be an object with field and eq".to_string())
     })?;
@@ -840,7 +840,7 @@ fn parse_filter(value: &Value) -> Result<TransformOp, TransformError> {
     })
 }
 
-fn parse_group_by(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_group_by(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid(
             "groupBy must be an object with keys and aggregates".to_string(),
@@ -957,7 +957,7 @@ fn parse_aggregate(value: &Value, index: usize) -> Result<AggregateSpec, Transfo
     })
 }
 
-fn parse_distinct(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_distinct(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("distinct must be an object with fields".to_string())
     })?;
@@ -992,7 +992,7 @@ fn parse_distinct(value: &Value) -> Result<TransformOp, TransformError> {
     Ok(TransformOp::Distinct { fields })
 }
 
-fn parse_add_to_set(value: &Value) -> Result<TransformOp, TransformError> {
+pub(crate) fn parse_add_to_set(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid(
             "addToSet must be an object with keys, field, and as".to_string(),
@@ -4435,8 +4435,9 @@ mod tests {
     }
 
     #[test]
-    fn dollar_lookup_and_equi_lookup_pipeline_fail_clearly() {
-        let err = parse_transform_steps(&[json!({
+    fn dollar_lookup_equijoin_accepted_pipeline_still_rejected() {
+        // Issue #232: constrained Aggregation `$lookup` expands beside `equiLookup`.
+        let ops = parse_transform_steps(&[json!({
             "$lookup": {
                 "from": "ORDERS",
                 "localField": "ID",
@@ -4444,12 +4445,22 @@ mod tests {
                 "as": "orders"
             }
         })])
-        .unwrap_err();
-        let msg = err.to_string().to_ascii_lowercase();
-        assert!(
-            msg.contains("$lookup") && msg.contains("equilookup"),
-            "expected clear $lookup → equiLookup guidance, got: {err}"
-        );
+        .unwrap();
+        match &ops[0] {
+            TransformOp::EquiLookup {
+                from,
+                local_field,
+                foreign_field,
+                as_name,
+                ..
+            } => {
+                assert_eq!(from, "ORDERS");
+                assert_eq!(local_field, "ID");
+                assert_eq!(foreign_field, "CUSTOMER_ID");
+                assert_eq!(as_name, "orders");
+            }
+            other => panic!("expected EquiLookup from $lookup, got {other:?}"),
+        }
 
         let err = parse_transform_steps(&[json!({
             "equiLookup": {
@@ -4466,6 +4477,18 @@ mod tests {
             "pipeline-style equiLookup must be Invalid, got {err:?}"
         );
         assert!(err.to_string().to_ascii_lowercase().contains("pipeline"));
+
+        let err = parse_transform_steps(&[json!({
+            "$lookup": {
+                "from": "ORDERS",
+                "localField": "ID",
+                "foreignField": "CUSTOMER_ID",
+                "as": "orders",
+                "let": {"x": 1}
+            }
+        })])
+        .unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("let"));
     }
 
     #[test]
@@ -5239,16 +5262,16 @@ mod tests {
     }
 
     #[test]
-    fn dollar_unwind_and_unsupported_forms_fail_clearly() {
-        let err = parse_transform_steps(&[json!({
+    fn dollar_unwind_accepted_unsupported_options_fail_clearly() {
+        // Issue #232: Aggregation `$unwind` string path expands beside `unwind`.
+        let ops = parse_transform_steps(&[json!({
             "$unwind": "$orders"
         })])
-        .unwrap_err();
-        let msg = err.to_string().to_ascii_lowercase();
-        assert!(
-            msg.contains("$unwind") && msg.contains("unwind"),
-            "expected clear $unwind → unwind guidance, got: {err}"
-        );
+        .unwrap();
+        match &ops[0] {
+            TransformOp::Unwind { path } => assert_eq!(path, "orders"),
+            other => panic!("expected Unwind from $unwind, got {other:?}"),
+        }
 
         let err = parse_transform_steps(&[json!({
             "unwind": {
@@ -5431,18 +5454,21 @@ mod tests {
     }
 
     #[test]
-    fn dollar_union_with_and_unsupported_forms_fail_clearly() {
-        let err = parse_transform_steps(&[json!({
+    fn dollar_union_with_accepted_unsupported_forms_fail_clearly() {
+        // Issue #232: Aggregation `$unionWith` expands beside `union`.
+        let ops = parse_transform_steps(&[json!({
             "$unionWith": {
                 "coll": "WEST_CUSTOMERS"
             }
         })])
-        .unwrap_err();
-        let msg = err.to_string().to_ascii_lowercase();
-        assert!(
-            msg.contains("$unionwith") && msg.contains("union"),
-            "expected clear $unionWith → union guidance, got: {err}"
-        );
+        .unwrap();
+        match &ops[0] {
+            TransformOp::Union { from, from_schema } => {
+                assert_eq!(from, "WEST_CUSTOMERS");
+                assert!(from_schema.is_none());
+            }
+            other => panic!("expected Union from $unionWith, got {other:?}"),
+        }
 
         let err = parse_transform_steps(&[json!({
             "union": {

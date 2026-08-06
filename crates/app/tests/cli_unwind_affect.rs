@@ -2,7 +2,7 @@
 //!
 //! Agreed seams: CLI config apply → equiLookup+unwind Derived rows + Mongo
 //! Delivery by unwound Output Identity; Affect Analysis on primary/foreign Bases
-//! (insert/update/delete of identities); `$unwind` / unsupported forms / scripts
+//! (insert/update/delete of identities); unsupported `$unwind` options / scripts
 //! fail apply clearly.
 
 mod common;
@@ -449,39 +449,12 @@ async fn unwind_affect_analysis_updates_and_deletes_identities() {
 }
 
 #[tokio::test]
-async fn unwind_rejects_dollar_unwind_unsupported_forms_and_scripts_on_apply() {
-    let url = ephemeral_database_url().await;
-    let mongo_database = unique_mongo_database();
-    let dir = TempDir::new().expect("tempdir");
-    let doubles = common::NamedScenarioDoubles::install(dir.path());
-
-    let dollar_pipeline = r#"
-    - name: bad-unwind
-      mode: transform
-      source:
-        table: CUSTOMERS
-      target:
-        collection: bad_unwind
-      outputIdentity: [ID]
-      transform:
-        - $unwind: "$orders"
-"#;
-    let dollar_config = write_config(
-        &dir,
-        "dollar.yaml",
-        &deployment_shell(&mongo_database, dollar_pipeline),
-    );
-    let err = apply_expect_failure(&url, &dollar_config, &doubles);
-    let lower = err.to_ascii_lowercase();
-    assert!(
-        lower.contains("$unwind") && lower.contains("unwind"),
-        "expected clear $unwind → unwind guidance, got:\n{err}"
-    );
-
+async fn unwind_rejects_unsupported_forms_and_scripts_on_apply() {
     let url2 = ephemeral_database_url().await;
     let mongo2 = unique_mongo_database();
     let dir2 = TempDir::new().expect("tempdir");
     let doubles2 = common::NamedScenarioDoubles::install(dir2.path());
+    // Issue #232: Aggregation `$unwind` path is accepted; preserveNullAndEmptyArrays is not.
     let unsupported_pipeline = r#"
     - name: bad-preserve
       mode: transform
@@ -491,12 +464,12 @@ async fn unwind_rejects_dollar_unwind_unsupported_forms_and_scripts_on_apply() {
         collection: bad_preserve
       outputIdentity: [ORDER_ID]
       transform:
-        - equiLookup:
+        - $lookup:
             from: ORDERS
             localField: ID
             foreignField: CUSTOMER_ID
             as: orders
-        - unwind:
+        - $unwind:
             path: orders
             preserveNullAndEmptyArrays: true
 "#;
