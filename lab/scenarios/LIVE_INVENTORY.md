@@ -1,13 +1,31 @@
 # Live catalog inventory (Lab Fixture)
 
-**Issue:** [#222](https://github.com/Migraloop/Migraloop/issues/222) (child of epic [#221](https://github.com/Migraloop/Migraloop/issues/221))  
+**Issue:** [#222](https://github.com/Migraloop/Migraloop/issues/222) inventory; formal go/no-go [#229](https://github.com/Migraloop/Migraloop/issues/229) (children of epic [#221](https://github.com/Migraloop/Migraloop/issues/221))  
 **Fixture:** Local Sync Lab (`migraloop lab up` / `lab status` → ready: platform-store, oracle, mongo, app)  
 **Method:** `migraloop lab scenario run <id> --auto-remove` against live Base/Target (host CLI + Instant Client; Fixture `app` paused for exclusive host apply/sync). Not contract/stub alone.  
 **Catalog:** selectable ids from `migraloop lab scenario list` / [`COVERAGE.md`](./COVERAGE.md) (25 shipped Scenarios).
 
 **Tally:** **25 PASS / 0 FAIL**
 
-**Basic-complete go/no-go (epic #221):** **go** — every shipped Scenario id in `COVERAGE.md` is live-green on the Lab Scenario seam (`lab scenario run` / real product apply+sync). Lab pauses Fixture continuous `run` only for the duration of each Scenario so host Sync is the sole Incremental Capture consumer (then resumes `app`); this is Fixture coordination, not a stub Sync/Delivery path. Direct+Transform performance work and Rich Transform DX (epic post-gate children) may open without re-litigating catalog completeness.
+## Basic-complete go/no-go ([#229](https://github.com/Migraloop/Migraloop/issues/229))
+
+**Decision: go** (no residual blockers).
+
+Every shipped Scenario id in `COVERAGE.md` is live-green on the Lab Scenario seam (`lab scenario run` / real product apply+sync), under the Sync correctness contract (Change Ordering, Eventual Consistency, ADR-0029). Lab pauses Fixture continuous `run` only for the duration of each Scenario so host Sync is the sole Incremental Capture consumer (then resumes `app`); this is Fixture coordination, not a stub Sync/Delivery path.
+
+**Evidence:**
+
+| Cluster | Ticket | Result |
+|---------|--------|--------|
+| Full catalog inventory | [#222](https://github.com/Migraloop/Migraloop/issues/222) | closed — initial live matrix |
+| Direct Sync | [#223](https://github.com/Migraloop/Migraloop/issues/223) | closed — 4/4 PASS re-verify |
+| Transform Sync | [#224](https://github.com/Migraloop/Migraloop/issues/224) | closed — 9/9 PASS re-verify |
+| Change Ordering / confluence | [#225](https://github.com/Migraloop/Migraloop/issues/225) | closed — `change-ordering` PASS |
+| Correctness safety nets | [#226](https://github.com/Migraloop/Migraloop/issues/226) | closed — 4/4 PASS re-verify |
+| Pipeline lifecycle verbs | [#227](https://github.com/Migraloop/Migraloop/issues/227) | closed — 3/3 PASS re-verify |
+| Operational surfaces | [#228](https://github.com/Migraloop/Migraloop/issues/228) | closed — 4/4 PASS re-verify |
+
+**Unblocked by this go:** Direct Pipeline throughput ([#230](https://github.com/Migraloop/Migraloop/issues/230)), Transform Pipeline throughput ([#231](https://github.com/Migraloop/Migraloop/issues/231)), Rich Transform DX expand ([#232](https://github.com/Migraloop/Migraloop/issues/232)) (and transitively DX contract [#233](https://github.com/Migraloop/Migraloop/issues/233) after #232). Do not re-litigate catalog completeness before those post-gate tickets.
 
 ## Change Ordering / confluence ([#225](https://github.com/Migraloop/Migraloop/issues/225))
 
