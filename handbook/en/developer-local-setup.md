@@ -40,7 +40,7 @@ Default compose credentials (`migraloop` / `migraloop`) are for local developmen
 
 ## Local Sync Lab Fixture
 
-Disposable Oracle + MongoDB + Platform Store + app for **manual** Sync→Delivery verification (ADR-0025). Distinct from the **Release Quality Gate** / CI contract-stub harness: operators choose Lab Scenarios; do **not** treat the Scenario catalog as a CI suite or add a job that runs the entire catalog as a release gate.
+Disposable Oracle + MongoDB + Platform Store + app for **manual** Sync→Delivery verification (ADR-0025). Distinct from the **Release Quality Gate** / CI contract-stub harness: operators choose Lab Scenarios; do **not** treat the Scenario catalog as a CI suite or add a job that runs the entire catalog as a release gate. While a Scenario runs, Lab pauses Fixture `app` (`migraloop run`) so host `apply`/`sync` is the sole Incremental Capture consumer, then resumes `app` afterward—still real product CLI Sync/Delivery, not a Lab stub.
 
 ```bash
 cargo build -p migraloop-app
@@ -77,7 +77,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab down
 ```
 
-Defaults after bring-up: Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`, MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`. Lab Compose also injects those Lab-only secrets into the Fixture `app` for continuous Sync. Lab bring-up does not apply sample Deployments/Pipelines. Requires Docker Compose; `lab up` builds `target/debug/migraloop` when missing and packs it via `lab/Dockerfile` (Ubuntu 24.04 base for host glibc). Lab Compose uses `network_mode: host`. First Oracle boot can take several minutes. Nested Docker whiteout extract failures: use dockerd `storage-driver: fuse-overlayfs` or `vfs` (containerd snapshotter disabled). On **Cursor Cloud**, environment `install`/`start` already configures `fuse-overlayfs` and pre-warms Lab images—run `migraloop lab up` after the session starts. See [CLI & Config](cli-and-config.md) (`lab`) and [Deployment](deployment.md).
+Defaults after bring-up: Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`, Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`, MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`. Lab Compose also injects those Lab-only secrets into the Fixture `app` for continuous Sync. Lab bring-up does not apply sample Deployments/Pipelines. Requires Docker Compose; `lab up` builds `target/debug/migraloop` when missing and packs it via `lab/Dockerfile` (Ubuntu 24.04 base for host glibc, plus Oracle Instant Client Basic Light so Fixture `migraloop run` can open LogMiner OCI). Host Scenario `apply`/`sync` still need Instant Client on the Developer machine (`LD_LIBRARY_PATH`). Lab Compose uses `network_mode: host`. First Oracle boot can take several minutes. Nested Docker whiteout extract failures: use dockerd `storage-driver: fuse-overlayfs` or `vfs` (containerd snapshotter disabled). On **Cursor Cloud**, environment `install`/`start` already configures `fuse-overlayfs` and pre-warms Lab images—run `migraloop lab up` after the session starts. See [CLI & Config](cli-and-config.md) (`lab`) and [Deployment](deployment.md).
 
 ### DB-level restore / load escape hatch
 

@@ -150,7 +150,7 @@ Schema discovery 之后，Sync 只把 allow-list 内的 Oracle 类型转入 Plat
 
 不支持的列会从 Base Dataset **省略**（表仍会 sync）；省略情况可在 `migraloop status` 看到。若 Pipeline 需要不支持列则无法使用—绝不做默默 coercion。
 
-**NUMBER：** 在安全时映射到保精度的 Mongo 类型（`NumberLong` / `Decimal128`）。Schema 不安全的 NUMBER 列必须在配置时以 Pipeline `fields`（`as: string` 或 `as: omit`）解决—不是在 runtime 逐行 quarantine。
+**NUMBER：** 在安全时映射到保精度的 Mongo 类型（`NumberLong` / `Decimal128`）。Capture JSON 对 `scale > 0` 会保留固定小数位（例如 scale 2 的 `10` 会变成 `"10.00"`），让 Managed decimals 对 Delivery 安全。Schema 不安全的 NUMBER 列必须在配置时以 Pipeline `fields`（`as: string` 或 `as: omit`）解决—不是在 runtime 逐行 quarantine。
 
 **时间类型：** 平台内部使用 UTC。带时区值会变成绝对瞬间。Naive DATE/TIMESTAMP 在可读时使用 Source DB timezone，否则使用配置的 Source `timezone`（IANA 名称或 Oracle 风格 `±HH:MM`）。
 

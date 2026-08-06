@@ -479,13 +479,19 @@ fn text_to_json(text: Option<String>, column: &SourceColumn) -> Result<Value, Ca
     };
     let normalized = normalize_oracle_type(&column.data_type);
     match normalized.as_str() {
-        "NUMBER" | "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" => parse_number_json(&text),
+        "NUMBER" => parse_number_json(&text, column.scale),
+        "FLOAT" | "BINARY_FLOAT" | "BINARY_DOUBLE" => parse_number_json(&text, None),
         _ => Ok(Value::String(text)),
     }
 }
 
-fn parse_number_json(text: &str) -> Result<Value, CaptureError> {
+fn parse_number_json(text: &str, scale: Option<i32>) -> Result<Value, CaptureError> {
     let trimmed = text.trim();
+    // Non-zero scale NUMBER must stay a decimal string so addToSet / Delivery /
+    // Lab inspect keep ADR-0023 precision (Oracle often returns `10` for 10.00).
+    if let Some(scale) = scale.filter(|s| *s > 0) {
+        return Ok(Value::String(format_decimal_with_scale(trimmed, scale as usize)));
+    }
     if let Ok(n) = trimmed.parse::<i64>() {
         return Ok(Value::Number(n.into()));
     }
@@ -494,6 +500,30 @@ fn parse_number_json(text: &str) -> Result<Value, CaptureError> {
     }
     // Keep decimal precision as string — Delivery maps via schema rules.
     Ok(Value::String(trimmed.to_string()))
+}
+
+/// Format a numeric text to exactly `scale` fractional digits (no IEEE double).
+fn format_decimal_with_scale(text: &str, scale: usize) -> String {
+    let negative = text.starts_with('-');
+    let body = text.trim_start_matches('+').trim_start_matches('-');
+    let (whole, frac) = match body.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (body, ""),
+    };
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let mut frac_digits: String = frac.chars().filter(|c| c.is_ascii_digit()).collect();
+    if frac_digits.len() > scale {
+        frac_digits.truncate(scale);
+    } else {
+        while frac_digits.len() < scale {
+            frac_digits.push('0');
+        }
+    }
+    if negative {
+        format!("-{whole}.{frac_digits}")
+    } else {
+        format!("{whole}.{frac_digits}")
+    }
 }
 
 /// Convert a LogMiner `MINE_VALUE` string into JSON using column metadata.
@@ -512,6 +542,27 @@ mod tests {
         snapshot, ContractSourceCatalog,
     };
     use serde_json::json;
+
+    #[test]
+    fn number_with_scale_preserves_fractional_string() {
+        assert_eq!(
+            parse_number_json("10", Some(2)).unwrap(),
+            Value::String("10.00".into())
+        );
+        assert_eq!(
+            parse_number_json("42.5", Some(2)).unwrap(),
+            Value::String("42.50".into())
+        );
+        assert_eq!(
+            parse_number_json("7.00", Some(2)).unwrap(),
+            Value::String("7.00".into())
+        );
+        // scale 0 / absent still prefers JSON integers.
+        assert_eq!(
+            parse_number_json("10", Some(0)).unwrap(),
+            Value::Number(10.into())
+        );
+    }
 
     #[test]
     fn contract_host_initial_load_without_inject_rejects_former_fixture_table() {

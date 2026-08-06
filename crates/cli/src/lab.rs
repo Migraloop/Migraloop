@@ -190,6 +190,47 @@ async fn run_compose(lab_dir: &Path, args: &[&str]) -> Result<(bool, String), Cl
     Ok((output.status.success(), combined))
 }
 
+/// Stop Lab Fixture `app` (`migraloop run`) so a Scenario's host apply/sync path
+/// is the sole Incremental Capture consumer for that Namespace.
+///
+/// Continuous Fixture `run` otherwise races Scenario mutate→sync (steals LogMiner
+/// changes / rewrites Base mid–Initial Load). Resume with
+/// [`resume_lab_app_after_scenario`]. Idempotent when `app` is already stopped.
+pub(crate) async fn pause_lab_app_for_exclusive_scenario(
+    lab_dir: &Path,
+) -> Result<(), CliError> {
+    let (ok, out) = run_compose(lab_dir, &["stop", "app"]).await?;
+    if !ok && !out.to_ascii_lowercase().contains("no such service") {
+        // `docker compose stop` succeeds when the container is already stopped.
+        // Only hard-fail on unexpected compose errors.
+        if !out.to_ascii_lowercase().contains("stopped") {
+            return Err(CliError::Failed(format!(
+                "Lab Scenario: failed to pause Fixture app for exclusive host Sync:\n{out}"
+            )));
+        }
+    }
+    println!(
+        "Lab Scenario: paused Fixture app (`migraloop run`) for exclusive host apply/sync"
+    );
+    Ok(())
+}
+
+/// Restart Lab Fixture `app` after a Scenario finishes (success or failure).
+///
+/// Best-effort: a stale app image must not block Scenario inventory. Rebuild via
+/// `migraloop lab up` when `lab status` shows `app: not ready`.
+pub(crate) async fn resume_lab_app_after_scenario(lab_dir: &Path) -> Result<(), CliError> {
+    let (ok, out) = run_compose(lab_dir, &["start", "app"]).await?;
+    if !ok {
+        eprintln!(
+            "Lab Scenario: warning: failed to resume Fixture app after Scenario:\n{out}"
+        );
+        return Ok(());
+    }
+    println!("Lab Scenario: resumed Fixture app (`migraloop run`)");
+    Ok(())
+}
+
 async fn lab_up(lab_dir: &Path) -> Result<(), CliError> {
     println!("Lab Fixture: bringing up disposable stack (Oracle, MongoDB, Platform Store, app)...");
     println!("Lab Fixture: no sample Deployment or Pipelines will be applied.");
@@ -666,6 +707,10 @@ pub(crate) fn lab_migraloop_bin() -> PathBuf {
 }
 
 /// Fixture readiness gate for Scenario runs (engines + Oracle prerequisites + Platform Store).
+///
+/// Does **not** require Fixture `app` healthy: Scenario host apply/sync pauses
+/// continuous `migraloop run` for exclusive capture, so app readiness is not a
+/// Scenario gate (Operators still use `lab status` / `lab up` for the full stack).
 pub(crate) async fn ensure_fixture_ready_for_scenario(lab_dir: &Path) -> Result<(), CliError> {
     let _ = compose_file(lab_dir)?;
     if !docker_available() {
@@ -676,14 +721,26 @@ pub(crate) async fn ensure_fixture_ready_for_scenario(lab_dir: &Path) -> Result<
         ));
     }
     let services = service_readiness(lab_dir).await?;
-    if !services.iter().all(|(_, ready)| *ready) {
+    let required = ["platform-store", "oracle", "mongo"];
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|name| {
+            !services
+                .iter()
+                .any(|(n, ready)| n == *name && *ready)
+        })
+        .map(|n| (*n).to_string())
+        .collect();
+    if !missing.is_empty() {
         let detail = services
             .iter()
             .map(|(n, r)| format!("{n}={}", if *r { "ready" } else { "not-ready" }))
             .collect::<Vec<_>>()
             .join(", ");
         return Err(CliError::Failed(format!(
-            "Lab Scenario requires a ready Lab Fixture ({detail}). Run `migraloop lab up` first."
+            "Lab Scenario requires a ready Lab Fixture ({detail}; missing {}). \
+             Run `migraloop lab up` first.",
+            missing.join(", ")
         )));
     }
     probe_oracle_prerequisites(lab_dir).await.map_err(|err| {

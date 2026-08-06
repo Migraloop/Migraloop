@@ -516,12 +516,42 @@ pub(crate) fn managed_field_present(inspect: &str, field: &str, value: &str) -> 
         format!("\"{field}\":\"{value}\""),
         format!("\"{lower_field}\": \"{value}\""),
         format!("\"{lower_field}\":\"{value}\""),
+        // Mongo Extended JSON for Decimal128 Delivery (ADR-0023).
+        format!("\"{field}\": {{\n    \"$numberDecimal\": \"{value}\"\n  }}"),
+        format!("\"{field}\":{{\"$numberDecimal\":\"{value}\"}}"),
+        format!("\"{field}\": {{ \"$numberDecimal\": \"{value}\" }}"),
+        format!("\"$numberDecimal\": \"{value}\""),
+        format!("\"$numberDecimal\":\"{value}\""),
     ];
     if patterns.iter().any(|p| inspect.contains(p.as_str())) {
         return true;
     }
+    // Pretty-printed mongosh / target inspect often wraps Decimal128 across lines
+    // next to the field key; accept when the field key and $numberDecimal value
+    // both appear in the same document slice.
+    if decimal128_field_present(inspect, field, value)
+        || decimal128_field_present(inspect, &lower_field, value)
+    {
+        return true;
+    }
     numeric_field_present(inspect, field, value)
         || numeric_field_present(inspect, &lower_field, value)
+}
+
+fn decimal128_field_present(inspect: &str, field: &str, value: &str) -> bool {
+    let key = format!("\"{field}\"");
+    let dec = format!("\"$numberDecimal\": \"{value}\"");
+    let dec_compact = format!("\"$numberDecimal\":\"{value}\"");
+    let mut start = 0;
+    while let Some(rel) = inspect[start..].find(&key) {
+        let abs = start + rel;
+        let window = &inspect[abs..inspect.len().min(abs + 180)];
+        if window.contains(&dec) || window.contains(&dec_compact) {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 fn numeric_field_present(inspect: &str, field: &str, value: &str) -> bool {
@@ -753,5 +783,18 @@ mod tests {
         );
         evaluate_fetched(&checks, &fetched).expect("ok");
         assert!(fetched_satisfies(&checks, &fetched));
+    }
+
+    #[test]
+    fn managed_field_present_accepts_mongo_decimal128_extended_json() {
+        let inspect = r#"{
+  "_id": 1,
+  "AVG_AMOUNT": {
+    "$numberDecimal": "17.5"
+  },
+  "ORDER_COUNT": 2
+}"#;
+        assert!(managed_field_present(inspect, "AVG_AMOUNT", "17.5"));
+        assert!(!managed_field_present(inspect, "AVG_AMOUNT", "15"));
     }
 }

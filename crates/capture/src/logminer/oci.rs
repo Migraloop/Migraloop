@@ -231,16 +231,12 @@ fn fetch_logminer_contents(
     result
 }
 
-fn read_mined_contents(
-    conn: &Connection,
-    host: &str,
-    owner: &str,
-    table: &str,
-    start_scn: i64,
-    columns: &[SourceColumn],
-    primary_key: &[String],
-    limit: Option<usize>,
-) -> Result<Vec<LogMinerContent>, CaptureError> {
+/// Build the OCI `V$LOGMNR_CONTENTS` query that reconstructs row images.
+///
+/// Backpressure limits (ADR-0020) are applied while iterating the result cursor —
+/// not via SQL `FETCH FIRST` / nested `ROWNUM`. On Oracle 23, `DBMS_LOGMNR.MINE_VALUE`
+/// raises ORA-01323 when the select is rewritten with those row-limit forms.
+fn mined_contents_sql(owner: &str, table: &str, columns: &[SourceColumn]) -> String {
     let mut select_parts = vec![
         "SCN".to_string(),
         "OPERATION".to_string(),
@@ -261,21 +257,28 @@ fn read_mined_contents(
         ));
     }
 
-    // FETCH FIRST bounds the LogMiner contents materialization under backpressure
-    // (ADR-0020) so Downstream slowness does not pull an unbounded redo window.
-    let fetch_clause = match limit {
-        Some(n) if n > 0 => format!(" FETCH FIRST {n} ROWS ONLY"),
-        _ => String::new(),
-    };
-    let sql = format!(
+    format!(
         "SELECT {} FROM V$LOGMNR_CONTENTS \
          WHERE UPPER(SEG_OWNER) = :1 \
            AND UPPER(SEG_NAME) = :2 \
            AND SCN >= :3 \
            AND OPERATION IN ('INSERT', 'UPDATE', 'DELETE') \
-         ORDER BY SCN, COMMIT_TIMESTAMP, RS_ID, SSN{fetch_clause}",
+         ORDER BY SCN, COMMIT_TIMESTAMP, RS_ID, SSN",
         select_parts.join(", ")
-    );
+    )
+}
+
+fn read_mined_contents(
+    conn: &Connection,
+    host: &str,
+    owner: &str,
+    table: &str,
+    start_scn: i64,
+    columns: &[SourceColumn],
+    primary_key: &[String],
+    limit: Option<usize>,
+) -> Result<Vec<LogMinerContent>, CaptureError> {
+    let sql = mined_contents_sql(owner, table, columns);
 
     let rows = conn
         .query(&sql, &[&owner, &table, &start_scn])
@@ -357,6 +360,14 @@ fn read_mined_contents(
             )
             .with_order(rs_id, ssn.max(0) as u32),
         );
+
+        // ADR-0020: bound the reconstructed batch under Downstream slowness by
+        // stopping the cursor after `limit` DML rows (SQL FETCH FIRST breaks MINE_VALUE).
+        if let Some(max) = limit {
+            if max > 0 && contents.len() >= max {
+                break;
+            }
+        }
     }
 
     Ok(contents)
@@ -510,6 +521,43 @@ mod tests {
             "OCI contents query must project LogMiner ordering keys for same-SCN identity"
         );
         assert!(sql[2].contains("END_LOGMNR"));
+    }
+
+    #[test]
+    fn mined_contents_sql_keeps_mine_value_compatible_with_oracle_23() {
+        // Oracle 23 raises ORA-01323 when MINE_VALUE is combined with FETCH FIRST /
+        // nested ROWNUM row limits. Backpressure bounds the cursor in Rust instead.
+        let columns = vec![
+            SourceColumn {
+                name: "ID".into(),
+                data_type: "NUMBER".into(),
+                supported: true,
+                precision: Some(10),
+                scale: Some(0),
+                size: None,
+            },
+            SourceColumn {
+                name: "NAME".into(),
+                data_type: "VARCHAR2".into(),
+                supported: true,
+                precision: None,
+                scale: None,
+                size: Some(100),
+            },
+        ];
+        let sql = mined_contents_sql("SYNC_USER", "LAB_DP_CUSTOMERS", &columns);
+        assert!(sql.contains("DBMS_LOGMNR.MINE_VALUE"));
+        assert!(sql.contains("SYNC_USER.LAB_DP_CUSTOMERS.ID"));
+        assert!(sql.contains("ORDER BY SCN, COMMIT_TIMESTAMP, RS_ID, SSN"));
+        let upper = sql.to_ascii_uppercase();
+        assert!(
+            !upper.contains("FETCH FIRST"),
+            "MINE_VALUE query must not use FETCH FIRST (ORA-01323): {sql}"
+        );
+        assert!(
+            !upper.contains("ROWNUM"),
+            "MINE_VALUE query must not use ROWNUM limits (ORA-01323): {sql}"
+        );
     }
 
     #[test]

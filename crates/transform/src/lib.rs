@@ -1594,11 +1594,25 @@ pub fn infer_derived_columns(
     }
     let mut alias_source: BTreeMap<String, String> = BTreeMap::new();
     let mut nested_document_fields: BTreeSet<String> = BTreeSet::new();
+    // groupBy avg produces a decimal quotient (ADR-0023 / fixed-point avg_field);
+    // do not inherit the source field's scale-0 Long mapping or Delivery rejects
+    // fractional averages (ORA-side live Lab: AVG_AMOUNT "17.5" → NUMBER Long parse).
+    let mut avg_aggregate_fields: BTreeSet<String> = BTreeSet::new();
+    let mut count_aggregate_fields: BTreeSet<String> = BTreeSet::new();
     for op in ops {
         match op {
             TransformOp::GroupBy { aggregates, .. } => {
                 for agg in aggregates {
                     alias_source.insert(agg.as_name.clone(), agg.field.clone());
+                    match agg.op {
+                        AggregateOp::Avg => {
+                            avg_aggregate_fields.insert(agg.as_name.clone());
+                        }
+                        AggregateOp::Count => {
+                            count_aggregate_fields.insert(agg.as_name.clone());
+                        }
+                        AggregateOp::Sum | AggregateOp::Min | AggregateOp::Max => {}
+                    }
                 }
             }
             TransformOp::AddFields { fields } => {
@@ -1649,6 +1663,22 @@ pub fn infer_derived_columns(
                     data_type: "JSON".to_string(),
                     precision: None,
                     scale: None,
+                }
+            } else if avg_aggregate_fields.contains(&name) {
+                // Decimal128-safe (precision ≤ 34). Scale covers avg_field's extra
+                // fixed-point places without inheriting integer source scale.
+                OutputColumn {
+                    name,
+                    data_type: "NUMBER".to_string(),
+                    precision: Some(34),
+                    scale: Some(10),
+                }
+            } else if count_aggregate_fields.contains(&name) {
+                OutputColumn {
+                    name,
+                    data_type: "NUMBER".to_string(),
+                    precision: Some(18),
+                    scale: Some(0),
                 }
             } else if let Some(col) = by_name.get(name.as_str()) {
                 (*col).clone()
@@ -4916,6 +4946,45 @@ mod tests {
         assert_eq!(by_name["TOTAL"].precision, Some(12));
         assert_eq!(by_name["TOTAL"].scale, Some(2));
         assert!(!by_name.contains_key("ID"));
+    }
+
+    #[test]
+    fn infer_derived_columns_avg_uses_decimal128_not_source_long_scale() {
+        // Source AMOUNT is integer (scale 0 → Long). Avg quotients are decimals and
+        // must Delivery as Decimal128 (ADR-0023), not inherit Long.
+        let ops = parse_transform_steps(&[json!({
+            "groupBy": {
+                "keys": ["CUSTOMER_ID"],
+                "aggregates": [
+                    {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"},
+                    {"op": "count", "field": "AMOUNT", "as": "ORDER_COUNT"},
+                    {"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}
+                ]
+            }
+        })])
+        .unwrap();
+        let primary = vec![
+            OutputColumn {
+                name: "CUSTOMER_ID".into(),
+                data_type: "NUMBER".into(),
+                precision: Some(10),
+                scale: Some(0),
+            },
+            OutputColumn {
+                name: "AMOUNT".into(),
+                data_type: "NUMBER".into(),
+                precision: Some(10),
+                scale: Some(0),
+            },
+        ];
+        let cols = infer_derived_columns(&ops, &primary, &[], &[]);
+        let by_name: BTreeMap<_, _> = cols.into_iter().map(|c| (c.name.clone(), c)).collect();
+        assert_eq!(by_name["AVG_AMOUNT"].precision, Some(34));
+        assert_eq!(by_name["AVG_AMOUNT"].scale, Some(10));
+        assert_eq!(by_name["ORDER_COUNT"].precision, Some(18));
+        assert_eq!(by_name["ORDER_COUNT"].scale, Some(0));
+        assert_eq!(by_name["TOTAL_AMOUNT"].precision, Some(10));
+        assert_eq!(by_name["TOTAL_AMOUNT"].scale, Some(0));
     }
 
     #[test]

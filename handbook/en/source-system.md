@@ -150,7 +150,7 @@ After schema discovery, Sync converts only an allow-listed Oracle type set into 
 
 Unsupported columns are **omitted** from the Base Dataset (the table still syncs); omission is visible in `migraloop status`. A Pipeline that requires an unsupported column cannot use it—never silent coercion.
 
-**NUMBER:** mapped to precision-preserving Mongo types (`NumberLong` / `Decimal128`) when safe. Schema-unsafe NUMBER columns must be resolved at configure time via Pipeline `fields` (`as: string` or `as: omit`)—not quarantined row-by-row at runtime.
+**NUMBER:** mapped to precision-preserving Mongo types (`NumberLong` / `Decimal128`) when safe. Capture JSON keeps fixed scale for `scale > 0` (for example `10` with scale 2 becomes `"10.00"`) so Managed decimals stay Delivery-safe. Schema-unsafe NUMBER columns must be resolved at configure time via Pipeline `fields` (`as: string` or `as: omit`)—not quarantined row-by-row at runtime.
 
 **Temporals:** platform-internal UTC. Timezone-aware values become absolute instants. Naive DATE/TIMESTAMP use the Source DB timezone when readable, else the configured Source `timezone` (IANA name or Oracle-style `±HH:MM`).
 

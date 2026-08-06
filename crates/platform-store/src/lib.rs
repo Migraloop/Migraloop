@@ -368,8 +368,16 @@ impl PlatformStore {
     ///
     /// Idempotent: missing Deployments are a no-op success so Lab Namespace cleanup
     /// and re-run wipe can call this unconditionally.
+    ///
+    /// `poison_quarantine` cascades via FK (migration 0022). An explicit delete remains
+    /// so older stores that have not migrated yet still clear quarantine on Namespace wipe.
     pub async fn delete_deployment(&self, deployment_name: &str) -> Result<(), PlatformStoreError> {
         let pool = &self.pool;
+        sqlx::query("DELETE FROM poison_quarantine WHERE deployment_name = $1")
+            .bind(deployment_name)
+            .execute(pool)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
         sqlx::query("DELETE FROM deployments WHERE name = $1")
             .bind(deployment_name)
             .execute(pool)
@@ -556,6 +564,78 @@ impl PlatformStore {
         )
         .await?;
         tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Persist Sync Health / checkpoint / lag / row_count without rewriting `base_rows`.
+    ///
+    /// Empty Incremental windows (caught-up) must not DELETE+reinsert Base rows from a
+    /// possibly stale in-memory snapshot — that races concurrent Initial Load and
+    /// shrinks durable `row_count`.
+    pub async fn persist_base_dataset_sync_fields(
+        &self,
+        dataset: &BaseDataset,
+    ) -> Result<(), PlatformStoreError> {
+        let pool = &self.pool;
+        let columns_json =
+            serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+        let omitted_json = serde_json::to_string(&dataset.omitted_columns)
+            .map_err(PlatformStoreError::InvalidJson)?;
+        let primary_key_json =
+            serde_json::to_string(&dataset.primary_key).map_err(PlatformStoreError::InvalidJson)?;
+        let cursor_json = match &dataset.initial_load_cursor {
+            Some(cursor) => {
+                Some(serde_json::to_string(cursor).map_err(PlatformStoreError::InvalidJson)?)
+            }
+            None => None,
+        };
+        let result = sqlx::query(
+            r#"
+            UPDATE base_datasets SET
+                status = $4,
+                primary_key_json = $5,
+                columns_json = $6,
+                omitted_columns_json = $7,
+                row_count = $8,
+                sync_applied_changes = $9,
+                sync_health = $10,
+                capture_low_watermark = $11,
+                capture_checkpoint = $12,
+                sync_lag = $13,
+                source_alignment = $14,
+                source_alignment_checked_rows = $15,
+                source_alignment_mismatched_rows = $16,
+                initial_load_cursor_json = $17,
+                loaded_at = now()
+            WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.source_schema)
+        .bind(&dataset.source_table)
+        .bind(&dataset.status)
+        .bind(&primary_key_json)
+        .bind(&columns_json)
+        .bind(&omitted_json)
+        .bind(dataset.row_count)
+        .bind(dataset.sync_applied_changes)
+        .bind(&dataset.sync_health)
+        .bind(dataset.capture_low_watermark)
+        .bind(dataset.capture_checkpoint)
+        .bind(dataset.sync_lag)
+        .bind(&dataset.source_alignment)
+        .bind(dataset.source_alignment_checked_rows)
+        .bind(dataset.source_alignment_mismatched_rows)
+        .bind(cursor_json)
+        .execute(pool)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+        if result.rows_affected() == 0 {
+            return Err(PlatformStoreError::NotFound(format!(
+                "Base Dataset {}.{} not found for Deployment {}",
+                dataset.source_schema, dataset.source_table, dataset.deployment_name
+            )));
+        }
         Ok(())
     }
 

@@ -132,6 +132,49 @@ async fn open_migrated_store() -> PlatformStore {
 }
 
 #[tokio::test]
+async fn persist_base_dataset_sync_fields_updates_metadata_without_rewriting_rows() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-sync-meta"))
+        .await
+        .expect("upsert Deployment");
+
+    let mut row_a = serde_json::Map::new();
+    row_a.insert("ID".to_string(), serde_json::json!(1));
+    let mut row_b = serde_json::Map::new();
+    row_b.insert("ID".to_string(), serde_json::json!(2));
+    let mut dataset = sample_base("intent-sync-meta");
+    dataset.row_count = 2;
+    dataset.status = "initial_load_complete".to_string();
+    store
+        .replace_base_dataset(&dataset, &[row_a, row_b])
+        .await
+        .expect("seed Base rows");
+
+    dataset.status = "incremental".to_string();
+    dataset.capture_checkpoint = Some(999);
+    dataset.sync_lag = 0;
+    dataset.sync_health = "ok".to_string();
+    store
+        .persist_base_dataset_sync_fields(&dataset)
+        .await
+        .expect("persist Sync fields only");
+
+    let (loaded, rows) = store
+        .get_base_rows("CUSTOMERS", Some("intent-sync-meta"))
+        .await
+        .expect("load Base");
+    assert_eq!(loaded.status, "incremental");
+    assert_eq!(loaded.capture_checkpoint, Some(999));
+    assert_eq!(loaded.row_count, 2);
+    assert_eq!(
+        rows.len(),
+        2,
+        "empty-window Sync metadata must not DELETE+rewrite base_rows"
+    );
+}
+
+#[tokio::test]
 async fn record_sync_window_progress_persists_base_and_applied_change_ids() {
     let store = open_migrated_store().await;
     store
@@ -273,6 +316,53 @@ async fn quarantine_change_persists_active_poison_record() {
             .await
             .expect("count"),
         1
+    );
+}
+
+#[tokio::test]
+async fn delete_deployment_removes_poison_quarantine_rows() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-quarantine-delete"))
+        .await
+        .expect("upsert Deployment");
+    store
+        .replace_pipelines(
+            "intent-quarantine-delete",
+            &[sample_pipeline("intent-quarantine-delete", "customers")],
+        )
+        .await
+        .expect("replace Pipelines");
+
+    store
+        .quarantine_change(&QuarantinedChange {
+            deployment_name: "intent-quarantine-delete".to_string(),
+            pipeline_name: "customers".to_string(),
+            source_schema: "APP".to_string(),
+            source_table: "CUSTOMERS".to_string(),
+            change_id: "poison-delete-1".to_string(),
+            capture_position: 77,
+            output_identity: serde_json::json!({"ID": 1}),
+            stage: "delivery".to_string(),
+            attempts: 2,
+            last_error: "injected".to_string(),
+            status: "quarantined".to_string(),
+        })
+        .await
+        .expect("quarantine change");
+
+    store
+        .delete_deployment("intent-quarantine-delete")
+        .await
+        .expect("delete Deployment");
+
+    let leftover = store
+        .list_quarantined_changes(Some("intent-quarantine-delete"))
+        .await
+        .expect("list quarantine after delete");
+    assert!(
+        leftover.is_empty(),
+        "delete_deployment must remove poison_quarantine rows (Namespace wipe / Lab remove)"
     );
 }
 

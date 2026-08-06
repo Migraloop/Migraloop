@@ -8,6 +8,8 @@ Policy: ADR-0025 / issue #66. Selectable Scenarios are manual verification—not
 
 `migraloop lab scenario list` repeats this claim only when every shipped capability below has a selectable Scenario. Operators still pick individual Scenarios; do **not** add a job that runs the full catalog as a release gate.
 
+Live Lab pass/fail evidence (Oracle → Mongo Fixture): [LIVE_INVENTORY.md](./LIVE_INVENTORY.md) (issues #221 / #222).
+
 ## Shipped capabilities ↔ selectable Scenarios
 
 | Capability | Scenario id(s) |

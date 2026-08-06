@@ -40,7 +40,7 @@ Compose 默认凭证（`migraloop` / `migraloop`）仅供本地开发。
 
 ## Local Sync Lab Fixture
 
-可丢弃的 Oracle + MongoDB + Platform Store + app，供**手动** Sync→Delivery 验证（ADR-0025）。与 **Release Quality Gate**／CI contract-stub harness 不同：由 operator 选择 Lab Scenarios；**不要**把 Scenario catalog 当成 CI suite，也不要新增会跑完整 catalog 的 release-gate job。
+可丢弃的 Oracle + MongoDB + Platform Store + app，供**手动** Sync→Delivery 验证（ADR-0025）。与 **Release Quality Gate**／CI contract-stub harness 不同：由 operator 选择 Lab Scenarios；**不要**把 Scenario catalog 当成 CI suite，也不要新增会跑完整 catalog 的 release-gate job。Scenario 执行期间 Lab 会暂停 Fixture `app`（`migraloop run`），让 host `apply`/`sync` 成为唯一的 Incremental Capture 消费者，结束后再恢复 `app`——仍是真实 product CLI Sync／Delivery，不是 Lab stub。
 
 ```bash
 cargo build -p migraloop-app
@@ -77,7 +77,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab down
 ```
 
-Bring-up 后默认：Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`、MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`。Lab Compose 也会把这些 Lab-only secrets 注入 Fixture `app` 供 continuous Sync。Lab bring-up 不会套用 sample Deployments/Pipelines。需要 Docker Compose；`lab up` 若缺少 binary 会构建 `target/debug/migraloop`，再由 `lab/Dockerfile` 打包（Ubuntu 24.04 base 以对齐 host glibc）。Lab Compose 使用 `network_mode: host`。第一次 Oracle 开机可能要数分钟。嵌套 Docker whiteout 解压失败时，请使用 dockerd `storage-driver: fuse-overlayfs` 或 `vfs`（并关闭 containerd snapshotter）。在 **Cursor Cloud** 上，environment 的 `install`/`start` 已配置 `fuse-overlayfs` 并预热 Lab images—session 就绪后直接跑 `migraloop lab up`。见 [CLI 与 Config](cli-and-config.md)（`lab`）与 [Deployment](deployment.md)。
+Bring-up 后默认：Platform Store `postgres://migraloop:migraloop@127.0.0.1:5432/migraloop`、Oracle `SYNC_USER` / `lab_oracle` @ `FREEPDB1`、MongoDB URI `mongodb://migraloop:lab_mongo@127.0.0.1:27017/lab?authSource=admin`。Lab Compose 也会把这些 Lab-only secrets 注入 Fixture `app` 供 continuous Sync。Lab bring-up 不会套用 sample Deployments/Pipelines。需要 Docker Compose；`lab up` 若缺少 binary 会构建 `target/debug/migraloop`，再由 `lab/Dockerfile` 打包（Ubuntu 24.04 base 以对齐 host glibc，并内建 Oracle Instant Client Basic Light，让 Fixture `migraloop run` 能打开 LogMiner OCI）。Host 上的 Scenario `apply`/`sync` 仍需本机 Instant Client（`LD_LIBRARY_PATH`）。Lab Compose 使用 `network_mode: host`。第一次 Oracle 开机可能要数分钟。嵌套 Docker whiteout 解压失败时，请使用 dockerd `storage-driver: fuse-overlayfs` 或 `vfs`（并关闭 containerd snapshotter）。在 **Cursor Cloud** 上，environment 的 `install`/`start` 已配置 `fuse-overlayfs` 并预热 Lab images—session 就绪后直接跑 `migraloop lab up`。见 [CLI 与 Config](cli-and-config.md)（`lab`）与 [Deployment](deployment.md)。
 
 ### DB-level restore / load escape hatch
 
