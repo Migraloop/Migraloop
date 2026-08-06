@@ -65,6 +65,17 @@ Re-ran the Pipeline lifecycle Lab Scenario cluster on a fresh ready Fixture (hos
 | `remove-pipeline` | PASS | Remove ceases Delivery; Shared Base kept; reporting Pipeline continues (`duration_ms=2067`) |
 | `change-pipeline` | PASS | Semantic ACTIVE filter rebuild + delete reconciliation; metadata-only skip (`duration_ms=2141`) |
 
+## Operational surfaces re-verify ([#228](https://github.com/Migraloop/Migraloop/issues/228))
+
+Re-ran the operational Lab Scenario cluster on a fresh ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts). All four acceptance Scenarios **PASS**; no additional product-path fixes required beyond the inventory fixes already on `main`. Bounded Backpressure, Observability Surface, Platform Store Guardrails, and Upgrade Compatibility match shipped handbook claims on the real product path. Relevant RQG contract twins stay green (`cli_bounded_backpressure`, `cli_observability_surface`, `cli_platform_store_guardrails`, `cli_backward_compatible_upgrades`).
+
+| Scenario id | Result | Notes |
+|-------------|--------|-------|
+| `bounded-backpressure` | PASS | Mid-sync Backpressure + lag; catch-up lag→0; Target backlog (`duration_ms=4325`) |
+| `observability-surface` | PASS | Structured logs; Sync/Delivery Health; Prometheus lag/failures (`duration_ms=3483`) |
+| `platform-store-guardrails` | PASS | Absurd lows rejected; disk warn-only; no auto-pause (`duration_ms=1073`) |
+| `backward-compatible-upgrades` | PASS | `migrate` preserves Deployment; older `v1.0.0` apply without IL rebuild (`duration_ms=1135`) |
+
 ## Matrix
 
 | Scenario id | Result | Notes |
