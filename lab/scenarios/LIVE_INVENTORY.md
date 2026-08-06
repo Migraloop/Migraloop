@@ -1,71 +1,55 @@
-# Lab Scenario live inventory (Oracle → Mongo)
+# Live catalog inventory (Lab Fixture)
 
-Evidence for GitHub issues #221 / #222. Primary verification seam:
-`migraloop lab scenario run <id>` on a real Local Sync Lab Fixture (Oracle Free 23 +
-MongoDB 7 + Platform Store + app). No Lab-only fake Sync/Delivery shortcuts.
+**Issue:** [#222](https://github.com/Migraloop/Migraloop/issues/222) (child of epic [#221](https://github.com/Migraloop/Migraloop/issues/221))  
+**Fixture:** Local Sync Lab (`migraloop lab up` / `lab status` → ready)  
+**Method:** `migraloop lab scenario run <id>` against live Base/Target (not contract-only).  
+**Binary:** host `./target/debug/migraloop` with `LD_LIBRARY_PATH` pointing at Oracle Instant Client; Platform Store on Lab Postgres.
 
-## Fixture
+**Tally:** **23 PASS / 1 FAIL** of 24 shipped Scenarios in [`COVERAGE.md`](./COVERAGE.md).
 
-| Item | Value |
-| --- | --- |
-| Date (UTC) | 2026-08-06 |
-| Host | Cursor Cloud agent + nested DinD (`fuse-overlayfs`) |
-| Fixture | `migraloop lab up` → `lab status` ready (platform-store, oracle, mongo, app) |
-| Product binary | `target/debug/migraloop` (branch work for #221) |
-| Host Instant Client | Basic Light 23.9 (`LD_LIBRARY_PATH=/opt/oracle/instantclient_23_9`) |
-| Fixture app Instant Client | Packaged in `lab/Dockerfile` (Basic Light) so `migraloop run` can open LogMiner OCI |
-| Product path | recipe `workload.product_path` → real `migraloop apply` / `migraloop sync` |
+**Basic-complete go/no-go (epic #221):** **no-go** until `bulk-load` is green (tracked under [#223](https://github.com/Migraloop/Migraloop/issues/223)) and remaining epic children through [#229](https://github.com/Migraloop/Migraloop/issues/229).
 
-## Catalog results
+## Matrix
 
-Shipped Scenario ids from [COVERAGE.md](./COVERAGE.md). Status after product fixes landed in this PR
-(LogMiner ORA-01323, Lab Instant Client, `avg` Decimal128 schema, NUMBER scale strings,
-Lab hook boundaries). Re-verified on a clean Fixture with explicit
-`lab scenario remove` after reds (see Operator notes).
+| Scenario | Result | Notes |
+|----------|--------|-------|
+| `happy-path` | PASS | |
+| `bulk-load` | **FAIL** | Initial Load did not reach 100k Base/Target rows within `max_duration_ms=600000` (~89k Base / ~91k Target, ~165 rows/s). Product path issue for #223 — not a Lab Fixture readiness problem. |
+| `type-mapping` | PASS | |
+| `pk-strategies` | PASS | |
+| `schema-change` | PASS | Must run on a clean Fixture (leftover Deployments make one-shot `migraloop sync` apply every Deployment). |
+| `conflict-last-write` | PASS | |
+| `observability-hooks` | PASS | Same cleanliness note as `schema-change`. |
+| `rp-filter` | PASS | |
+| `rp-project` | PASS | |
+| `rp-rename` | PASS | |
+| `rp-cast` | PASS | |
+| `rp-derived` | PASS | Requires `avg` → Decimal128 schema inference (Delivery rejects fractional `avg` as Integer). |
+| `rp-mask` | PASS | |
+| `rt-lookup` | PASS | |
+| `rt-unwind` | PASS | |
+| `rt-groupby` | PASS | Same `avg` / Decimal128 path as `rp-derived`. |
+| `rt-sortlimit` | PASS | |
+| `rt-distinct-addtoset` | PASS | Requires scale-preserving NUMBER JSON (`10` → `"10.00"` when scale>0) so Mongo distinct matches Oracle `TO_CHAR` expectations. |
+| `rt-union` | PASS | |
+| `rt-window` | PASS | |
+| `rt-conditional` | PASS | |
+| `rt-array` | PASS | |
+| `rt-string` | PASS | |
+| `rt-math` | PASS | |
 
-| Scenario id | Result | Duration (approx) | Notes |
-| --- | --- | --- | --- |
-| `direct-pipeline` | **PASS** | ~3s | |
-| `transform-pipeline` | **PASS** | ~3s | Was red: `avg` → Long Delivery; fixed via Decimal128 schema + inspect |
-| `rt-project` | **PASS** | ~3s | |
-| `rt-filter` | **PASS** | ~3s | |
-| `rt-field-ops` | **PASS** | ~4s | |
-| `rt-equilookup` | **PASS** | ~3s | |
-| `rt-union` | **PASS** | ~4s | |
-| `rt-unwind` | **PASS** | ~4s | |
-| `rt-distinct-addtoset` | **PASS** | ~2s | Was red: NUMBER(12,2) collapsed to ints; scale-preserving strings fixed |
-| `concurrent-source-workload` | **PASS** | ~5s | |
-| `bulk-load` | **FAIL** | ~608s | Expected 100k Base/Target; observed `base_rows=89000` `target_rows=91000` inside `max_duration_ms=600000` (`rows_per_s≈165`). Follow-up: #223 |
-| `idempotent-redelivery` | **PASS** | ~12s | |
-| `pause-resume` | **PASS** | ~16s | |
-| `remove-pipeline` | **PASS** | ~3s | Was false-red: `lab-rp-customers` prefix matched `-reporting` |
-| `change-pipeline` | **PASS** | ~20s | |
-| `poison-quarantine` | **PASS** | ~15s | |
-| `schema-change-pause` | **PASS** | ~3s | First FAIL was leftover Deployments polluting one-shot `sync` |
-| `source-alignment` | **PASS** | ~3s | |
-| `drift-check` | **PASS** | ~4s | |
-| `bounded-backpressure` | **PASS** | ~13s | |
-| `observability-surface` | **PASS** | ~4s | First FAIL was leftover bulk-load metrics lag=0 |
-| `platform-store-guardrails` | **PASS** | ~2s | |
-| `backward-compatible-upgrades` | **PASS** | ~2s | |
-| `initial-load-throttled` | **PASS** | ~5s | |
+## Product fixes landed while clearing false reds
 
-**Live catalog tally:** 23 PASS / 1 FAIL (`bulk-load`).
+These were required for live Scenario apply/sync (not Lab harness-only stubs):
 
-## Product defects fixed while gathering inventory
-
-1. **ORA-01323 on Incremental Capture** — Oracle 23 rejects `DBMS_LOGMNR.MINE_VALUE` with SQL `FETCH FIRST` / nested `ROWNUM`. Backpressure limits stop the OCI cursor in Rust (`crates/capture`).
-2. **Lab Fixture `app` DPI-1047** — `lab/Dockerfile` installs Instant Client Basic Light for continuous `migraloop run`.
-3. **`groupBy` `avg` Long mapping** — Derived schema inherited integer source scale; `infer_derived_columns` maps `avg` → Decimal128-safe NUMBER(34,10). Lab inspect accepts `$numberDecimal`.
-4. **NUMBER(p,s>0) JSON collapse** — Initial Load / LogMiner text→JSON now keeps scale-preserving decimal strings (`10` → `"10.00"`).
-5. **Lab hook pipeline-name prefix** — `remove-pipeline` / `pause-resume` Delivery assertions use token boundaries.
-6. **Cloud DinD `/var/run` 0700** — `cloud-dind-start.sh` chmods `/var/run` for non-root `docker.sock` access.
+1. **Incremental Capture / LogMiner (Oracle 23)** — `DBMS_LOGMNR.MINE_VALUE` rejects SQL that wraps the mine call in `FETCH FIRST` / nested `ROWNUM`. Backpressure limits are applied in Rust after OCI fetch; SQL keeps `ORDER BY SCN` only (`crates/capture`).
+2. **Lab app image Instant Client** — Fixture `migraloop run` needs Instant Client in `lab/Dockerfile` (host CLI already uses host libraries).
+3. **`groupBy` `avg` schema** — inferred as `NUMBER(34,10)` → Decimal128 so Delivery can parse fractional averages (`crates/transform`).
+4. **NUMBER scale in Capture JSON** — scale>0 emits fixed-scale decimal strings (`crates/capture`).
+5. **Lab inspect hooks** — accept Mongo `$numberDecimal`; match Delivery Deployment names on path boundaries; loosen Initial Load amount checks for distinct/addToSet expected shapes (`crates/cli` Lab Scenario).
 
 ## Operator notes for re-runs
 
-- `--auto-remove` only cleans Namespace on **PASS** (US35 keeps failures for inspect). Multi-Scenario inventory must `lab scenario remove <id>` after reds or leftovers share one-shot `migraloop sync`.
-- Host Scenario CLI still requires Instant Client on the Developer machine (`LD_LIBRARY_PATH`).
-
-## Go/no-go (parent #221)
-
-**Not yet go.** One shipped Scenario remains live-red: `bulk-load` (#223). Child tickets #223–#228 / #229 stay open until that settles and any residual correctness/ops gaps are cleared.
+- Prefer `--auto-remove` on PASS paths. After **FAIL**, always `migraloop lab scenario remove <id>` — auto-remove is PASS-only (US35).
+- One-shot `migraloop sync` syncs **all** Deployments in the Platform Store; leftover Scenarios pollute later runs (especially `schema-change` / `observability-hooks`).
+- Host Incremental Capture needs Instant Client on `LD_LIBRARY_PATH` (see handbook local setup / deployment).
