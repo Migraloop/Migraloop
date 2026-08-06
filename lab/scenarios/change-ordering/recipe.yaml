@@ -1,0 +1,104 @@
+# Lab Scenario recipe (ADR-0025 / ADR-0029 / issue #225).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+id: change-ordering
+summary: "Change Ordering / confluence: same-key capture order, cross-key interleave, min Base recompute (ADR-0029)"
+namespace:
+  source_tables:
+    - LAB_CO_CUSTOMERS
+    - LAB_CO_ORDERS
+  target_collections:
+    - lab_co_customers
+    - lab_co_order_stats
+  deployment: lab-change-ordering
+  pipelines:
+    - lab-co-customers
+    - lab-co-order-stats
+  lifecycle:
+    tables:
+      - name: LAB_CO_CUSTOMERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200)
+      - name: LAB_CO_ORDERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          CUSTOMER_ID NUMBER(10) NOT NULL,
+          AMOUNT NUMBER(10) NOT NULL,
+          NOTE VARCHAR2(200)
+    seed_sql: |
+      INSERT INTO LAB_CO_CUSTOMERS (ID, NAME, EMAIL) VALUES (1, 'NameA', 'a@example.com');
+      INSERT INTO LAB_CO_CUSTOMERS (ID, NAME, EMAIL) VALUES (2, 'Key2Start', 'k2@example.com');
+      INSERT INTO LAB_CO_ORDERS (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (1, 1, 10, 'min-extreme');
+      INSERT INTO LAB_CO_ORDERS (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (2, 1, 20, 'keep');
+      INSERT INTO LAB_CO_ORDERS (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (3, 2, 5, 'other-key');
+    mutate_sql: |
+      -- Same source key ID=1: A→B→C. Wrong capture order would leave NameB as final Managed.
+      UPDATE LAB_CO_CUSTOMERS SET NAME = 'NameB' WHERE ID = 1;
+      -- Distinct key interleave mid-stream (ID=2 between ID=1 updates).
+      UPDATE LAB_CO_CUSTOMERS SET NAME = 'Key2Mid' WHERE ID = 2;
+      UPDATE LAB_CO_CUSTOMERS SET NAME = 'NameC' WHERE ID = 1;
+      UPDATE LAB_CO_CUSTOMERS SET NAME = 'Key2Final' WHERE ID = 2;
+      -- Delete current min extreme for customer 1; running min alone is insufficient → Base recompute.
+      DELETE FROM LAB_CO_ORDERS WHERE ID = 1;
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace + seed + table-level supplemental logging
+    - apply Deployment via real product path (Initial Load + Derived)
+    - mutate same-key A→B→C, cross-key interleave, and min-extreme delete
+    - sync Incremental Capture + Delivery via real LogMiner path (no Alignment/Drift)
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - mutate
+      - product_sync
+      - assert
+    apply:
+      require_initial_load: true
+      require_derived: true
+    sync:
+      require_logminer: true
+checks:
+  correctness:
+    - surface: base
+      table: LAB_CO_CUSTOMERS
+      present:
+        - { field: NAME, value: NameC }
+        - { field: NAME, value: Key2Final }
+      absent:
+        - { field: NAME, value: NameA }
+        - { field: NAME, value: NameB }
+        - { field: NAME, value: Key2Start }
+        - { field: NAME, value: Key2Mid }
+    - surface: target
+      collection: lab_co_customers
+      present:
+        - { field: NAME, value: NameC }
+        - { field: NAME, value: Key2Final }
+      absent:
+        - { field: NAME, value: NameA }
+        - { field: NAME, value: NameB }
+        - { field: NAME, value: Key2Start }
+        - { field: NAME, value: Key2Mid }
+    - surface: derived
+      pipeline: lab-co-order-stats
+      present:
+        - { field: MIN_AMOUNT, value: "20" }
+        - { field: MAX_AMOUNT, value: "20" }
+        - { field: ORDER_COUNT, value: "1" }
+        - { field: MIN_AMOUNT, value: "5" }
+      amount_present: ["20", "5"]
+      amount_absent: ["10"]
+    - surface: target
+      collection: lab_co_order_stats
+      present:
+        - { field: MIN_AMOUNT, value: "20" }
+        - { field: MAX_AMOUNT, value: "20" }
+        - { field: ORDER_COUNT, value: "1" }
+        - { field: MIN_AMOUNT, value: "5" }
+      amount_present: ["20", "5"]
+      amount_absent: ["10"]
+thresholds: {}
