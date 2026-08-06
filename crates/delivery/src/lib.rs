@@ -453,7 +453,8 @@ pub async fn upsert_managed_documents(
             .run_command(doc! {
                 "update": collection_name,
                 "updates": updates,
-                "ordered": false,
+                // Preserve submit order within a batch (same-key Change Ordering).
+                "ordered": true,
             })
             .await
             .map_err(|err| DeliveryError::Apply(err.to_string()))?;
@@ -505,7 +506,7 @@ pub async fn delete_documents_by_identity(
             .run_command(doc! {
                 "delete": collection_name,
                 "deletes": deletes,
-                "ordered": false,
+                "ordered": true,
             })
             .await
             .map_err(|err| DeliveryError::Apply(err.to_string()))?;

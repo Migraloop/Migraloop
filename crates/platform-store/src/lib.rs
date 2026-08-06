@@ -27,9 +27,10 @@ const INCREMENTAL_SYNC_ADVISORY_LOCK_KEY: i64 = 0x4D47_5F53_594E_4301; // "MG_SY
 
 /// One Base Dataset row mutation for Incremental Sync persist without rewriting peers.
 ///
-/// Used by [`PlatformStore::record_sync_row_progress`] so Direct/Transform Sync can
-/// advance one Output Identity / source key without DELETE+reinsert of all `base_rows`
-/// (issue #230 / ADR-0029 throughput path).
+/// Used by [`PlatformStore::record_sync_row_progress`] so Incremental Capture can
+/// advance one source key (Base primary-key identity) without DELETE+reinsert of all
+/// `base_rows` (issue #230 / ADR-0029 throughput path). This is the Base source-key
+/// seam — not Target Output Identity.
 #[derive(Debug, Clone, Copy)]
 pub enum BaseRowMutation<'a> {
     /// Insert or replace the Base row matching `identity` (JSON containment on PK fields).
@@ -2047,14 +2048,21 @@ async fn upsert_base_row_by_identity_in_tx(
 ) -> Result<(), PlatformStoreError> {
     let identity_json = identity_json_for_containment(identity)?;
     let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
+    // Match by PK containment; `ctid` LIMIT 1 keeps a single ordinal if peers somehow
+    // share a partial identity (full Primary Key identity should be unique).
     let updated = sqlx::query(
         r#"
             UPDATE base_rows
             SET row_json = $5
-            WHERE deployment_name = $1
-              AND source_schema = $2
-              AND source_table = $3
-              AND row_json::jsonb @> $4::jsonb
+            WHERE ctid = (
+                SELECT ctid FROM base_rows
+                WHERE deployment_name = $1
+                  AND source_schema = $2
+                  AND source_table = $3
+                  AND row_json::jsonb @> $4::jsonb
+                ORDER BY row_ordinal
+                LIMIT 1
+            )
             "#,
     )
     .bind(deployment_name)
@@ -2110,10 +2118,15 @@ async fn delete_base_row_by_identity_in_tx(
     sqlx::query(
         r#"
             DELETE FROM base_rows
-            WHERE deployment_name = $1
-              AND source_schema = $2
-              AND source_table = $3
-              AND row_json::jsonb @> $4::jsonb
+            WHERE ctid = (
+                SELECT ctid FROM base_rows
+                WHERE deployment_name = $1
+                  AND source_schema = $2
+                  AND source_table = $3
+                  AND row_json::jsonb @> $4::jsonb
+                ORDER BY row_ordinal
+                LIMIT 1
+            )
             "#,
     )
     .bind(deployment_name)
