@@ -781,6 +781,22 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                 .await
                 .map_err(|err| RuntimeError::Failed(err.to_string()))?;
 
+            // Initial Load owns Base mutation until cutover completes. Concurrent
+            // Incremental (for example Lab Fixture `migraloop run` racing host apply)
+            // must not rewrite an in-progress Base from a partial snapshot.
+            if dataset.status == "initial_load_in_progress"
+                || dataset.status == "initial_load_paused"
+            {
+                if !quiet {
+                    println!(
+                        "Incremental Capture: skipping Base Dataset {table} \
+                         (status={} — Initial Load still owns Base)",
+                        dataset.status
+                    );
+                }
+                continue;
+            }
+
             let cutover = resume_for_incremental(
                 &table,
                 dataset.capture_low_watermark,
@@ -900,10 +916,12 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                         } else {
                             "incremental".to_string()
                         };
+                    // Preserve durable row_count / base_rows — do not rewrite from the
+                    // in-memory snapshot on an empty window (races Initial Load).
                     let caught_up = base_with_sync_progress(
                         &dataset,
                         status,
-                        rows.len() as i32,
+                        dataset.row_count,
                         sync_applied,
                         if windows_processed == 0 {
                             dataset.capture_checkpoint
@@ -914,7 +932,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                         0,
                     );
                     store
-                        .record_sync_window_progress(&caught_up, &rows, &[])
+                        .persist_base_dataset_sync_fields(&caught_up)
                         .await
                         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                     set_delivery_lag_for_table(

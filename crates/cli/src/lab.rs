@@ -190,6 +190,39 @@ async fn run_compose(lab_dir: &Path, args: &[&str]) -> Result<(bool, String), Cl
     Ok((output.status.success(), combined))
 }
 
+/// Stop Lab Fixture `app` (`migraloop run`) so a Scenario's host apply/sync path
+/// is the sole Incremental Capture consumer for that Namespace.
+///
+/// Continuous Fixture `run` otherwise races Scenario mutate→sync (steals LogMiner
+/// changes / rewrites Base mid–Initial Load). Resume with
+/// [`resume_lab_app_after_scenario`].
+pub(crate) async fn pause_lab_app_for_exclusive_scenario(
+    lab_dir: &Path,
+) -> Result<(), CliError> {
+    let (ok, out) = run_compose(lab_dir, &["stop", "app"]).await?;
+    if !ok {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario: failed to pause Fixture app for exclusive host Sync:\n{out}"
+        )));
+    }
+    println!(
+        "Lab Scenario: paused Fixture app (`migraloop run`) for exclusive host apply/sync"
+    );
+    Ok(())
+}
+
+/// Restart Lab Fixture `app` after a Scenario finishes (success or failure).
+pub(crate) async fn resume_lab_app_after_scenario(lab_dir: &Path) -> Result<(), CliError> {
+    let (ok, out) = run_compose(lab_dir, &["start", "app"]).await?;
+    if !ok {
+        return Err(CliError::Failed(format!(
+            "Lab Scenario: failed to resume Fixture app after Scenario:\n{out}"
+        )));
+    }
+    println!("Lab Scenario: resumed Fixture app (`migraloop run`)");
+    Ok(())
+}
+
 async fn lab_up(lab_dir: &Path) -> Result<(), CliError> {
     println!("Lab Fixture: bringing up disposable stack (Oracle, MongoDB, Platform Store, app)...");
     println!("Lab Fixture: no sample Deployment or Pipelines will be applied.");

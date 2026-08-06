@@ -36,7 +36,8 @@ use tokio::process::Command;
 
 use crate::config::load_deployment_config;
 use crate::lab::{
-    ensure_fixture_ready_for_scenario, lab_migraloop_bin, mongosh_in_mongo, sqlplus_in_oracle,
+    ensure_fixture_ready_for_scenario, lab_migraloop_bin, mongosh_in_mongo,
+    pause_lab_app_for_exclusive_scenario, resume_lab_app_after_scenario, sqlplus_in_oracle,
     LAB_MONGO_DATABASE, LAB_MONGO_HOST, LAB_MONGO_PASSWORD_DEFAULT, LAB_MONGO_PASSWORD_ENV,
     LAB_MONGO_PORT, LAB_MONGO_USER, LAB_ORACLE_HOST, LAB_ORACLE_PASSWORD_DEFAULT,
     LAB_ORACLE_PASSWORD_ENV, LAB_ORACLE_PORT, LAB_ORACLE_SERVICE, LAB_ORACLE_USER,
@@ -555,6 +556,9 @@ async fn scenario_run(
     ensure_fixture_ready_for_scenario(lab_dir).await?;
 
     let lock = ScenarioLock::acquire(&lock_path, scenario)?;
+    // Host Scenario apply/sync must be the sole Incremental Capture consumer.
+    // Fixture `app` runs continuous `migraloop run` and otherwise races mutate→sync.
+    pause_lab_app_for_exclusive_scenario(lab_dir).await?;
     let started = Instant::now();
     // Recipe-driven path: print recipe interface, run shared product-path hooks,
     // evaluate thresholds.
@@ -600,6 +604,10 @@ async fn scenario_run(
     })
     .await;
     let duration = started.elapsed();
+    // Always resume Fixture app so `lab status` stays ready for the next Scenario.
+    if let Err(resume_err) = resume_lab_app_after_scenario(lab_dir).await {
+        eprintln!("{resume_err}");
+    }
 
     match result {
         Ok(report) => {
