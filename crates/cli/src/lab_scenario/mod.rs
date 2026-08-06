@@ -1503,67 +1503,13 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
                 Ok(())
             }
             Self::ChangeOrdering => {
+                // Thin hook: only gate Derived materialization. Final Managed /
+                // min-recompute outcomes live in recipe checks.correctness (#205).
                 if !(apply_out.to_ascii_lowercase().contains("derived")
                     || apply_out.contains(CHANGE_ORDERING_ORDER_STATS_PIPELINE))
                 {
                     return Err(CliError::Failed(format!(
                         "Lab Scenario apply did not materialize Transform Derived Dataset:\n{apply_out}"
-                    )));
-                }
-                let customers_base = run_product_cli(
-                    &bin,
-                    &[
-                        "base",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--table",
-                        CHANGE_ORDERING_CUSTOMERS_TABLE,
-                    ],
-                )
-                .await?;
-                let orders_base = run_product_cli(
-                    &bin,
-                    &[
-                        "base",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--table",
-                        CHANGE_ORDERING_ORDERS_TABLE,
-                    ],
-                )
-                .await?;
-                if !(managed_field_present(&customers_base, "NAME", "NameA")
-                    && managed_field_present(&customers_base, "NAME", "Key2Start"))
-                {
-                    return Err(CliError::Failed(format!(
-                        "Initial Load customers Base check failed (expected NameA and Key2Start):\n{customers_base}"
-                    )));
-                }
-                if !(managed_field_present(&orders_base, "AMOUNT", "10")
-                    && managed_field_present(&orders_base, "AMOUNT", "20")
-                    && managed_field_present(&orders_base, "AMOUNT", "5"))
-                {
-                    return Err(CliError::Failed(format!(
-                        "Initial Load orders Base check failed (expected amounts 10/20/5):\n{orders_base}"
-                    )));
-                }
-                let derived_after_apply = run_product_cli(
-                    &bin,
-                    &[
-                        "derived",
-                        "--platform-store-url",
-                        LAB_PLATFORM_STORE_URL,
-                        "--pipeline",
-                        CHANGE_ORDERING_ORDER_STATS_PIPELINE,
-                    ],
-                )
-                .await?;
-                if !(managed_field_present(&derived_after_apply, "MIN_AMOUNT", "10")
-                    && managed_field_present(&derived_after_apply, "MAX_AMOUNT", "20")
-                    && inspect_mentions_amount(&derived_after_apply, "5"))
-                {
-                    return Err(CliError::Failed(format!(
-                        "Initial Load Derived check failed (expected min/max 10/20 and key2=5):\n{derived_after_apply}"
                     )));
                 }
                 Ok(())

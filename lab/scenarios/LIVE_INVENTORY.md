@@ -11,11 +11,11 @@
 
 ## Change Ordering / confluence ([#225](https://github.com/Migraloop/Migraloop/issues/225))
 
-Ran new Scenario `change-ordering` on a ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts; no Source Alignment Check / Drift Check on the path). **PASS** — same-key A→B→C finals (`NameC`), cross-key interleave finals (`Key2Final`), min extreme delete → Base recompute (`MIN_AMOUNT=20`, stale `10` gone). Matching RQG twin: `cli_change_ordering`.
+Ran new Scenario `change-ordering` on a ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts; no Source Alignment Check / Drift Check on the path). **PASS** — same-key A→B→C finals (`NameC`), serial cross-key interleave finals (`Key2Final`), min extreme delete → eventual `MIN_AMOUNT=20` (stale `10` gone) via Incremental Affect / Base recompute. Matching RQG twin: `cli_change_ordering`. True OS-parallel cross-key contention remains covered by already-green `concurrent-source-workload`.
 
 | Scenario id | Result | Notes |
 |-------------|--------|-------|
-| `change-ordering` | PASS | ADR-0029; LogMiner OCI; same SCN multi-row order via RS_ID preserved |
+| `change-ordering` | PASS | ADR-0029; LogMiner OCI; capture-order finals for same-key + interleave + min recompute |
 
 ## Direct Sync cluster re-verify ([#223](https://github.com/Migraloop/Migraloop/issues/223))
 
