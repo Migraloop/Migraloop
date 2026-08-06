@@ -28,6 +28,8 @@ migraloop apply -f deployment.yaml
 migraloop status
 ```
 
+Transform Pipelines in `deployment.yaml` may use classic Rich Transform steps or Aggregation/SQL-like DX (`$project`, `$match`, `$group`, …)—see [Rich Transform](rich-transform.md) and [Pipeline](pipeline.md).
+
 ## Local Sync Lab Fixture
 
 For manual end-to-end verification on a disposable real stack (ADR-0025), use the **Local Sync Lab** Fixture. It extends the real install shape with Lab-provisioned Oracle and MongoDB beside Platform Store + app:

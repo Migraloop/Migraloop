@@ -53,7 +53,7 @@ transform:
 | `$lookup` / `join` | `equiLookup` | 僅 equijoin—不可用 `pipeline` / `let` |
 | `$unwind` | `unwind` | path 字串或 `{ path }`—不可用 `preserveNullAndEmptyArrays` |
 | `$unionWith` | `union` | `coll` / `from` / 字串—不可用 nested `pipeline` |
-| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`；accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet` |
+| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`；accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet`。`$count` 需欄位 ref（`{ $count: "$ORDER_ID" }` = SQL `COUNT(field)`），不是 Mongo 空的 `{ $count: {} }` |
 
 使用 classic steps 的既有 Deployments 可持續運作（Upgrade Compatibility）。為可讀性，每個 Pipeline 建議只用一種形式；同一列表混用 classic 與 Aggregation 步驟在各自合法時也被允許。
 

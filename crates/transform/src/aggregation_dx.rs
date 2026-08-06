@@ -16,6 +16,12 @@ use crate::{
     TransformOp,
 };
 
+fn is_classic_fields_body(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|o| o.contains_key("fields") && o.keys().all(|k| k == "fields"))
+}
+
 /// Try parsing one step as Aggregation-like / SQL-alias DX.
 ///
 /// Returns `None` when the step is not an Aggregation/SQL-alias shape (caller
@@ -38,21 +44,14 @@ pub(crate) fn try_parse_aggregation_step(
         "$unwind" => Some(parse_unwind_dx(value)?),
         "$unionWith" => Some(parse_union_with_dx(value)?),
         "$group" => Some(parse_group_dx(value)?),
-        // Current-form keys that Aggregation DX also documents under `$` aliases
-        // are handled by the classic parsers; `$distinct` is not a Mongo stage.
-        "$distinct" => Some(parse_distinct(value)?),
-        "$addToSet" => Some(parse_add_to_set(value)?),
         _ => None,
     };
     Ok(op)
 }
 
 fn parse_project_dx(value: &Value) -> Result<TransformOp, TransformError> {
-    // Classic body: { fields: [...] }
-    if value
-        .as_object()
-        .is_some_and(|o| o.contains_key("fields") && !o.keys().any(|k| k != "fields"))
-    {
+    // Classic body: { fields: [...] } (also allowed under $project / select).
+    if is_classic_fields_body(value) {
         return parse_project(value);
     }
     // Aggregation inclusion map: { ID: 1, NAME: true } — inclusion only.
@@ -161,10 +160,7 @@ fn parse_match_dx(value: &Value) -> Result<TransformOp, TransformError> {
 
 fn parse_add_fields_dx(value: &Value) -> Result<TransformOp, TransformError> {
     // Classic body: { fields: [{ as, value|field }] }
-    if value
-        .as_object()
-        .is_some_and(|o| o.contains_key("fields") && !o.keys().any(|k| k != "fields"))
-    {
+    if is_classic_fields_body(value) {
         return parse_add_fields(value);
     }
     let obj = value.as_object().ok_or_else(|| {
@@ -221,10 +217,7 @@ fn parse_add_fields_dx(value: &Value) -> Result<TransformOp, TransformError> {
 
 fn parse_unset_dx(value: &Value) -> Result<TransformOp, TransformError> {
     // Classic remove body
-    if value
-        .as_object()
-        .is_some_and(|o| o.contains_key("fields") && !o.keys().any(|k| k != "fields"))
-    {
+    if is_classic_fields_body(value) {
         return parse_remove(value);
     }
     let fields = match value {
@@ -267,10 +260,7 @@ fn parse_unset_dx(value: &Value) -> Result<TransformOp, TransformError> {
 }
 
 fn parse_rename_dx(value: &Value) -> Result<TransformOp, TransformError> {
-    if value
-        .as_object()
-        .is_some_and(|o| o.contains_key("fields") && !o.keys().any(|k| k != "fields"))
-    {
+    if is_classic_fields_body(value) {
         return parse_rename(value);
     }
     let obj = value.as_object().ok_or_else(|| {
@@ -833,6 +823,84 @@ mod tests {
         let analysis_classic = analyze_base_change(&classic, &ctx, None).unwrap();
         let analysis_agg = analyze_base_change(&agg, &ctx, None).unwrap();
         assert_eq!(analysis_classic.outcome, analysis_agg.outcome);
+    }
+
+    #[test]
+    fn project_match_and_lookup_affect_eval_match_classic() {
+        let classic_pf = parse_transform_steps(&[
+            json!({"project": {"fields": ["ID", "NAME", "ACTIVE"]}}),
+            json!({"filter": {"field": "ACTIVE", "eq": 1}}),
+        ])
+        .unwrap();
+        let agg_pf = parse_transform_steps(&[
+            json!({"$project": {"fields": ["ID", "NAME", "ACTIVE"]}}),
+            json!({"$match": {"ACTIVE": 1}}),
+        ])
+        .unwrap();
+        assert_eq!(classic_pf, agg_pf);
+
+        let rows = vec![
+            row(&[("ID", json!(1)), ("NAME", json!("A")), ("ACTIVE", json!(1)), ("EMAIL", json!("a"))]),
+            row(&[("ID", json!(2)), ("NAME", json!("B")), ("ACTIVE", json!(0)), ("EMAIL", json!("b"))]),
+        ];
+        let secondary = BTreeMap::new();
+        assert_eq!(
+            evaluate_transform_with_bases(&classic_pf, &rows, &secondary).unwrap(),
+            evaluate_transform_with_bases(&agg_pf, &rows, &secondary).unwrap()
+        );
+        let after_email = row(&[
+            ("ID", json!(1)),
+            ("NAME", json!("A")),
+            ("ACTIVE", json!(1)),
+            ("EMAIL", json!("changed")),
+        ]);
+        let ctx = BaseChangeContext {
+            changed_base: "CUSTOMERS",
+            primary_base: "CUSTOMERS",
+            kind: BaseChangeKind::Update,
+            before: Some(&rows[0]),
+            after: Some(&after_email),
+            primary_rows: &rows,
+            secondary_bases: &secondary,
+        };
+        assert_eq!(
+            analyze_base_change(&classic_pf, &ctx, None).unwrap().outcome,
+            analyze_base_change(&agg_pf, &ctx, None).unwrap().outcome
+        );
+
+        let classic_join = parse_transform_steps(&[json!({
+            "equiLookup": {
+                "from": "ORDERS",
+                "localField": "ID",
+                "foreignField": "CUSTOMER_ID",
+                "as": "orders"
+            }
+        })])
+        .unwrap();
+        let agg_join = parse_transform_steps(&[json!({
+            "$lookup": {
+                "from": "ORDERS",
+                "localField": "ID",
+                "foreignField": "CUSTOMER_ID",
+                "as": "orders"
+            }
+        })])
+        .unwrap();
+        assert_eq!(classic_join, agg_join);
+        let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("A"))])];
+        let mut secondary_orders = BTreeMap::new();
+        secondary_orders.insert(
+            "ORDERS".to_string(),
+            vec![row(&[
+                ("ORDER_ID", json!(10)),
+                ("CUSTOMER_ID", json!(1)),
+                ("AMOUNT", json!("5.00")),
+            ])],
+        );
+        assert_eq!(
+            evaluate_transform_with_bases(&classic_join, &customers, &secondary_orders).unwrap(),
+            evaluate_transform_with_bases(&agg_join, &customers, &secondary_orders).unwrap()
+        );
     }
 
     #[test]

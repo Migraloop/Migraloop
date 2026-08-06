@@ -53,7 +53,7 @@ Constrained Aggregation stages map as follows (unanalyzable extensions stay reje
 | `$lookup` / `join` | `equiLookup` | Equijoin only — no `pipeline` / `let` |
 | `$unwind` | `unwind` | Path string or `{ path }` — no `preserveNullAndEmptyArrays` |
 | `$unionWith` | `union` | `coll` / `from` / string — no nested `pipeline` |
-| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`; accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet` |
+| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`; accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet`. `$count` takes a field ref (`{ $count: "$ORDER_ID" }` = SQL `COUNT(field)`), not Mongo’s empty `{ $count: {} }` |
 
 Existing Deployments that use classic steps keep working (Upgrade Compatibility). Prefer one form per Pipeline for readability; mixing classic and Aggregation steps in one list is allowed when each step is valid.
 

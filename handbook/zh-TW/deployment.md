@@ -28,6 +28,8 @@ migraloop apply -f deployment.yaml
 migraloop status
 ```
 
+`deployment.yaml` 中的 Transform Pipelines 可用 classic Rich Transform 步驟，或 Aggregation／SQL-like DX（`$project`、`$match`、`$group`…）—見 [Rich Transform](rich-transform.md) 與 [Pipeline](pipeline.md)。
+
 ## Local Sync Lab Fixture
 
 若要在可拋棄的真實堆疊上手動端到端驗證（ADR-0025），使用 **Local Sync Lab** Fixture。它在既有 Platform Store + app 安裝形態旁，再佈建 Lab 用的 Oracle 與 MongoDB：
