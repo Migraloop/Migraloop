@@ -55,6 +55,16 @@ Re-ran the correctness safety-net Lab Scenario cluster on a fresh ready Fixture 
 | `poison-quarantine` | PASS | Quarantine + alert; Pipeline continues other identities; Delivery Health unhealthy |
 | `schema-change-pause` | PASS | Blocking DDL WARN + pause; distinct from poison quarantine |
 
+## Pipeline lifecycle verbs re-verify ([#227](https://github.com/Migraloop/Migraloop/issues/227))
+
+Re-ran the Pipeline lifecycle Lab Scenario cluster on a fresh ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts). All three acceptance Scenarios **PASS**; no additional product-path fixes required beyond the inventory fixes already on `main`. Control-plane verbs match shipped handbook claims: pause/resume catch-up Delivery, remove keeps Shared Base for remaining Pipelines, change-via-apply rebuilds Derived on semantic revision and skips rebuild for metadata-only. Relevant RQG contract twins stay green (`cli_pause_resume_pipeline`, `cli_remove_pipeline`, `cli_change_pipeline_revision`).
+
+| Scenario id | Result | Notes |
+|-------------|--------|-------|
+| `pause-resume` | PASS | Pause skips Delivery; resume catch-up from durable Base; other Pipelines unaffected (`duration_ms=3897`) |
+| `remove-pipeline` | PASS | Remove ceases Delivery; Shared Base kept; reporting Pipeline continues (`duration_ms=2067`) |
+| `change-pipeline` | PASS | Semantic ACTIVE filter rebuild + delete reconciliation; metadata-only skip (`duration_ms=2141`) |
+
 ## Matrix
 
 | Scenario id | Result | Notes |
