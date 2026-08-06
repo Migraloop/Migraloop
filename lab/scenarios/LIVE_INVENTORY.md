@@ -44,6 +44,17 @@ Re-ran the Transform Sync Lab Scenario cluster on a ready Fixture (host Instant 
 | `rt-distinct-addtoset` | PASS | |
 | `concurrent-source-workload` | PASS | Parallel sqlplus settle; `settle_ms=744` ≪ `max_settle_ms=300000` |
 
+## Correctness safety nets re-verify ([#226](https://github.com/Migraloop/Migraloop/issues/226))
+
+Re-ran the correctness safety-net Lab Scenario cluster on a fresh ready Fixture (host Instant Client + product `apply`/`sync`; no Lab-only shortcuts). All four acceptance Scenarios **PASS**; no additional product-path fixes required beyond the inventory fixes already on `main`. These checks remain edge-case remediation (Operator-visible Source Alignment Check / Drift Check / quarantine / Schema Change pause)—not a substitute for correct Incremental Capture. Relevant RQG contract twins stay green (`cli_source_alignment`, `cli_drift_check`, `cli_poison_quarantine`, `cli_schema_change_pause`).
+
+| Scenario id | Result | Notes |
+|-------------|--------|-------|
+| `source-alignment` | PASS | Detect + repair Base≠Source; resource-gated `--max-rows`; Source not written |
+| `drift-check` | PASS | Managed-field Target auto-repair; non-Managed EXTRA preserved; resource gate |
+| `poison-quarantine` | PASS | Quarantine + alert; Pipeline continues other identities; Delivery Health unhealthy |
+| `schema-change-pause` | PASS | Blocking DDL WARN + pause; distinct from poison quarantine |
+
 ## Matrix
 
 | Scenario id | Result | Notes |
