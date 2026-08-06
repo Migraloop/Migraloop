@@ -44,6 +44,12 @@ pub enum BaseRowMutation<'a> {
     },
 }
 
+/// Derived Dataset identity changes for Incremental Transform maintenance.
+///
+/// Used by [`PlatformStore::apply_derived_identity_changes`] so Affect Analysis
+/// recompute can replace only touched Output Identities (or group keys) without
+/// DELETE+reinsert of all `derived_rows` (issue #231 / ADR-0029 Transform path).
+
 /// Prior-release Platform Store schema cut for upgrade-smoke verification.
 ///
 /// Migrations `1..=4` cover bootstrap through Delivery binding — a store shape
@@ -1394,6 +1400,10 @@ impl PlatformStore {
     }
 
     /// Persist a Derived Dataset snapshot (metadata + rows) for a Transform Pipeline.
+    ///
+    /// Full-snapshot path (Initial Load / reconcile). Prefer
+    /// [`apply_derived_identity_changes`] for ordinary Incremental Affect recompute
+    /// so untouched Derived peers are not rewritten (issue #231).
     pub async fn replace_derived_dataset(
         &self,
         dataset: &DerivedDataset,
@@ -1417,52 +1427,86 @@ impl PlatformStore {
         .await
         .map_err(PlatformStoreError::Persist)?;
 
-        let output_identity_json = serde_json::to_string(&dataset.output_identity)
-            .map_err(PlatformStoreError::InvalidJson)?;
-        let columns_json =
-            serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+        upsert_derived_dataset_metadata_in_tx(&mut tx, dataset).await?;
+        insert_derived_rows_bulk_in_tx(
+            &mut tx,
+            &dataset.deployment_name,
+            &dataset.pipeline_name,
+            rows,
+            0,
+        )
+        .await?;
 
-        sqlx::query(
+        tx.commit().await.map_err(PlatformStoreError::Persist)?;
+        Ok(())
+    }
+
+    /// Apply Incremental Transform Derived identity changes without rewriting peers.
+    ///
+    /// Deletes every Derived row matching any `remove_identities` containment key,
+    /// then bulk-inserts `upsert_rows`. Metadata `row_count` is set from the durable
+    /// row count after those mutations (caller's `dataset.row_count` is overwritten).
+    /// Issue #231 / ADR-0029 Transform path.
+    pub async fn apply_derived_identity_changes(
+        &self,
+        dataset: &DerivedDataset,
+        remove_identities: &[serde_json::Map<String, serde_json::Value>],
+        upsert_rows: &[serde_json::Map<String, serde_json::Value>],
+    ) -> Result<(), PlatformStoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+
+        for identity in remove_identities {
+            delete_derived_rows_by_identity_in_tx(
+                &mut tx,
+                &dataset.deployment_name,
+                &dataset.pipeline_name,
+                identity,
+            )
+            .await?;
+        }
+
+        let next_ordinal: i32 = sqlx::query_scalar(
             r#"
-            INSERT INTO derived_datasets (
-                deployment_name, pipeline_name, status,
-                output_identity_json, columns_json, row_count, materialized_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, now())
-            ON CONFLICT (deployment_name, pipeline_name) DO UPDATE SET
-                status = EXCLUDED.status,
-                output_identity_json = EXCLUDED.output_identity_json,
-                columns_json = EXCLUDED.columns_json,
-                row_count = EXCLUDED.row_count,
-                materialized_at = now()
+            SELECT COALESCE(MAX(row_ordinal), -1) + 1
+            FROM derived_rows
+            WHERE deployment_name = $1 AND pipeline_name = $2
             "#,
         )
         .bind(&dataset.deployment_name)
         .bind(&dataset.pipeline_name)
-        .bind(&dataset.status)
-        .bind(&output_identity_json)
-        .bind(&columns_json)
-        .bind(dataset.row_count)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(PlatformStoreError::Persist)?;
 
-        for (ordinal, row) in rows.iter().enumerate() {
-            let row_json = serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?;
-            sqlx::query(
-                r#"
-                INSERT INTO derived_rows (
-                    deployment_name, pipeline_name, row_ordinal, row_json
-                ) VALUES ($1, $2, $3, $4)
-                "#,
-            )
-            .bind(&dataset.deployment_name)
-            .bind(&dataset.pipeline_name)
-            .bind(ordinal as i32)
-            .bind(&row_json)
-            .execute(&mut *tx)
-            .await
-            .map_err(PlatformStoreError::Persist)?;
-        }
+        insert_derived_rows_bulk_in_tx(
+            &mut tx,
+            &dataset.deployment_name,
+            &dataset.pipeline_name,
+            upsert_rows,
+            next_ordinal,
+        )
+        .await?;
+
+        let durable_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM derived_rows
+            WHERE deployment_name = $1 AND pipeline_name = $2
+            "#,
+        )
+        .bind(&dataset.deployment_name)
+        .bind(&dataset.pipeline_name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(PlatformStoreError::Persist)?;
+
+        let mut metadata = dataset.clone();
+        metadata.row_count = durable_count as i32;
+        upsert_derived_dataset_metadata_in_tx(&mut tx, &metadata).await?;
 
         tx.commit().await.map_err(PlatformStoreError::Persist)?;
         Ok(())
@@ -1984,6 +2028,105 @@ async fn upsert_base_dataset_metadata_in_tx(
     .bind(dataset.source_alignment_checked_rows)
     .bind(dataset.source_alignment_mismatched_rows)
     .bind(&cursor_json)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+/// Insert `derived_rows` in one statement via UNNEST (IL + Incremental identity upserts).
+async fn insert_derived_rows_bulk_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    deployment_name: &str,
+    pipeline_name: &str,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    start_ordinal: i32,
+) -> Result<(), PlatformStoreError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut ordinals = Vec::with_capacity(rows.len());
+    let mut row_jsons = Vec::with_capacity(rows.len());
+    for (offset, row) in rows.iter().enumerate() {
+        ordinals.push(start_ordinal + offset as i32);
+        row_jsons.push(serde_json::to_string(row).map_err(PlatformStoreError::InvalidJson)?);
+    }
+    let deployments = vec![deployment_name.to_string(); rows.len()];
+    let pipelines = vec![pipeline_name.to_string(); rows.len()];
+    sqlx::query(
+        r#"
+            INSERT INTO derived_rows (
+                deployment_name, pipeline_name, row_ordinal, row_json
+            )
+            SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::int4[], $4::text[]
+            )
+            "#,
+    )
+    .bind(&deployments)
+    .bind(&pipelines)
+    .bind(&ordinals)
+    .bind(&row_jsons)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+async fn upsert_derived_dataset_metadata_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    dataset: &DerivedDataset,
+) -> Result<(), PlatformStoreError> {
+    let output_identity_json = serde_json::to_string(&dataset.output_identity)
+        .map_err(PlatformStoreError::InvalidJson)?;
+    let columns_json =
+        serde_json::to_string(&dataset.columns).map_err(PlatformStoreError::InvalidJson)?;
+    sqlx::query(
+        r#"
+            INSERT INTO derived_datasets (
+                deployment_name, pipeline_name, status,
+                output_identity_json, columns_json, row_count, materialized_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, now())
+            ON CONFLICT (deployment_name, pipeline_name) DO UPDATE SET
+                status = EXCLUDED.status,
+                output_identity_json = EXCLUDED.output_identity_json,
+                columns_json = EXCLUDED.columns_json,
+                row_count = EXCLUDED.row_count,
+                materialized_at = now()
+            "#,
+    )
+    .bind(&dataset.deployment_name)
+    .bind(&dataset.pipeline_name)
+    .bind(&dataset.status)
+    .bind(&output_identity_json)
+    .bind(&columns_json)
+    .bind(dataset.row_count)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
+    Ok(())
+}
+
+async fn delete_derived_rows_by_identity_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    deployment_name: &str,
+    pipeline_name: &str,
+    identity: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), PlatformStoreError> {
+    let identity_json = identity_json_for_containment(identity)?;
+    // Delete every match (not LIMIT 1): Output Identity / group keys must cover the
+    // Derived grain, but unwind fan-out historically could share partial keys.
+    sqlx::query(
+        r#"
+            DELETE FROM derived_rows
+            WHERE deployment_name = $1
+              AND pipeline_name = $2
+              AND row_json::jsonb @> $3::jsonb
+            "#,
+    )
+    .bind(deployment_name)
+    .bind(pipeline_name)
+    .bind(&identity_json)
     .execute(&mut **tx)
     .await
     .map_err(PlatformStoreError::Persist)?;

@@ -1443,8 +1443,39 @@ pub fn evaluate_transform_for_identities_with_bases(
     let has_union = ops
         .iter()
         .any(|op| matches!(op, TransformOp::Union { .. }));
+    // equiLookup/unwind fan-out: Output Identity may live on joined/unwound fields,
+    // so primary-row prefilter by identity is unsafe — full eval then filter.
+    let has_join_fanout = ops.iter().any(|op| {
+        matches!(
+            op,
+            TransformOp::EquiLookup { .. } | TransformOp::Unwind { .. }
+        )
+    });
     let Some(group_keys) = output_grouping_keys(ops) else {
-        // Row-grain transforms: filter full evaluation to matching Output Identity.
+        // Row-grain without join fan-out (issue #231): when Affect identities still
+        // share field names with primary Base rows, evaluate only those contributors.
+        // Rename of identity keys (Derived-only names) shares no overlap — fall back
+        // to full eval then filter so we never drop the contributing primary row.
+        if !has_union && !has_join_fanout {
+            let has_primary_overlap = identities.iter().any(|id| {
+                id.keys()
+                    .any(|key| primary_rows.iter().any(|row| row.contains_key(key)))
+            });
+            if has_primary_overlap {
+                let filtered: Vec<Map<String, Value>> = primary_rows
+                    .iter()
+                    .filter(|row| {
+                        identities.iter().any(|id| primary_row_matches_identity_overlap(id, row))
+                    })
+                    .cloned()
+                    .collect();
+                let out = evaluate_transform_with_bases(ops, &filtered, secondary_bases)?;
+                return Ok(out
+                    .into_iter()
+                    .filter(|row| identities.iter().any(|id| identity_matches_row(id, row)))
+                    .collect());
+            }
+        }
         let all = evaluate_transform_with_bases(ops, primary_rows, secondary_bases)?;
         return Ok(all
             .into_iter()
@@ -3391,6 +3422,27 @@ pub fn identity_matches_row(identity: &Map<String, Value>, row: &Map<String, Val
     identity
         .iter()
         .all(|(key, expected)| row.get(key).is_some_and(|v| json_values_eq(v, expected)))
+}
+
+/// Primary-row prefilter for identity recompute: overlapping keys must match.
+///
+/// Affect identities are shaped Derived maps and may include rename/addFields keys
+/// absent from Base. Keys missing on the primary row are ignored; at least one
+/// overlapping key must match for the row to be kept.
+fn primary_row_matches_identity_overlap(
+    identity: &Map<String, Value>,
+    row: &Map<String, Value>,
+) -> bool {
+    let mut overlapped = false;
+    for (key, expected) in identity {
+        if let Some(value) = row.get(key) {
+            overlapped = true;
+            if !json_values_eq(value, expected) {
+                return false;
+            }
+        }
+    }
+    overlapped
 }
 
 #[derive(Debug, Clone)]
