@@ -50,7 +50,7 @@ pipelines:
 - Transform Pipelines 需要 `outputIdentity` 与非空的声明式 `transform`
 - `fields` 的 key 把 source/Managed 字段映射到 `{ as: string }` 或 `{ as: omit }`（ADR-0023；NUMBER classification 位于 shared `ColumnShape` 旁）
 
-Operator 形状见 [Rich Transform](rich-transform.md)（`project`、`addFields`、`rename`、`remove`、`filter`、`equiLookup`、`unwind`、`union`、`groupBy`（含 sum/count/min/max/avg）、`distinct`、`addToSet`）。
+Operator 形状见 [Rich Transform](rich-transform.md)（classic `project`／`filter`／`equiLookup`／…，以及 Aggregation／SQL-like DX 如 `$project`／`$match`／`$lookup`／`$group`）。
 
 ## Lifecycle（control plane）
 

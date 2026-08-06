@@ -62,7 +62,8 @@ pub struct PipelineSpec {
     /// Required Output Identity field names for Transform Pipelines.
     #[serde(default)]
     pub output_identity: Option<Vec<String>>,
-    /// Declarative Rich Transform steps (project/addFields/rename/remove/filter/equiLookup/unwind/groupBy/distinct/addToSet). Rejected for Direct.
+    /// Declarative Rich Transform steps: classic operators and/or Aggregation/SQL-like
+    /// expand DX (`$project`, `$match`, `$group`, …). Rejected for Direct.
     #[serde(default)]
     pub transform: Option<Vec<serde_json::Value>>,
 }

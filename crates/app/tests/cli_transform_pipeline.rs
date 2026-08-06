@@ -1,7 +1,9 @@
-//! Operator-visible seam: Transform Pipeline MVP (issue #16 / PRD).
+//! Operator-visible seam: Transform Pipeline MVP (issue #16 / PRD) plus
+//! Aggregation/SQL-like Rich Transform DX expand (issue #232).
 //!
 //! Agreed seam: CLI config/status + Derived Dataset + Target documents.
-//! Declarative project/filter only; Output Identity required; scripts rejected.
+//! Classic declarative steps and Aggregation-like stages both accepted;
+//! Output Identity required; free-form scripts rejected.
 
 mod common;
 
@@ -482,5 +484,86 @@ async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_
     assert!(
         !target_out.contains("alice@example.com"),
         "EMAIL must not be Delivered after project, got:\n{target_out}"
+    );
+}
+
+#[tokio::test]
+async fn transform_pipeline_aggregation_dx_project_match_matches_classic_outcomes() {
+    // Issue #232: Aggregation-like `$project` / `$match` beside classic form.
+    let url = ephemeral_database_url().await;
+    let mongo_database = unique_mongo_database();
+    let dir = TempDir::new().expect("tempdir");
+    let doubles = common::NamedScenarioDoubles::install(dir.path());
+    let pipeline = r#"
+    - name: active-customers-agg
+      mode: transform
+      source:
+        table: CUSTOMERS
+      target:
+        collection: active_customers_agg
+      outputIdentity: [ID]
+      transform:
+        - $project:
+            ID: 1
+            NAME: 1
+            ACTIVE: 1
+        - $match:
+            ACTIVE: 1
+"#;
+    let config = write_config(
+        &dir,
+        "deployment.yaml",
+        &deployment_shell(&mongo_database, pipeline),
+    );
+
+    migrate_and_apply(&url, &config, &doubles);
+
+    let derived = Command::new(bin())
+        .args([
+            "derived",
+            "--platform-store-url",
+            &url,
+            "--pipeline",
+            "active-customers-agg",
+        ])
+        .output()
+        .expect("run derived");
+    assert!(
+        derived.status.success(),
+        "derived inspect failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&derived.stdout),
+        String::from_utf8_lossy(&derived.stderr)
+    );
+    let derived_out = String::from_utf8_lossy(&derived.stdout);
+    assert!(
+        derived_out.contains("Alice") && derived_out.contains("Carol"),
+        "Aggregation DX Derived must include ACTIVE=1 Alice/Carol, got:\n{derived_out}"
+    );
+    assert!(
+        !derived_out.contains("Bob"),
+        "Aggregation DX Derived must filter out Bob, got:\n{derived_out}"
+    );
+
+    let target = Command::new(bin())
+        .env("MONGO_PASSWORD", "mongo-secret-value")
+        .args([
+            "target",
+            "--platform-store-url",
+            &url,
+            "--collection",
+            "active_customers_agg",
+        ])
+        .output()
+        .expect("run target");
+    assert!(
+        target.status.success(),
+        "target inspect failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&target.stdout),
+        String::from_utf8_lossy(&target.stderr)
+    );
+    let target_out = String::from_utf8_lossy(&target.stdout);
+    assert!(
+        target_out.contains("Alice") && target_out.contains("Carol") && !target_out.contains("Bob"),
+        "Aggregation DX Delivery must match classic project/filter outcomes, got:\n{target_out}"
     );
 }

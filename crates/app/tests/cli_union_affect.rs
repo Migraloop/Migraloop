@@ -2,7 +2,7 @@
 //!
 //! Agreed seams: CLI config apply → Initial Load of primary + union.from Bases;
 //! Derived concatenation + Mongo Delivery by Output Identity; Affect Analysis on
-//! both contributing Bases; `$unionWith` / free-form scripts fail apply clearly.
+//! both contributing Bases; free-form `$unionWith` extensions and scripts fail apply.
 
 mod common;
 
@@ -565,12 +565,13 @@ async fn union_affect_analysis_updates_on_either_base_side() {
 }
 
 #[tokio::test]
-async fn union_rejects_dollar_union_with_and_scripts_on_apply() {
+async fn union_rejects_pipeline_union_with_and_scripts_on_apply() {
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
     let doubles = UnionDoubles::install(dir.path());
 
+    // Issue #232: constrained Aggregation `$unionWith` is accepted; nested `pipeline` is not.
     let union_with_pipeline = r#"
     - name: bad-union-with
       mode: transform
@@ -582,6 +583,7 @@ async fn union_rejects_dollar_union_with_and_scripts_on_apply() {
       transform:
         - $unionWith:
             coll: WEST_CUSTOMERS
+            pipeline: []
 "#;
     let union_with_config = write_config(
         &dir,
@@ -591,8 +593,8 @@ async fn union_rejects_dollar_union_with_and_scripts_on_apply() {
     let err = apply_expect_failure(&url, &union_with_config, &doubles);
     let lower = err.to_ascii_lowercase();
     assert!(
-        lower.contains("$unionwith") && lower.contains("union"),
-        "expected clear $unionWith → union guidance, got:\n{err}"
+        lower.contains("pipeline"),
+        "expected clear rejection of $unionWith pipeline extension, got:\n{err}"
     );
 
     let url2 = ephemeral_database_url().await;

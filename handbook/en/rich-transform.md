@@ -11,9 +11,55 @@ Transform Pipelines must declare:
 - `outputIdentity` — stable key fields for Delivery insert/update/delete
 - `transform` — ordered list of declarative operator steps
 
+## Authoring forms (expand)
+
+Operators may author the same analyzable surface in either form—both normalize to one IR for **Affect Analysis**:
+
+1. **Classic steps** — `project`, `filter`, `equiLookup`, `groupBy`, … (examples below; still fully supported).
+2. **Aggregation / SQL-like DX** — MongoDB Aggregation–shaped stages (`$project`, `$match`, `$lookup`, `$group`, …) plus thin SQL-ish aliases (`select`, `where`, `join`).
+
+Example (same Pipeline as classic `project` + `filter`):
+
+```yaml
+transform:
+  - $project:
+      ID: 1
+      NAME: 1
+      ACTIVE: 1
+  - $match:
+      ACTIVE: 1
+```
+
+Equivalent SQL-ish aliases:
+
+```yaml
+transform:
+  - select:
+      fields: [ID, NAME, ACTIVE]
+  - where:
+      field: ACTIVE
+      eq: 1
+```
+
+Constrained Aggregation stages map as follows (unanalyzable extensions stay rejected):
+
+| Aggregation / SQL-like | Classic equivalent | Notes |
+| --- | --- | --- |
+| `$project` / `select` | `project` | Inclusion map (`FIELD: 1`) or `{ fields: [...] }` |
+| `$match` / `where` | `filter` | Single-field equality only |
+| `$addFields` / `$set` | `addFields` | `"$field"` copy or `{ $literal: ... }` / JSON literal |
+| `$unset` | `remove` | Field name or array of names |
+| `$rename` | `rename` | `{ FROM: TO }` map |
+| `$lookup` / `join` | `equiLookup` | Equijoin only — no `pipeline` / `let` |
+| `$unwind` | `unwind` | Path string or `{ path }` — no `preserveNullAndEmptyArrays` |
+| `$unionWith` | `union` | `coll` / `from` / string — no nested `pipeline` |
+| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`; accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet` |
+
+Existing Deployments that use classic steps keep working (Upgrade Compatibility). Prefer one form per Pipeline for readability; mixing classic and Aggregation steps in one list is allowed when each step is valid.
+
 ## v1 operator surface (implemented)
 
-The shipped parser currently accepts these analyzable operators (Oracle → MongoDB slice):
+The shipped parser currently accepts these analyzable operators (Oracle → MongoDB slice)—shown in classic form; see **Authoring forms** for Aggregation equivalents:
 
 ### `project`
 
@@ -145,8 +191,9 @@ Pipeline source schema).
     as: orders
 ```
 
-Free-form Mongo `$lookup` (including `pipeline` / `let` extensions) is rejected—use this
-declarative form so **Affect Analysis** stays correct. A change on either Base side
+Use classic `equiLookup` or constrained Aggregation `$lookup` / `join` with the same
+equijoin fields. Free-form Mongo `$lookup` extensions (`pipeline` / `let`) are
+rejected so **Affect Analysis** stays correct. A change on either Base side
 updates only the affected primary Output Identities; unused primary fields (for example
 EMAIL after `project`) still skip recompute. Embedded foreign rows include full Base
 fields, so foreign-side field changes recompute matching identities.
@@ -164,8 +211,9 @@ is `equiLookup` then `unwind` so Delivery can key documents by unwound Output Id
 
 When an array element is an object, its fields are **merged into the parent row** and the
 array path is removed (Delivery-friendly flatten). Scalar elements replace the path value
-(Mongo-style). Missing, null, or empty arrays emit no rows. Free-form `$unwind` and
-options such as `preserveNullAndEmptyArrays` / `includeArrayIndex` are rejected so
+(Mongo-style). Missing, null, or empty arrays emit no rows. Use classic `unwind` or
+Aggregation `$unwind` (`"$path"` or `{ path }`). Options such as
+`preserveNullAndEmptyArrays` / `includeArrayIndex` are rejected so
 **Affect Analysis** can expand only the affected Output Identities—including deletes when
 array members disappear.
 
@@ -185,13 +233,13 @@ schema (defaults to the Pipeline source schema).
     fields: [ID, NAME]
 ```
 
-Free-form Mongo `$unionWith` (including `pipeline` / `coll` extensions) is rejected—use
-this declarative form so **Affect Analysis** stays correct. A change on either contributing
-Base updates only the affected Output Identities; unused fields after a following `project`
-(for example EMAIL) still skip recompute. v1 does not combine `union` with `distinct` /
-`addToSet`. Choose **Output Identity** values that stay unique across contributing Bases—
-Delivery upserts one Target document per identity (SQL `UNION ALL` row multiplicity does not
-create multiple Mongo documents for the same key).
+Use classic `union` or constrained Aggregation `$unionWith` (`coll` / `from` / string name).
+Nested `$unionWith` `pipeline` extensions are rejected so **Affect Analysis** stays correct.
+A change on either contributing Base updates only the affected Output Identities; unused
+fields after a following `project` (for example EMAIL) still skip recompute. v1 does not
+combine `union` with `distinct` / `addToSet`. Choose **Output Identity** values that stay
+unique across contributing Bases—Delivery upserts one Target document per identity (SQL
+`UNION ALL` row multiplicity does not create multiple Mongo documents for the same key).
 
 ## Output Identity
 

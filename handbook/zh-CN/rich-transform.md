@@ -11,9 +11,55 @@ Transform Pipelines 必须声明：
 - `outputIdentity` — Delivery insert/update/delete 用的稳定 key 字段
 - `transform` — 声明式 operator 步骤的有序列表
 
+## Authoring forms（expand）
+
+Operator 可用下列任一形式编写同一组可分析 surface—两者都规范化成同一 IR，供 **Affect Analysis** 使用：
+
+1. **Classic steps** — `project`、`filter`、`equiLookup`、`groupBy`…（下方示例；仍完全支持）。
+2. **Aggregation / SQL-like DX** — 接近 MongoDB Aggregation 的 stages（`$project`、`$match`、`$lookup`、`$group`…），以及精简 SQL 别名（`select`、`where`、`join`）。
+
+示例（等同 classic `project` + `filter`）：
+
+```yaml
+transform:
+  - $project:
+      ID: 1
+      NAME: 1
+      ACTIVE: 1
+  - $match:
+      ACTIVE: 1
+```
+
+等效 SQL 别名：
+
+```yaml
+transform:
+  - select:
+      fields: [ID, NAME, ACTIVE]
+  - where:
+      field: ACTIVE
+      eq: 1
+```
+
+受限 Aggregation stages 对应如下（无法分析的扩展仍会被拒绝）：
+
+| Aggregation / SQL-like | Classic 等效 | 说明 |
+| --- | --- | --- |
+| `$project` / `select` | `project` | inclusion map（`FIELD: 1`）或 `{ fields: [...] }` |
+| `$match` / `where` | `filter` | 仅单字段 equality |
+| `$addFields` / `$set` | `addFields` | `"$field"` 复制或 `{ $literal: ... }`／JSON literal |
+| `$unset` | `remove` | 字段名或名称数组 |
+| `$rename` | `rename` | `{ FROM: TO }` map |
+| `$lookup` / `join` | `equiLookup` | 仅 equijoin—不可用 `pipeline` / `let` |
+| `$unwind` | `unwind` | path 字符串或 `{ path }`—不可用 `preserveNullAndEmptyArrays` |
+| `$unionWith` | `union` | `coll` / `from` / 字符串—不可用 nested `pipeline` |
+| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`；accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet` |
+
+使用 classic steps 的既有 Deployments 可持续运行（Upgrade Compatibility）。为可读性，每个 Pipeline 建议只用一种形式；同一列表混用 classic 与 Aggregation 步骤在各自合法时也被允许。
+
 ## v1 operator surface（已实现）
 
-当前出货的 parser 接受这些可分析 operators（Oracle → MongoDB 切片）：
+当前出货的 parser 接受这些可分析 operators（Oracle → MongoDB 切片）—以下以 classic 形式说明；Aggregation 等效见 **Authoring forms**：
 
 ### `project`
 
@@ -143,10 +189,11 @@ Base；`from` 命名 secondary Base（Initial Load 与 Incremental Capture 都�
     as: orders
 ```
 
-自由形式的 Mongo `$lookup`（含 `pipeline` / `let` 扩展）会被拒绝—请用此声明式
-形式，以便 **Affect Analysis** 保持正确。任一侧 Base 变更只更新受影响的 primary
-Output Identities；未使用的 primary 字段（例如 `project` 之后的 EMAIL）仍会跳过重算。
-嵌入的 foreign rows 包含完整 Base 字段，因此 foreign 侧字段变更会重算匹配的 identities。
+请用 classic `equiLookup`，或带相同 equijoin 字段的受限 Aggregation `$lookup` / `join`。
+自由形式的 Mongo `$lookup` 扩展（`pipeline` / `let`）会被拒绝，以便 **Affect Analysis**
+保持正确。任一侧 Base 变更只更新受影响的 primary Output Identities；未使用的 primary
+字段（例如 `project` 之后的 EMAIL）仍会跳过重算。嵌入的 foreign rows 包含完整 Base
+字段，因此 foreign 侧字段变更会重算匹配的 identities。
 
 ### `unwind`
 
@@ -159,9 +206,10 @@ Output Identities；未使用的 primary 字段（例如 `project` 之后的 EMA
 ```
 
 当数组元素是对象时，其字段会**合并进 parent 行**，并移除数组 path（利于 Delivery 的 flatten）。
-标量元素则替换该 path 的值（Mongo 风格）。缺失、null 或空数组不产生行。自由形式的
-`$unwind` 以及 `preserveNullAndEmptyArrays` / `includeArrayIndex` 等选项会被拒绝，以便
-**Affect Analysis** 只展开受影响的 Output Identities—包括数组成员消失时的 deletes。
+标量元素则替换该 path 的值（Mongo 风格）。缺失、null 或空数组不产生行。请用 classic
+`unwind` 或 Aggregation `$unwind`（`"$path"` 或 `{ path }`）。`preserveNullAndEmptyArrays` /
+`includeArrayIndex` 等选项会被拒绝，以便 **Affect Analysis** 只展开受影响的 Output
+Identities—包括数组成员消失时的 deletes。
 
 ### `union`
 
@@ -178,12 +226,12 @@ secondary schema（默认为 Pipeline source schema）。
     fields: [ID, NAME]
 ```
 
-自由形式的 Mongo `$unionWith`（含 `pipeline` / `coll` 扩展）会被拒绝—请用此声明式形状，
-以便 **Affect Analysis** 保持正确。任一贡献 Base 的变更只更新受影响的 Output Identities；
-后续 `project` 未使用的字段（例如 EMAIL）仍会 skip 重算。v1 不允许 `union` 与
-`distinct` / `addToSet` 并用。请选择跨贡献 Bases 仍唯一的 **Output Identity**—Delivery
-对每个 identity upsert 一份 Target 文档（SQL `UNION ALL` 的行多重性不会为同一 key 建立多份
-Mongo 文档）。
+请用 classic `union`，或受限 Aggregation `$unionWith`（`coll` / `from` / 字符串名称）。
+嵌套 `$unionWith` `pipeline` 扩展会被拒绝，以便 **Affect Analysis** 保持正确。任一贡献
+Base 的变更只更新受影响的 Output Identities；后续 `project` 未使用的字段（例如 EMAIL）仍会
+skip 重算。v1 不允许 `union` 与 `distinct` / `addToSet` 并用。请选择跨贡献 Bases 仍唯一的
+**Output Identity**—Delivery 对每个 identity upsert 一份 Target 文档（SQL `UNION ALL` 的行
+多重性不会为同一 key 建立多份 Mongo 文档）。
 
 ## Output Identity
 
