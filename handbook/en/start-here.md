@@ -66,9 +66,10 @@ migraloop sync
 migraloop status
 ```
 
-Read Platform Store health, Deployments, Pipelines, Base Dataset cutover/lag, **Sync Health**, and **Delivery Health**. For deeper inspection:
+Read Platform Store health, Deployments, Pipelines, Base Dataset cutover/lag, **Sync Health**, **Delivery Health**, and **component pressure** (`app` / `source` / `platform_store` / `target`). For deeper inspection:
 
 ```bash
+migraloop capacity-estimate   # limiting component + coarse max e2e QPS (read-only)
 migraloop base --table ORDERS
 migraloop target --collection orders
 migraloop derived --pipeline orders_by_customer   # Transform Pipelines

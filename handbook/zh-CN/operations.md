@@ -75,12 +75,13 @@ Operator 依可见 lag 行动（扩容 Target、降低负载、检查 Delivery �
 
 | 设置 | Compose 默认 | 产品下限（floor） |
 | --- | --- | --- |
-| `shared_buffers` | `128MB` | ≥ `64MB` |
-| `work_mem` | `8MB` | ≥ `4MB` |
-| `maintenance_work_mem` | `128MB` | ≥ `64MB` |
-| `max_connections` | `100` | ≥ `20` |
+| `shared_buffers` | `512MB` | ≥ `64MB` |
+| `work_mem` | `32MB` | ≥ `4MB` |
+| `maintenance_work_mem` | `256MB` | ≥ `64MB` |
+| `max_connections` | `200` | ≥ `20` |
+| `effective_cache_size` | `2GB` | _（无产品下限）_ |
 
-根目录 `compose.yaml` 与 `lab/compose.yaml` 会在 `platform-store` service 带上这些默认。
+根目录 `compose.yaml` 与 `lab/compose.yaml` 会在 `platform-store` service 带上这些面向吞吐的默认（ADR-0031；仍高于 Guardrails 下限）。
 
 **可用磁盘警告（warn-only）：** 当 Platform Store data volume 可用空间低于 **1 GiB** 时，产品会在 `migraloop status`（以及 sync / apply / run 路径）打印 `WARN: …`、发出 structured event `platform_store_disk_warn`，并暴露 Prometheus gauges `migraloop_platform_store_disk_free_bytes` 与 `migraloop_platform_store_disk_warn`。跨越门槛 **不会** 自动 pause Pipelines—除非另有问题，Platform Store 仍保持 healthy；如何响应警告是 Operator 的责任。
 

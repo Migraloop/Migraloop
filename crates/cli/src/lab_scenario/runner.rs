@@ -10,6 +10,7 @@
 //! thresholds as equal-weight fail axes and builds the report.
 
 use crate::CliError;
+use migraloop_runtime::ComponentPressure;
 
 use super::recipe::{ProductPathStepKind, ScenarioRecipe, ScenarioRecipeThresholds};
 
@@ -58,6 +59,10 @@ pub(crate) struct ScenarioReport {
     pub measured_duration_ms: Option<u128>,
     /// Operational threshold outcome; `true` when the Scenario defines none.
     pub thresholds_ok: bool,
+    /// Per-component pressure summaries (same stable names as Observability / Capacity Estimate).
+    pub component_pressure: Vec<ComponentPressure>,
+    /// True when Source / Platform Store / Target is saturated (infra — resize, not product fail).
+    pub infra_saturated: bool,
 }
 
 /// Summarize recipe workload / checks / threshold axes for the runner interface.
@@ -177,6 +182,8 @@ pub(crate) fn report_from_adapter_outcome(
         measured_rows_per_s: outcome.metrics.rows_per_s,
         measured_duration_ms: outcome.metrics.duration_ms,
         thresholds_ok,
+        component_pressure: Vec::new(),
+        infra_saturated: false,
     }
 }
 

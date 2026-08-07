@@ -9,19 +9,21 @@ services:
       POSTGRES_USER: migraloop
       POSTGRES_PASSWORD: migraloop
       POSTGRES_DB: migraloop
-    # Product-enforced safe defaults — operators may raise these, but the app
-    # rejects absurdly low overrides (shared_buffers≥64MB, work_mem≥4MB,
-    # maintenance_work_mem≥64MB, max_connections≥20).
+    # Product-owned Platform Store defaults sized for throughput (ADR-0031 / #249).
+    # Operators may raise further; the app rejects absurdly low overrides
+    # (shared_buffers≥64MB, work_mem≥4MB, maintenance_work_mem≥64MB, max_connections≥20).
     command:
       - postgres
       - -c
-      - shared_buffers=128MB
+      - shared_buffers=512MB
       - -c
-      - work_mem=8MB
+      - work_mem=32MB
       - -c
-      - maintenance_work_mem=128MB
+      - maintenance_work_mem=256MB
       - -c
-      - max_connections=100
+      - max_connections=200
+      - -c
+      - effective_cache_size=2GB
     volumes:
       - platform_store_data:/var/lib/postgresql/data
     ports:

@@ -18,17 +18,20 @@ services:
       POSTGRES_USER: migraloop
       POSTGRES_PASSWORD: migraloop
       POSTGRES_DB: migraloop
-    # Same Platform Store Guardrails defaults as root compose.yaml (ADR-0010).
+    # Raised Platform Store defaults for throughput evidence (ADR-0031 / #249).
+    # Same product-owned knobs as root compose.yaml (still above ADR-0010 floors).
     command:
       - postgres
       - -c
-      - shared_buffers=128MB
+      - shared_buffers=512MB
       - -c
-      - work_mem=8MB
+      - work_mem=32MB
       - -c
-      - maintenance_work_mem=128MB
+      - maintenance_work_mem=256MB
       - -c
-      - max_connections=100
+      - max_connections=200
+      - -c
+      - effective_cache_size=2GB
     volumes:
       - lab_platform_store_data:/var/lib/postgresql/data
     healthcheck:
@@ -40,6 +43,8 @@ services:
   oracle:
     image: gvenzl/oracle-free:23-slim
     network_mode: host
+    # Extra /dev/shm so Lab Oracle SGA is not starved during headline evidence runs.
+    shm_size: 1gb
     environment:
       ORACLE_PASSWORD: lab_oracle_sys
       APP_USER: SYNC_USER
@@ -61,6 +66,8 @@ services:
       MONGO_INITDB_ROOT_USERNAME: migraloop
       MONGO_INITDB_ROOT_PASSWORD: lab_mongo
       MONGO_INITDB_DATABASE: lab
+    # WiredTiger cache sized for Lab throughput evidence (ADR-0031 / #249).
+    command: ["mongod", "--wiredTigerCacheSizeGB", "1"]
     volumes:
       - lab_mongo_data:/data/db
     healthcheck:

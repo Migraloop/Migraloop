@@ -895,6 +895,50 @@ async fn lab_scenario_bulk_load_threshold_fail_via_cli_probe() {
     );
 }
 
+/// CLI-seam infra-saturated: labeled resize guidance, not product FAIL (ADR-0031 / #249).
+#[tokio::test]
+async fn lab_scenario_bulk_load_infra_saturated_via_cli_probe() {
+    let (_tmp, lab) = temp_lab_dir_with_recipes(&["bulk-load"]);
+    let run = Command::new(bin())
+        .env("MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE", "infra-saturated")
+        .args(["lab", "scenario", "run", "bulk-load", "--lab-dir", &lab])
+        .output()
+        .expect("run bulk-load infra-saturated probe");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        run.status.success(),
+        "infra-saturated must not count as product failure, got:\n{out}"
+    );
+    assert!(
+        out.contains("Lab Scenario: INFRA-SATURATED"),
+        "expected INFRA-SATURATED report, got:\n{out}"
+    );
+    assert!(
+        out.contains("infra_saturated=yes"),
+        "expected infra_saturated=yes, got:\n{out}"
+    );
+    assert!(
+        out.contains("component_pressure:")
+            && out.contains("app:")
+            && out.contains("source:")
+            && out.contains("platform_store:")
+            && out.contains("target:"),
+        "report must expose stable component pressure names, got:\n{out}"
+    );
+    assert!(
+        out.contains("resize") && out.contains("not a product failure"),
+        "expected resize guidance, got:\n{out}"
+    );
+    assert!(
+        !out.contains("Lab Scenario: FAIL"),
+        "infra-saturated must not be labeled FAIL, got:\n{out}"
+    );
+}
+
 /// CLI-seam correctness-fail: row-level miss fails even when metrics would pass.
 #[tokio::test]
 async fn lab_scenario_bulk_load_correctness_fail_via_cli_probe() {

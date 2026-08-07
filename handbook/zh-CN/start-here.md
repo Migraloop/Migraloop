@@ -66,9 +66,10 @@ migraloop sync
 migraloop status
 ```
 
-查看 Platform Store 健康、Deployments、Pipelines、Base Dataset cutover/lag、**Sync Health** 与 **Delivery Health**。更细的检查：
+查看 Platform Store 健康、Deployments、Pipelines、Base Dataset cutover/lag、**Sync Health**、**Delivery Health**，以及 **component pressure**（`app` / `source` / `platform_store` / `target`）。更细的检查：
 
 ```bash
+migraloop capacity-estimate   # limiting component + 粗粒度 max e2e QPS（只读）
 migraloop base --table ORDERS
 migraloop target --collection orders
 migraloop derived --pipeline orders_by_customer   # Transform Pipelines

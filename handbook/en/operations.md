@@ -74,12 +74,13 @@ The bundled PostgreSQL Platform Store ships with safe defaults and product-enfor
 
 | Setting | Compose default | Product minimum (floor) |
 | --- | --- | --- |
-| `shared_buffers` | `128MB` | ≥ `64MB` |
-| `work_mem` | `8MB` | ≥ `4MB` |
-| `maintenance_work_mem` | `128MB` | ≥ `64MB` |
-| `max_connections` | `100` | ≥ `20` |
+| `shared_buffers` | `512MB` | ≥ `64MB` |
+| `work_mem` | `32MB` | ≥ `4MB` |
+| `maintenance_work_mem` | `256MB` | ≥ `64MB` |
+| `max_connections` | `200` | ≥ `20` |
+| `effective_cache_size` | `2GB` | _(no product floor)_ |
 
-Root `compose.yaml` and `lab/compose.yaml` ship those defaults on the `platform-store` service.
+Root `compose.yaml` and `lab/compose.yaml` ship those throughput-oriented defaults on the `platform-store` service (ADR-0031; still above Guardrails floors).
 
 **Free-disk warn (warn-only):** when free space on the Platform Store data volume drops below **1 GiB**, the product prints `WARN: …` on `migraloop status` (and on sync / apply / run paths), emits structured event `platform_store_disk_warn`, and exposes Prometheus gauges `migraloop_platform_store_disk_free_bytes` and `migraloop_platform_store_disk_warn`. Crossing the threshold does **not** auto-pause Pipelines—Platform Store stays healthy unless something else is wrong; acting on the warning is an Operator responsibility.
 
