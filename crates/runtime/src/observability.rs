@@ -195,17 +195,6 @@ pub fn assemble_observability_surface(inventory: &StatusInventory) -> Observabil
     surface
 }
 
-/// Re-assemble component pressure on an existing surface with optional overrides
-/// (Capacity Estimate inject / Lab).
-pub fn with_component_pressure_overrides(
-    surface: &ObservabilitySurface,
-    overrides: &ComponentPressureOverrides,
-) -> ObservabilitySurface {
-    let mut out = surface.clone();
-    out.component_pressure = assemble_component_pressure_from_surface(surface, overrides);
-    out
-}
-
 /// Derive Sync Health from lag / progress / durable failure — beyond `unknown`/`ok`.
 pub(crate) fn derive_sync_health(base: &BaseDataset) -> SyncHealth {
     let stored = base.sync_health.as_str();

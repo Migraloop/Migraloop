@@ -71,9 +71,8 @@ pub use capacity::{
     COMPONENT_SOURCE, COMPONENT_TARGET,
 };
 pub use observability::{
-    assemble_observability_surface, emit_event, render_prometheus_metrics,
-    with_component_pressure_overrides, BaseSyncObservation, DeliveryHealth, EventValue,
-    ObservabilitySurface, PipelineDeliveryObservation, SyncHealth,
+    assemble_observability_surface, emit_event, render_prometheus_metrics, BaseSyncObservation,
+    DeliveryHealth, EventValue, ObservabilitySurface, PipelineDeliveryObservation, SyncHealth,
 };
 pub(crate) use observability::sync_health_label_for_progress;
 

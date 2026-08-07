@@ -951,6 +951,16 @@ fn format_scenario_report(
     }
     if report.infra_saturated {
         out.push_str("  infra_saturated=yes\n");
+        if let Some(limiting) = report
+            .component_pressure
+            .iter()
+            .max_by_key(|c| c.pressure)
+        {
+            out.push_str(&format!(
+                "  limiting_component={}\n",
+                limiting.component
+            ));
+        }
         out.push_str(
             "  guidance: resize Lab Fixture Source / Platform Store / Target and re-run — \
              infra-saturated is not a product failure (ADR-0031)\n",

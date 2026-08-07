@@ -27,9 +27,6 @@ pub const COMPONENT_PRESSURE_NAMES: [&str; 4] = [
 /// Coarse reference QPS used when no component is saturated (ADR-0031 Direct floor scale).
 pub const CAPACITY_REFERENCE_E2E_QPS: f64 = 100_000.0;
 
-/// Lag at/above this maps Source/Target to saturated (infra — resize Lab / advise Operator).
-const LAG_SATURATION_THRESHOLD: i32 = 10_000;
-
 /// Per-component pressure summary with stable name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentPressure {
@@ -189,23 +186,27 @@ fn derive_platform_store_pressure(surface: &ObservabilitySurface) -> ComponentPr
     }
 }
 
-fn lag_to_pressure(lag: i32) -> (u8, bool) {
-    if lag >= LAG_SATURATION_THRESHOLD {
-        (95, true)
+/// Map Sync/Delivery lag to coarse pressure. Lag alone is a product-path backlog
+/// signal — it does **not** mark Source/Target infra-saturated (that would hide
+/// product FAIL under INFRA-SATURATED). Saturation for Source/Target comes from
+/// explicit overrides / Lab inject; Platform Store saturation uses disk-warn.
+fn lag_to_pressure(lag: i32) -> u8 {
+    if lag >= 10_000 {
+        90
     } else if lag >= 1_000 {
-        (85, false)
+        85
     } else if lag >= 100 {
-        (60, false)
+        60
     } else if lag >= 1 {
-        (30, false)
+        30
     } else {
-        (5, false)
+        5
     }
 }
 
 fn derive_source_pressure(surface: &ObservabilitySurface) -> ComponentPressure {
     let max_lag = surface.sync.iter().map(|s| s.lag).max().unwrap_or(0);
-    let (mut pressure, saturated) = lag_to_pressure(max_lag);
+    let mut pressure = lag_to_pressure(max_lag);
     if surface
         .sync
         .iter()
@@ -213,19 +214,16 @@ fn derive_source_pressure(surface: &ObservabilitySurface) -> ComponentPressure {
     {
         pressure = pressure.max(80);
     }
-    if saturated {
-        pressure = pressure.max(95);
-    }
     ComponentPressure {
         component: COMPONENT_SOURCE.to_string(),
         pressure,
-        saturated,
+        saturated: false,
     }
 }
 
 fn derive_target_pressure(surface: &ObservabilitySurface) -> ComponentPressure {
     let max_lag = surface.delivery.iter().map(|d| d.lag).max().unwrap_or(0);
-    let (mut pressure, saturated) = lag_to_pressure(max_lag);
+    let mut pressure = lag_to_pressure(max_lag);
     if surface
         .delivery
         .iter()
@@ -233,13 +231,10 @@ fn derive_target_pressure(surface: &ObservabilitySurface) -> ComponentPressure {
     {
         pressure = pressure.max(70);
     }
-    if saturated {
-        pressure = pressure.max(95);
-    }
     ComponentPressure {
         component: COMPONENT_TARGET.to_string(),
         pressure,
-        saturated,
+        saturated: false,
     }
 }
 
@@ -446,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn high_source_lag_raises_source_pressure() {
+    fn high_source_lag_raises_source_pressure_without_infra_saturated() {
         let inventory = empty_inventory(false, 12_000, 0);
         let components =
             assemble_component_pressure(&inventory, &ComponentPressureOverrides::default());
@@ -454,8 +449,12 @@ mod tests {
             .iter()
             .find(|c| c.component == COMPONENT_SOURCE)
             .unwrap();
-        assert!(source.saturated);
-        assert!(infra_saturated(&components));
+        assert!(source.pressure >= 90);
+        assert!(
+            !source.saturated,
+            "lag backlog must not hide product FAIL as infra-saturated"
+        );
+        assert!(!infra_saturated(&components));
     }
 
     #[test]
