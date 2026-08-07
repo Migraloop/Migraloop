@@ -59,8 +59,9 @@ use self::correctness::{
 use self::mega_mix::{
     covers_required_path_families, e2e_qps, evaluate_mega_mix_gates,
     format_mega_mix_report_section, incremental_batch_sql, mega_mix_pipelines,
-    store_pending_evidence, take_pending_evidence, PipelineQpsSample, INCREMENTAL_BATCH_ROWS,
-    MEGA_MIX_DEPLOYMENT, MEGA_MIX_ID, MIX_ID_BASE, SOLO_ID_BASE,
+    store_pending_evidence, take_pending_evidence, PipelineQpsSample,
+    batch_rows_for_path, INCREMENTAL_BATCH_ROWS, MEGA_MIX_SYNC_QUEUE_CAPACITY,
+    ID_STRIDE, MEGA_MIX_DEPLOYMENT, MEGA_MIX_ID, MIX_ID_BASE, SOLO_ID_BASE,
 };
 use self::namespace::{mutate_namespace_from_recipe, prepare_namespace, wipe_namespace};
 use self::recipe::{
@@ -150,7 +151,8 @@ const BULK_LOAD_DEPLOYMENT: &str = "lab-bulk-load";
 /// Poll while waiting for mega-mix Incremental Delivery settle (#251).
 const MEGA_MIX_SETTLE_POLL: Duration = Duration::from_secs(2);
 /// Max wall time for one solo/mix Incremental window before correctness/QPS give up.
-const MEGA_MIX_WINDOW_MAX: Duration = Duration::from_secs(300);
+/// Settle budget for large Direct evidence batches (#252) plus Transform siblings.
+const MEGA_MIX_WINDOW_MAX: Duration = Duration::from_secs(1200);
 
 const RT_PROJECT_ID: &str = "rt-project";
 const RT_PROJECT_COLLECTION: &str = "lab_rp_customers";
@@ -3986,11 +3988,11 @@ async fn run_mega_mix_protocol(
     let mut solo_qps: Vec<f64> = Vec::with_capacity(pipelines.len());
     for (idx, pipe) in pipelines.iter().enumerate() {
         mega_mix_pause_all_except(lab_dir, pipe.name).await?;
-        let started = Instant::now();
+        let batch_rows = batch_rows_for_path(pipe.path);
         let mut source_rows = 0u64;
         for table in pipe.workload_tables {
-            let id_base = SOLO_ID_BASE + (idx as i64) * 1_000;
-            let (sql, rows) = incremental_batch_sql(table, id_base, INCREMENTAL_BATCH_ROWS);
+            let id_base = SOLO_ID_BASE + (idx as i64) * ID_STRIDE;
+            let (sql, rows) = incremental_batch_sql(table, id_base, batch_rows);
             if rows == 0 {
                 return Err(CliError::Failed(format!(
                     "mega-mix solo: unsupported workload table {table}"
@@ -3999,6 +4001,9 @@ async fn run_mega_mix_protocol(
             source_rows += rows;
             run_oracle_sql_body(lab_dir, &sql).await?;
         }
+        // e2e Managed Delivery rate: Source changes already durable → lag zero.
+        // Do not include SQL*Plus inject time in QPS (ADR-0031 / #252).
+        let started = Instant::now();
         mega_mix_sync_until_pipeline_lag_zero(lab_dir, pipe.name, pipe.workload_tables).await?;
         let qps = e2e_qps(source_rows, started.elapsed().as_secs_f64());
         println!(
@@ -4019,23 +4024,24 @@ async fn run_mega_mix_protocol(
     let mut mix_source_rows: Vec<u64> = Vec::with_capacity(pipelines.len());
     let mut driven: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for (idx, pipe) in pipelines.iter().enumerate() {
+        let batch_rows = batch_rows_for_path(pipe.path);
         let mut rows_for_pipe = 0u64;
         for table in pipe.workload_tables {
             if !driven.insert(*table) {
                 // Shared Source table already in this burst; both Pipelines still
                 // Deliver the same Incremental changes under mix contention.
-                rows_for_pipe += INCREMENTAL_BATCH_ROWS;
+                rows_for_pipe += batch_rows;
                 continue;
             }
-            let id_base = MIX_ID_BASE + (idx as i64) * 1_000;
-            let (sql, rows) = incremental_batch_sql(table, id_base, INCREMENTAL_BATCH_ROWS);
+            let id_base = MIX_ID_BASE + (idx as i64) * ID_STRIDE;
+            let (sql, rows) = incremental_batch_sql(table, id_base, batch_rows);
             rows_for_pipe += rows;
             mix_sql.push_str(&sql);
         }
         mix_source_rows.push(rows_for_pipe);
     }
-    let mix_started = Instant::now();
     run_oracle_sql_body(lab_dir, &mix_sql).await?;
+    let mix_started = Instant::now();
     mega_mix_sync_until_all_pipelines_settled(lab_dir).await?;
     let mix_elapsed = mix_started.elapsed().as_secs_f64();
     let mut samples = Vec::with_capacity(pipelines.len());
@@ -4064,7 +4070,7 @@ async fn run_mega_mix_protocol(
     store_pending_evidence(evidence.clone());
     println!(
         "Lab Scenario: mega-mix gates gate_0_7={} gate_0_95={} \
-direct_agg={:.2} transform_agg={:.2} (floors reported; not accept on #251)",
+direct_agg={:.2} transform_agg={:.2} (Direct floor #252 / Transform floor #253; Lab-manual)",
         if evidence.gate_0_7_pass {
             "pass"
         } else {
@@ -4080,7 +4086,10 @@ direct_agg={:.2} transform_agg={:.2} (floors reported; not accept on #251)",
     );
 
     let rows_applied = count_delivery_ops(&ctx.apply_out)
-        + samples.len() as u64 * INCREMENTAL_BATCH_ROWS;
+        + pipelines
+            .iter()
+            .map(|p| batch_rows_for_path(p.path))
+            .sum::<u64>();
     let detail = if correctness {
         String::new()
     } else {
@@ -4209,10 +4218,16 @@ async fn mega_mix_sync_until_settled(
     let bin = lab_migraloop_bin();
     let started = Instant::now();
     let mut last_status = String::new();
+    // Large Direct Incremental windows for ≥100k evidence (#252).
+    let sync_env = [(
+        "MIGRALOOP_SYNC_QUEUE_CAPACITY",
+        MEGA_MIX_SYNC_QUEUE_CAPACITY,
+    )];
     loop {
-        let sync_out = run_product_cli(
+        let sync_out = run_product_cli_with_env(
             &bin,
             &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+            &sync_env,
         )
         .await?;
         if sync_out.to_ascii_lowercase().contains("contract")

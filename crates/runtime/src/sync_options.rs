@@ -71,7 +71,10 @@ impl Default for PoisonOptions {
 /// (pause remains for true blockers such as unblockable Schema Change).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackpressureOptions {
-    /// Max pending changes materialized per Incremental window. Must be > 0; default 256.
+    /// Max pending changes materialized per Incremental window. Must be > 0; default 2048.
+    ///
+    /// Raised from 256 for Direct Incremental window-batch Delivery (#252) while
+    /// remaining a bounded Backpressure queue (ADR-0020) — not an unbounded buffer.
     pub queue_capacity: usize,
     /// Artificial Downstream Delivery slowness (milliseconds) for fault injection / Lab.
     pub delivery_delay_ms: Option<u64>,
@@ -80,7 +83,7 @@ pub struct BackpressureOptions {
 impl Default for BackpressureOptions {
     fn default() -> Self {
         Self {
-            queue_capacity: 256,
+            queue_capacity: 2048,
             delivery_delay_ms: None,
         }
     }
@@ -124,7 +127,7 @@ impl SyncOptions {
                 poison_identity_keys: BTreeSet::new(),
             },
             backpressure: BackpressureOptions {
-                queue_capacity: env_usize_gt0("MIGRALOOP_SYNC_QUEUE_CAPACITY").unwrap_or(256),
+                queue_capacity: env_usize_gt0("MIGRALOOP_SYNC_QUEUE_CAPACITY").unwrap_or(2048),
                 delivery_delay_ms: None,
             },
             poll_interval_ms: env_u64_gt0("MIGRALOOP_SYNC_POLL_INTERVAL_MS").unwrap_or(1000),
@@ -188,7 +191,7 @@ impl SyncOptions {
             self.poison.max_attempts = 3;
         }
         if self.backpressure.queue_capacity == 0 {
-            self.backpressure.queue_capacity = 256;
+            self.backpressure.queue_capacity = 2048;
         }
         if self.poll_interval_ms == 0 {
             self.poll_interval_ms = 1000;
@@ -244,7 +247,7 @@ mod tests {
         let opts = SyncOptions::production();
         assert_eq!(opts.poison.max_attempts, 3);
         assert!(opts.poison.poison_identity_keys.is_empty());
-        assert_eq!(opts.backpressure.queue_capacity, 256);
+        assert_eq!(opts.backpressure.queue_capacity, 2048);
         assert_eq!(opts.backpressure.delivery_delay_ms, None);
         assert_eq!(opts.poll_interval_ms, 1000);
         assert_eq!(opts.fail_after_changes, None);
@@ -266,7 +269,7 @@ mod tests {
         }
         .normalized();
         assert_eq!(opts.poison.max_attempts, 3);
-        assert_eq!(opts.backpressure.queue_capacity, 256);
+        assert_eq!(opts.backpressure.queue_capacity, 2048);
         assert_eq!(opts.poll_interval_ms, 1000);
     }
 

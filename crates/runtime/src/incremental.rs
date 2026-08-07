@@ -32,9 +32,10 @@ use crate::backpressure::BoundedWindow;
 use crate::cutover::resume_for_incremental;
 use crate::observability::{emit_event, EventValue};
 use crate::poison::{
-    delete_with_bounded_retries, quarantine_poison_change, upsert_with_bounded_retries,
-    with_bounded_delivery_retries,
+    delete_many_with_bounded_retries, delete_with_bounded_retries, quarantine_poison_change,
+    upsert_many_with_bounded_retries, upsert_with_bounded_retries, with_bounded_delivery_retries,
 };
+use migraloop_delivery::DeliveryDocument;
 use crate::schema_impact::apply_schema_change_impacts;
 use crate::sync_options::SyncOptions;
 use crate::{
@@ -480,6 +481,337 @@ impl IncrementalItem {
             Self::Schema(c) => c.position,
         }
     }
+}
+
+/// Whether this bounded window can use Direct path batch Delivery + Store persist (#252).
+///
+/// Falls back to per-change when: fail_after / poison injection (RQG seams), Schema
+/// Change items, or any active Transform Pipeline references the table (Transform
+/// Affect stays per-change; #253).
+fn direct_window_batch_eligible(
+    items: &[IncrementalItem],
+    pipelines: &[Pipeline],
+    table: &str,
+    fail_after: Option<u32>,
+    poison_keys: &BTreeSet<String>,
+) -> bool {
+    if fail_after.is_some() || !poison_keys.is_empty() {
+        return false;
+    }
+    if items
+        .iter()
+        .any(|item| matches!(item, IncrementalItem::Schema(_)))
+    {
+        return false;
+    }
+    for pipeline in pipelines {
+        if pipeline.paused || pipeline.target_collection.is_empty() {
+            continue;
+        }
+        if !pipeline_references_table(pipeline, table) {
+            continue;
+        }
+        if pipeline.mode != "direct" {
+            return false;
+        }
+    }
+    true
+}
+
+fn change_identity_key(
+    identity: &BTreeMap<String, serde_json::Value>,
+) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = identity
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    migraloop_types::output_identity_key(&serde_json::Value::Object(map))
+}
+
+/// Collapsed Direct Delivery op for one Output Identity within a window.
+enum CollapsedDirectOp {
+    Upsert(DeliveryDocument),
+    Delete(serde_json::Value),
+}
+
+/// Apply a Direct-only Incremental window: in-memory Base apply → batched Target
+/// Delivery → one Platform Store TX for all Base mutations + change ids (#252).
+///
+/// Same-key capture order is applied in memory first; Delivery/Base persist use
+/// the collapsed final state per identity (confluent for Direct). Deliver-before-
+/// checkpoint is preserved at window granularity.
+async fn apply_direct_incremental_window<T: TargetEngine>(
+    store: &PlatformStore,
+    target: &T,
+    deployment_pipelines: &[Pipeline],
+    dataset: &BaseDataset,
+    _schema: &str,
+    table: &str,
+    items: &[IncrementalItem],
+    rows: &mut Vec<serde_json::Map<String, serde_json::Value>>,
+    supported_names: &BTreeSet<String>,
+    source_columns: &[SourceColumn],
+    configured_tz: Option<&str>,
+    sync_applied: &mut i32,
+    pending_at_window_start: usize,
+    max_poison_attempts: u32,
+    poison_identity_keys: &BTreeSet<String>,
+    delivery_delay_ms: Option<u64>,
+    quiet: bool,
+    cycle: &mut IncrementalSyncCycle,
+) -> Result<(), RuntimeError> {
+    let row_changes: Vec<&ChangeEvent> = items
+        .iter()
+        .filter_map(|item| match item {
+            IncrementalItem::Row(change) => Some(change),
+            IncrementalItem::Schema(_) => None,
+        })
+        .collect();
+    if row_changes.is_empty() {
+        return Ok(());
+    }
+
+    // Same-key order into Base (ADR-0029).
+    let owned_changes: Vec<ChangeEvent> = row_changes.iter().map(|c| (*c).clone()).collect();
+    if let Err(err) = apply_change_events_to_base_rows(
+        rows,
+        &owned_changes,
+        supported_names,
+        source_columns,
+        configured_tz,
+    ) {
+        let lag = (pending_at_window_start as i32).max(1);
+        let mut failed = base_with_sync_progress(
+            dataset,
+            dataset.status.clone(),
+            rows.len() as i32,
+            *sync_applied,
+            dataset.capture_checkpoint,
+            lag,
+        );
+        failed.sync_health = crate::observability::sync_health_label_failed().to_string();
+        let _ = store
+            .record_sync_window_progress(&failed, rows, &[])
+            .await;
+        return Err(err);
+    }
+
+    // Collapse Base mutations and Direct Delivery ops to final per-identity state.
+    let mut base_by_key: BTreeMap<
+        String,
+        (
+            serde_json::Map<String, serde_json::Value>,
+            Option<serde_json::Map<String, serde_json::Value>>,
+        ),
+    > = BTreeMap::new();
+    let mut delivery_by_pipeline: BTreeMap<String, BTreeMap<String, CollapsedDirectOp>> =
+        BTreeMap::new();
+    let mut applied_changes: Vec<(String, i64)> = Vec::with_capacity(row_changes.len());
+
+    for change in &row_changes {
+        let identity_map: serde_json::Map<String, serde_json::Value> = change
+            .identity
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let key = change_identity_key(&change.identity);
+        match change.op {
+            ChangeOp::Insert | ChangeOp::Update => {
+                let Some(base_row) = rows
+                    .iter()
+                    .find(|row| row_matches_identity(row, &change.identity))
+                    .cloned()
+                else {
+                    return Err(RuntimeError::Failed(format!(
+                        "Base Dataset {table} missing row for identity {:?}",
+                        change.identity
+                    )));
+                };
+                base_by_key.insert(key.clone(), (identity_map, Some(base_row)));
+            }
+            ChangeOp::Delete => {
+                base_by_key.insert(key.clone(), (identity_map, None));
+            }
+        }
+        applied_changes.push((change.change_id.clone(), change.position.as_i64()));
+
+        for pipeline in deployment_pipelines {
+            if pipeline.target_collection.is_empty()
+                || pipeline.paused
+                || !pipeline.source_table.eq_ignore_ascii_case(table)
+                || pipeline.mode != "direct"
+            {
+                continue;
+            }
+            let pipeline_ops = delivery_by_pipeline
+                .entry(pipeline.name.clone())
+                .or_default();
+            match change.op {
+                ChangeOp::Insert | ChangeOp::Update => {
+                    let Some(base_row) = rows
+                        .iter()
+                        .find(|row| row_matches_identity(row, &change.identity))
+                    else {
+                        return Err(RuntimeError::Failed(format!(
+                            "Base Dataset {} missing row for Output Identity {:?}",
+                            pipeline.source_table, change.identity
+                        )));
+                    };
+                    let document = delivery_document_for_row(
+                        base_row,
+                        &dataset.primary_key,
+                        &dataset.columns,
+                        pipeline,
+                    )?;
+                    let doc_key = migraloop_types::output_identity_key(&document.identity);
+                    pipeline_ops.insert(doc_key, CollapsedDirectOp::Upsert(document));
+                }
+                ChangeOp::Delete => {
+                    let identity =
+                        identity_value_from_change(change, &dataset.primary_key)?;
+                    let doc_key = migraloop_types::output_identity_key(&identity);
+                    pipeline_ops.insert(doc_key, CollapsedDirectOp::Delete(identity));
+                }
+            }
+        }
+    }
+
+    // Deliver-before-checkpoint: flush Target batches before Platform Store TX.
+    for pipeline in deployment_pipelines {
+        let Some(ops) = delivery_by_pipeline.get(&pipeline.name) else {
+            continue;
+        };
+        let mut upserts: Vec<DeliveryDocument> = Vec::new();
+        let mut deletes: Vec<serde_json::Value> = Vec::new();
+        for op in ops.values() {
+            match op {
+                CollapsedDirectOp::Upsert(doc) => upserts.push(doc.clone()),
+                CollapsedDirectOp::Delete(identity) => deletes.push(identity.clone()),
+            }
+        }
+        let mut upserted = 0usize;
+        let mut deleted = 0usize;
+        if !upserts.is_empty() {
+            match upsert_many_with_bounded_retries(
+                target,
+                &pipeline.target_collection,
+                &upserts,
+                max_poison_attempts,
+                poison_identity_keys,
+                delivery_delay_ms,
+            )
+            .await
+            {
+                Ok(n) => upserted = n,
+                Err((attempts, last_error)) => {
+                    // Window batch failed: quarantine is per-identity; surface as hard
+                    // failure so Operator/RQG see the Delivery error (poison disabled
+                    // on this path). Retry of the sync window remains idempotent.
+                    return Err(RuntimeError::Failed(format!(
+                        "Direct batch Delivery upsert failed for Pipeline {} after {attempts} \
+                         attempt(s): {last_error}",
+                        pipeline.name
+                    )));
+                }
+            }
+        }
+        if !deletes.is_empty() {
+            match delete_many_with_bounded_retries(
+                target,
+                &pipeline.target_collection,
+                &deletes,
+                max_poison_attempts,
+                poison_identity_keys,
+                // Delay already applied on upsert attempt when both present.
+                if upserts.is_empty() {
+                    delivery_delay_ms
+                } else {
+                    None
+                },
+            )
+            .await
+            {
+                Ok(n) => deleted = n,
+                Err((attempts, last_error)) => {
+                    return Err(RuntimeError::Failed(format!(
+                        "Direct batch Delivery delete failed for Pipeline {} after {attempts} \
+                         attempt(s): {last_error}",
+                        pipeline.name
+                    )));
+                }
+            }
+        }
+        let lag_after = (pending_at_window_start as i32)
+            .saturating_sub(row_changes.len() as i32)
+            .max(0);
+        store
+            .record_delivery_progress(
+                &pipeline.deployment_name,
+                &pipeline.name,
+                Some("delivered"),
+                Some((upserted + deleted) as i32),
+                Some(lag_after),
+            )
+            .await
+            .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+        if !quiet {
+            println!(
+                "Delivery complete: Pipeline {} upserts={upserted} deletes={deleted} \
+                 (window-batch checkpoint-bound)",
+                pipeline.name
+            );
+        }
+    }
+
+    *sync_applied += row_changes.len() as i32;
+    let last_checkpoint = row_changes
+        .last()
+        .expect("non-empty row_changes")
+        .position
+        .as_i64();
+    let lag_after = (pending_at_window_start as i32)
+        .saturating_sub(row_changes.len() as i32)
+        .max(0);
+    let updated = base_with_sync_progress(
+        dataset,
+        "incremental",
+        rows.len() as i32,
+        *sync_applied,
+        Some(last_checkpoint),
+        lag_after,
+    );
+
+    // Keep mutation references alive for the Store call.
+    let owned_mutations: Vec<(
+        serde_json::Map<String, serde_json::Value>,
+        Option<serde_json::Map<String, serde_json::Value>>,
+    )> = base_by_key.into_values().collect();
+    let mutation_refs: Vec<BaseRowMutation<'_>> = owned_mutations
+        .iter()
+        .map(|(identity, row)| match row {
+            Some(row) => BaseRowMutation::Upsert { identity, row },
+            None => BaseRowMutation::Delete { identity },
+        })
+        .collect();
+    store
+        .record_sync_rows_progress(&updated, &mutation_refs, &applied_changes)
+        .await
+        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    set_delivery_lag_for_table(store, deployment_pipelines, table, lag_after).await?;
+
+    cycle.applied_this_run = cycle
+        .applied_this_run
+        .saturating_add(row_changes.len() as u32);
+    cycle.progressed = true;
+    if !quiet {
+        println!(
+            "Incremental Capture: Base Dataset {table} applied window changes={} \
+             checkpoint={last_checkpoint} lag={lag_after} rows={}",
+            row_changes.len(),
+            updated.row_count
+        );
+    }
+    Ok(())
 }
 
 fn base_with_sync_progress(
@@ -1046,6 +1378,58 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                         ("resume_from", EventValue::from(resume_from.to_string())),
                     ],
                 );
+
+                // Direct-only windows: batch Target Delivery + one Store TX (#252).
+                // Preserve per-change path for fail_after / poison / Schema / Transform.
+                if direct_window_batch_eligible(
+                    &items,
+                    deployment_pipelines,
+                    &table,
+                    fail_after,
+                    &poison_identity_keys,
+                ) {
+                    apply_direct_incremental_window(
+                        store,
+                        target,
+                        deployment_pipelines,
+                        &dataset,
+                        &schema,
+                        &table,
+                        &items,
+                        &mut rows,
+                        &supported_names,
+                        &source_columns,
+                        configured_tz,
+                        &mut sync_applied,
+                        pending_at_window_start,
+                        max_poison_attempts,
+                        &poison_identity_keys,
+                        delivery_delay_ms,
+                        quiet,
+                        cycle,
+                    )
+                    .await?;
+                    if let Some(limit) = fail_after {
+                        if cycle.applied_this_run >= limit {
+                            let current_checkpoint =
+                                items.last().expect("non-empty window").position().as_i64();
+                            return Err(RuntimeError::Failed(format!(
+                                "simulated process kill after {limit} durable checkpoint(s) \
+                                 (fail_after_changes / FAIL_AFTER); \
+                                 resume from Platform Store checkpoint={current_checkpoint}"
+                            )));
+                        }
+                    }
+                    let last_pos = items.last().expect("non-empty window").position().as_i64();
+                    resume_from = CapturePosition::from_i64(last_pos).ok_or_else(|| {
+                        RuntimeError::Failed(format!(
+                            "invalid capture position advance for Base Dataset {table}: {last_pos}"
+                        ))
+                    })?;
+                    windows_processed += 1;
+                    cycle.progressed = true;
+                    continue;
+                }
 
                 for (index, item) in items.iter().enumerate() {
                     // Remaining Source+schema pending after this durable apply.

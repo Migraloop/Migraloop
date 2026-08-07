@@ -1,7 +1,8 @@
 # Lab Scenario recipe (ADR-0031 / issue #251).
 # Catalog listing (`migraloop lab scenario list`) reads this file.
-# Solo baseline → mix Incremental protocol + gate reporting live in MegaMix hooks;
-# absolute 100k/50k floors are reported honestly but are not accept thresholds here.
+# Solo baseline → mix Incremental protocol + gate reporting live in MegaMix hooks.
+# Absolute floors are Lab-manual evidence (Direct ≥100k #252 / Transform ≥50k #253),
+# not Scenario accept thresholds in CI.
 id: mega-mix
 summary: "Mega-mix: all path families + solo/mix e2e QPS + 0.7/0.95 gates (Aggregation $… only)"
 namespace:

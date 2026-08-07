@@ -62,7 +62,7 @@ Lab Scenario `initial-load-throttled` 会在可丢弃 Fixture 上演练 chunked 
 
 当 Platform Store apply、Derived maintenance 或 Target Delivery 跟不上时（ADR-0020）：
 
-- 各阶段使用 **bounded queues**（默认 Incremental window `MIGRALOOP_SYNC_QUEUE_CAPACITY`，256）并放慢 capture/apply
+- 各阶段使用 **bounded queues**（默认 Incremental window `MIGRALOOP_SYNC_QUEUE_CAPACITY`，2048）并放慢 capture/apply
 - Sync Health 与 Delivery Health 都暴露当前 window 剩余工作的 `lag=`；当 window 已满或 Downstream 延迟时，`sync` 会打印 `Backpressure: queue_depth=… capacity=…`
 - 拒绝无界内存缓冲 / 把 OOM 当 backpressure
 - 只因 Target 慢就 pause 整条 Pipeline **不是**默认行为

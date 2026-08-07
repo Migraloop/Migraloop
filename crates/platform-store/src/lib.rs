@@ -600,33 +600,51 @@ impl PlatformStore {
         mutation: BaseRowMutation<'_>,
         applied_changes: &[(String, i64)],
     ) -> Result<(), PlatformStoreError> {
+        self.record_sync_rows_progress(dataset, &[mutation], applied_changes)
+            .await
+    }
+
+    /// Record many Incremental Capture Base mutations + applied change ids in one TX.
+    ///
+    /// Window-batch Direct Incremental path (issue #252): Deliver-before-checkpoint
+    /// still holds when Runtime flushes Target Delivery for the window first, then
+    /// calls this once for all collapsed Base identity mutations and change ids.
+    /// Untouched peers are never rewritten.
+    pub async fn record_sync_rows_progress(
+        &self,
+        dataset: &BaseDataset,
+        mutations: &[BaseRowMutation<'_>],
+        applied_changes: &[(String, i64)],
+    ) -> Result<(), PlatformStoreError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(PlatformStoreError::Persist)?;
         upsert_base_dataset_metadata_in_tx(&mut tx, dataset).await?;
-        match mutation {
-            BaseRowMutation::Upsert { identity, row } => {
-                upsert_base_row_by_identity_in_tx(
-                    &mut tx,
-                    &dataset.deployment_name,
-                    &dataset.source_schema,
-                    &dataset.source_table,
-                    identity,
-                    row,
-                )
-                .await?;
-            }
-            BaseRowMutation::Delete { identity } => {
-                delete_base_row_by_identity_in_tx(
-                    &mut tx,
-                    &dataset.deployment_name,
-                    &dataset.source_schema,
-                    &dataset.source_table,
-                    identity,
-                )
-                .await?;
+        for mutation in mutations {
+            match mutation {
+                BaseRowMutation::Upsert { identity, row } => {
+                    upsert_base_row_by_identity_in_tx(
+                        &mut tx,
+                        &dataset.deployment_name,
+                        &dataset.source_schema,
+                        &dataset.source_table,
+                        identity,
+                        row,
+                    )
+                    .await?;
+                }
+                BaseRowMutation::Delete { identity } => {
+                    delete_base_row_by_identity_in_tx(
+                        &mut tx,
+                        &dataset.deployment_name,
+                        &dataset.source_schema,
+                        &dataset.source_table,
+                        identity,
+                    )
+                    .await?;
+                }
             }
         }
         record_applied_source_changes_in_tx(
@@ -2364,24 +2382,34 @@ async fn record_applied_source_changes_in_tx(
     source_table: &str,
     changes: &[(String, i64)],
 ) -> Result<(), PlatformStoreError> {
-    for (change_id, position) in changes {
-        sqlx::query(
-            r#"
-                INSERT INTO applied_source_changes (
-                    deployment_name, source_schema, source_table, change_id, position
-                ) VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (deployment_name, source_schema, source_table, change_id) DO NOTHING
-                "#,
-        )
-        .bind(deployment_name)
-        .bind(source_schema)
-        .bind(source_table)
-        .bind(change_id)
-        .bind(position)
-        .execute(&mut **tx)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
+    if changes.is_empty() {
+        return Ok(());
     }
+    // Bulk UNNEST insert for Direct Incremental window batches (#252).
+    let change_ids: Vec<&str> = changes.iter().map(|(id, _)| id.as_str()).collect();
+    let positions: Vec<i64> = changes.iter().map(|(_, pos)| *pos).collect();
+    let deployment_names = vec![deployment_name; changes.len()];
+    let source_schemas = vec![source_schema; changes.len()];
+    let source_tables = vec![source_table; changes.len()];
+    sqlx::query(
+        r#"
+            INSERT INTO applied_source_changes (
+                deployment_name, source_schema, source_table, change_id, position
+            )
+            SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[]
+            )
+            ON CONFLICT (deployment_name, source_schema, source_table, change_id) DO NOTHING
+            "#,
+    )
+    .bind(&deployment_names)
+    .bind(&source_schemas)
+    .bind(&source_tables)
+    .bind(&change_ids)
+    .bind(&positions)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
     Ok(())
 }
 

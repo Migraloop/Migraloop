@@ -41,7 +41,7 @@ Live Lab pass/fail evidence (Oracle → Mongo Fixture): [LIVE_INVENTORY.md](./LI
 | Platform Store Guardrails and warn-only disk thresholds | `platform-store-guardrails` |
 | Backward-compatible upgrades / Platform Store migrations | `backward-compatible-upgrades` |
 | Chunked / rate-limited / pausable Initial Load with backoff | `initial-load-throttled` |
-| Mega-mix (all path families + solo/mix e2e QPS + 0.7/0.95 gates; Aggregation `$…` only) | `mega-mix` (volume/QPS floors and gate pass/fail stay Lab-manual evidence per ADR-0025/0028/0031; absolute 100k/50k may fail until later throughput tickets) |
+| Mega-mix (all path families + solo/mix e2e QPS + 0.7/0.95 gates; Aggregation `$…` only) | `mega-mix` (volume/QPS floors and gate pass/fail stay Lab-manual evidence per ADR-0025/0028/0031; Direct ≥100k floor is #252 evidence, Transform ≥50k is #253) |
 
 ## Visible gaps (not yet shipped)
 

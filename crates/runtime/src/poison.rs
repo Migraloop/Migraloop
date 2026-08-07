@@ -79,22 +79,50 @@ pub(crate) async fn upsert_with_bounded_retries<T: TargetEngine>(
     poison_keys: &BTreeSet<String>,
     delivery_delay_ms: Option<u64>,
 ) -> Result<usize, (u32, String)> {
+    upsert_many_with_bounded_retries(
+        target,
+        collection,
+        std::slice::from_ref(document),
+        max_attempts,
+        poison_keys,
+        delivery_delay_ms,
+    )
+    .await
+}
+
+/// Batch Managed upserts with Poison retry policy (Direct Incremental window #252).
+///
+/// Poison-injected identities are excluded from the batch and fail immediately so
+/// callers can quarantine them; remaining docs still Deliver in one Target call.
+pub(crate) async fn upsert_many_with_bounded_retries<T: TargetEngine>(
+    target: &T,
+    collection: &str,
+    documents: &[DeliveryDocument],
+    max_attempts: u32,
+    poison_keys: &BTreeSet<String>,
+    delivery_delay_ms: Option<u64>,
+) -> Result<usize, (u32, String)> {
+    if documents.is_empty() {
+        return Ok(0);
+    }
+    if let Some(poisoned) = documents
+        .iter()
+        .find(|doc| output_identity_matches_poison_keys(&doc.identity, poison_keys))
+    {
+        return Err((
+            max_attempts,
+            format!(
+                "injected poison Delivery failure for Output Identity {}",
+                format_output_identity(&poisoned.identity)
+            ),
+        ));
+    }
     let mut last_error = String::new();
     for attempt in 1..=max_attempts {
         apply_delivery_delay(delivery_delay_ms).await;
-        if output_identity_matches_poison_keys(&document.identity, poison_keys) {
-            last_error = format!(
-                "injected poison Delivery failure for Output Identity {}",
-                format_output_identity(&document.identity)
-            );
-        } else {
-            match target
-                .upsert_managed(collection, std::slice::from_ref(document))
-                .await
-            {
-                Ok(n) => return Ok(n),
-                Err(err) => last_error = err.to_string(),
-            }
+        match target.upsert_managed(collection, documents).await {
+            Ok(n) => return Ok(n),
+            Err(err) => last_error = err.to_string(),
         }
         if attempt < max_attempts {
             eprintln!("Delivery retry {attempt}/{max_attempts} failed: {last_error}");
@@ -111,22 +139,47 @@ pub(crate) async fn delete_with_bounded_retries<T: TargetEngine>(
     poison_keys: &BTreeSet<String>,
     delivery_delay_ms: Option<u64>,
 ) -> Result<usize, (u32, String)> {
+    delete_many_with_bounded_retries(
+        target,
+        collection,
+        std::slice::from_ref(identity),
+        max_attempts,
+        poison_keys,
+        delivery_delay_ms,
+    )
+    .await
+}
+
+/// Batch Managed deletes with Poison retry policy (Direct Incremental window #252).
+pub(crate) async fn delete_many_with_bounded_retries<T: TargetEngine>(
+    target: &T,
+    collection: &str,
+    identities: &[serde_json::Value],
+    max_attempts: u32,
+    poison_keys: &BTreeSet<String>,
+    delivery_delay_ms: Option<u64>,
+) -> Result<usize, (u32, String)> {
+    if identities.is_empty() {
+        return Ok(0);
+    }
+    if let Some(poisoned) = identities
+        .iter()
+        .find(|identity| output_identity_matches_poison_keys(identity, poison_keys))
+    {
+        return Err((
+            max_attempts,
+            format!(
+                "injected poison Delivery failure for Output Identity {}",
+                format_output_identity(poisoned)
+            ),
+        ));
+    }
     let mut last_error = String::new();
     for attempt in 1..=max_attempts {
         apply_delivery_delay(delivery_delay_ms).await;
-        if output_identity_matches_poison_keys(identity, poison_keys) {
-            last_error = format!(
-                "injected poison Delivery failure for Output Identity {}",
-                format_output_identity(identity)
-            );
-        } else {
-            match target
-                .delete_by_identity(collection, std::slice::from_ref(identity))
-                .await
-            {
-                Ok(n) => return Ok(n),
-                Err(err) => last_error = err.to_string(),
-            }
+        match target.delete_by_identity(collection, identities).await {
+            Ok(n) => return Ok(n),
+            Err(err) => last_error = err.to_string(),
         }
         if attempt < max_attempts {
             eprintln!("Delivery retry {attempt}/{max_attempts} failed: {last_error}");
