@@ -40,7 +40,7 @@ Compose 預設憑證（`migraloop` / `migraloop`）僅供本機開發。
 
 ## Local Sync Lab Fixture
 
-可拋棄的 Oracle + MongoDB + Platform Store + app，供**手動** Sync→Delivery 驗證（ADR-0025）。與 **Release Quality Gate**／CI contract-stub harness 不同：由 operator 選擇 Lab Scenarios；**不要**把 Scenario catalog 當成 CI suite，也不要新增會跑完整 catalog 的 release-gate job。Scenario 執行期間 Lab 會暫停 Fixture `app`（`migraloop run`），讓 host `apply`/`sync` 成為唯一的 Incremental Capture 消費者，結束後再恢復 `app`——仍是真實 product CLI Sync／Delivery，不是 Lab stub。
+可拋棄的 Oracle + MongoDB + Platform Store + app，供**手動** Sync→Delivery 驗證（ADR-0025）。與 **Release Quality Gate**／CI contract-stub harness 不同：由 operator 選擇 Lab Scenarios；**不要**把 Scenario catalog 當成 CI suite，也不要新增會跑完整 catalog 的 release-gate job。Scenario 執行期間 Lab 會暫停 Fixture `app`（`migraloop run`），讓 host `apply`/`sync` 成為唯一的 Incremental Capture 消費者，結束後再恢復 `app`——仍是真實 product CLI Sync／Delivery，不是 Lab stub。Lab Fixture compose 提高 Platform Store／Oracle `shm_size`／MongoDB WiredTiger 預設，避免吞吐證據被過小資料庫餓死（ADR-0031）；Scenario 報告含 component pressure（`app` / `source` / `platform_store` / `target`），並可能標記 `INFRA-SATURATED`（擴容後重跑 — 不是產品 FAIL）。線上 Deployment 使用 `migraloop capacity-estimate` 取得相同 limiting-component 語義。
 
 ```bash
 cargo build -p migraloop-app

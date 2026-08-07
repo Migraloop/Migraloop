@@ -16,9 +16,10 @@ use migraloop_platform_store::{
     PlatformStoreHealth, SystemConnection,
 };
 use migraloop_runtime::{
-    assemble_observability_surface, cutover_facts_from_base, inspect_base_rows,
-    inspect_derived_rows, inspect_target_documents, status_inventory_from_url, ApplyOptions,
-    ApplyOptionsOverrides, CutoverFacts, SyncOptions, SyncOptionsOverrides,
+    assemble_observability_surface, capacity_estimate_from_inventory, cutover_facts_from_base,
+    inspect_base_rows, inspect_derived_rows, inspect_target_documents, status_inventory_from_url,
+    ApplyOptions, ApplyOptionsOverrides, ComponentPressureOverrides, CutoverFacts, SyncOptions,
+    SyncOptionsOverrides, COMPONENT_PRESSURE_NAMES,
 };
 use thiserror::Error;
 
@@ -81,6 +82,15 @@ pub enum Command {
         /// Platform Store connection URL (postgres://...)
         #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
         platform_store_url: String,
+    },
+    /// Capacity Estimate: limiting component + coarse max end-to-end Managed Delivery QPS (ADR-0031)
+    CapacityEstimate {
+        /// Platform Store connection URL (postgres://...)
+        #[arg(long, env = "MIGRALOOP_PLATFORM_STORE_URL")]
+        platform_store_url: String,
+        /// Test/Lab: inject component pressure `name=pressure:saturated,...` (never mutates Source/Target)
+        #[arg(long = "component-pressure-override", env = "MIGRALOOP_COMPONENT_PRESSURE_OVERRIDE", hide = true)]
+        component_pressure_override: Option<String>,
     },
     /// Inspect Base Dataset rows for a Source table (operator-facing Platform Store check)
     Base {
@@ -533,10 +543,59 @@ async fn drift_check(
     Ok(())
 }
 
+fn print_component_pressure_lines(
+    components: &[migraloop_runtime::ComponentPressure],
+) {
+    println!("Component pressure:");
+    for name in COMPONENT_PRESSURE_NAMES {
+        let comp = components.iter().find(|c| c.component == name);
+        match comp {
+            Some(c) => println!(
+                "  {name}: pressure={} saturated={}",
+                c.pressure,
+                if c.saturated { "yes" } else { "no" }
+            ),
+            None => println!("  {name}: pressure=0 saturated=no"),
+        }
+    }
+}
+
+async fn print_capacity_estimate(
+    platform_store_url: &str,
+    override_spec: Option<&str>,
+) -> Result<(), CliError> {
+    let inventory = status_inventory_from_url(platform_store_url).await?;
+    let overrides = match override_spec {
+        Some(spec) if !spec.trim().is_empty() => ComponentPressureOverrides::parse(spec)
+            .map_err(CliError::Failed)?,
+        _ => ComponentPressureOverrides::default(),
+    };
+    // Read-only: inventory + pressure assembly only — never mutates Source/Target DB config.
+    let estimate = capacity_estimate_from_inventory(&inventory, &overrides);
+    println!("Capacity Estimate");
+    println!("  limiting_component={}", estimate.limiting_component);
+    println!("  max_e2e_qps={:.0}", estimate.max_e2e_qps);
+    println!(
+        "  infra_saturated={}",
+        if estimate.infra_saturated { "yes" } else { "no" }
+    );
+    print_component_pressure_lines(&estimate.components);
+    if estimate.infra_saturated {
+        println!(
+            "  guidance: resize Source / Platform Store / Target (or Lab Fixture) and re-run — \
+             infra-saturated is not a product failure (ADR-0031)"
+        );
+    }
+    println!(
+        "  note: Capacity Estimate is advisory and never mutates Source System or Target System configuration"
+    );
+    Ok(())
+}
+
 async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
     let inventory = status_inventory_from_url(platform_store_url).await?;
-    // Typed Sync/Delivery Health (+ lag / quarantine / schema-impact / disk-warn)
-    // come from one runtime assembly; CLI only formats Operator narrative (#174).
+    // Typed Sync/Delivery Health (+ lag / quarantine / schema-impact / disk-warn /
+    // component pressure) come from one runtime assembly; CLI only formats (#174 / #249).
     let surface = assemble_observability_surface(&inventory);
 
     match &surface.store_health {
@@ -783,6 +842,8 @@ async fn print_status(platform_store_url: &str) -> Result<(), CliError> {
         }
     }
 
+    print_component_pressure_lines(&surface.component_pressure);
+
     Ok(())
 }
 
@@ -951,6 +1012,16 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             apply_deployment(&platform_store_url, &file, options).await
         }
         Command::Status { platform_store_url } => print_status(&platform_store_url).await,
+        Command::CapacityEstimate {
+            platform_store_url,
+            component_pressure_override,
+        } => {
+            print_capacity_estimate(
+                &platform_store_url,
+                component_pressure_override.as_deref(),
+            )
+            .await
+        }
         Command::Base {
             platform_store_url,
             table,

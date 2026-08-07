@@ -3,12 +3,17 @@
 //! Typed Sync Health / Delivery Health (plus lag, quarantine, schema-impact
 //! blockers, and ADR-0010 disk-warn) are assembled here from a status inventory
 //! snapshot. Operator CLI formats narrative from this assembly; Prometheus
-//! scrapes derive the same failure / lag / disk-warn facts.
+//! scrapes derive the same failure / lag / disk-warn facts. Component pressure
+//! summaries (ADR-0031 / issue #249) use the same stable names as Lab reports
+//! and Capacity Estimate.
 
 use std::collections::BTreeMap;
 
 use migraloop_platform_store::{BaseDataset, Pipeline, PlatformStoreHealth};
 
+use crate::capacity::{
+    assemble_component_pressure_from_surface, ComponentPressure, ComponentPressureOverrides,
+};
 use crate::lifecycle::StatusInventory;
 
 /// Typed Sync Health for a Base Dataset.
@@ -90,7 +95,7 @@ pub struct PipelineDeliveryObservation {
 /// Runtime-facing Observability Surface assembled from durable inventory.
 ///
 /// CLI `status` and Prometheus `/metrics` must agree on these health / failure /
-/// lag / disk-warn facts.
+/// lag / disk-warn / component-pressure facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservabilitySurface {
     pub store_health: PlatformStoreHealth,
@@ -104,10 +109,13 @@ pub struct ObservabilitySurface {
     pub schema_blocking_total: usize,
     /// Alertable failures: active quarantines + blocking Schema Change impacts.
     pub failure_count: usize,
+    /// Per-component pressure (app / source / platform_store / target) — ADR-0031.
+    pub component_pressure: Vec<ComponentPressure>,
 }
 
-/// Assemble typed Sync / Delivery Health (+ lag, quarantine, schema-impact, disk-warn).
-pub fn assemble_observability_surface(inventory: &StatusInventory) -> ObservabilitySurface {
+/// Assemble typed Sync / Delivery Health (+ lag, quarantine, schema-impact, disk-warn)
+/// without component pressure (used by Capacity Estimate to avoid recursion).
+pub(crate) fn assemble_observability_core(inventory: &StatusInventory) -> ObservabilitySurface {
     let sync: Vec<BaseSyncObservation> = inventory
         .bases
         .iter()
@@ -172,7 +180,30 @@ pub fn assemble_observability_surface(inventory: &StatusInventory) -> Observabil
         quarantined_total,
         schema_blocking_total,
         failure_count: quarantined_total + schema_blocking_total,
+        component_pressure: Vec::new(),
     }
+}
+
+/// Assemble typed Sync / Delivery Health (+ lag, quarantine, schema-impact, disk-warn,
+/// component pressure).
+pub fn assemble_observability_surface(inventory: &StatusInventory) -> ObservabilitySurface {
+    let mut surface = assemble_observability_core(inventory);
+    surface.component_pressure = assemble_component_pressure_from_surface(
+        &surface,
+        &ComponentPressureOverrides::default(),
+    );
+    surface
+}
+
+/// Re-assemble component pressure on an existing surface with optional overrides
+/// (Capacity Estimate inject / Lab).
+pub fn with_component_pressure_overrides(
+    surface: &ObservabilitySurface,
+    overrides: &ComponentPressureOverrides,
+) -> ObservabilitySurface {
+    let mut out = surface.clone();
+    out.component_pressure = assemble_component_pressure_from_surface(surface, overrides);
+    out
 }
 
 /// Derive Sync Health from lag / progress / durable failure — beyond `unknown`/`ok`.
@@ -329,6 +360,30 @@ pub fn render_prometheus_metrics(surface: &ObservabilitySurface) -> String {
         "migraloop_platform_store_disk_warn {}\n",
         if surface.disk_warn { 1 } else { 0 }
     ));
+
+    // Component pressure (ADR-0031): same stable names as Lab reports / Capacity Estimate.
+    out.push_str(
+        "# HELP migraloop_component_pressure Coarse 0–100 pressure for app, Source, Platform Store, or Target.\n",
+    );
+    out.push_str("# TYPE migraloop_component_pressure gauge\n");
+    for comp in &surface.component_pressure {
+        out.push_str(&format!(
+            "migraloop_component_pressure{{component=\"{}\"}} {}\n",
+            prom_label(&comp.component),
+            comp.pressure
+        ));
+    }
+    out.push_str(
+        "# HELP migraloop_component_saturated Whether a component is saturated (1) or not (0). Source/Platform Store/Target saturation means infra-saturated evidence.\n",
+    );
+    out.push_str("# TYPE migraloop_component_saturated gauge\n");
+    for comp in &surface.component_pressure {
+        out.push_str(&format!(
+            "migraloop_component_saturated{{component=\"{}\"}} {}\n",
+            prom_label(&comp.component),
+            if comp.saturated { 1 } else { 0 }
+        ));
+    }
 
     out
 }
@@ -601,6 +656,14 @@ mod tests {
         assert_eq!(surface.quarantined_total, 1);
         assert_eq!(surface.schema_blocking_total, 1);
         assert_eq!(surface.failure_count, 2);
+        assert_eq!(surface.component_pressure.len(), 4);
+        assert!(
+            surface
+                .component_pressure
+                .iter()
+                .any(|c| c.component == "platform_store" && c.saturated),
+            "disk-warn must saturate platform_store pressure"
+        );
     }
 
     #[test]
@@ -638,6 +701,14 @@ mod tests {
         // Disk warn must not imply pause in metrics.
         assert!(
             text.contains("migraloop_pipeline_paused{deployment=\"dep\",pipeline=\"customers\"} 0")
+        );
+        assert!(
+            text.contains("migraloop_component_pressure{component=\"platform_store\"}"),
+            "Prometheus must expose component pressure: {text}"
+        );
+        assert!(
+            text.contains("migraloop_component_saturated{component=\"platform_store\"} 1"),
+            "Prometheus must expose component saturated: {text}"
         );
     }
 

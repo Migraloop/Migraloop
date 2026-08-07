@@ -37,7 +37,7 @@ Live Lab pass/fail evidence (Oracle → Mongo Fixture): [LIVE_INVENTORY.md](./LI
 | Source Alignment Check for Base Datasets | `source-alignment` |
 | Drift Check with Managed-field auto-repair | `drift-check` |
 | Bounded backpressure with visible lag | `bounded-backpressure` |
-| Observability Surface (logs, health, Prometheus) | `observability-surface` |
+| Observability Surface (logs, health, Prometheus; component pressure names + Lab `infra-saturated`) | `observability-surface` (all Scenario reports share pressure / Capacity Estimate semantics; live verb `capacity-estimate`) |
 | Platform Store Guardrails and warn-only disk thresholds | `platform-store-guardrails` |
 | Backward-compatible upgrades / Platform Store migrations | `backward-compatible-upgrades` |
 | Chunked / rate-limited / pausable Initial Load with backoff | `initial-load-throttled` |

@@ -374,6 +374,16 @@ async fn observability_surface_exposes_metrics_structured_logs_and_health() {
             || metrics_body.contains("migraloop_failures"),
         "Prometheus body must expose alertable failure counters, got:\n{metrics_body}"
     );
+    for name in ["app", "source", "platform_store", "target"] {
+        assert!(
+            metrics_body.contains(&format!("migraloop_component_pressure{{component=\"{name}\"}}")),
+            "Prometheus must expose component pressure for {name}, got:\n{metrics_body}"
+        );
+        assert!(
+            metrics_body.contains(&format!("migraloop_component_saturated{{component=\"{name}\"}}")),
+            "Prometheus must expose component saturated for {name}, got:\n{metrics_body}"
+        );
+    }
 
     let sync_lag = extract_prometheus_gauge(&metrics_body, "migraloop_sync_lag")
         .expect("parse migraloop_sync_lag");

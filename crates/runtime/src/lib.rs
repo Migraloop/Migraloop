@@ -12,7 +12,8 @@
 //! lifecycle ([`pause_pipeline`], [`resume_pipeline`], [`remove_pipeline`]),
 //! [`source_alignment_check`], [`drift_check`], status inventory ([`status_inventory`],
 //! [`status_inventory_from_url`]), Observability Surface assembly
-//! ([`assemble_observability_surface`]), cutover facts / hand-off
+//! ([`assemble_observability_surface`]), Capacity Estimate
+//! ([`capacity_estimate_from_inventory`]), cutover facts / hand-off
 //! ([`cutover_facts_from_base`], [`handoff_from_low_watermark`],
 //! [`resume_for_incremental`]), and inspect
 //! ([`inspect_base_rows`], [`inspect_derived_rows`], [`inspect_target_documents`]).
@@ -48,6 +49,7 @@ mod engines;
 mod apply;
 mod apply_options;
 mod backpressure;
+mod capacity;
 mod cutover;
 mod observability;
 mod incremental;
@@ -61,9 +63,17 @@ pub use cutover::{
     cutover_facts_from_base, handoff_from_low_watermark, handoff_from_optional_low_watermark,
     resume_for_incremental, CutoverFacts, CutoverHandoff, IncrementalResume,
 };
+pub use capacity::{
+    assemble_component_pressure, assemble_component_pressure_from_surface,
+    capacity_estimate_from_inventory, estimate_capacity, infra_saturated, CapacityEstimate,
+    ComponentPressure, ComponentPressureOverride, ComponentPressureOverrides,
+    CAPACITY_REFERENCE_E2E_QPS, COMPONENT_APP, COMPONENT_PLATFORM_STORE, COMPONENT_PRESSURE_NAMES,
+    COMPONENT_SOURCE, COMPONENT_TARGET,
+};
 pub use observability::{
-    assemble_observability_surface, emit_event, render_prometheus_metrics, BaseSyncObservation,
-    DeliveryHealth, EventValue, ObservabilitySurface, PipelineDeliveryObservation, SyncHealth,
+    assemble_observability_surface, emit_event, render_prometheus_metrics,
+    with_component_pressure_overrides, BaseSyncObservation, DeliveryHealth, EventValue,
+    ObservabilitySurface, PipelineDeliveryObservation, SyncHealth,
 };
 pub(crate) use observability::sync_health_label_for_progress;
 

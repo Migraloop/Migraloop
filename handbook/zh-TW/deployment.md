@@ -17,7 +17,7 @@
 docker compose up -d --build
 ```
 
-Compose 會把 `MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@platform-store:5432/migraloop` 注入 app，並執行 `migraloop run`（對已套用 Pipelines 做 continuous Incremental Capture + Delivery，並經 `MIGRALOOP_METRICS_ADDR` 在 host port `9090` 提供 Prometheus `/metrics`）。請把 Source/Target secret refs 注入 app 環境，讓 continuous Sync 能執行。隨附 Postgres 帶有 Platform Store Guardrails 安全預設（`shared_buffers=128MB`、`work_mem=8MB`、`maintenance_work_mem=128MB`、`max_connections=100`）；store data volume 也會以 read-only 掛進 app（`MIGRALOOP_PLATFORM_STORE_DATA_DIR`）供可用磁碟警告探測。可向上調整 Postgres volumes/resources；不要更換 store 引擎，也不要把設定降到產品下限以下（見 [Operations](operations.md)）。
+Compose 會把 `MIGRALOOP_PLATFORM_STORE_URL=postgres://migraloop:migraloop@platform-store:5432/migraloop` 注入 app，並執行 `migraloop run`（對已套用 Pipelines 做 continuous Incremental Capture + Delivery，並經 `MIGRALOOP_METRICS_ADDR` 在 host port `9090` 提供 Prometheus `/metrics`）。請把 Source/Target secret refs 注入 app 環境，讓 continuous Sync 能執行。隨附 Postgres 帶有面向吞吐證據的產品預設（`shared_buffers=512MB`、`work_mem=32MB`、`maintenance_work_mem=256MB`、`max_connections=200`、`effective_cache_size=2GB`）——仍高於 Platform Store Guardrails 下限（ADR-0010 / ADR-0031）。store data volume 也會以 read-only 掛進 app（`MIGRALOOP_PLATFORM_STORE_DATA_DIR`）供可用磁碟警告探測。Local Sync Lab Fixture 使用相同 Store 旋鈕，並提高 Oracle `shm_size` 與 MongoDB WiredTiger cache，避免頭條 Lab 證據被過小資料庫餓死。可向上調整 volumes/resources；不要更換 store 引擎，也不要把設定降到產品下限以下（見 [Operations](operations.md)）。當 Lab 證據標記為 `infra-saturated` 時，應調整 Fixture 規模後重跑——該結果不算產品失敗。
 
 若在 host 上對已 publish 的 store port `5432` 使用 Operator CLI：
 

@@ -45,6 +45,10 @@ use crate::lab::{
 };
 use crate::CliError;
 use migraloop_platform_store::PlatformStore;
+use migraloop_runtime::{
+    capacity_estimate_from_inventory, status_inventory_from_url, ComponentPressure,
+    ComponentPressureOverrides, COMPONENT_PRESSURE_NAMES,
+};
 
 use self::correctness::{
     execute_recipe_correctness, fetch_all, fetched_satisfies, inspect_mentions_amount,
@@ -624,7 +628,8 @@ async fn scenario_run(
 
     match result {
         Ok(report) => {
-            let passed = report.correctness && report.thresholds_ok;
+            let report = enrich_report_component_pressure(report).await?;
+            let passed = report.correctness && report.thresholds_ok && !report.infra_saturated;
             let mut namespace_removed = false;
             if auto_remove && passed {
                 // Opt-in cleanup after success only — failures keep Namespace for debug (US35).
@@ -633,7 +638,10 @@ async fn scenario_run(
             }
             drop(lock);
             print_scenario_report(&recipe.id, true, duration, &report, namespace_removed);
-            if passed {
+            if report.infra_saturated {
+                // ADR-0031 / #249: infra-saturated evidence is resize+re-run, not product FAIL.
+                Ok(())
+            } else if passed {
                 Ok(())
             } else {
                 // US36: name correctness vs threshold (or both) — equal-weight fail axes.
@@ -660,11 +668,32 @@ async fn scenario_run(
                 measured_rows_per_s: None,
                 measured_duration_ms: None,
                 thresholds_ok: true,
+                component_pressure: Vec::new(),
+                infra_saturated: false,
             };
             print_scenario_report(&recipe.id, false, duration, &report, false);
             Err(err)
         }
     }
+}
+
+/// Attach component pressure / infra-saturated from Lab Platform Store (+ optional inject).
+async fn enrich_report_component_pressure(
+    mut report: ScenarioReport,
+) -> Result<ScenarioReport, CliError> {
+    let overrides = match std::env::var("MIGRALOOP_COMPONENT_PRESSURE_OVERRIDE") {
+        Ok(spec) if !spec.trim().is_empty() => {
+            ComponentPressureOverrides::parse(&spec).map_err(CliError::Failed)?
+        }
+        _ => ComponentPressureOverrides::default(),
+    };
+    let inventory = status_inventory_from_url(LAB_PLATFORM_STORE_URL)
+        .await
+        .map_err(|err| CliError::Failed(err.to_string()))?;
+    let estimate = capacity_estimate_from_inventory(&inventory, &overrides);
+    report.component_pressure = estimate.components;
+    report.infra_saturated = estimate.infra_saturated;
+    Ok(report)
 }
 
 async fn scenario_remove(scenario: &str, lab_dir: &Path) -> Result<(), CliError> {
@@ -772,10 +801,43 @@ base_rows={} target_rows={}",
             };
             report_from_adapter_outcome(recipe, outcome)
         }
+        "infra-saturated" => {
+            let mut report = report_from_adapter_outcome(
+                recipe,
+                AdapterOutcome {
+                    correctness: true,
+                    detail: String::new(),
+                    metrics: ScenarioMetrics {
+                        settle_ms: None,
+                        lag: Some(0),
+                        rows_per_s: Some(800.0),
+                        duration_ms: Some(120_000),
+                        rows_applied: BULK_LOAD_ROW_COUNT,
+                        capture_path_note: "Initial Load".to_string(),
+                    },
+                },
+            );
+            report.component_pressure = COMPONENT_PRESSURE_NAMES
+                .iter()
+                .map(|name| {
+                    let saturated = *name == "source";
+                    ComponentPressure {
+                        component: (*name).to_string(),
+                        pressure: if saturated { 95 } else { 10 },
+                        saturated,
+                    }
+                })
+                .collect();
+            report.infra_saturated = true;
+            let duration = Duration::from_millis(report.measured_duration_ms.unwrap_or(0) as u64);
+            print_scenario_report(&recipe.id, true, duration, &report, false);
+            // infra-saturated is not a product failure — exit success with labeled report.
+            return Ok(());
+        }
         other => {
             return Err(CliError::Failed(format!(
                 "Unknown MIGRALOOP_LAB_SCENARIO_OUTCOME_PROBE `{other}` \
-                 (expected `threshold-fail` or `correctness-fail`)"
+                 (expected `threshold-fail`, `correctness-fail`, or `infra-saturated`)"
             )));
         }
     };
@@ -826,7 +888,9 @@ fn format_scenario_report(
             report.rows_applied as f64
         }
     });
-    let outcome = if overall_pass && report.correctness && report.thresholds_ok {
+    let outcome = if report.infra_saturated {
+        "INFRA-SATURATED"
+    } else if overall_pass && report.correctness && report.thresholds_ok {
         "PASS"
     } else {
         "FAIL"
@@ -868,6 +932,29 @@ fn format_scenario_report(
     out.push_str(&format!("  rows_per_s={rows_per_s:.2}\n"));
     if !report.capture_path_note.is_empty() {
         out.push_str(&format!("  capture={}\n", report.capture_path_note));
+    }
+    // Always print the four stable component pressure names (ADR-0031 / #249).
+    out.push_str("  component_pressure:\n");
+    for name in COMPONENT_PRESSURE_NAMES {
+        let comp = report
+            .component_pressure
+            .iter()
+            .find(|c| c.component == *name);
+        match comp {
+            Some(c) => out.push_str(&format!(
+                "    {name}: pressure={} saturated={}\n",
+                c.pressure,
+                if c.saturated { "yes" } else { "no" }
+            )),
+            None => out.push_str(&format!("    {name}: pressure=0 saturated=no\n")),
+        }
+    }
+    if report.infra_saturated {
+        out.push_str("  infra_saturated=yes\n");
+        out.push_str(
+            "  guidance: resize Lab Fixture Source / Platform Store / Target and re-run — \
+             infra-saturated is not a product failure (ADR-0031)\n",
+        );
     }
     if !report.detail.is_empty() && outcome == "FAIL" {
         out.push_str(&format!("  detail={}\n", report.detail));
@@ -5014,6 +5101,77 @@ mod tests {
             max_duration_ms: Some(600_000),
             min_rows_per_s: Some(50.0),
         }
+    }
+
+    #[test]
+    fn infra_saturated_report_is_not_product_fail() {
+        let thresholds = bulk_load_recipe_thresholds();
+        let metrics = ScenarioMetrics {
+            settle_ms: None,
+            lag: Some(0),
+            rows_per_s: Some(800.0),
+            duration_ms: Some(120_000),
+            rows_applied: BULK_LOAD_ROW_COUNT,
+            capture_path_note: "Initial Load".to_string(),
+        };
+        let recipe = ScenarioRecipe {
+            id: BULK_LOAD_ID.to_string(),
+            summary: "bulk".to_string(),
+            namespace: ScenarioRecipeNamespace {
+                source_tables: vec![BULK_LOAD_TABLE.to_string()],
+                target_collections: vec![BULK_LOAD_COLLECTION.to_string()],
+                deployment: BULK_LOAD_DEPLOYMENT.to_string(),
+                pipelines: vec![],
+                lifecycle: None,
+            },
+            deployment_config: "deployment.yaml".to_string(),
+            workload: ScenarioRecipeWorkload {
+                concurrency: "serial".to_string(),
+                steps: vec!["prepare".to_string()],
+                product_path: None,
+            },
+            checks: ScenarioRecipeChecks {
+                correctness: vec![crate::lab_scenario::correctness::CorrectnessCheck {
+                    surface: crate::lab_scenario::correctness::CorrectnessSurface::Base,
+                    table: Some(BULK_LOAD_TABLE.to_string()),
+                    row_count: Some(BULK_LOAD_ROW_COUNT),
+                    ..Default::default()
+                }],
+            },
+            thresholds,
+        };
+        let mut report = report_from_adapter_outcome(
+            &recipe,
+            AdapterOutcome {
+                correctness: true,
+                detail: String::new(),
+                metrics,
+            },
+        );
+        report.infra_saturated = true;
+        report.component_pressure = COMPONENT_PRESSURE_NAMES
+            .iter()
+            .map(|name| ComponentPressure {
+                component: (*name).to_string(),
+                pressure: if *name == "platform_store" { 90 } else { 10 },
+                saturated: *name == "platform_store",
+            })
+            .collect();
+        let rendered = format_scenario_report(
+            BULK_LOAD_ID,
+            true,
+            Duration::from_millis(120_000),
+            &report,
+            false,
+        );
+        assert!(
+            rendered.contains("Lab Scenario: INFRA-SATURATED"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("infra_saturated=yes"), "{rendered}");
+        assert!(rendered.contains("platform_store: pressure=90"), "{rendered}");
+        assert!(rendered.contains("not a product failure"), "{rendered}");
+        assert!(!rendered.contains("Lab Scenario: FAIL"), "{rendered}");
     }
 
     #[test]

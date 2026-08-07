@@ -4,6 +4,7 @@
 align
 apply
 base
+capacity-estimate
 derived
 drift
 lab

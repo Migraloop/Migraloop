@@ -17,6 +17,7 @@ migraloop status
 - 每條 Pipeline 的 **Delivery Health**（已套用變更 / lag / status；有 Poison Change quarantine 時為 `unhealthy`；有 blocking Schema Change pause 時為 `paused`；Downstream backpressure 下 lag 會上升但不會 pause Pipeline）
 - 作用中的 **Quarantine** 列（Output Identity、change id、attempts、last error — unhealthy / not aligned）
 - Transform Pipelines 的 **Derived Datasets**（若有）
+- **Component pressure** 摘要，穩定名稱為 `app`、`source`、`platform_store`、`target`（與 Lab Scenario 報告及 Capacity Estimate 相同 — ADR-0031）
 
 第一次 sync 後 Operator 常看的健康跡象：
 
@@ -27,10 +28,18 @@ migraloop status
 - Quarantine：`(none)`（除非刻意留下被 quarantine 的 poison identity）
 - Schema Change：`(none)`（除非刻意留下 blocking DDL pause）
 
+## Component pressure 與 Capacity Estimate
+
+依元件壓力將吞吐瓶頸歸因到 app 路徑、Source System、Platform Store 或 Target System。線上 `status` / Prometheus 與 Lab Scenario 報告使用**相同穩定名稱**：`app`、`source`、`platform_store`、`target`。
+
+- 當 Source、Platform Store 或 Target 飽和時，Lab 證據標記為 `INFRA-SATURATED` 並給出擴容指引 — **不是**產品 FAIL。調整 Lab Fixture（或線上 infra）後重跑。
+- `migraloop capacity-estimate` 是線上 Operator 指令：回報 `limiting_component` 與粗粒度 `max_e2e_qps`。僅供建議，**永不**修改 Source System 或 Target System 的資料庫設定。
+
 ## 更深的檢查指令
 
 | 指令 | 用途 |
 | --- | --- |
+| `migraloop capacity-estimate` | 限制元件 + 粗粒度最大端到端 Managed Delivery QPS（唯讀） |
 | `migraloop base --table <TABLE>` | 抽樣 Platform Store 中的 Base Dataset 列 |
 | `migraloop target --collection <name>` | 抽樣已 Deliver 的 MongoDB documents |
 | `migraloop derived --pipeline <name>` | 抽樣 Derived Dataset 列 |
@@ -47,8 +56,8 @@ migraloop status
 ## Logs 與 metrics
 
 - App/CLI 在 Initial Load、Incremental Capture、Delivery、Backpressure、Poison Change quarantine、blocking Schema Change，以及 Platform Store 可用磁碟警告會發出 **structured JSON** operator event lines（並保留 human-readable 對應行）（`migraloop` 行程 / container logs 的 stdout/stderr）。請找 `"event":"…"` 欄位，例如 `initial_load_progress`、`initial_load_paused`、`initial_load_backoff`、`initial_load_complete`、`incremental_capture`、`delivery_complete`、`backpressure`、`poison_quarantine`、`schema_change_blocked`、`platform_store_disk_warn`。
-- `migraloop run` 會對已套用 Pipelines 持續執行 Incremental Capture → Delivery，並在同一個 single active instance 上於 `http://<metrics-addr>/metrics` 提供 Prometheus scrape endpoint（預設 `0.0.0.0:9090`，可用 `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` 覆寫）。Compose 會公布 host port `9090`。Metrics 包含 Sync/Delivery lag（`migraloop_sync_lag`、`migraloop_delivery_lag`）、Pipeline pause、可告警 failure gauges（`migraloop_quarantined_changes`、`migraloop_failures`，皆自耐久 Platform Store state 讀取），以及 Platform Store disk gauges（`migraloop_platform_store_disk_free_bytes`、`migraloop_platform_store_disk_warn` — warn-only；絕不自動 pause）。
-- `status` 仍是 Operator 解讀 lag/checkpoint/error 的主要迴圈；用 scrape `/metrics` 做 alerting 與 dashboards。
+- `migraloop run` 會對已套用 Pipelines 持續執行 Incremental Capture → Delivery，並在同一個 single active instance 上於 `http://<metrics-addr>/metrics` 提供 Prometheus scrape endpoint（預設 `0.0.0.0:9090`，可用 `--metrics-addr` / `MIGRALOOP_METRICS_ADDR` 覆寫）。Compose 會公布 host port `9090`。Metrics 包含 Sync/Delivery lag（`migraloop_sync_lag`、`migraloop_delivery_lag`）、Pipeline pause、可告警 failure gauges（`migraloop_quarantined_changes`、`migraloop_failures`，皆自耐久 Platform Store state 讀取）、Platform Store disk gauges（`migraloop_platform_store_disk_free_bytes`、`migraloop_platform_store_disk_warn` — warn-only；絕不自動 pause），以及 component pressure gauges（`migraloop_component_pressure{component=…}`、`migraloop_component_saturated{component=…}`，涵蓋 `app` / `source` / `platform_store` / `target`）。
+- `status` 仍是 Operator 解讀 lag/checkpoint/error 與 component pressure 的主要迴圈；用 scrape `/metrics` 做 alerting 與 dashboards；需要限制元件與粗粒度 max e2e QPS 時使用 `capacity-estimate`。
 
 ## 相關章節
 
