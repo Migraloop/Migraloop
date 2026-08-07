@@ -57,11 +57,11 @@ use self::correctness::{
     parse_inspect_row_count, parse_target_document_count,
 };
 use self::mega_mix::{
-    covers_required_path_families, e2e_qps, evaluate_mega_mix_gates,
+    batch_rows_for_path, covers_required_path_families, e2e_qps, evaluate_mega_mix_gates,
     format_mega_mix_report_section, incremental_batch_sql, mega_mix_pipelines,
-    store_pending_evidence, take_pending_evidence, PipelineQpsSample,
-    batch_rows_for_path, INCREMENTAL_BATCH_ROWS, MEGA_MIX_SYNC_QUEUE_CAPACITY,
-    ID_STRIDE, MEGA_MIX_DEPLOYMENT, MEGA_MIX_ID, MIX_ID_BASE, SOLO_ID_BASE,
+    store_pending_evidence, take_pending_evidence, PathKind, PipelineQpsSample, ID_STRIDE,
+    INCREMENTAL_BATCH_ROWS, MEGA_MIX_DEPLOYMENT, MEGA_MIX_ID, MEGA_MIX_SYNC_QUEUE_CAPACITY,
+    MIX_ID_BASE, SOLO_ID_BASE,
 };
 use self::namespace::{mutate_namespace_from_recipe, prepare_namespace, wipe_namespace};
 use self::recipe::{
@@ -3982,7 +3982,9 @@ async fn run_mega_mix_protocol(
     }
     println!(
         "Lab Scenario: mega-mix solo baseline protocol \
-(same Fixture sizing; pause siblings; Incremental batch={INCREMENTAL_BATCH_ROWS})..."
+(same Fixture sizing; pause siblings; Direct batch={} / Transform batch={})...",
+        batch_rows_for_path(PathKind::Direct),
+        batch_rows_for_path(PathKind::Transform)
     );
 
     let mut solo_qps: Vec<f64> = Vec::with_capacity(pipelines.len());
@@ -4017,7 +4019,10 @@ async fn run_mega_mix_protocol(
 
     println!(
         "Lab Scenario: mega-mix mix Incremental protocol \
-(all Pipelines active; one Source burst + shared settle; batch={INCREMENTAL_BATCH_ROWS})..."
+(all Pipelines active; one Source burst + shared settle; \
+Direct batch={} / Transform batch={})...",
+        batch_rows_for_path(PathKind::Direct),
+        batch_rows_for_path(PathKind::Transform)
     );
     // Build one Source burst for all path families (shared tables inserted once).
     let mut mix_sql = String::new();

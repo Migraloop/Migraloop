@@ -610,6 +610,9 @@ impl PlatformStore {
     /// still holds when Runtime flushes Target Delivery for the window first, then
     /// calls this once for all collapsed Base identity mutations and change ids.
     /// Untouched peers are never rewritten.
+    ///
+    /// Upserts are applied as delete-by-identity then bulk `UNNEST` insert so large
+    /// insert-heavy Direct windows avoid per-row UPDATE+INSERT round-trips.
     pub async fn record_sync_rows_progress(
         &self,
         dataset: &BaseDataset,
@@ -622,31 +625,67 @@ impl PlatformStore {
             .await
             .map_err(PlatformStoreError::Persist)?;
         upsert_base_dataset_metadata_in_tx(&mut tx, dataset).await?;
+
+        let mut delete_identities: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut upsert_identities: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut upsert_rows: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
         for mutation in mutations {
             match mutation {
                 BaseRowMutation::Upsert { identity, row } => {
-                    upsert_base_row_by_identity_in_tx(
-                        &mut tx,
-                        &dataset.deployment_name,
-                        &dataset.source_schema,
-                        &dataset.source_table,
-                        identity,
-                        row,
-                    )
-                    .await?;
+                    upsert_identities.push(identity);
+                    upsert_rows.push(row);
                 }
                 BaseRowMutation::Delete { identity } => {
-                    delete_base_row_by_identity_in_tx(
-                        &mut tx,
-                        &dataset.deployment_name,
-                        &dataset.source_schema,
-                        &dataset.source_table,
-                        identity,
-                    )
-                    .await?;
+                    delete_identities.push(identity);
                 }
             }
         }
+
+        // Removals first (explicit deletes + identities about to be replaced).
+        delete_base_rows_by_identities_in_tx(
+            &mut tx,
+            &dataset.deployment_name,
+            &dataset.source_schema,
+            &dataset.source_table,
+            &delete_identities,
+        )
+        .await?;
+        delete_base_rows_by_identities_in_tx(
+            &mut tx,
+            &dataset.deployment_name,
+            &dataset.source_schema,
+            &dataset.source_table,
+            &upsert_identities,
+        )
+        .await?;
+
+        if !upsert_rows.is_empty() {
+            let next_ordinal: i32 = sqlx::query_scalar(
+                r#"
+                SELECT COALESCE(MAX(row_ordinal), -1) + 1
+                FROM base_rows
+                WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+                "#,
+            )
+            .bind(&dataset.deployment_name)
+            .bind(&dataset.source_schema)
+            .bind(&dataset.source_table)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+            let owned_rows: Vec<serde_json::Map<String, serde_json::Value>> =
+                upsert_rows.iter().map(|row| (*row).clone()).collect();
+            insert_base_rows_bulk_in_tx(
+                &mut tx,
+                &dataset.deployment_name,
+                &dataset.source_schema,
+                &dataset.source_table,
+                &owned_rows,
+                next_ordinal,
+            )
+            .await?;
+        }
+
         record_applied_source_changes_in_tx(
             &mut tx,
             &dataset.deployment_name,
@@ -2269,25 +2308,45 @@ async fn delete_base_row_by_identity_in_tx(
     source_table: &str,
     identity: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), PlatformStoreError> {
-    let identity_json = identity_json_for_containment(identity)?;
+    delete_base_rows_by_identities_in_tx(
+        tx,
+        deployment_name,
+        source_schema,
+        source_table,
+        &[identity],
+    )
+    .await
+}
+
+/// Delete Base rows whose JSON contains any of the given identities (batch #252).
+async fn delete_base_rows_by_identities_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    identities: &[&serde_json::Map<String, serde_json::Value>],
+) -> Result<(), PlatformStoreError> {
+    if identities.is_empty() {
+        return Ok(());
+    }
+    let mut identity_jsons = Vec::with_capacity(identities.len());
+    for identity in identities {
+        identity_jsons.push(identity_json_for_containment(identity)?);
+    }
     sqlx::query(
         r#"
-            DELETE FROM base_rows
-            WHERE ctid = (
-                SELECT ctid FROM base_rows
-                WHERE deployment_name = $1
-                  AND source_schema = $2
-                  AND source_table = $3
-                  AND row_json::jsonb @> $4::jsonb
-                ORDER BY row_ordinal
-                LIMIT 1
-            )
+            DELETE FROM base_rows b
+            USING UNNEST($4::text[]) AS id(identity_json)
+            WHERE b.deployment_name = $1
+              AND b.source_schema = $2
+              AND b.source_table = $3
+              AND b.row_json::jsonb @> id.identity_json::jsonb
             "#,
     )
     .bind(deployment_name)
     .bind(source_schema)
     .bind(source_table)
-    .bind(&identity_json)
+    .bind(&identity_jsons)
     .execute(&mut **tx)
     .await
     .map_err(PlatformStoreError::Persist)?;

@@ -596,6 +596,22 @@ async fn apply_direct_incremental_window<T: TargetEngine>(
         return Err(err);
     }
 
+    // Index post-apply Base rows by identity for O(1) collapse (large Direct windows).
+    let mut rows_by_key: BTreeMap<String, &serde_json::Map<String, serde_json::Value>> =
+        BTreeMap::new();
+    for row in rows.iter() {
+        let mut identity_map = serde_json::Map::new();
+        for field in &dataset.primary_key {
+            if let Some(value) = row.get(field) {
+                identity_map.insert(field.clone(), value.clone());
+            }
+        }
+        let key = migraloop_types::output_identity_key(&serde_json::Value::Object(
+            identity_map.clone(),
+        ));
+        rows_by_key.insert(key, row);
+    }
+
     // Collapse Base mutations and Direct Delivery ops to final per-identity state.
     let mut base_by_key: BTreeMap<
         String,
@@ -608,6 +624,16 @@ async fn apply_direct_incremental_window<T: TargetEngine>(
         BTreeMap::new();
     let mut applied_changes: Vec<(String, i64)> = Vec::with_capacity(row_changes.len());
 
+    let direct_pipelines: Vec<&Pipeline> = deployment_pipelines
+        .iter()
+        .filter(|pipeline| {
+            !pipeline.target_collection.is_empty()
+                && !pipeline.paused
+                && pipeline.source_table.eq_ignore_ascii_case(table)
+                && pipeline.mode == "direct"
+        })
+        .collect();
+
     for change in &row_changes {
         let identity_map: serde_json::Map<String, serde_json::Value> = change
             .identity
@@ -617,46 +643,14 @@ async fn apply_direct_incremental_window<T: TargetEngine>(
         let key = change_identity_key(&change.identity);
         match change.op {
             ChangeOp::Insert | ChangeOp::Update => {
-                let Some(base_row) = rows
-                    .iter()
-                    .find(|row| row_matches_identity(row, &change.identity))
-                    .cloned()
-                else {
+                let Some(base_row) = rows_by_key.get(&key).copied() else {
                     return Err(RuntimeError::Failed(format!(
                         "Base Dataset {table} missing row for identity {:?}",
                         change.identity
                     )));
                 };
-                base_by_key.insert(key.clone(), (identity_map, Some(base_row)));
-            }
-            ChangeOp::Delete => {
-                base_by_key.insert(key.clone(), (identity_map, None));
-            }
-        }
-        applied_changes.push((change.change_id.clone(), change.position.as_i64()));
-
-        for pipeline in deployment_pipelines {
-            if pipeline.target_collection.is_empty()
-                || pipeline.paused
-                || !pipeline.source_table.eq_ignore_ascii_case(table)
-                || pipeline.mode != "direct"
-            {
-                continue;
-            }
-            let pipeline_ops = delivery_by_pipeline
-                .entry(pipeline.name.clone())
-                .or_default();
-            match change.op {
-                ChangeOp::Insert | ChangeOp::Update => {
-                    let Some(base_row) = rows
-                        .iter()
-                        .find(|row| row_matches_identity(row, &change.identity))
-                    else {
-                        return Err(RuntimeError::Failed(format!(
-                            "Base Dataset {} missing row for Output Identity {:?}",
-                            pipeline.source_table, change.identity
-                        )));
-                    };
+                base_by_key.insert(key.clone(), (identity_map, Some(base_row.clone())));
+                for pipeline in &direct_pipelines {
                     let document = delivery_document_for_row(
                         base_row,
                         &dataset.primary_key,
@@ -664,16 +658,26 @@ async fn apply_direct_incremental_window<T: TargetEngine>(
                         pipeline,
                     )?;
                     let doc_key = migraloop_types::output_identity_key(&document.identity);
-                    pipeline_ops.insert(doc_key, CollapsedDirectOp::Upsert(document));
+                    delivery_by_pipeline
+                        .entry(pipeline.name.clone())
+                        .or_default()
+                        .insert(doc_key, CollapsedDirectOp::Upsert(document));
                 }
-                ChangeOp::Delete => {
+            }
+            ChangeOp::Delete => {
+                base_by_key.insert(key.clone(), (identity_map, None));
+                for pipeline in &direct_pipelines {
                     let identity =
                         identity_value_from_change(change, &dataset.primary_key)?;
                     let doc_key = migraloop_types::output_identity_key(&identity);
-                    pipeline_ops.insert(doc_key, CollapsedDirectOp::Delete(identity));
+                    delivery_by_pipeline
+                        .entry(pipeline.name.clone())
+                        .or_default()
+                        .insert(doc_key, CollapsedDirectOp::Delete(identity));
                 }
             }
         }
+        applied_changes.push((change.change_id.clone(), change.position.as_i64()));
     }
 
     // Deliver-before-checkpoint: flush Target batches before Platform Store TX.
@@ -1409,17 +1413,6 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                         cycle,
                     )
                     .await?;
-                    if let Some(limit) = fail_after {
-                        if cycle.applied_this_run >= limit {
-                            let current_checkpoint =
-                                items.last().expect("non-empty window").position().as_i64();
-                            return Err(RuntimeError::Failed(format!(
-                                "simulated process kill after {limit} durable checkpoint(s) \
-                                 (fail_after_changes / FAIL_AFTER); \
-                                 resume from Platform Store checkpoint={current_checkpoint}"
-                            )));
-                        }
-                    }
                     let last_pos = items.last().expect("non-empty window").position().as_i64();
                     resume_from = CapturePosition::from_i64(last_pos).ok_or_else(|| {
                         RuntimeError::Failed(format!(
