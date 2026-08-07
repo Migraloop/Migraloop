@@ -21,6 +21,7 @@
 //! `apply` re-Delivers the same Output Identities (at-least-once / upsert).
 
 mod correctness;
+mod mega_mix;
 mod namespace;
 mod recipe;
 mod runner;
@@ -54,6 +55,12 @@ use self::correctness::{
     execute_recipe_correctness, fetch_all, fetched_satisfies, inspect_mentions_amount,
     inspect_mentions_email_field, managed_field_present, managed_name_present,
     parse_inspect_row_count, parse_target_document_count,
+};
+use self::mega_mix::{
+    covers_required_path_families, e2e_qps, evaluate_mega_mix_gates,
+    format_mega_mix_report_section, incremental_batch_sql, mega_mix_pipelines,
+    store_pending_evidence, take_pending_evidence, PipelineQpsSample, INCREMENTAL_BATCH_ROWS,
+    MEGA_MIX_DEPLOYMENT, MEGA_MIX_ID, MIX_ID_BASE, SOLO_ID_BASE,
 };
 use self::namespace::{mutate_namespace_from_recipe, prepare_namespace, wipe_namespace};
 use self::recipe::{
@@ -139,6 +146,11 @@ const BULK_LOAD_ID: &str = "bulk-load";
 const BULK_LOAD_TABLE: &str = "LAB_BL_ITEMS";
 const BULK_LOAD_COLLECTION: &str = "lab_bl_items";
 const BULK_LOAD_DEPLOYMENT: &str = "lab-bulk-load";
+
+/// Poll while waiting for mega-mix Incremental Delivery settle (#251).
+const MEGA_MIX_SETTLE_POLL: Duration = Duration::from_secs(2);
+/// Max wall time for one solo/mix Incremental window before correctness/QPS give up.
+const MEGA_MIX_WINDOW_MAX: Duration = Duration::from_secs(300);
 
 const RT_PROJECT_ID: &str = "rt-project";
 const RT_PROJECT_COLLECTION: &str = "lab_rp_customers";
@@ -356,6 +368,7 @@ fn registered_scenario_ids() -> &'static [&'static str] {
         PLATFORM_STORE_GUARDRAILS_ID,
         BACKWARD_COMPATIBLE_UPGRADES_ID,
         INITIAL_LOAD_THROTTLED_ID,
+        MEGA_MIX_ID,
     ]
 }
 
@@ -442,6 +455,10 @@ fn shipped_capability_scenario_requirements() -> &'static [(&'static str, &'stat
         (
             INITIAL_LOAD_THROTTLED_ID,
             "Chunked / rate-limited / pausable Initial Load with backoff",
+        ),
+        (
+            MEGA_MIX_ID,
+            "mega-mix all path families + solo/mix e2e QPS + 0.7/0.95 gates",
         ),
     ]
 }
@@ -601,6 +618,7 @@ async fn scenario_run(
             | PLATFORM_STORE_GUARDRAILS_ID
             | BACKWARD_COMPATIBLE_UPGRADES_ID
             | INITIAL_LOAD_THROTTLED_ID
+            | MEGA_MIX_ID
             | RT_PROJECT_ID
             | RT_FILTER_ID
             | RT_FIELD_OPS_ID
@@ -628,7 +646,8 @@ async fn scenario_run(
 
     match result {
         Ok(report) => {
-            let report = enrich_report_component_pressure(report).await?;
+            let mut report = enrich_report_component_pressure(report).await?;
+            attach_mega_mix_evidence(&mut report);
             let passed = report.correctness && report.thresholds_ok && !report.infra_saturated;
             let mut namespace_removed = false;
             if auto_remove && passed {
@@ -670,10 +689,23 @@ async fn scenario_run(
                 thresholds_ok: true,
                 component_pressure: Vec::new(),
                 infra_saturated: false,
+                limiting_component: None,
+                max_e2e_qps: None,
+                mega_mix: None,
             };
             print_scenario_report(&recipe.id, false, duration, &report, false);
             Err(err)
         }
+    }
+}
+
+/// Attach pending mega-mix gate evidence after pressure enrichment (#251).
+fn attach_mega_mix_evidence(report: &mut ScenarioReport) {
+    if let Some(mut evidence) = take_pending_evidence() {
+        if report.infra_saturated {
+            evidence.gate_0_95_pass = None;
+        }
+        report.mega_mix = Some(evidence);
     }
 }
 
@@ -693,6 +725,8 @@ async fn enrich_report_component_pressure(
     let estimate = capacity_estimate_from_inventory(&inventory, &overrides);
     report.component_pressure = estimate.components;
     report.infra_saturated = estimate.infra_saturated;
+    report.limiting_component = Some(estimate.limiting_component);
+    report.max_e2e_qps = Some(estimate.max_e2e_qps);
     Ok(report)
 }
 
@@ -949,22 +983,21 @@ fn format_scenario_report(
             None => out.push_str(&format!("    {name}: pressure=0 saturated=no\n")),
         }
     }
+    if let Some(limiting) = &report.limiting_component {
+        out.push_str(&format!("  limiting_component={limiting}\n"));
+    }
+    if let Some(max_e2e_qps) = report.max_e2e_qps {
+        out.push_str(&format!("  max_e2e_qps={max_e2e_qps:.2}\n"));
+    }
     if report.infra_saturated {
         out.push_str("  infra_saturated=yes\n");
-        if let Some(limiting) = report
-            .component_pressure
-            .iter()
-            .max_by_key(|c| c.pressure)
-        {
-            out.push_str(&format!(
-                "  limiting_component={}\n",
-                limiting.component
-            ));
-        }
         out.push_str(
             "  guidance: resize Lab Fixture Source / Platform Store / Target and re-run — \
              infra-saturated is not a product failure (ADR-0031)\n",
         );
+    }
+    if let Some(evidence) = &report.mega_mix {
+        out.push_str(&format_mega_mix_report_section(evidence));
     }
     if !report.detail.is_empty() && outcome == "FAIL" {
         out.push_str(&format!("  detail={}\n", report.detail));
@@ -1132,6 +1165,7 @@ enum ProductPathHooks {
     PlatformStoreGuardrails,
     BackwardCompatibleUpgrades,
     InitialLoadThrottled,
+    MegaMix,
 }
 
 impl ProductPathHooks {
@@ -1162,6 +1196,7 @@ impl ProductPathHooks {
             PLATFORM_STORE_GUARDRAILS_ID => Ok(Self::PlatformStoreGuardrails),
             BACKWARD_COMPATIBLE_UPGRADES_ID => Ok(Self::BackwardCompatibleUpgrades),
             INITIAL_LOAD_THROTTLED_ID => Ok(Self::InitialLoadThrottled),
+            MEGA_MIX_ID => Ok(Self::MegaMix),
             other => Err(CliError::Failed(format!(
                 "Lab Scenario `{other}` declares workload.product_path but has no product-path hooks \
                  (migrate the Scenario or remove product_path from recipe.yaml)"
@@ -1691,7 +1726,8 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
             | Self::DriftCheck
             | Self::BoundedBackpressure
             | Self::PlatformStoreGuardrails
-            | Self::BackwardCompatibleUpgrades => Ok(()),
+            | Self::BackwardCompatibleUpgrades
+            | Self::MegaMix => Ok(()),
         }
     }
 
@@ -1718,7 +1754,8 @@ distinct:\n{distinct_after_apply}\naddToSet:\n{add_after_apply}"
             | Self::BulkLoad
             | Self::PlatformStoreGuardrails
             | Self::BackwardCompatibleUpgrades
-            | Self::InitialLoadThrottled => Ok(()),
+            | Self::InitialLoadThrottled
+            | Self::MegaMix => Ok(()),
             Self::ConcurrentSourceWorkload => {
                 println!(
                     "Lab Scenario: driving concurrent Source workload \
@@ -3923,7 +3960,374 @@ Target:
                         },
                     })
             }
+
+            Self::MegaMix => run_mega_mix_protocol(lab_dir, recipe, ctx).await,
         }
+    }
+}
+
+/// Solo baseline → mix Incremental → correctness for mega-mix (#251 / ADR-0031).
+async fn run_mega_mix_protocol(
+    lab_dir: &Path,
+    recipe: &ScenarioRecipe,
+    ctx: &ProductPathRunContext,
+) -> Result<AdapterOutcome, CliError> {
+    let pipelines = mega_mix_pipelines();
+    if !covers_required_path_families(pipelines) {
+        return Err(CliError::Failed(
+            "internal: mega-mix catalog missing a required path family (#251)".to_string(),
+        ));
+    }
+    println!(
+        "Lab Scenario: mega-mix solo baseline protocol \
+(same Fixture sizing; pause siblings; Incremental batch={INCREMENTAL_BATCH_ROWS})..."
+    );
+
+    let mut solo_qps: Vec<f64> = Vec::with_capacity(pipelines.len());
+    for (idx, pipe) in pipelines.iter().enumerate() {
+        mega_mix_pause_all_except(lab_dir, pipe.name).await?;
+        let started = Instant::now();
+        let mut source_rows = 0u64;
+        for table in pipe.workload_tables {
+            let id_base = SOLO_ID_BASE + (idx as i64) * 1_000;
+            let (sql, rows) = incremental_batch_sql(table, id_base, INCREMENTAL_BATCH_ROWS);
+            if rows == 0 {
+                return Err(CliError::Failed(format!(
+                    "mega-mix solo: unsupported workload table {table}"
+                )));
+            }
+            source_rows += rows;
+            run_oracle_sql_body(lab_dir, &sql).await?;
+        }
+        mega_mix_sync_until_pipeline_lag_zero(lab_dir, pipe.name, pipe.workload_tables).await?;
+        let qps = e2e_qps(source_rows, started.elapsed().as_secs_f64());
+        println!(
+            "Lab Scenario: solo baseline pipeline={} path={} qps_solo={qps:.2} rows={source_rows}",
+            pipe.name,
+            pipe.path.as_str()
+        );
+        solo_qps.push(qps);
+    }
+    mega_mix_resume_all(lab_dir).await?;
+
+    println!(
+        "Lab Scenario: mega-mix mix Incremental protocol \
+(all Pipelines active; one Source burst + shared settle; batch={INCREMENTAL_BATCH_ROWS})..."
+    );
+    // Build one Source burst for all path families (shared tables inserted once).
+    let mut mix_sql = String::new();
+    let mut mix_source_rows: Vec<u64> = Vec::with_capacity(pipelines.len());
+    let mut driven: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (idx, pipe) in pipelines.iter().enumerate() {
+        let mut rows_for_pipe = 0u64;
+        for table in pipe.workload_tables {
+            if !driven.insert(*table) {
+                // Shared Source table already in this burst; both Pipelines still
+                // Deliver the same Incremental changes under mix contention.
+                rows_for_pipe += INCREMENTAL_BATCH_ROWS;
+                continue;
+            }
+            let id_base = MIX_ID_BASE + (idx as i64) * 1_000;
+            let (sql, rows) = incremental_batch_sql(table, id_base, INCREMENTAL_BATCH_ROWS);
+            rows_for_pipe += rows;
+            mix_sql.push_str(&sql);
+        }
+        mix_source_rows.push(rows_for_pipe);
+    }
+    let mix_started = Instant::now();
+    run_oracle_sql_body(lab_dir, &mix_sql).await?;
+    mega_mix_sync_until_all_pipelines_settled(lab_dir).await?;
+    let mix_elapsed = mix_started.elapsed().as_secs_f64();
+    let mut samples = Vec::with_capacity(pipelines.len());
+    for (idx, pipe) in pipelines.iter().enumerate() {
+        let qps_mix = e2e_qps(mix_source_rows[idx], mix_elapsed);
+        println!(
+            "Lab Scenario: mix pipeline={} path={} qps_mix={qps_mix:.2} rows={}",
+            pipe.name,
+            pipe.path.as_str(),
+            mix_source_rows[idx]
+        );
+        samples.push(PipelineQpsSample {
+            name: pipe.name.to_string(),
+            path: pipe.path,
+            qps_solo: solo_qps[idx],
+            qps_mix,
+        });
+    }
+
+    // Correctness mutate + sync (Managed/Derived/Target convergence — not metrics-only).
+    println!("Lab Scenario: mega-mix correctness mutate + sync...");
+    mutate_namespace_from_recipe(lab_dir, recipe).await?;
+    let correctness = mega_mix_sync_until_correctness(lab_dir, recipe).await?;
+
+    let evidence = evaluate_mega_mix_gates(&samples, false);
+    store_pending_evidence(evidence.clone());
+    println!(
+        "Lab Scenario: mega-mix gates gate_0_7={} gate_0_95={} \
+direct_agg={:.2} transform_agg={:.2} (floors reported; not accept on #251)",
+        if evidence.gate_0_7_pass {
+            "pass"
+        } else {
+            "fail"
+        },
+        match evidence.gate_0_95_pass {
+            Some(true) => "pass",
+            Some(false) => "fail",
+            None => "n/a",
+        },
+        evidence.direct_aggregate_qps,
+        evidence.transform_aggregate_qps
+    );
+
+    let rows_applied = count_delivery_ops(&ctx.apply_out)
+        + samples.len() as u64 * INCREMENTAL_BATCH_ROWS;
+    let detail = if correctness {
+        String::new()
+    } else {
+        "correctness: mega-mix Managed/Derived/Target outcomes not settled".to_string()
+    };
+    Ok(AdapterOutcome {
+        correctness,
+        detail,
+        metrics: ScenarioMetrics {
+            settle_ms: None,
+            lag: None,
+            rows_per_s: Some(evidence.sum_mix_qps),
+            duration_ms: Some((mix_elapsed * 1000.0) as u128),
+            rows_applied,
+            capture_path_note: "LogMiner mega-mix Incremental".to_string(),
+        },
+    })
+}
+
+async fn mega_mix_pause_all_except(_lab_dir: &Path, keep: &str) -> Result<(), CliError> {
+    let bin = lab_migraloop_bin();
+    for pipe in mega_mix_pipelines() {
+        if pipe.name == keep {
+            // Ensure the measured Pipeline is running.
+            let _ = run_product_cli(
+                &bin,
+                &[
+                    "resume",
+                    "--platform-store-url",
+                    LAB_PLATFORM_STORE_URL,
+                    "--pipeline",
+                    pipe.name,
+                    "--deployment",
+                    MEGA_MIX_DEPLOYMENT,
+                ],
+            )
+            .await;
+            continue;
+        }
+        let out = run_product_cli(
+            &bin,
+            &[
+                "pause",
+                "--platform-store-url",
+                LAB_PLATFORM_STORE_URL,
+                "--pipeline",
+                pipe.name,
+                "--deployment",
+                MEGA_MIX_DEPLOYMENT,
+            ],
+        )
+        .await?;
+        if !out.to_ascii_lowercase().contains("paused") {
+            return Err(CliError::Failed(format!(
+                "mega-mix solo: failed to pause sibling Pipeline {}:\n{out}",
+                pipe.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn mega_mix_resume_all(_lab_dir: &Path) -> Result<(), CliError> {
+    let bin = lab_migraloop_bin();
+    for pipe in mega_mix_pipelines() {
+        let out = run_product_cli(
+            &bin,
+            &[
+                "resume",
+                "--platform-store-url",
+                LAB_PLATFORM_STORE_URL,
+                "--pipeline",
+                pipe.name,
+                "--deployment",
+                MEGA_MIX_DEPLOYMENT,
+            ],
+        )
+        .await?;
+        if out.to_ascii_lowercase().contains("error")
+            && !out.to_ascii_lowercase().contains("not paused")
+            && !out.to_ascii_lowercase().contains("already")
+        {
+            // Best-effort: already-running is fine.
+            if !out.to_ascii_lowercase().contains("resumed")
+                && !out.to_ascii_lowercase().contains("running")
+            {
+                return Err(CliError::Failed(format!(
+                    "mega-mix: failed to resume Pipeline {}:\n{out}",
+                    pipe.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_oracle_sql_body(lab_dir: &Path, sql_body: &str) -> Result<(), CliError> {
+    let connect = format!("{LAB_ORACLE_USER}/{LAB_ORACLE_PASSWORD_DEFAULT}@FREEPDB1");
+    let script = format!(
+        "SET DEFINE OFF\nWHENEVER SQLERROR EXIT SQL.SQLCODE\n{sql_body}\nCOMMIT;\nEXIT;\n"
+    );
+    sqlplus_in_oracle(lab_dir, &connect, &script)
+        .await
+        .map(|_| ())
+        .map_err(|err| CliError::Failed(format!("mega-mix Source SQL failed:\n{err}")))?;
+    Ok(())
+}
+
+async fn mega_mix_sync_until_pipeline_lag_zero(
+    _lab_dir: &Path,
+    pipeline: &str,
+    tables: &[&str],
+) -> Result<(), CliError> {
+    mega_mix_sync_until_settled(_lab_dir, Some((pipeline, tables))).await
+}
+
+async fn mega_mix_sync_until_all_pipelines_settled(lab_dir: &Path) -> Result<(), CliError> {
+    mega_mix_sync_until_settled(lab_dir, None).await
+}
+
+/// Sync until Delivery/Sync Health lag is parsed and zero for one Pipeline or all.
+async fn mega_mix_sync_until_settled(
+    _lab_dir: &Path,
+    only: Option<(&str, &[&str])>,
+) -> Result<(), CliError> {
+    let bin = lab_migraloop_bin();
+    let started = Instant::now();
+    let mut last_status = String::new();
+    loop {
+        let sync_out = run_product_cli(
+            &bin,
+            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        )
+        .await?;
+        if sync_out.to_ascii_lowercase().contains("contract")
+            || sync_out.to_ascii_lowercase().contains("stub")
+        {
+            return Err(CliError::Failed(format!(
+                "mega-mix sync must use real LogMiner path:\n{sync_out}"
+            )));
+        }
+        let status_out = run_product_cli(
+            &bin,
+            &["status", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        )
+        .await?;
+        last_status = status_out.clone();
+
+        let settled = match only {
+            Some((pipeline, tables)) => {
+                mega_mix_pipeline_settled(&status_out, pipeline, tables)?
+            }
+            None => {
+                let mut all_ok = true;
+                for pipe in mega_mix_pipelines() {
+                    if !mega_mix_pipeline_settled(
+                        &status_out,
+                        pipe.name,
+                        pipe.workload_tables,
+                    )? {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                all_ok
+            }
+        };
+        if settled {
+            return Ok(());
+        }
+        if started.elapsed() > MEGA_MIX_WINDOW_MAX {
+            return Err(CliError::Failed(format!(
+                "mega-mix Incremental settle timed out. Status:\n{last_status}"
+            )));
+        }
+        tokio::time::sleep(MEGA_MIX_SETTLE_POLL).await;
+    }
+}
+
+/// Require parsed Delivery + Sync Health lags (missing parse ≠ settled).
+fn mega_mix_pipeline_settled(
+    status_out: &str,
+    pipeline: &str,
+    tables: &[&str],
+) -> Result<bool, CliError> {
+    let Some(delivery_lag) = parse_delivery_lag_for_pipeline(status_out, pipeline) else {
+        return Ok(false);
+    };
+    if delivery_lag > 0 {
+        return Ok(false);
+    }
+    for table in tables {
+        let Some(sync_lag) = parse_sync_lag_for_table(status_out, table) else {
+            return Ok(false);
+        };
+        if sync_lag > 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn mega_mix_sync_until_correctness(
+    _lab_dir: &Path,
+    recipe: &ScenarioRecipe,
+) -> Result<bool, CliError> {
+    let bin = lab_migraloop_bin();
+    let started = Instant::now();
+    let mut last_detail = String::new();
+    loop {
+        let sync_out = run_product_cli(
+            &bin,
+            &["sync", "--platform-store-url", LAB_PLATFORM_STORE_URL],
+        )
+        .await?;
+        if sync_out.to_ascii_lowercase().contains("logminer")
+            || sync_out.to_ascii_lowercase().contains("delivery")
+            || sync_out.to_ascii_lowercase().contains("no changes")
+        {
+            // ok
+        } else if sync_out.to_ascii_lowercase().contains("stub") {
+            return Err(CliError::Failed(format!(
+                "mega-mix correctness sync must use real LogMiner path:\n{sync_out}"
+            )));
+        }
+        match fetch_all(&recipe.checks.correctness).await {
+            Ok(fetched) if fetched_satisfies(&recipe.checks.correctness, &fetched) => {
+                println!(
+                    "Lab Scenario: mega-mix correctness checks passed \
+(Managed/Derived/Target convergence)"
+                );
+                return Ok(true);
+            }
+            Ok(_) => {
+                last_detail = "recipe checks.correctness not yet satisfied".to_string();
+            }
+            Err(err) => {
+                last_detail = err.to_string();
+            }
+        }
+        if started.elapsed() > MEGA_MIX_WINDOW_MAX {
+            println!(
+                "Lab Scenario: mega-mix correctness settle timed out ({last_detail})"
+            );
+            return Ok(false);
+        }
+        tokio::time::sleep(MEGA_MIX_SETTLE_POLL).await;
     }
 }
 
@@ -5114,6 +5518,68 @@ mod tests {
     }
 
     #[test]
+    fn mega_mix_recipe_covers_path_families_and_report_prints_gates() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lab/scenarios/mega-mix/recipe.yaml");
+        let recipe = load_recipe(&path).expect("load mega-mix recipe");
+        assert_eq!(recipe.id, MEGA_MIX_ID);
+        assert_eq!(recipe.namespace.deployment, MEGA_MIX_DEPLOYMENT);
+        for pipe in mega_mix_pipelines() {
+            assert!(
+                recipe.namespace.pipelines.iter().any(|p| p == pipe.name),
+                "recipe namespace.pipelines missing {}",
+                pipe.name
+            );
+        }
+        assert!(
+            crate::lab_scenario::mega_mix::covers_required_path_families(mega_mix_pipelines())
+        );
+        let samples = mega_mix_pipelines()
+            .iter()
+            .map(|p| PipelineQpsSample {
+                name: p.name.to_string(),
+                path: p.path,
+                qps_solo: 100.0,
+                qps_mix: 96.0,
+            })
+            .collect::<Vec<_>>();
+        let evidence = evaluate_mega_mix_gates(&samples, false);
+        let mut report = report_from_adapter_outcome(
+            &recipe,
+            AdapterOutcome {
+                correctness: true,
+                detail: String::new(),
+                metrics: ScenarioMetrics {
+                    settle_ms: None,
+                    lag: None,
+                    rows_per_s: Some(evidence.sum_mix_qps),
+                    duration_ms: Some(1_000),
+                    rows_applied: INCREMENTAL_BATCH_ROWS,
+                    capture_path_note: "LogMiner mega-mix Incremental".to_string(),
+                },
+            },
+        );
+        report.mega_mix = Some(evidence);
+        let rendered = format_scenario_report(
+            MEGA_MIX_ID,
+            true,
+            Duration::from_millis(1_000),
+            &report,
+            false,
+        );
+        assert!(rendered.contains("mega_mix:"), "{rendered}");
+        assert!(rendered.contains("gate_0_7="), "{rendered}");
+        assert!(rendered.contains("gate_0_95="), "{rendered}");
+        assert!(rendered.contains("path_aggregate_direct_qps="), "{rendered}");
+        assert!(
+            rendered.contains("path_aggregate_transform_qps="),
+            "{rendered}"
+        );
+        assert!(rendered.contains("component_pressure:"), "{rendered}");
+        assert!(rendered.contains("protocol=solo_baseline_then_mix"), "{rendered}");
+    }
+
+    #[test]
     fn infra_saturated_report_is_not_product_fail() {
         let thresholds = bulk_load_recipe_thresholds();
         let metrics = ScenarioMetrics {
@@ -5600,6 +6066,7 @@ mod tests {
                 false,
                 false,
             ),
+            (MEGA_MIX_ID, three_step.as_slice(), false, true, false),
         ] {
             let recipe = load_recipe(&lab.join(id).join("recipe.yaml"))
                 .unwrap_or_else(|err| panic!("load {id}: {err}"));

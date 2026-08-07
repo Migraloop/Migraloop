@@ -258,6 +258,30 @@ async fn lab_scenario_list_includes_bulk_load() {
 }
 
 #[tokio::test]
+async fn lab_scenario_list_includes_mega_mix() {
+    let list = Command::new(bin())
+        .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])
+        .output()
+        .expect("run lab scenario list");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(list.status.success(), "lab scenario list failed:\n{out}");
+    assert!(
+        out.contains("mega-mix"),
+        "catalog must list mega-mix Lab Scenario (all path families + gates), got:\n{out}"
+    );
+    assert!(
+        out.to_ascii_lowercase().contains("gate")
+            || out.to_ascii_lowercase().contains("qps")
+            || out.to_ascii_lowercase().contains("path"),
+        "mega-mix summary should mention gates/QPS/path families, got:\n{out}"
+    );
+}
+
+#[tokio::test]
 async fn lab_scenario_list_includes_rt_project() {
     let list = Command::new(bin())
         .args(["lab", "scenario", "list", "--lab-dir", &lab_dir()])

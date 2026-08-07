@@ -1,0 +1,280 @@
+# Lab Scenario recipe (ADR-0031 / issue #251).
+# Catalog listing (`migraloop lab scenario list`) reads this file.
+# Solo baseline → mix Incremental protocol + gate reporting live in MegaMix hooks;
+# absolute 100k/50k floors are reported honestly but are not accept thresholds here.
+id: mega-mix
+summary: "Mega-mix: all path families + solo/mix e2e QPS + 0.7/0.95 gates (Aggregation $… only)"
+namespace:
+  source_tables:
+    - LAB_MM_DIRECT_A
+    - LAB_MM_DIRECT_B
+    - LAB_MM_PROJECT
+    - LAB_MM_FIELD_OPS
+    - LAB_MM_MATCH
+    - LAB_MM_LOOKUP_CUSTOMERS
+    - LAB_MM_LOOKUP_ORDERS
+    - LAB_MM_EAST
+    - LAB_MM_WEST
+    - LAB_MM_UNWIND_CUSTOMERS
+    - LAB_MM_UNWIND_ORDERS
+    - LAB_MM_GROUP_ORDERS
+    - LAB_MM_DIST_ORDERS
+  target_collections:
+    - lab_mm_direct_a
+    - lab_mm_direct_b
+    - lab_mm_project
+    - lab_mm_field_ops
+    - lab_mm_match
+    - lab_mm_lookup
+    - lab_mm_union
+    - lab_mm_unwind
+    - lab_mm_group
+    - lab_mm_distinct
+    - lab_mm_addtoset
+  deployment: lab-mega-mix
+  pipelines:
+    - lab-mm-direct-a
+    - lab-mm-direct-b
+    - lab-mm-project
+    - lab-mm-field-ops
+    - lab-mm-match
+    - lab-mm-lookup
+    - lab-mm-union
+    - lab-mm-unwind
+    - lab-mm-group
+    - lab-mm-distinct
+    - lab-mm-addtoset
+  lifecycle:
+    tables:
+      - name: LAB_MM_DIRECT_A
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL
+      - name: LAB_MM_DIRECT_B
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL
+      - name: LAB_MM_PROJECT
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200)
+      - name: LAB_MM_FIELD_OPS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200),
+          ACTIVE NUMBER(1) NOT NULL
+      - name: LAB_MM_MATCH
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL,
+          EMAIL VARCHAR2(200),
+          ACTIVE NUMBER(1) NOT NULL
+      - name: LAB_MM_LOOKUP_CUSTOMERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL
+      - name: LAB_MM_LOOKUP_ORDERS
+        columns: |
+          ORDER_ID NUMBER(10) PRIMARY KEY,
+          CUSTOMER_ID NUMBER(10) NOT NULL,
+          AMOUNT NUMBER(12,2) NOT NULL
+      - name: LAB_MM_EAST
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL
+      - name: LAB_MM_WEST
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL
+      - name: LAB_MM_UNWIND_CUSTOMERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          NAME VARCHAR2(100) NOT NULL
+      - name: LAB_MM_UNWIND_ORDERS
+        columns: |
+          ORDER_ID NUMBER(10) PRIMARY KEY,
+          CUSTOMER_ID NUMBER(10) NOT NULL,
+          AMOUNT NUMBER(12,2) NOT NULL
+      - name: LAB_MM_GROUP_ORDERS
+        columns: |
+          ID NUMBER(10) PRIMARY KEY,
+          CUSTOMER_ID NUMBER(10) NOT NULL,
+          AMOUNT NUMBER(10) NOT NULL,
+          NOTE VARCHAR2(200)
+      - name: LAB_MM_DIST_ORDERS
+        columns: |
+          ORDER_ID NUMBER(10) PRIMARY KEY,
+          CUSTOMER_ID NUMBER(10) NOT NULL,
+          AMOUNT NUMBER(12,2) NOT NULL,
+          ADDRESS VARCHAR2(200)
+    seed_sql: |
+      INSERT INTO LAB_MM_DIRECT_A (ID, NAME) VALUES (1, 'Alice');
+      INSERT INTO LAB_MM_DIRECT_B (ID, NAME) VALUES (1, 'Alice');
+      INSERT INTO LAB_MM_PROJECT (ID, NAME, EMAIL) VALUES (1, 'Alice', 'alice@example.com');
+      INSERT INTO LAB_MM_FIELD_OPS (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);
+      INSERT INTO LAB_MM_MATCH (ID, NAME, EMAIL, ACTIVE) VALUES (1, 'Alice', 'alice@example.com', 1);
+      INSERT INTO LAB_MM_MATCH (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Bob', 'bob@example.com', 0);
+      INSERT INTO LAB_MM_LOOKUP_CUSTOMERS (ID, NAME) VALUES (1, 'Alice');
+      INSERT INTO LAB_MM_LOOKUP_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (100, 1, 10.00);
+      INSERT INTO LAB_MM_EAST (ID, NAME) VALUES (1, 'East-Alice');
+      INSERT INTO LAB_MM_WEST (ID, NAME) VALUES (2, 'West-Bob');
+      INSERT INTO LAB_MM_UNWIND_CUSTOMERS (ID, NAME) VALUES (1, 'Alice');
+      INSERT INTO LAB_MM_UNWIND_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (100, 1, 42.50);
+      INSERT INTO LAB_MM_GROUP_ORDERS (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (1, 1, 10, 'seed-a');
+      INSERT INTO LAB_MM_GROUP_ORDERS (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (2, 1, 20, 'seed-b');
+      INSERT INTO LAB_MM_DIST_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (100, 1, 42.50, '1 Main St');
+      INSERT INTO LAB_MM_DIST_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (101, 1, 10.00, '1 Main St');
+    mutate_sql: |
+      UPDATE LAB_MM_DIRECT_A SET NAME = 'Alicia' WHERE ID = 1;
+      INSERT INTO LAB_MM_DIRECT_A (ID, NAME) VALUES (2, 'Carol');
+      UPDATE LAB_MM_DIRECT_B SET NAME = 'Alicia' WHERE ID = 1;
+      INSERT INTO LAB_MM_DIRECT_B (ID, NAME) VALUES (2, 'Carol');
+      UPDATE LAB_MM_PROJECT SET NAME = 'Alicia' WHERE ID = 1;
+      INSERT INTO LAB_MM_PROJECT (ID, NAME, EMAIL) VALUES (2, 'Carol', 'carol@example.com');
+      UPDATE LAB_MM_FIELD_OPS SET NAME = 'Alicia' WHERE ID = 1;
+      INSERT INTO LAB_MM_FIELD_OPS (ID, NAME, EMAIL, ACTIVE) VALUES (2, 'Carol', 'carol@example.com', 1);
+      UPDATE LAB_MM_MATCH SET NAME = 'Alicia' WHERE ID = 1;
+      UPDATE LAB_MM_MATCH SET ACTIVE = 1 WHERE ID = 2;
+      INSERT INTO LAB_MM_MATCH (ID, NAME, EMAIL, ACTIVE) VALUES (3, 'Carol', 'carol@example.com', 1);
+      UPDATE LAB_MM_LOOKUP_CUSTOMERS SET NAME = 'Alicia' WHERE ID = 1;
+      INSERT INTO LAB_MM_LOOKUP_CUSTOMERS (ID, NAME) VALUES (2, 'Carol');
+      INSERT INTO LAB_MM_LOOKUP_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (200, 2, 5.00);
+      UPDATE LAB_MM_EAST SET NAME = 'East-Alicia' WHERE ID = 1;
+      INSERT INTO LAB_MM_EAST (ID, NAME) VALUES (3, 'East-Carol');
+      UPDATE LAB_MM_WEST SET NAME = 'West-Robert' WHERE ID = 2;
+      UPDATE LAB_MM_UNWIND_CUSTOMERS SET NAME = 'Alicia' WHERE ID = 1;
+      UPDATE LAB_MM_UNWIND_ORDERS SET AMOUNT = 50.00 WHERE ORDER_ID = 100;
+      INSERT INTO LAB_MM_UNWIND_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES (101, 1, 7.00);
+      INSERT INTO LAB_MM_GROUP_ORDERS (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES (3, 1, 15, 'new');
+      UPDATE LAB_MM_GROUP_ORDERS SET AMOUNT = 50, NOTE = 'bumped' WHERE ID = 2;
+      INSERT INTO LAB_MM_DIST_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (102, 1, 7.00, '1 Main Ave');
+      INSERT INTO LAB_MM_DIST_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES (200, 3, 5.00, '3 Side Rd');
+deployment_config: deployment.yaml
+workload:
+  concurrency: serial
+  steps:
+    - prepare Scenario Namespace tables + seed + table-level supplemental logging
+    - apply full mega-mix Deployment via real product path (Initial Load + Derived)
+    - solo baseline protocol (pause siblings; Incremental batch; measure QPS_solo_i)
+    - mix Incremental protocol (all Pipelines active; measure QPS_mix_i)
+    - correctness mutate + sync; assert Managed/Derived/Target convergence
+    - report path aggregates, 0.7/0.95 gates, component pressure / infra-saturated
+  product_path:
+    steps:
+      - prepare_namespace
+      - product_apply
+      - assert
+    apply:
+      require_initial_load: true
+      require_derived: true
+    sync:
+      require_logminer: true
+checks:
+  correctness:
+    - surface: target
+      collection: lab_mm_direct_a
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+    - surface: target
+      collection: lab_mm_direct_b
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+    - surface: derived
+      pipeline: lab-mm-project
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      field_absent: [EMAIL]
+    - surface: target
+      collection: lab_mm_project
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+      field_absent: [EMAIL]
+    - surface: derived
+      pipeline: lab-mm-field-ops
+      present:
+        - { field: customerName, value: Alicia }
+        - { field: customerName, value: Carol }
+      field_absent: [EMAIL]
+    - surface: target
+      collection: lab_mm_field_ops
+      present:
+        - { field: customerName, value: Alicia }
+        - { field: customerName, value: Carol }
+      field_absent: [EMAIL]
+    - surface: derived
+      pipeline: lab-mm-match
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+        - { field: NAME, value: Carol }
+    - surface: target
+      collection: lab_mm_match
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+        - { field: NAME, value: Carol }
+    - surface: derived
+      pipeline: lab-mm-lookup
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+    - surface: target
+      collection: lab_mm_lookup
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+    - surface: derived
+      pipeline: lab-mm-union
+      present:
+        - { field: NAME, value: East-Alicia }
+        - { field: NAME, value: West-Robert }
+        - { field: NAME, value: East-Carol }
+    - surface: target
+      collection: lab_mm_union
+      present:
+        - { field: NAME, value: East-Alicia }
+        - { field: NAME, value: West-Robert }
+        - { field: NAME, value: East-Carol }
+    - surface: derived
+      pipeline: lab-mm-unwind
+      contains:
+        - "50"
+        - "7"
+    - surface: target
+      collection: lab_mm_unwind
+      contains:
+        - "50"
+        - "7"
+    - surface: derived
+      pipeline: lab-mm-group
+      amount_present: ["75"]
+    - surface: target
+      collection: lab_mm_group
+      amount_present: ["75"]
+    - surface: derived
+      pipeline: lab-mm-distinct
+      contains:
+        - '"CUSTOMER_ID": 1'
+        - '"CUSTOMER_ID": 3'
+    - surface: target
+      collection: lab_mm_distinct
+      contains:
+        - '"CUSTOMER_ID": 1'
+        - '"CUSTOMER_ID": 3'
+    - surface: derived
+      pipeline: lab-mm-addtoset
+      contains:
+        - "7.00"
+        - '"CUSTOMER_ID": 3'
+    - surface: target
+      collection: lab_mm_addtoset
+      contains:
+        - "7.00"
+        - '"CUSTOMER_ID": 3'
+thresholds: {}

@@ -60,6 +60,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run change-ordering
 ./target/debug/migraloop lab scenario run bulk-load
+./target/debug/migraloop lab scenario run mega-mix
 ./target/debug/migraloop lab scenario run idempotent-redelivery
 ./target/debug/migraloop lab scenario run pause-resume
 ./target/debug/migraloop lab scenario run remove-pipeline
@@ -172,7 +173,7 @@ export MIGRALOOP_TEST_MONGO_HOST=127.0.0.1
 export MIGRALOOP_TEST_MONGO_PORT=27017
 ```
 
-Default `cargo test -p migraloop-app` skips `#[ignore]` Lab Fixture / Lab Scenario / live Oracle tests and the `rqg-perf`-only microbench—keep it that way. Lab Scenario `bulk-load` stays **manual**; it is not the performance gate (`ci/rqg/` owns `rqg-perf`). Matrix of shipped Lab capabilities → non-ignored CI twin evidence: `docs/rqg/CI_TWIN_COVERAGE.md`.
+Default `cargo test -p migraloop-app` skips `#[ignore]` Lab Fixture / Lab Scenario / live Oracle tests and the `rqg-perf`-only microbench—keep it that way. Lab Scenario `bulk-load` and `mega-mix` stay **manual**; they are not the performance gate (`ci/rqg/` owns `rqg-perf`). Matrix of shipped Lab capabilities → non-ignored CI twin evidence: `docs/rqg/CI_TWIN_COVERAGE.md`.
 
 ## Tests
 
@@ -208,7 +209,7 @@ Lab Fixture lifecycle seam (ignored by default; requires Docker Compose + Lab Or
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline, Rich Transform capabilities (`project`/`filter`/`addFields`/`rename`/`remove`/`equiLookup`/`union`/`unwind`, authored as Aggregation `$project`/`$match`/… only — see [Rich Transform](rich-transform.md)), multi-table Transform Pipeline (`groupBy` / `$group` sum/count/min/max/avg), concurrent Source workload, Change Ordering / confluence (`change-ordering`), bulk-load, idempotent-redelivery, pause-resume, remove-pipeline, change-pipeline, poison-quarantine, schema-change-pause, source-alignment, drift-check, bounded-backpressure, observability-surface, platform-store-guardrails, backward-compatible-upgrades, and initial-load-throttled seams (ignored by default; requires Docker Lab Fixture + Instant Client). These are **manual Lab** seams—not Release Quality Gate evidence and not something to wire into CI:
+Lab Scenario Direct Pipeline, Rich Transform capabilities (`project`/`filter`/`addFields`/`rename`/`remove`/`equiLookup`/`union`/`unwind`, authored as Aggregation `$project`/`$match`/… only — see [Rich Transform](rich-transform.md)), multi-table Transform Pipeline (`groupBy` / `$group` sum/count/min/max/avg), concurrent Source workload, Change Ordering / confluence (`change-ordering`), bulk-load, idempotent-redelivery, pause-resume, remove-pipeline, change-pipeline, poison-quarantine, schema-change-pause, source-alignment, drift-check, bounded-backpressure, observability-surface, platform-store-guardrails, backward-compatible-upgrades, initial-load-throttled, and mega-mix seams (ignored by default; requires Docker Lab Fixture + Instant Client). These are **manual Lab** seams—not Release Quality Gate evidence and not something to wire into CI:
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
