@@ -202,6 +202,18 @@ checks:
         - { field: customerName, value: Carol }
       field_absent: [EMAIL]
     - surface: target
+      collection: lab_mm_field_ops
+      present:
+        - { field: customerName, value: Alicia }
+        - { field: customerName, value: Carol }
+      field_absent: [EMAIL]
+    - surface: derived
+      pipeline: lab-mm-match
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Bob }
+        - { field: NAME, value: Carol }
+    - surface: target
       collection: lab_mm_match
       present:
         - { field: NAME, value: Alicia }
@@ -213,11 +225,27 @@ checks:
         - { field: NAME, value: Alicia }
         - { field: NAME, value: Carol }
     - surface: target
+      collection: lab_mm_lookup
+      present:
+        - { field: NAME, value: Alicia }
+        - { field: NAME, value: Carol }
+    - surface: derived
+      pipeline: lab-mm-union
+      present:
+        - { field: NAME, value: East-Alicia }
+        - { field: NAME, value: West-Robert }
+        - { field: NAME, value: East-Carol }
+    - surface: target
       collection: lab_mm_union
       present:
         - { field: NAME, value: East-Alicia }
         - { field: NAME, value: West-Robert }
         - { field: NAME, value: East-Carol }
+    - surface: derived
+      pipeline: lab-mm-unwind
+      contains:
+        - "50"
+        - "7"
     - surface: target
       collection: lab_mm_unwind
       contains:
@@ -226,13 +254,26 @@ checks:
     - surface: derived
       pipeline: lab-mm-group
       amount_present: ["75"]
+    - surface: target
+      collection: lab_mm_group
+      amount_present: ["75"]
     - surface: derived
       pipeline: lab-mm-distinct
       contains:
         - '"CUSTOMER_ID": 1'
         - '"CUSTOMER_ID": 3'
+    - surface: target
+      collection: lab_mm_distinct
+      contains:
+        - '"CUSTOMER_ID": 1'
+        - '"CUSTOMER_ID": 3'
     - surface: derived
       pipeline: lab-mm-addtoset
+      contains:
+        - "7.00"
+        - '"CUSTOMER_ID": 3'
+    - surface: target
+      collection: lab_mm_addtoset
       contains:
         - "7.00"
         - '"CUSTOMER_ID": 3'

@@ -64,6 +64,10 @@ pub(crate) struct ScenarioReport {
     pub component_pressure: Vec<ComponentPressure>,
     /// True when Source / Platform Store / Target is saturated (infra — resize, not product fail).
     pub infra_saturated: bool,
+    /// Capacity Estimate limiting component (same semantics as `capacity-estimate` CLI).
+    pub limiting_component: Option<String>,
+    /// Coarse max end-to-end Managed Delivery QPS from Capacity Estimate.
+    pub max_e2e_qps: Option<f64>,
     /// Mega-mix gate / path-aggregate evidence (#251).
     pub mega_mix: Option<MegaMixEvidence>,
 }
@@ -187,6 +191,8 @@ pub(crate) fn report_from_adapter_outcome(
         thresholds_ok,
         component_pressure: Vec::new(),
         infra_saturated: false,
+        limiting_component: None,
+        max_e2e_qps: None,
         mega_mix: None,
     }
 }
