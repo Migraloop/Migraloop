@@ -498,12 +498,12 @@ async fn unwind_rejects_unsupported_forms_and_scripts_on_apply() {
         collection: scripted
       outputIdentity: [ORDER_ID]
       transform:
-        - equiLookup:
+        - $lookup:
             from: ORDERS
             localField: ID
             foreignField: CUSTOMER_ID
             as: orders
-        - unwind:
+        - $unwind:
             path: orders
         - script: "return true"
 "#;

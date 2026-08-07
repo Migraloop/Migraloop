@@ -453,10 +453,8 @@ async fn transform_field_ops_script_and_unsupported_still_fail_apply() {
         collection: scripted
       outputIdentity: [ID]
       transform:
-        - addFields:
-            fields:
-              - as: ok
-                value: 1
+        - $addFields:
+            ok: 1
         - script: "return true"
 "#;
     let script_config = write_config(
@@ -484,10 +482,8 @@ async fn transform_field_ops_script_and_unsupported_still_fail_apply() {
         collection: faceted
       outputIdentity: [ID]
       transform:
-        - rename:
-            fields:
-              - from: NAME
-                to: customerName
+        - $rename:
+            NAME: customerName
         - facet:
             stages: []
 "#;

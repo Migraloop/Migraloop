@@ -480,7 +480,7 @@ async fn equilookup_rejects_pipeline_lookup_and_scripts_on_apply() {
         collection: scripted
       outputIdentity: [ID]
       transform:
-        - equiLookup:
+        - $lookup:
             from: ORDERS
             localField: ID
             foreignField: CUSTOMER_ID

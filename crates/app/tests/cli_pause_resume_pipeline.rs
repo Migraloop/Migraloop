@@ -147,11 +147,10 @@ spec:
         collection: active_customers
       outputIdentity: [ID]
       transform:
-        - project:
+        - $project:
             fields: [ID, NAME, ACTIVE]
-        - filter:
-            field: ACTIVE
-            eq: 1
+        - $match:
+            ACTIVE: 1
     - name: orders
       mode: direct
       source:

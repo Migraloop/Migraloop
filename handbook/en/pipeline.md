@@ -48,7 +48,7 @@ Validation rules enforced on `apply`:
 - Transform Pipelines require `outputIdentity` and a non-empty declarative `transform`
 - `fields` keys map source/Managed field names to `{ as: string }` or `{ as: omit }` (ADR-0023; NUMBER classification lives next to shared `ColumnShape`)
 
-See [Rich Transform](rich-transform.md) for operator shapes (preferred Aggregation/SQL-like DX such as `$project` / `$match` / `$lookup` / `$group`; classic steps remain Upgrade Compatible).
+See [Rich Transform](rich-transform.md) for operator shapes (Aggregation-only `$project` / `$match` / `$lookup` / `$group`; classic and SQL-ish aliases are rejected — ADR-0030).
 
 ## Lifecycle (control plane)
 

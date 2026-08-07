@@ -11,14 +11,21 @@ Transform Pipelines must declare:
 - `outputIdentity` — stable key fields for Delivery insert/update/delete
 - `transform` — ordered list of declarative operator steps
 
-## Authoring forms
+## Authoring surface
 
-Operators author the same analyzable surface in either form—both normalize to one IR for **Affect Analysis**:
+Operators author Rich Transforms **only** as MongoDB Aggregation–shaped stages using the
+**same stage/accumulator names** for the same capability (`$project`, `$match`, `$lookup`,
+`$group`, …). Stages normalize to one analyzable IR for **Affect Analysis**. Full
+Aggregation feature parity is not required—unsupported stages reject clearly. The
+platform evaluates and maintains Derived Datasets itself; it does **not** run the
+pipeline on Target MongoDB as a compute engine.
 
-1. **Aggregation / SQL-like DX (preferred)** — MongoDB Aggregation–shaped stages (`$project`, `$match`, `$lookup`, `$group`, …) plus thin SQL-ish aliases (`select`, `where`, `join`). This is the supported authoring path for new Pipelines and shipped Lab Scenarios.
-2. **Classic steps (Upgrade Compatibility)** — `project`, `filter`, `equiLookup`, `groupBy`, … Existing Deployments that use classic steps keep applying without a forced rewrite.
+Classic step names (`project` / `filter` / `groupBy` / …) and SQL-ish aliases
+(`select` / `where` / `join`) are **rejected** with **no** read-compat window and
+**no** automated migration (ADR-0030). Rewrite those Deployments to `$…` stages before
+`migraloop apply`.
 
-Example (preferred Aggregation form):
+Example:
 
 ```yaml
 transform:
@@ -30,43 +37,27 @@ transform:
       ACTIVE: 1
 ```
 
-Equivalent SQL-ish aliases:
+Supported Aggregation stages (unanalyzable extensions stay rejected):
 
-```yaml
-transform:
-  - select:
-      fields: [ID, NAME, ACTIVE]
-  - where:
-      field: ACTIVE
-      eq: 1
-```
+| Stage | Notes |
+| --- | --- |
+| `$project` | Inclusion map (`FIELD: 1`) or `{ fields: [...] }` |
+| `$match` | Single-field equality only |
+| `$addFields` / `$set` | `"$field"` copy or `{ $literal: ... }` / JSON literal |
+| `$unset` | Field name or array of names |
+| `$rename` | `{ FROM: TO }` map |
+| `$lookup` | Equijoin only — no `pipeline` / `let` |
+| `$unwind` | Path string or `{ path }` — no `preserveNullAndEmptyArrays` |
+| `$unionWith` | `coll` / `from` / string — no nested `pipeline` |
+| `$group` | `_id: "$KEY"`; accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet`. `$count` takes a field ref (`{ $count: "$ORDER_ID" }` = SQL `COUNT(field)`), not Mongo’s empty `{ $count: {} }`. Distinct = `$group` with `_id` only |
 
-Constrained Aggregation stages map as follows (unanalyzable extensions stay rejected):
-
-| Aggregation / SQL-like | Classic equivalent | Notes |
-| --- | --- | --- |
-| `$project` / `select` | `project` | Inclusion map (`FIELD: 1`) or `{ fields: [...] }` |
-| `$match` / `where` | `filter` | Single-field equality only |
-| `$addFields` / `$set` | `addFields` | `"$field"` copy or `{ $literal: ... }` / JSON literal |
-| `$unset` | `remove` | Field name or array of names |
-| `$rename` | `rename` | `{ FROM: TO }` map |
-| `$lookup` / `join` | `equiLookup` | Equijoin only — no `pipeline` / `let` |
-| `$unwind` | `unwind` | Path string or `{ path }` — no `preserveNullAndEmptyArrays` |
-| `$unionWith` | `union` | `coll` / `from` / string — no nested `pipeline` |
-| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`; accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet`. `$count` takes a field ref (`{ $count: "$ORDER_ID" }` = SQL `COUNT(field)`), not Mongo’s empty `{ $count: {} }` |
-
-Prefer one form per Pipeline for readability; mixing classic and Aggregation steps in one list is allowed when each step is valid.
-
-### Migration notes
-
-- **No wipe required to keep classic YAML.** Upgrading the app does not force Operators to rewrite classic `project` / `filter` / `groupBy` / … Deployments (Upgrade Compatibility / ADR-0014). Classic steps still parse; existing Deployments keep Syncing.
-- **New authoring should use Aggregation DX.** Lab Scenarios and handbook examples use `$project` / `$match` / `$group` / … as the supported style.
-- **Rewriting form in config is a Pipeline revision.** Authored `transform` JSON is stored as written. Replacing classic steps with IR-equivalent Aggregation YAML (or the reverse) changes the stored declaration, so `migraloop apply` treats it as a **semantic Pipeline revision**: pause that Pipeline’s old Delivery, rebuild its Derived Dataset, re-Deliver (including delete reconciliation), then resume. Prefer migrating when you already intend a revision window—or leave classic Deployments unchanged.
-- **Capability names in catalogs stay classic.** Coverage rows and glossary still say `project` / `equiLookup` / `groupBy` for the analyzable surface; authoring may use either form.
+Lab Scenarios, samples, and this handbook use `$…` only. Changing authored `transform`
+JSON is a **semantic Pipeline revision** (pause Delivery, rebuild Derived, re-Deliver,
+resume)—same as any other transform change.
 
 ## v1 operator surface (implemented)
 
-The shipped parser accepts these analyzable operators (Oracle → MongoDB slice)—shown in preferred Aggregation form. Classic equivalents remain supported (see mapping table above).
+The shipped parser accepts these analyzable Aggregation stages (Oracle → MongoDB slice):
 
 ### `$project`
 
@@ -189,12 +180,12 @@ Pipeline source schema).
     as: orders
 ```
 
-Use constrained Aggregation `$lookup` / `join` (or classic `equiLookup`) with the same
-equijoin fields. Free-form Mongo `$lookup` extensions (`pipeline` / `let`) are
-rejected so **Affect Analysis** stays correct. A change on either Base side
-updates only the affected primary Output Identities; unused primary fields (for example
-EMAIL after `$project`) still skip recompute. Embedded foreign rows include full Base
-fields, so foreign-side field changes recompute matching identities.
+Use constrained Aggregation `$lookup` with the same equijoin fields. Free-form Mongo
+`$lookup` extensions (`pipeline` / `let`) are rejected so **Affect Analysis** stays
+correct. A change on either Base side updates only the affected primary Output
+Identities; unused primary fields (for example EMAIL after `$project`) still skip
+recompute. Embedded foreign rows include full Base fields, so foreign-side field
+changes recompute matching identities.
 
 ### `$unwind`
 

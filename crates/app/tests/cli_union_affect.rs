@@ -610,7 +610,7 @@ async fn union_rejects_pipeline_union_with_and_scripts_on_apply() {
         collection: scripted
       outputIdentity: [ID]
       transform:
-        - union:
+        - $unionWith:
             from: WEST_CUSTOMERS
         - script: "return true"
 "#;
