@@ -173,7 +173,7 @@ export MIGRALOOP_TEST_MONGO_HOST=127.0.0.1
 export MIGRALOOP_TEST_MONGO_PORT=27017
 ```
 
-默认 `cargo test -p migraloop-app` 会跳过 `#[ignore]` 的 Lab Fixture／Lab Scenario／live Oracle 测试，以及仅供 `rqg-perf` 的 microbench—请保持如此。Lab Scenario `bulk-load` 与 `mega-mix` 保持**手动**；它们不是 performance gate（`rqg-perf` 由 `ci/rqg/` 负责）。已出货 Lab capability → 非 ignored CI twin 证据矩阵：`docs/rqg/CI_TWIN_COVERAGE.md`。
+默认 `cargo test -p migraloop-app` 会跳过 `#[ignore]` 的 Lab Fixture／Lab Scenario／live Oracle 测试，以及仅供 `rqg-perf` 的 microbench—请保持如此。Lab Scenario `bulk-load` 与 `mega-mix` 保持**手动**；它们不是 performance gate（`rqg-perf` 由 `ci/rqg/` 负责）。Mega-mix Direct path-aggregate ≥100k e2e QPS 为 issue #252 的 Lab-manual 证据（Transform ≥50k 仍为 #253）。已出货 Lab capability → 非 ignored CI twin 证据矩阵：`docs/rqg/CI_TWIN_COVERAGE.md`。
 
 ## 测试
 

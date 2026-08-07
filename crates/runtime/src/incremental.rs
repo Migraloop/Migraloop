@@ -1244,6 +1244,10 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
             // bounded window. Keep filtered leftovers so later windows do not re-START
             // LogMiner and re-MINE already-seen rows (#252 / issue #143 inclusive resume).
             let mut leftover_changes: VecDeque<ChangeEvent> = VecDeque::new();
+            // Sticky: once a bounded fetch saturates, leftovers alone cannot prove the
+            // Source is drained — COUNT until a later fetch returns unsaturated (#252
+            // skips COUNT only when the whole burst fits in prefetch).
+            let mut source_backlog_incomplete = false;
 
             // ADR-0020 / #203: bounded Incremental windows via Backpressure module.
             // Capture only fills up to window capacity; Downstream slowness drains
@@ -1277,10 +1281,15 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
 
                 let mut fetch_saturated = false;
                 if candidate_changes.len() < window.capacity() {
-                    let need = window.capacity() - candidate_changes.len();
-                    let fetch_limit = Some(need.saturating_add(applied_skip.len()));
-                    // Skip a separate LogMiner COUNT session when draining leftovers or
-                    // fetching the next slice — one START_LOGMNR per window (#252).
+                    // Prefetch several windows in one LogMiner session (still bounded:
+                    // 4× capacity), then drain via leftovers. Same-SCN mega-mix bursts
+                    // otherwise re-START LogMiner once per window (#252).
+                    let prefetch = window
+                        .capacity()
+                        .saturating_mul(4)
+                        .saturating_sub(candidate_changes.len())
+                        .max(window.capacity() - candidate_changes.len());
+                    let fetch_limit = Some(prefetch.saturating_add(applied_skip.len()));
                     let fetched_changes = capture
                         .fetch_changes_in_schema_limited(
                             &schema,
@@ -1290,6 +1299,7 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                         )
                         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                     fetch_saturated = fetch_limit.is_some_and(|n| fetched_changes.len() >= n);
+                    source_backlog_incomplete = fetch_saturated;
                     let mut filtered = fetched_changes
                         .into_iter()
                         .filter(|c| !applied_skip.contains(&c.change_id));
@@ -1327,14 +1337,22 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                     .iter()
                     .filter(|c| unapplied_set.contains(&c.change_id))
                     .count();
-                // Lag from materialized window + leftovers (+1 when fetch saturated).
-                // Avoids a second LogMiner COUNT session per window (#252).
-                let source_pending = candidate_changes
-                    .iter()
-                    .filter(|c| unapplied_set.contains(&c.change_id))
-                    .count()
-                    .saturating_add(leftover_changes.len())
-                    .saturating_add(usize::from(fetch_saturated));
+                // Prefer materialized window + leftovers when prefetch covered the
+                // Source burst (exact known backlog — skips LogMiner COUNT, #252).
+                // When a prior fetch saturated, COUNT so Sync/Delivery Health lag
+                // still reflects the full Source backlog (ADR-0020 / backpressure).
+                let source_pending = if source_backlog_incomplete {
+                    let source_pending_total = capture
+                        .count_changes_in_schema(&schema, &table, resume_from)
+                        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+                    source_pending_total.saturating_sub(applied_skip.len())
+                } else {
+                    candidate_changes
+                        .iter()
+                        .filter(|c| unapplied_set.contains(&c.change_id))
+                        .count()
+                        .saturating_add(leftover_changes.len())
+                };
                 let pending_at_window_start = source_pending.saturating_add(schema_pending);
                 let mut items: Vec<IncrementalItem> = candidate_changes
                     .into_iter()

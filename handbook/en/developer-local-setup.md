@@ -173,7 +173,7 @@ export MIGRALOOP_TEST_MONGO_HOST=127.0.0.1
 export MIGRALOOP_TEST_MONGO_PORT=27017
 ```
 
-Default `cargo test -p migraloop-app` skips `#[ignore]` Lab Fixture / Lab Scenario / live Oracle tests and the `rqg-perf`-only microbench—keep it that way. Lab Scenario `bulk-load` and `mega-mix` stay **manual**; they are not the performance gate (`ci/rqg/` owns `rqg-perf`). Matrix of shipped Lab capabilities → non-ignored CI twin evidence: `docs/rqg/CI_TWIN_COVERAGE.md`.
+Default `cargo test -p migraloop-app` skips `#[ignore]` Lab Fixture / Lab Scenario / live Oracle tests and the `rqg-perf`-only microbench—keep it that way. Lab Scenario `bulk-load` and `mega-mix` stay **manual**; they are not the performance gate (`ci/rqg/` owns `rqg-perf`). Mega-mix Direct path-aggregate ≥100k e2e QPS is Lab-manual evidence for issue #252 (Transform ≥50k remains #253). Matrix of shipped Lab capabilities → non-ignored CI twin evidence: `docs/rqg/CI_TWIN_COVERAGE.md`.
 
 ## Tests
 
