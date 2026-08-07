@@ -60,6 +60,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run change-ordering
 ./target/debug/migraloop lab scenario run bulk-load
+./target/debug/migraloop lab scenario run mega-mix
 ./target/debug/migraloop lab scenario run idempotent-redelivery
 ./target/debug/migraloop lab scenario run pause-resume
 ./target/debug/migraloop lab scenario run remove-pipeline
@@ -172,7 +173,7 @@ export MIGRALOOP_TEST_MONGO_HOST=127.0.0.1
 export MIGRALOOP_TEST_MONGO_PORT=27017
 ```
 
-默认 `cargo test -p migraloop-app` 会跳过 `#[ignore]` 的 Lab Fixture／Lab Scenario／live Oracle 测试，以及仅供 `rqg-perf` 的 microbench—请保持如此。Lab Scenario `bulk-load` 保持**手动**；它不是 performance gate（`rqg-perf` 由 `ci/rqg/` 负责）。已出货 Lab capability → 非 ignored CI twin 证据矩阵：`docs/rqg/CI_TWIN_COVERAGE.md`。
+默认 `cargo test -p migraloop-app` 会跳过 `#[ignore]` 的 Lab Fixture／Lab Scenario／live Oracle 测试，以及仅供 `rqg-perf` 的 microbench—请保持如此。Lab Scenario `bulk-load` 与 `mega-mix` 保持**手动**；它们不是 performance gate（`rqg-perf` 由 `ci/rqg/` 负责）。已出货 Lab capability → 非 ignored CI twin 证据矩阵：`docs/rqg/CI_TWIN_COVERAGE.md`。
 
 ## 测试
 

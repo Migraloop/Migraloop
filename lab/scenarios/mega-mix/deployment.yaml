@@ -1,0 +1,166 @@
+# Lab Scenario: mega-mix
+# Deployment-realistic mix of every shipped path family (ADR-0031 / issue #251).
+# Aggregation `$…` authoring only (ADR-0030). Applied via real `migraloop apply`.
+apiVersion: migraloop.dev/v1
+kind: Deployment
+metadata:
+  name: lab-mega-mix
+spec:
+  source:
+    kind: oracle
+    host: 127.0.0.1
+    port: 1521
+    database: FREEPDB1
+    username: SYNC_USER
+    password:
+      fromEnv: ORACLE_PASSWORD
+  target:
+    kind: mongodb
+    host: 127.0.0.1
+    port: 27017
+    database: lab
+    username: migraloop
+    password:
+      fromEnv: MONGO_PASSWORD
+  pipelines:
+    - name: lab-mm-direct-a
+      mode: direct
+      source:
+        table: LAB_MM_DIRECT_A
+      target:
+        collection: lab_mm_direct_a
+    - name: lab-mm-direct-b
+      mode: direct
+      source:
+        table: LAB_MM_DIRECT_B
+      target:
+        collection: lab_mm_direct_b
+    - name: lab-mm-project
+      mode: transform
+      source:
+        table: LAB_MM_PROJECT
+      target:
+        collection: lab_mm_project
+      outputIdentity: [ID]
+      transform:
+        - $project:
+            ID: 1
+            NAME: 1
+    - name: lab-mm-field-ops
+      mode: transform
+      source:
+        table: LAB_MM_FIELD_OPS
+      target:
+        collection: lab_mm_field_ops
+      outputIdentity: [ID]
+      transform:
+        - $project:
+            ID: 1
+            NAME: 1
+            EMAIL: 1
+            ACTIVE: 1
+        - $unset: EMAIL
+        - $rename:
+            NAME: customerName
+        - $addFields:
+            source: oracle
+            displayName: "$customerName"
+        - $match:
+            ACTIVE: 1
+    - name: lab-mm-match
+      mode: transform
+      source:
+        table: LAB_MM_MATCH
+      target:
+        collection: lab_mm_match
+      outputIdentity: [ID]
+      transform:
+        - $match:
+            ACTIVE: 1
+    - name: lab-mm-lookup
+      mode: transform
+      source:
+        table: LAB_MM_LOOKUP_CUSTOMERS
+      target:
+        collection: lab_mm_lookup
+      outputIdentity: [ID]
+      transform:
+        - $project:
+            ID: 1
+            NAME: 1
+        - $lookup:
+            from: LAB_MM_LOOKUP_ORDERS
+            localField: ID
+            foreignField: CUSTOMER_ID
+            as: orders
+    - name: lab-mm-union
+      mode: transform
+      source:
+        table: LAB_MM_EAST
+      target:
+        collection: lab_mm_union
+      outputIdentity: [ID]
+      transform:
+        - $unionWith: LAB_MM_WEST
+        - $project:
+            ID: 1
+            NAME: 1
+    - name: lab-mm-unwind
+      mode: transform
+      source:
+        table: LAB_MM_UNWIND_CUSTOMERS
+      target:
+        collection: lab_mm_unwind
+      outputIdentity: [ORDER_ID]
+      transform:
+        - $project:
+            ID: 1
+            NAME: 1
+        - $lookup:
+            from: LAB_MM_UNWIND_ORDERS
+            localField: ID
+            foreignField: CUSTOMER_ID
+            as: orders
+        - $unwind: "$orders"
+    - name: lab-mm-group
+      mode: transform
+      source:
+        table: LAB_MM_GROUP_ORDERS
+      target:
+        collection: lab_mm_group
+      outputIdentity: [CUSTOMER_ID]
+      transform:
+        - $group:
+            _id: "$CUSTOMER_ID"
+            ORDER_COUNT:
+              $count: "$ID"
+            MIN_AMOUNT:
+              $min: "$AMOUNT"
+            MAX_AMOUNT:
+              $max: "$AMOUNT"
+            AVG_AMOUNT:
+              $avg: "$AMOUNT"
+            TOTAL_AMOUNT:
+              $sum: "$AMOUNT"
+    - name: lab-mm-distinct
+      mode: transform
+      source:
+        table: LAB_MM_DIST_ORDERS
+      target:
+        collection: lab_mm_distinct
+      outputIdentity: [CUSTOMER_ID]
+      transform:
+        - $group:
+            _id: "$CUSTOMER_ID"
+    - name: lab-mm-addtoset
+      mode: transform
+      source:
+        table: LAB_MM_DIST_ORDERS
+      target:
+        collection: lab_mm_addtoset
+      outputIdentity: [CUSTOMER_ID]
+      transform:
+        - $group:
+            _id: "$CUSTOMER_ID"
+            AMOUNTS:
+              $addToSet: "$AMOUNT"

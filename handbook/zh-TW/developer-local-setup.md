@@ -60,6 +60,7 @@ cargo build -p migraloop-app
 ./target/debug/migraloop lab scenario run concurrent-source-workload
 ./target/debug/migraloop lab scenario run change-ordering
 ./target/debug/migraloop lab scenario run bulk-load
+./target/debug/migraloop lab scenario run mega-mix
 ./target/debug/migraloop lab scenario run idempotent-redelivery
 ./target/debug/migraloop lab scenario run pause-resume
 ./target/debug/migraloop lab scenario run remove-pipeline
@@ -172,7 +173,7 @@ export MIGRALOOP_TEST_MONGO_HOST=127.0.0.1
 export MIGRALOOP_TEST_MONGO_PORT=27017
 ```
 
-預設 `cargo test -p migraloop-app` 會略過 `#[ignore]` 的 Lab Fixture／Lab Scenario／live Oracle 測試，以及僅供 `rqg-perf` 的 microbench—請維持如此。Lab Scenario `bulk-load` 維持**手動**；它不是 performance gate（`rqg-perf` 由 `ci/rqg/` 負責）。已出貨 Lab capability → 非 ignored CI twin 證據矩陣：`docs/rqg/CI_TWIN_COVERAGE.md`。
+預設 `cargo test -p migraloop-app` 會略過 `#[ignore]` 的 Lab Fixture／Lab Scenario／live Oracle 測試，以及僅供 `rqg-perf` 的 microbench—請維持如此。Lab Scenario `bulk-load` 與 `mega-mix` 維持**手動**；它們不是 performance gate（`rqg-perf` 由 `ci/rqg/` 負責）。已出貨 Lab capability → 非 ignored CI twin 證據矩陣：`docs/rqg/CI_TWIN_COVERAGE.md`。
 
 ## 測試
 
@@ -208,7 +209,7 @@ Lab Fixture lifecycle seam（預設 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、Rich Transform 能力（`project`/`filter`/`addFields`/`rename`/`remove`/`equiLookup`/`union`/`unwind`，僅以 Aggregation `$project`/`$match`/… 撰寫—見 [Rich Transform](rich-transform.md)）、多表 Transform Pipeline（`groupBy`／`$group` sum/count/min/max/avg）、concurrent Source workload、Change Ordering / confluence（`change-ordering`）、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine、schema-change-pause 、source-alignment、drift-check 、bounded-backpressure、observability-surface 、platform-store-guardrails 、backward-compatible-upgrades 與 initial-load-throttled seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）。這些是**手動 Lab** seams—不是 Release Quality Gate 證據，也不應接到 CI：
+Lab Scenario Direct Pipeline、Rich Transform 能力（`project`/`filter`/`addFields`/`rename`/`remove`/`equiLookup`/`union`/`unwind`，僅以 Aggregation `$project`/`$match`/… 撰寫—見 [Rich Transform](rich-transform.md)）、多表 Transform Pipeline（`groupBy`／`$group` sum/count/min/max/avg）、concurrent Source workload、Change Ordering / confluence（`change-ordering`）、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine、schema-change-pause 、source-alignment、drift-check 、bounded-backpressure、observability-surface 、platform-store-guardrails 、backward-compatible-upgrades、initial-load-throttled 與 mega-mix seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）。這些是**手動 Lab** seams—不是 Release Quality Gate 證據，也不應接到 CI：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
