@@ -12,13 +12,12 @@
 use serde_json::{Map, Value};
 
 use crate::{
-    parse_add_fields, parse_add_to_set, parse_distinct, parse_equi_lookup, parse_filter,
-    parse_group_by, parse_project, parse_remove, parse_rename, parse_union, parse_unwind,
-    AddFieldSource, AddFieldSpec, AggregateOp, AggregateSpec, RenameSpec, TransformError,
-    TransformOp,
+    parse_equi_lookup, parse_project, parse_union, parse_unwind, AddFieldSource, AddFieldSpec,
+    AggregateOp, AggregateSpec, RenameSpec, TransformError, TransformOp,
 };
 
-fn is_classic_fields_body(value: &Value) -> bool {
+/// `$project` may use `{ fields: [...] }` (order-preserving Aggregation body).
+fn is_project_fields_array_body(value: &Value) -> bool {
     value
         .as_object()
         .is_some_and(|o| o.contains_key("fields") && o.keys().all(|k| k == "fields"))
@@ -52,8 +51,8 @@ pub(crate) fn try_parse_aggregation_step(
 }
 
 fn parse_project_dx(value: &Value) -> Result<TransformOp, TransformError> {
-    // Classic body: { fields: [...] } (also allowed under $project / select).
-    if is_classic_fields_body(value) {
+    // Order-preserving Aggregation body: { fields: [...] }.
+    if is_project_fields_array_body(value) {
         return parse_project(value);
     }
     // Aggregation inclusion map: { ID: 1, NAME: true } — inclusion only.
@@ -113,17 +112,17 @@ fn parse_project_dx(value: &Value) -> Result<TransformOp, TransformError> {
 }
 
 fn parse_match_dx(value: &Value) -> Result<TransformOp, TransformError> {
-    // Classic filter body: { field, eq }
-    if value.as_object().is_some_and(|o| {
-        o.contains_key("field") && o.contains_key("eq") && o.keys().all(|k| k == "field" || k == "eq")
-    }) {
-        return parse_filter(value);
-    }
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid(
             "$match must be an object with one equality predicate".to_string(),
         )
     })?;
+    if obj.contains_key("field") && obj.contains_key("eq") {
+        return Err(TransformError::Invalid(
+            "$match does not accept classic { field, eq }; use { FIELD: value } equality"
+                .to_string(),
+        ));
+    }
     if obj.len() != 1 {
         return Err(TransformError::Invalid(
             "$match supports exactly one equality predicate (no $and/$or/multi-field)".to_string(),
@@ -160,15 +159,17 @@ fn parse_match_dx(value: &Value) -> Result<TransformOp, TransformError> {
 }
 
 fn parse_add_fields_dx(value: &Value) -> Result<TransformOp, TransformError> {
-    // Classic body: { fields: [{ as, value|field }] }
-    if is_classic_fields_body(value) {
-        return parse_add_fields(value);
-    }
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid(
-            "$addFields/$set must be an object map of new fields or { fields: [...] }".to_string(),
+            "$addFields/$set must be an object map of new fields".to_string(),
         )
     })?;
+    if obj.contains_key("fields") && obj.keys().all(|k| k == "fields") {
+        return Err(TransformError::Invalid(
+            "$addFields does not accept classic { fields: [...] }; use a field map (as: \"$field\"|literal)"
+                .to_string(),
+        ));
+    }
     if obj.is_empty() {
         return Err(TransformError::Invalid(
             "$addFields/$set must declare at least one field".to_string(),
@@ -217,10 +218,6 @@ fn parse_add_fields_dx(value: &Value) -> Result<TransformOp, TransformError> {
 }
 
 fn parse_unset_dx(value: &Value) -> Result<TransformOp, TransformError> {
-    // Classic remove body
-    if is_classic_fields_body(value) {
-        return parse_remove(value);
-    }
     let fields = match value {
         Value::String(s) => {
             let name = s.trim();
@@ -251,9 +248,17 @@ fn parse_unset_dx(value: &Value) -> Result<TransformOp, TransformError> {
             }
             fields
         }
+        Value::Object(obj)
+            if obj.contains_key("fields") && obj.keys().all(|k| k == "fields") =>
+        {
+            return Err(TransformError::Invalid(
+                "$unset does not accept classic { fields: [...] }; use a field name or array of names"
+                    .to_string(),
+            ));
+        }
         _ => {
             return Err(TransformError::Invalid(
-                "$unset must be a field name, an array of names, or { fields: [...] }".to_string(),
+                "$unset must be a field name or an array of names".to_string(),
             ));
         }
     };
@@ -261,14 +266,15 @@ fn parse_unset_dx(value: &Value) -> Result<TransformOp, TransformError> {
 }
 
 fn parse_rename_dx(value: &Value) -> Result<TransformOp, TransformError> {
-    if is_classic_fields_body(value) {
-        return parse_rename(value);
-    }
     let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid(
-            "$rename must be a from→to map or { fields: [{ from, to }] }".to_string(),
-        )
+        TransformError::Invalid("$rename must be a from→to map".to_string())
     })?;
+    if obj.contains_key("fields") && obj.keys().all(|k| k == "fields") {
+        return Err(TransformError::Invalid(
+            "$rename does not accept classic { fields: [{ from, to }] }; use a { FROM: TO } map"
+                .to_string(),
+        ));
+    }
     if obj.is_empty() {
         return Err(TransformError::Invalid(
             "$rename map must not be empty".to_string(),
@@ -483,33 +489,22 @@ fn parse_group_id_keys(id: &Value) -> Result<Vec<String>, TransformError> {
 }
 
 fn parse_group_dx(value: &Value) -> Result<TransformOp, TransformError> {
-    // Classic groupBy / distinct / addToSet bodies reuse existing parsers when present.
-    if let Some(obj) = value.as_object() {
-        if obj.contains_key("keys") && obj.contains_key("aggregates") {
-            return parse_group_by(value);
-        }
-        if obj.contains_key("fields")
-            && !obj.contains_key("_id")
-            && !obj.contains_key("keys")
-            && obj.keys().all(|k| k == "fields")
-        {
-            return parse_distinct(value);
-        }
-        if obj.contains_key("keys")
-            && obj.contains_key("field")
-            && obj.contains_key("as")
-            && !obj.contains_key("_id")
-        {
-            return parse_add_to_set(value);
-        }
-    }
-
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid("$group must be an object with _id".to_string())
     })?;
-    let id = obj.get("_id").ok_or_else(|| {
-        TransformError::Invalid("$group._id is required".to_string())
-    })?;
+    if !obj.contains_key("_id") {
+        if obj.contains_key("keys") || obj.contains_key("aggregates") || obj.contains_key("fields")
+        {
+            return Err(TransformError::Invalid(
+                "$group requires `_id`; classic groupBy/distinct/addToSet bodies are not accepted — use `_id: \"$KEY\"` and `$sum`/`$count`/`$addToSet`/…"
+                    .to_string(),
+            ));
+        }
+        return Err(TransformError::Invalid(
+            "$group._id is required".to_string(),
+        ));
+    }
+    let id = obj.get("_id").expect("_id present");
     let keys = parse_group_id_keys(id)?;
 
     let mut aggregates: Vec<AggregateSpec> = Vec::new();

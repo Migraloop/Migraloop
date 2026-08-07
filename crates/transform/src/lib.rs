@@ -521,429 +521,6 @@ pub(crate) fn parse_project(value: &Value) -> Result<TransformOp, TransformError
     Ok(TransformOp::Project { fields })
 }
 
-pub(crate) fn parse_add_fields(value: &Value) -> Result<TransformOp, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid("addFields must be an object with fields".to_string())
-    })?;
-    let fields_value = obj.get("fields").ok_or_else(|| {
-        TransformError::Invalid("addFields.fields is required".to_string())
-    })?;
-    let fields_arr = fields_value.as_array().ok_or_else(|| {
-        TransformError::Invalid("addFields.fields must be an array".to_string())
-    })?;
-    if fields_arr.is_empty() {
-        return Err(TransformError::Invalid(
-            "addFields.fields must not be empty".to_string(),
-        ));
-    }
-    let mut fields = Vec::with_capacity(fields_arr.len());
-    for (index, entry) in fields_arr.iter().enumerate() {
-        fields.push(parse_add_field_spec(entry, index)?);
-    }
-    if obj.keys().any(|k| k != "fields") {
-        return Err(TransformError::Invalid(
-            "addFields only supports fields".to_string(),
-        ));
-    }
-    Ok(TransformOp::AddFields { fields })
-}
-
-fn parse_add_field_spec(value: &Value, index: usize) -> Result<AddFieldSpec, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid(format!("addFields.fields[{index}] must be an object"))
-    })?;
-    let as_name = obj
-        .get("as")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            TransformError::Invalid(format!("addFields.fields[{index}].as is required"))
-        })?;
-    if as_name.trim().is_empty() {
-        return Err(TransformError::Invalid(format!(
-            "addFields.fields[{index}].as must not be empty"
-        )));
-    }
-    let has_value = obj.contains_key("value");
-    let has_field = obj.contains_key("field");
-    let source = match (has_value, has_field) {
-        (true, false) => AddFieldSource::Literal(obj.get("value").expect("value").clone()),
-        (false, true) => {
-            let field = obj
-                .get("field")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    TransformError::Invalid(format!(
-                        "addFields.fields[{index}].field must be a string"
-                    ))
-                })?;
-            if field.trim().is_empty() {
-                return Err(TransformError::Invalid(format!(
-                    "addFields.fields[{index}].field must not be empty"
-                )));
-            }
-            AddFieldSource::Field(field.to_string())
-        }
-        (true, true) => {
-            return Err(TransformError::Invalid(format!(
-                "addFields.fields[{index}] must set exactly one of value or field"
-            )));
-        }
-        (false, false) => {
-            return Err(TransformError::Invalid(format!(
-                "addFields.fields[{index}] requires value or field"
-            )));
-        }
-    };
-    if obj
-        .keys()
-        .any(|k| k != "as" && k != "value" && k != "field")
-    {
-        return Err(TransformError::Invalid(format!(
-            "addFields.fields[{index}] only supports as, value, and field"
-        )));
-    }
-    Ok(AddFieldSpec {
-        as_name: as_name.to_string(),
-        source,
-    })
-}
-
-pub(crate) fn parse_rename(value: &Value) -> Result<TransformOp, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid("rename must be an object with fields".to_string())
-    })?;
-    let fields_value = obj.get("fields").ok_or_else(|| {
-        TransformError::Invalid("rename.fields is required".to_string())
-    })?;
-    let fields_arr = fields_value.as_array().ok_or_else(|| {
-        TransformError::Invalid("rename.fields must be an array".to_string())
-    })?;
-    if fields_arr.is_empty() {
-        return Err(TransformError::Invalid(
-            "rename.fields must not be empty".to_string(),
-        ));
-    }
-    let mut fields = Vec::with_capacity(fields_arr.len());
-    for (index, entry) in fields_arr.iter().enumerate() {
-        let entry_obj = entry.as_object().ok_or_else(|| {
-            TransformError::Invalid(format!("rename.fields[{index}] must be an object"))
-        })?;
-        let from = entry_obj
-            .get("from")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                TransformError::Invalid(format!("rename.fields[{index}].from is required"))
-            })?;
-        if from.trim().is_empty() {
-            return Err(TransformError::Invalid(format!(
-                "rename.fields[{index}].from must not be empty"
-            )));
-        }
-        let to = entry_obj
-            .get("to")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                TransformError::Invalid(format!("rename.fields[{index}].to is required"))
-            })?;
-        if to.trim().is_empty() {
-            return Err(TransformError::Invalid(format!(
-                "rename.fields[{index}].to must not be empty"
-            )));
-        }
-        if entry_obj.keys().any(|k| k != "from" && k != "to") {
-            return Err(TransformError::Invalid(format!(
-                "rename.fields[{index}] only supports from and to"
-            )));
-        }
-        fields.push(RenameSpec {
-            from: from.to_string(),
-            to: to.to_string(),
-        });
-    }
-    if obj.keys().any(|k| k != "fields") {
-        return Err(TransformError::Invalid(
-            "rename only supports fields".to_string(),
-        ));
-    }
-    Ok(TransformOp::Rename { fields })
-}
-
-pub(crate) fn parse_remove(value: &Value) -> Result<TransformOp, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid("remove must be an object with fields".to_string())
-    })?;
-    let fields_value = obj.get("fields").ok_or_else(|| {
-        TransformError::Invalid("remove.fields is required".to_string())
-    })?;
-    let fields_arr = fields_value.as_array().ok_or_else(|| {
-        TransformError::Invalid("remove.fields must be an array of field names".to_string())
-    })?;
-    if fields_arr.is_empty() {
-        return Err(TransformError::Invalid(
-            "remove.fields must not be empty".to_string(),
-        ));
-    }
-    let mut fields = Vec::with_capacity(fields_arr.len());
-    for entry in fields_arr {
-        let name = entry.as_str().ok_or_else(|| {
-            TransformError::Invalid("remove.fields entries must be strings".to_string())
-        })?;
-        if name.trim().is_empty() {
-            return Err(TransformError::Invalid(
-                "remove.fields entries must not be empty".to_string(),
-            ));
-        }
-        fields.push(name.to_string());
-    }
-    if obj.keys().any(|k| k != "fields") {
-        return Err(TransformError::Invalid(
-            "remove only supports fields".to_string(),
-        ));
-    }
-    Ok(TransformOp::Remove { fields })
-}
-
-pub(crate) fn parse_filter(value: &Value) -> Result<TransformOp, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid("filter must be an object with field and eq".to_string())
-    })?;
-    let field = obj
-        .get("field")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| TransformError::Invalid("filter.field is required".to_string()))?;
-    if field.trim().is_empty() {
-        return Err(TransformError::Invalid(
-            "filter.field must not be empty".to_string(),
-        ));
-    }
-    let eq = obj.get("eq").ok_or_else(|| {
-        TransformError::Invalid("filter.eq is required".to_string())
-    })?;
-    if obj.keys().any(|k| k != "field" && k != "eq") {
-        return Err(TransformError::Invalid(
-            "filter only supports field and eq".to_string(),
-        ));
-    }
-    Ok(TransformOp::FilterEq {
-        field: field.to_string(),
-        value: eq.clone(),
-    })
-}
-
-pub(crate) fn parse_group_by(value: &Value) -> Result<TransformOp, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid(
-            "groupBy must be an object with keys and aggregates".to_string(),
-        )
-    })?;
-    let keys_value = obj.get("keys").ok_or_else(|| {
-        TransformError::Invalid("groupBy.keys is required".to_string())
-    })?;
-    let keys_arr = keys_value.as_array().ok_or_else(|| {
-        TransformError::Invalid("groupBy.keys must be an array of field names".to_string())
-    })?;
-    if keys_arr.is_empty() {
-        return Err(TransformError::Invalid(
-            "groupBy.keys must not be empty".to_string(),
-        ));
-    }
-    let mut keys = Vec::with_capacity(keys_arr.len());
-    for entry in keys_arr {
-        let name = entry.as_str().ok_or_else(|| {
-            TransformError::Invalid("groupBy.keys entries must be strings".to_string())
-        })?;
-        if name.trim().is_empty() {
-            return Err(TransformError::Invalid(
-                "groupBy.keys entries must not be empty".to_string(),
-            ));
-        }
-        keys.push(name.to_string());
-    }
-
-    let aggregates_value = obj.get("aggregates").ok_or_else(|| {
-        TransformError::Invalid("groupBy.aggregates is required".to_string())
-    })?;
-    let aggregates_arr = aggregates_value.as_array().ok_or_else(|| {
-        TransformError::Invalid("groupBy.aggregates must be an array".to_string())
-    })?;
-    if aggregates_arr.is_empty() {
-        return Err(TransformError::Invalid(
-            "groupBy.aggregates must not be empty".to_string(),
-        ));
-    }
-    let mut aggregates = Vec::with_capacity(aggregates_arr.len());
-    for (index, entry) in aggregates_arr.iter().enumerate() {
-        aggregates.push(parse_aggregate(entry, index)?);
-    }
-
-    if obj.keys().any(|k| k != "keys" && k != "aggregates") {
-        return Err(TransformError::Invalid(
-            "groupBy only supports keys and aggregates".to_string(),
-        ));
-    }
-    Ok(TransformOp::GroupBy { keys, aggregates })
-}
-
-fn parse_aggregate(value: &Value, index: usize) -> Result<AggregateSpec, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid(format!(
-            "groupBy.aggregates[{index}] must be an object"
-        ))
-    })?;
-    let op_raw = obj
-        .get("op")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            TransformError::Invalid(format!("groupBy.aggregates[{index}].op is required"))
-        })?;
-    let op = match op_raw {
-        "sum" => AggregateOp::Sum,
-        "count" => AggregateOp::Count,
-        "min" => AggregateOp::Min,
-        "max" => AggregateOp::Max,
-        "avg" => AggregateOp::Avg,
-        other => {
-            return Err(TransformError::Invalid(format!(
-                "groupBy.aggregates[{index}].op {other:?} is unsupported; v1 allows sum, count, min, max, avg"
-            )));
-        }
-    };
-    let field = obj
-        .get("field")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            TransformError::Invalid(format!(
-                "groupBy.aggregates[{index}].field is required"
-            ))
-        })?;
-    if field.trim().is_empty() {
-        return Err(TransformError::Invalid(format!(
-            "groupBy.aggregates[{index}].field must not be empty"
-        )));
-    }
-    let as_name = obj
-        .get("as")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            TransformError::Invalid(format!("groupBy.aggregates[{index}].as is required"))
-        })?;
-    if as_name.trim().is_empty() {
-        return Err(TransformError::Invalid(format!(
-            "groupBy.aggregates[{index}].as must not be empty"
-        )));
-    }
-    if obj
-        .keys()
-        .any(|k| k != "op" && k != "field" && k != "as")
-    {
-        return Err(TransformError::Invalid(format!(
-            "groupBy.aggregates[{index}] only supports op, field, and as"
-        )));
-    }
-    Ok(AggregateSpec {
-        op,
-        field: field.to_string(),
-        as_name: as_name.to_string(),
-    })
-}
-
-pub(crate) fn parse_distinct(value: &Value) -> Result<TransformOp, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid("distinct must be an object with fields".to_string())
-    })?;
-    let fields_value = obj.get("fields").ok_or_else(|| {
-        TransformError::Invalid("distinct.fields is required".to_string())
-    })?;
-    let fields_arr = fields_value.as_array().ok_or_else(|| {
-        TransformError::Invalid("distinct.fields must be an array of field names".to_string())
-    })?;
-    if fields_arr.is_empty() {
-        return Err(TransformError::Invalid(
-            "distinct.fields must not be empty".to_string(),
-        ));
-    }
-    let mut fields = Vec::with_capacity(fields_arr.len());
-    for entry in fields_arr {
-        let name = entry.as_str().ok_or_else(|| {
-            TransformError::Invalid("distinct.fields entries must be strings".to_string())
-        })?;
-        if name.trim().is_empty() {
-            return Err(TransformError::Invalid(
-                "distinct.fields entries must not be empty".to_string(),
-            ));
-        }
-        fields.push(name.to_string());
-    }
-    if obj.keys().any(|k| k != "fields") {
-        return Err(TransformError::Invalid(
-            "distinct only supports fields".to_string(),
-        ));
-    }
-    Ok(TransformOp::Distinct { fields })
-}
-
-pub(crate) fn parse_add_to_set(value: &Value) -> Result<TransformOp, TransformError> {
-    let obj = value.as_object().ok_or_else(|| {
-        TransformError::Invalid(
-            "addToSet must be an object with keys, field, and as".to_string(),
-        )
-    })?;
-    let keys_value = obj.get("keys").ok_or_else(|| {
-        TransformError::Invalid("addToSet.keys is required".to_string())
-    })?;
-    let keys_arr = keys_value.as_array().ok_or_else(|| {
-        TransformError::Invalid("addToSet.keys must be an array of field names".to_string())
-    })?;
-    if keys_arr.is_empty() {
-        return Err(TransformError::Invalid(
-            "addToSet.keys must not be empty".to_string(),
-        ));
-    }
-    let mut keys = Vec::with_capacity(keys_arr.len());
-    for entry in keys_arr {
-        let name = entry.as_str().ok_or_else(|| {
-            TransformError::Invalid("addToSet.keys entries must be strings".to_string())
-        })?;
-        if name.trim().is_empty() {
-            return Err(TransformError::Invalid(
-                "addToSet.keys entries must not be empty".to_string(),
-            ));
-        }
-        keys.push(name.to_string());
-    }
-    let field = obj
-        .get("field")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| TransformError::Invalid("addToSet.field is required".to_string()))?;
-    if field.trim().is_empty() {
-        return Err(TransformError::Invalid(
-            "addToSet.field must not be empty".to_string(),
-        ));
-    }
-    let as_name = obj
-        .get("as")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| TransformError::Invalid("addToSet.as is required".to_string()))?;
-    if as_name.trim().is_empty() {
-        return Err(TransformError::Invalid(
-            "addToSet.as must not be empty".to_string(),
-        ));
-    }
-    if obj
-        .keys()
-        .any(|k| k != "keys" && k != "field" && k != "as")
-    {
-        return Err(TransformError::Invalid(
-            "addToSet only supports keys, field, and as".to_string(),
-        ));
-    }
-    Ok(TransformOp::AddToSet {
-        keys,
-        field: field.to_string(),
-        as_name: as_name.to_string(),
-    })
-}
-
 /// Parse a list of declarative transform step JSON values.
 pub fn parse_transform_steps(steps: &[Value]) -> Result<Vec<TransformOp>, TransformError> {
     if steps.is_empty() {
@@ -3924,16 +3501,9 @@ mod tests {
     fn add_fields_rename_remove_evaluate_and_skip_unused() {
         let ops = parse_transform_steps(&[
             json!({"$project": {"fields": ["ID", "NAME", "EMAIL", "ACTIVE"]}}),
-            json!({"$unset": {"fields": ["EMAIL"]}}),
-            json!({"$rename": {"fields": [{"from": "NAME", "to": "customerName"}]}}),
-            json!({
-                "$addFields": {
-                    "fields": [
-                        {"as": "source", "value": "oracle"},
-                        {"as": "displayName", "field": "customerName"}
-                    ]
-                }
-            }),
+            json!({"$unset": ["EMAIL"]}),
+            json!({"$rename": {"NAME": "customerName"}}),
+            json!({"$addFields": {"source": "oracle", "displayName": "$customerName"}}),
             json!({"$match": {"ACTIVE": 1}}),
         ])
         .unwrap();
@@ -4020,7 +3590,7 @@ mod tests {
 
     #[test]
     fn remove_only_skips_removed_field_updates_in_open_passthrough() {
-        let ops = parse_transform_steps(&[json!({"$unset": {"fields": ["ADDRESS"]}})]).unwrap();
+        let ops = parse_transform_steps(&[json!({"$unset": ["ADDRESS"]})]).unwrap();
         let pre = row(&[
             ("ORDER_ID", json!(100)),
             ("AMOUNT", json!("42.50")),
@@ -4051,7 +3621,7 @@ mod tests {
         for step in [
             json!({"$addFields": {"fields": []}}),
             json!({"$rename": {"fields": [{"from": "A"}]}}),
-            json!({"$unset": {"fields": []}}),
+            json!({"$unset": []}),
         ] {
             let err = parse_transform_steps(&[step]).unwrap_err();
             assert!(
@@ -4313,7 +3883,7 @@ mod tests {
         // rename ID → customerId, then equiLookup on customerId — foreign Affect must
         // still resolve primary Output Identities.
         let ops = parse_transform_steps(&[
-            json!({"$rename": {"fields": [{"from": "ID", "to": "customerId"}]}}),
+            json!({"$rename": {"ID": "customerId"}}),
             json!({
                 "$lookup": {
                     "from": "ORDERS",
@@ -4322,7 +3892,7 @@ mod tests {
                     "as": "orders"
                 }
             }),
-            json!({"$rename": {"fields": [{"from": "orders", "to": "orderList"}]}}),
+            json!({"$rename": {"orders": "orderList"}}),
         ])
         .unwrap();
         let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("Alice"))])];
@@ -4367,7 +3937,7 @@ mod tests {
                     "as": "orders"
                 }
             }),
-            json!({"$unset": {"fields": ["orders"]}}),
+            json!({"$unset": ["orders"]}),
         ])
         .unwrap();
         let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("Alice"))])];
@@ -4703,14 +4273,7 @@ mod tests {
     fn add_to_set_affect_shapes_through_rename_prefix() {
         // Prefix rename must align Affect Analysis keys/values with Maintenance State.
         let ops = parse_transform_steps(&[
-            json!({
-                "$rename": {
-                    "fields": [
-                        {"from": "CUSTOMER_ID", "to": "CUST"},
-                        {"from": "AMOUNT", "to": "AMT"}
-                    ]
-                }
-            }),
+            json!({"$rename": {"CUSTOMER_ID": "CUST", "AMOUNT": "AMT"}}),
             json!({"$group": {"_id": "$CUST", "AMTS": {"$addToSet": "$AMT"}}}),
         ])
         .unwrap();
@@ -5017,11 +4580,7 @@ mod tests {
         // Scalar unwind (literal array via addFields).
         let scalar_ops = parse_transform_steps(&[
             json!({"$project": {"fields": ["ID"]}}),
-            json!({
-                "$addFields": {
-                    "fields": [{"as": "tags", "value": ["a", "b"]}]
-                }
-            }),
+            json!({"$addFields": {"tags": ["a", "b"]}}),
             json!({"$unwind": {"path": "$tags"}}),
         ])
         .unwrap();

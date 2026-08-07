@@ -208,7 +208,7 @@ Lab Fixture lifecycle seam（預設 ignored；需要 Docker Compose + Lab Oracle
 cargo test -p migraloop-app --test cli_lab_fixture -- --ignored --nocapture
 ```
 
-Lab Scenario Direct Pipeline、Rich Transform 能力（`project`/`filter`/`addFields`/`rename`/`remove`/`equiLookup`/`union`/`unwind`，以 Aggregation DX `$project`/`$match`/… 撰寫—見 [Rich Transform](rich-transform.md)）、多表 Transform Pipeline（`groupBy`／`$group` sum/count/min/max/avg）、concurrent Source workload、Change Ordering / confluence（`change-ordering`）、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine、schema-change-pause 、source-alignment、drift-check 、bounded-backpressure、observability-surface 、platform-store-guardrails 、backward-compatible-upgrades 與 initial-load-throttled seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）。這些是**手動 Lab** seams—不是 Release Quality Gate 證據，也不應接到 CI：
+Lab Scenario Direct Pipeline、Rich Transform 能力（`project`/`filter`/`addFields`/`rename`/`remove`/`equiLookup`/`union`/`unwind`，僅以 Aggregation `$project`/`$match`/… 撰寫—見 [Rich Transform](rich-transform.md)）、多表 Transform Pipeline（`groupBy`／`$group` sum/count/min/max/avg）、concurrent Source workload、Change Ordering / confluence（`change-ordering`）、bulk-load、idempotent-redelivery、pause-resume、remove-pipeline、change-pipeline 、poison-quarantine、schema-change-pause 、source-alignment、drift-check 、bounded-backpressure、observability-surface 、platform-store-guardrails 、backward-compatible-upgrades 與 initial-load-throttled seams（預設 ignored；需要 Docker Lab Fixture + Instant Client）。這些是**手動 Lab** seams—不是 Release Quality Gate 證據，也不應接到 CI：
 
 ```bash
 export LD_LIBRARY_PATH=/path/to/instantclient
