@@ -27,11 +27,11 @@ Post basic-complete go (#229), Direct Sync/IL hot-path work landed:
   (MongoDB 7–compatible; not the 8.0+ `bulkWrite` API)
 
 Committed baseline moved from `duration_ms=3400` / `rows_per_s=290` to
-`duration_ms=800` / `rows_per_s=1200` after #230, then to `duration_ms=450` /
-`rows_per_s=2200` after #252 Direct window-batch Delivery (same `seed_rows=1000`,
+`duration_ms=800` / `rows_per_s=1200` after #230, then to `duration_ms=650` /
+`rows_per_s=1400` after #252 Direct window-batch Delivery (same `seed_rows=1000`,
 same ~55% regression band). Local contract/stub timed runs after #252 clustered
-near ~280–300ms / ~3400–3500 rows/s; the committed numbers stay intentionally
-conservative for hosted-runner noise.
+near ~300–380ms / ~2600–3200 rows/s; the committed numbers stay intentionally
+conservative for hosted-runner noise (GHA often ~700–750ms).
 
 ## Issue #231 evidence (Transform Pipeline throughput)
 
