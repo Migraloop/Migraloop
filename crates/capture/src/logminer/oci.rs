@@ -1,9 +1,10 @@
 //! Oracle OCI LogMiner adapter (ADR-0013).
 //!
 //! Production Incremental Capture starts a `DBMS_LOGMNR` session over OCI and
-//! reconstructs supplemental-logged row images into [`super::LogMinerContent`]
-//! via `DBMS_LOGMNR.MINE_VALUE` (identity + after_image). The platform maps those
-//! contents to [`crate::ChangeEvent`]; it does **not** parse `SQL_REDO` text.
+//! reconstructs supplemental-logged row images into [`super::LogMinerContent`].
+//! INSERT after-images use LogMiner `SQL_REDO` (avoids per-column
+//! `DBMS_LOGMNR.MINE_VALUE` on insert-heavy Direct bursts, #252); UPDATE/DELETE
+//! still mine REDO/UNDO via `MINE_VALUE`.
 //!
 //! Requires Oracle Instant Client at runtime. Missing client libraries or OCI
 //! failures surface as [`CaptureError::OciUnavailable`] — never a silent stub
@@ -25,6 +26,7 @@ use super::contents::{
     change_events_from_logminer_contents, LogMinerContent, LogMinerOperation,
 };
 use super::source::OracleSourceConnect;
+use super::sql_redo::parse_insert_sql_redo;
 
 /// Start a LogMiner session for an SCN window (Oracle 19c+ compatible).
 ///
@@ -244,16 +246,25 @@ fn mined_contents_sql(owner: &str, table: &str, columns: &[SourceColumn]) -> Str
         "TABLE_NAME".to_string(),
         "RS_ID".to_string(),
         "SSN".to_string(),
+        // INSERT after-image/identity come from SQL_REDO (#252); projected for
+        // every row so the cursor shape stays stable across OPERATION values.
+        "SQL_REDO".to_string(),
     ];
     for column in columns {
         let name = &column.name;
         // Oracle requires schema.table.column for MINE_VALUE / COLUMN_PRESENT.
         let qualified = format!("{owner}.{table}.{name}");
+        // INSERT: SQL_REDO path (no MINE_VALUE). DELETE: identity from UNDO only.
+        // UPDATE: mine REDO + UNDO. CASE short-circuits PL/SQL mine on insert bursts.
         select_parts.push(format!(
-            "DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, '{qualified}') AS \"R_{name}\""
+            "CASE WHEN OPERATION = 'UPDATE' THEN \
+                DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, '{qualified}') \
+             ELSE NULL END AS \"R_{name}\""
         ));
         select_parts.push(format!(
-            "DBMS_LOGMNR.MINE_VALUE(UNDO_VALUE, '{qualified}') AS \"U_{name}\""
+            "CASE WHEN OPERATION IN ('UPDATE', 'DELETE') THEN \
+                DBMS_LOGMNR.MINE_VALUE(UNDO_VALUE, '{qualified}') \
+             ELSE NULL END AS \"U_{name}\""
         ));
     }
 
@@ -305,30 +316,55 @@ fn read_mined_contents(
             _ => continue,
         };
 
-        let mut redo = BTreeMap::new();
-        let mut undo = BTreeMap::new();
-        for (idx, column) in columns.iter().enumerate() {
-            let redo_idx = 6 + idx * 2;
-            let undo_idx = redo_idx + 1;
-            let redo_text: Option<String> = row
-                .get(redo_idx)
-                .map_err(|err| map_oracle_error(host, err))?;
-            let undo_text: Option<String> = row
-                .get(undo_idx)
-                .map_err(|err| map_oracle_error(host, err))?;
-            redo.insert(column.name.clone(), mined_value_to_json(redo_text, column)?);
-            undo.insert(column.name.clone(), mined_value_to_json(undo_text, column)?);
-        }
+        let sql_redo: Option<String> = row.get(6).map_err(|err| map_oracle_error(host, err))?;
 
-        let identity = match op {
-            LogMinerOperation::Delete => identity_from_row(&undo, primary_key),
-            LogMinerOperation::Insert | LogMinerOperation::Update => {
-                let from_redo = identity_from_row(&redo, primary_key);
-                if from_redo.values().any(|v| !v.is_null()) {
-                    from_redo
-                } else {
-                    identity_from_row(&undo, primary_key)
+        let (identity, after_image) = match op {
+            LogMinerOperation::Insert => {
+                let sql = sql_redo.ok_or_else(|| CaptureError::OciUnavailable {
+                    host: host.to_string(),
+                    detail: format!(
+                        "LogMiner (OCI) INSERT at SCN {scn} for {owner}.{table} has empty SQL_REDO; \
+                         enable supplemental logging and DICT_FROM_ONLINE_CATALOG"
+                    ),
+                })?;
+                let after = parse_insert_sql_redo(&sql, columns, host)?;
+                let identity = identity_from_row(&after, primary_key);
+                (identity, Some(after))
+            }
+            LogMinerOperation::Update | LogMinerOperation::Delete => {
+                let mut redo = BTreeMap::new();
+                let mut undo = BTreeMap::new();
+                for (idx, column) in columns.iter().enumerate() {
+                    // Fixed prefix: SCN..SSN + SQL_REDO (7 cols), then R/U pairs.
+                    let redo_idx = 7 + idx * 2;
+                    let undo_idx = redo_idx + 1;
+                    let redo_text: Option<String> = row
+                        .get(redo_idx)
+                        .map_err(|err| map_oracle_error(host, err))?;
+                    let undo_text: Option<String> = row
+                        .get(undo_idx)
+                        .map_err(|err| map_oracle_error(host, err))?;
+                    redo.insert(column.name.clone(), mined_value_to_json(redo_text, column)?);
+                    undo.insert(column.name.clone(), mined_value_to_json(undo_text, column)?);
                 }
+                let identity = match op {
+                    LogMinerOperation::Delete => identity_from_row(&undo, primary_key),
+                    LogMinerOperation::Update => {
+                        let from_redo = identity_from_row(&redo, primary_key);
+                        if from_redo.values().any(|v| !v.is_null()) {
+                            from_redo
+                        } else {
+                            identity_from_row(&undo, primary_key)
+                        }
+                    }
+                    LogMinerOperation::Insert => unreachable!("INSERT handled above"),
+                };
+                let after_image = match op {
+                    LogMinerOperation::Delete => None,
+                    LogMinerOperation::Update => Some(redo),
+                    LogMinerOperation::Insert => unreachable!("INSERT handled above"),
+                };
+                (identity, after_image)
             }
         };
 
@@ -338,16 +374,11 @@ fn read_mined_contents(
                 detail: format!(
                     "LogMiner (OCI) could not reconstruct primary-key identity for {owner}.{table} \
                      at SCN {scn} ({}); enable PRIMARY KEY or ALL COLUMNS supplemental logging \
-                     and confirm Instant Client can read V$LOGMNR_CONTENTS via DBMS_LOGMNR.MINE_VALUE",
+                     and confirm Instant Client can read V$LOGMNR_CONTENTS (SQL_REDO / MINE_VALUE)",
                     op.as_str()
                 ),
             });
         }
-
-        let after_image = match op {
-            LogMinerOperation::Delete => None,
-            LogMinerOperation::Insert | LogMinerOperation::Update => Some(redo),
-        };
 
         contents.push(
             LogMinerContent::new(
@@ -557,6 +588,19 @@ mod tests {
         assert!(
             !upper.contains("ROWNUM"),
             "MINE_VALUE query must not use ROWNUM limits (ORA-01323): {sql}"
+        );
+        // INSERT uses SQL_REDO; UPDATE/DELETE keep MINE_VALUE (#252).
+        assert!(
+            upper.contains("SQL_REDO"),
+            "INSERT fast path requires SQL_REDO projection: {sql}"
+        );
+        assert!(
+            upper.contains("CASE WHEN OPERATION = 'UPDATE' THEN"),
+            "REDO MINE_VALUE must run only for UPDATE: {sql}"
+        );
+        assert!(
+            upper.contains("CASE WHEN OPERATION IN ('UPDATE', 'DELETE') THEN"),
+            "UNDO MINE_VALUE must run for UPDATE/DELETE only: {sql}"
         );
     }
 
