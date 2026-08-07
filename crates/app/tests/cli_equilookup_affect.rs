@@ -112,9 +112,10 @@ fn equi_lookup_pipeline() -> &'static str {
         collection: customers_with_orders
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME]
-        - equiLookup:
+        - $project:
+            ID: 1
+            NAME: 1
+        - $lookup:
             from: ORDERS
             localField: ID
             foreignField: CUSTOMER_ID

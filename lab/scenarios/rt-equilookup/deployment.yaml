@@ -31,9 +31,10 @@ spec:
         collection: lab_rel_customers
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME]
-        - equiLookup:
+        - $project:
+            ID: 1
+            NAME: 1
+        - $lookup:
             from: LAB_REL_ORDERS
             localField: ID
             foreignField: CUSTOMER_ID

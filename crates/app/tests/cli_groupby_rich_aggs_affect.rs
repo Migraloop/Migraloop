@@ -100,24 +100,18 @@ spec:
         collection: order_stats
       outputIdentity: [CUSTOMER_ID]
       transform:
-        - groupBy:
-            keys: [CUSTOMER_ID]
-            aggregates:
-              - op: count
-                field: ORDER_ID
-                as: ORDER_COUNT
-              - op: min
-                field: AMOUNT
-                as: MIN_AMOUNT
-              - op: max
-                field: AMOUNT
-                as: MAX_AMOUNT
-              - op: avg
-                field: AMOUNT
-                as: AVG_AMOUNT
-              - op: sum
-                field: AMOUNT
-                as: TOTAL_AMOUNT
+        - $group:
+            _id: "$CUSTOMER_ID"
+            ORDER_COUNT:
+              $count: "$ORDER_ID"
+            MIN_AMOUNT:
+              $min: "$AMOUNT"
+            MAX_AMOUNT:
+              $max: "$AMOUNT"
+            AVG_AMOUNT:
+              $avg: "$AMOUNT"
+            TOTAL_AMOUNT:
+              $sum: "$AMOUNT"
 "#,
         host = mongo_host(),
         port = mongo_port(),

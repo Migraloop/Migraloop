@@ -119,11 +119,12 @@ fn active_customers_and_reporting(
         collection: active_customers
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME, ACTIVE]
-        - filter:
-            field: ACTIVE
-            eq: {active_eq}
+        - $project:
+            ID: 1
+            NAME: 1
+            ACTIVE: 1
+        - $match:
+            ACTIVE: {active_eq}
     - name: customers_reporting
       mode: direct
       source:

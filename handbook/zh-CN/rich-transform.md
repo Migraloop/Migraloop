@@ -11,14 +11,14 @@ Transform Pipelines 必须声明：
 - `outputIdentity` — Delivery insert/update/delete 用的稳定 key 字段
 - `transform` — 声明式 operator 步骤的有序列表
 
-## Authoring forms（expand）
+## Authoring forms
 
 Operator 可用下列任一形式编写同一组可分析 surface—两者都规范化成同一 IR，供 **Affect Analysis** 使用：
 
-1. **Classic steps** — `project`、`filter`、`equiLookup`、`groupBy`…（下方示例；仍完全支持）。
-2. **Aggregation / SQL-like DX** — 接近 MongoDB Aggregation 的 stages（`$project`、`$match`、`$lookup`、`$group`…），以及精简 SQL 别名（`select`、`where`、`join`）。
+1. **Aggregation / SQL-like DX（建议）** — 接近 MongoDB Aggregation 的 stages（`$project`、`$match`、`$lookup`、`$group`…），以及精简 SQL 别名（`select`、`where`、`join`）。这是新 Pipeline 与出货 Lab Scenarios 的支持编写路径。
+2. **Classic steps（Upgrade Compatibility）** — `project`、`filter`、`equiLookup`、`groupBy`…。使用 classic steps 的既有 Deployments 可持续 apply，无需强制改写。
 
-示例（等同 classic `project` + `filter`）：
+示例（建议的 Aggregation 形式）：
 
 ```yaml
 transform:
@@ -55,195 +55,196 @@ transform:
 | `$unionWith` | `union` | `coll` / `from` / 字符串—不可用 nested `pipeline` |
 | `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`；accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet`。`$count` 需字段 ref（`{ $count: "$ORDER_ID" }` = SQL `COUNT(field)`），不是 Mongo 空的 `{ $count: {} }` |
 
-使用 classic steps 的既有 Deployments 可持续运行（Upgrade Compatibility）。为可读性，每个 Pipeline 建议只用一种形式；同一列表混用 classic 与 Aggregation 步骤在各自合法时也被允许。
+为可读性，每个 Pipeline 建议只用一种形式；同一列表混用 classic 与 Aggregation 步骤在各自合法时也被允许。
+
+### Migration notes
+
+- **保留 classic YAML 不需 wipe。** 升级 app 不会强制 Operator 改写 classic `project`／`filter`／`groupBy`／… Deployments（Upgrade Compatibility／ADR-0014）。Classic steps 仍可解析；既有 Deployments 可持续 Sync。
+- **新编写应使用 Aggregation DX。** Lab Scenarios 与 handbook 示例以 `$project`／`$match`／`$group`／… 为支持风格。
+- **在配置中改写形式属于 Pipeline revision。** 编写的 `transform` JSON 会原样存储。以 IR 等效的 Aggregation YAML 取代 classic steps（或反向）会改变已存储的声明，因此 `migraloop apply` 会视为 **语义 Pipeline revision**：暂停该 Pipeline 旧的 Delivery、重建 Derived Dataset、重新 Deliver（含 delete reconciliation），再 resume。建议在已规划 revision 窗口时迁移—或让 classic Deployments 保持不变。
+- **目录中的能力名称仍用 classic。** Coverage 行与 glossary 仍以 `project`／`equiLookup`／`groupBy` 称呼可分析 surface；编写可用任一形式。
 
 ## v1 operator surface（已实现）
 
-当前出货的 parser 接受这些可分析 operators（Oracle → MongoDB 切片）—以下以 classic 形式说明；Aggregation 等效见 **Authoring forms**：
+当前出货的 parser 接受这些可分析 operators（Oracle → MongoDB 切片）—以下以建议的 Aggregation 形式说明。Classic 等效仍支持（见上方对应表）。
 
-### `project`
+### `$project`
 
-只保留列出的字段：
+只保留列出的字段（inclusion map 或 `{ fields: [...] }`）：
 
 ```yaml
-- project:
-    fields: [ID, CUSTOMER_ID, AMOUNT]
+- $project:
+    ID: 1
+    CUSTOMER_ID: 1
+    AMOUNT: 1
 ```
 
-### `addFields`
+### `$addFields` / `$set`
 
-新增 Managed 字段：literal JSON `value`，或从既有字段 `field` 复制（二者择一）：
+新增 Managed 字段：JSON literal 或复制既有字段：
 
 ```yaml
-- addFields:
-    fields:
-      - as: currency
-        value: USD
-      - as: displayName
-        field: customerName
+- $addFields:
+    currency: USD
+    displayName: "$customerName"
 ```
 
-### `rename`
+（literal 也可写成 `{ $literal: USD }`。）
 
-重命名字段（`from` → `to`）：
+### `$rename`
+
+重命名字段（`FROM` → `TO`）：
 
 ```yaml
-- rename:
-    fields:
-      - from: NAME
-        to: customerName
+- $rename:
+    NAME: customerName
 ```
 
-### `remove`
+### `$unset`
 
-从行中移除字段（移除后对 Affect Analysis 视为未使用）：
+从行中移除字段（移除后对 Affect Analysis 视为 unused）：
 
 ```yaml
-- remove:
-    fields: [EMAIL, NOTES]
+- $unset: [EMAIL, NOTES]
 ```
 
-### `filter`
+### `$match`
 
-单字段等值过滤：
+单字段 equality filter：
 
 ```yaml
-- filter:
-    field: STATUS
-    eq: OPEN
+- $match:
+    STATUS: OPEN
 ```
 
-### `groupBy`
+### `$group`（aggregations）
 
-Group keys 加上 aggregates。v1 aggregate ops：`sum`、`count`、`min`、`max`、`avg`。
-每个 aggregate 都需要 `field` 与 `as`。`count` 计算 `field` 的非 null 值数量
-（SQL `COUNT(field)`）。`min` / `max` / `avg` / `sum` 使用精度保留的 decimal 算术
-（非 IEEE double）。空 group 会被省略；若 `field` 全为 null，`min` / `max` / `avg`
-为 JSON `null`，`count` 为 `0`，`sum` 为 `0`。
+Group keys 加上 aggregates。v1 aggregate ops：`$sum`、`$count`、`$min`、`$max`、`$avg`。
+`$count` 计算被引用字段的非 null 值（SQL `COUNT(field)`）。`$min`／`$max`／`$avg`／`$sum`
+使用保留精度的 decimal 算术（非 IEEE double）。空 group 会省略；仅有 null 字段值时
+`$min`／`$max`／`$avg` 为 JSON `null`，而 `$count` 为 `0`、`$sum` 为 `0`。
 
 ```yaml
-- groupBy:
-    keys: [CUSTOMER_ID]
-    aggregates:
-      - op: count
-        field: ORDER_ID
-        as: ORDER_COUNT
-      - op: min
-        field: AMOUNT
-        as: MIN_AMOUNT
-      - op: max
-        field: AMOUNT
-        as: MAX_AMOUNT
-      - op: avg
-        field: AMOUNT
-        as: AVG_AMOUNT
-      - op: sum
-        field: AMOUNT
-        as: TOTAL_AMOUNT
+- $group:
+    _id: "$CUSTOMER_ID"
+    ORDER_COUNT:
+      $count: "$ORDER_ID"
+    MIN_AMOUNT:
+      $min: "$AMOUNT"
+    MAX_AMOUNT:
+      $max: "$AMOUNT"
+    AVG_AMOUNT:
+      $avg: "$AMOUNT"
+    TOTAL_AMOUNT:
+      $sum: "$AMOUNT"
 ```
 
-这些 aggregation **不会**额外发明 Maintenance State：incremental 更新只从 Base
-重算受影响的 Output Identities。未使用字段变更（例如 aggregates 读 ORDER_ID/AMOUNT
-时只改 ADDRESS）会跳过 Derived 重算。
+这些 aggregations **不会** 发明 Maintenance State：增量更新只从 Base 重算受影响的
+Output Identities。Unused 字段变更（例如 aggregates 读 ORDER_ID/AMOUNT 时的 ADDRESS）
+会跳过 Derived recompute。
 
-### `distinct`
+### `$group` for distinct
 
-按 `fields` 的唯一组合各产生一行 Derived（SQL `DISTINCT` 语义）。Output Identity
-通常对应这些 fields。
+每个唯一 key 一行 Derived（SQL `DISTINCT` 语义）—仅含 `_id` 的 `$group`。
+Output Identity 通常对齐这些字段。
 
 ```yaml
-- distinct:
-    fields: [CUSTOMER_ID]
+- $group:
+    _id: "$CUSTOMER_ID"
 ```
 
-### `addToSet`
+### `$group` with `$addToSet`
 
-按 `keys` 分组，把 `field` 的唯一非 null 值收集成 JSON 数组 `as`（Mongo 风格
-`$addToSet`）。数组内的值以确定性顺序排列。
+按 `_id` 分组，并把唯一非 null 值收集成 JSON 数组（Mongo 风格 `$addToSet`）。
+数组中的值顺序是确定性的。
 
 ```yaml
-- addToSet:
-    keys: [CUSTOMER_ID]
-    field: AMOUNT
-    as: AMOUNTS
+- $group:
+    _id: "$CUSTOMER_ID"
+    AMOUNTS:
+      $addToSet: "$AMOUNT"
 ```
 
-`distinct` 与 `addToSet` **会**创建 **Maintenance State**（Platform Store 内的
-per-identity / per-member refcounts），让 value-level Affect Analysis 能跳过无用的
-Derived 更新—例如插入已计入的重复 `CUSTOMER_ID`，或 set 中已存在的 `AMOUNT`。v1
-每个 transform 最多允许一个 `distinct` 或 `addToSet`。简单的 `groupBy`
-sum/count/min/max/avg 仍不得发明 Maintenance State。
+Distinct 与 `$addToSet` **会** 建立 **Maintenance State**（Platform Store 中 per-identity／
+per-member refcounts），让 value-level Affect Analysis 能跳过无用的 Derived 更新—例如插入
+已计入的重复 `CUSTOMER_ID`，或 set 中已存在的 `AMOUNT`。v1 每个 transform 最多允许一个
+distinct 或 `$addToSet` operator。简单的 `$group` sum/count/min/max/avg 仍不得发明
+Maintenance State。
 
-### `equiLookup`
+### `$lookup`
 
-对同一 Deployment 内另一个 **Base Dataset** 做 left-outer equijoin。匹配的
-foreign rows 会嵌成数组放在 `as` 之下。Pipeline 的 `source.table` 是左侧（primary）
-Base；`from` 命名 secondary Base（Initial Load 与 Incremental Capture 都会覆盖两者）。
-可选的 `fromSchema` 覆盖 secondary schema（默认为 Pipeline source schema）。
+对同一 Deployment 内另一个 **Base Dataset** 做 left-outer equijoin。匹配的 foreign 行会嵌成
+`as` 下的数组。Pipeline 的 `source.table` 是 left（primary）Base；`from` 命名 secondary Base
+（Initial Load + Incremental Capture 两者都会纳入）。可选 `fromSchema` 覆盖 secondary schema
+（默认为 Pipeline source schema）。
 
 ```yaml
-- equiLookup:
+- $lookup:
     from: ORDERS
     localField: ID
     foreignField: CUSTOMER_ID
     as: orders
 ```
 
-请用 classic `equiLookup`，或带相同 equijoin 字段的受限 Aggregation `$lookup` / `join`。
-自由形式的 Mongo `$lookup` 扩展（`pipeline` / `let`）会被拒绝，以便 **Affect Analysis**
-保持正确。任一侧 Base 变更只更新受影响的 primary Output Identities；未使用的 primary
-字段（例如 `project` 之后的 EMAIL）仍会跳过重算。嵌入的 foreign rows 包含完整 Base
-字段，因此 foreign 侧字段变更会重算匹配的 identities。
+请用带相同 equijoin 字段的受限 Aggregation `$lookup`／`join`（或 classic `equiLookup`）。
+自由形式 Mongo `$lookup` 扩展（`pipeline`／`let`）会被拒绝，以维持 **Affect Analysis**
+正确。任一侧 Base 的变更只更新受影响的 primary Output Identities；`$project` 后 unused 的
+primary 字段（例如 EMAIL）仍会跳过 recompute。嵌入的 foreign 行含完整 Base 字段，因此
+foreign 侧字段变更会重算匹配 identities。
 
-### `unwind`
+### `$unwind`
 
-把数组字段展开成每个元素一行 Derived（1→N 粒度）。常见组合是先 `equiLookup`
-再 `unwind`，让 Delivery 能以展开后的 Output Identity（例如 `ORDER_ID`）为文档键。
-
-```yaml
-- unwind:
-    path: orders
-```
-
-当数组元素是对象时，其字段会**合并进 parent 行**，并移除数组 path（利于 Delivery 的 flatten）。
-标量元素则替换该 path 的值（Mongo 风格）。缺失、null 或空数组不产生行。请用 classic
-`unwind` 或 Aggregation `$unwind`（`"$path"` 或 `{ path }`）。`preserveNullAndEmptyArrays` /
-`includeArrayIndex` 等选项会被拒绝，以便 **Affect Analysis** 只展开受影响的 Output
-Identities—包括数组成员消失时的 deletes。
-
-### `union`
-
-把另一个 **Base Dataset** 串联到流（SQL `UNION ALL` / Mongo `$unionWith` 且无 nested
-pipeline）。Pipeline 的 `source.table` 是 primary Base；`from` 命名 secondary Base
-（Initial Load + Incremental Capture 覆盖两者）。先前步骤已塑造的行在前；secondary Base
-行原样接在后面；之后的步骤（例如 `project`）对两边都生效。可选的 `fromSchema` 覆盖
-secondary schema（默认为 Pipeline source schema）。
+把数组字段展开成每个元素一行 Derived（1→N grain）。典型组合是 `$lookup` 再 `$unwind`，
+让 Delivery 能以 unwind 后的 Output Identity（例如 `ORDER_ID`）键结文档。
 
 ```yaml
-- union:
-    from: WEST_CUSTOMERS
-- project:
-    fields: [ID, NAME]
+- $unwind: "$orders"
 ```
 
-请用 classic `union`，或受限 Aggregation `$unionWith`（`coll` / `from` / 字符串名称）。
-嵌套 `$unionWith` `pipeline` 扩展会被拒绝，以便 **Affect Analysis** 保持正确。任一贡献
-Base 的变更只更新受影响的 Output Identities；后续 `project` 未使用的字段（例如 EMAIL）仍会
-skip 重算。v1 不允许 `union` 与 `distinct` / `addToSet` 并用。请选择跨贡献 Bases 仍唯一的
-**Output Identity**—Delivery 对每个 identity upsert 一份 Target 文档（SQL `UNION ALL` 的行
-多重性不会为同一 key 建立多份 Mongo 文档）。
+当数组元素是对象时，其字段会 **merge 进 parent 行** 并移除该 path（利于 Delivery 的 flatten）。
+标量元素则替换该 path 的值（Mongo 风格）。缺失、null 或空数组不产生行。`preserveNullAndEmptyArrays`／
+`includeArrayIndex` 等选项会被拒绝，让 **Affect Analysis** 只展开受影响的 Output Identities—
+包含数组成员消失时的 deletes。
+
+### `$unionWith`
+
+把另一个 **Base Dataset** 串进流（SQL `UNION ALL`／不含 nested pipeline 的 Mongo `$unionWith`）。
+Pipeline 的 `source.table` 是 primary Base；`$unionWith` 名称是 secondary Base（Initial Load +
+Incremental Capture 两者都会纳入）。先前步骤已塑形的行在前；secondary Base 行原样附加；之后的
+步骤（例如 `$project`）两边都适用。可选 `fromSchema` 覆盖 secondary schema（默认为 Pipeline
+source schema）。
+
+```yaml
+- $unionWith: WEST_CUSTOMERS
+- $project:
+    ID: 1
+    NAME: 1
+```
+
+Nested `$unionWith` `pipeline` 扩展会被拒绝，以维持 **Affect Analysis** 正确。任一侧贡献
+Base 的变更只更新受影响的 Output Identities；后续 `$project` 后 unused 的字段（例如 EMAIL）
+仍会跳过 recompute。v1 不把 `$unionWith` 与 distinct／`$addToSet` 组合。请选择在贡献 Bases
+之间仍保持唯一的 **Output Identity**—Delivery 对每个 identity upsert 一份 Target document
+（SQL `UNION ALL` 行多重性不会为同一 key 创建多份 Mongo documents）。
 
 ## Output Identity
 
-**Output Identity** 在 Target 上定位一份文档，供 Delivery 与 Drift Check 使用。必须可由 transform 输入决定—不能用随机 UUID。对 aggregation，identity 通常对应 `groupBy` keys。
+**Output Identity** 在 Target 上定位一份文档，供 Delivery 与 Drift Check 使用。它必须可从
+transform 输入决定—不可用随机 UUID。对 aggregations，identity 通常对齐 `$group` 的 `_id` keys。
 
 ## Affect Analysis
 
-**Affect Analysis** 依 transform 定义与进来的 Base change，决定哪些 Output Identities（若有）需要 Derived 重算。未使用的字段不得触发重算（例如只改地址不应重算按客户加总金额）。对 `distinct` / `addToSet`，Maintenance State 可在重复 key 或 set member 已计入时（以及 delete 并非最后一个贡献者时）做 value-level skip。
+**Affect Analysis** 依 transform 定义与进来的 Base change，决定哪些 Output Identities（若有）
+需要 Derived recomputation。Unused 字段不得触发 recompute（例如只改 address 不得重算
+sum-of-amount-by-customer）。对 distinct／`$addToSet`，Maintenance State 让已计入的重复 key
+或 set member（以及 delete 并非最后贡献者时）可做 value-level skip。
 
-当 Base 行的 `groupBy` key 变更时，Affect Analysis 会在应用 change **之前**读取 Base 行，以便同时更新旧与新的 Output Identity（调整或移除旧 identity；upsert 新 identity）。不可先覆盖 Base 再尝试找回先前的 key。
+当 Base 行的 `$group` key 变更时，Affect Analysis 会在应用变更 **之前** 读取 Base 行，以便更新
+旧与新的 Output Identities（调整或移除旧 identity；upsert 新的）。不得先覆盖 Base 再试图
+还原先前的 key。
 
-稳态下对整个 Derived Dataset 做 full recompute 不可接受。在正确时优先走 operator-equivalent 快速路径；否则只对受影响 identities 从平台 Base 输入重算。
+对整个 Derived Dataset 做 steady-state 全量 recompute 不可接受。在正确时优先走
+operator-equivalent fast paths；否则只从 platform Base 输入重算受影响 identities。
 
 检查 Derived 行：
 
@@ -251,7 +252,7 @@ skip 重算。v1 不允许 `union` 与 `distinct` / `addToSet` 并用。请选�
 migraloop derived --pipeline orders_by_customer
 ```
 
-## 相关章节
+## Related chapters
 
 - Pipeline 声明：[Pipeline](pipeline.md)
 - Derived 输出的 Delivery：[Target System](target-system.md)

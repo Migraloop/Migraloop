@@ -31,6 +31,5 @@ spec:
         collection: lab_rf_customers
       outputIdentity: [ID]
       transform:
-        - filter:
-            field: ACTIVE
-            eq: 1
+        - $match:
+            ACTIVE: 1

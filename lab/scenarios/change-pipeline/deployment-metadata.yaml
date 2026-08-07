@@ -30,11 +30,12 @@ spec:
         collection: lab_cp_active_customers
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME, ACTIVE]
-        - filter:
-            field: ACTIVE
-            eq: 0
+        - $project:
+            ID: 1
+            NAME: 1
+            ACTIVE: 1
+        - $match:
+            ACTIVE: 0
     - name: lab-cp-customers-reporting
       mode: direct
       source:

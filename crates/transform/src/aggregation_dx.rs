@@ -1,8 +1,9 @@
-//! Aggregation / SQL-like Rich Transform authoring (expand DX).
+//! Aggregation / SQL-like Rich Transform authoring (preferred DX).
 //!
-//! Accepts MongoDB Aggregation–shaped stages and thin SQL-ish aliases beside the
-//! current declarative step form. Every accepted shape normalizes to the same
-//! [`TransformOp`] IR so Affect Analysis and evaluation stay unchanged.
+//! Accepts MongoDB Aggregation–shaped stages and thin SQL-ish aliases as the
+//! preferred declarative authoring form beside classic steps (Upgrade
+//! Compatibility). Every accepted shape normalizes to the same [`TransformOp`]
+//! IR so Affect Analysis and evaluation stay unchanged.
 //!
 //! Free-form scripts and unanalyzable Aggregation extensions (`pipeline`, `let`,
 //! multi-predicate `$match`, expression `$project`, …) remain rejected.
@@ -953,6 +954,7 @@ mod tests {
 
     #[test]
     fn classic_form_still_parses_unchanged() {
+        // Issue #233: classic steps remain Upgrade Compatible after Aggregation DX contract.
         let ops = parse_transform_steps(&[
             json!({"project": {"fields": ["ID", "NAME"]}}),
             json!({"filter": {"field": "STATUS", "eq": "OPEN"}}),

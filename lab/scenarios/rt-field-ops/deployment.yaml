@@ -31,20 +31,16 @@ spec:
         collection: lab_rfo_customers
       outputIdentity: [ID]
       transform:
-        - project:
-            fields: [ID, NAME, EMAIL, ACTIVE]
-        - remove:
-            fields: [EMAIL]
-        - rename:
-            fields:
-              - from: NAME
-                to: customerName
-        - addFields:
-            fields:
-              - as: source
-                value: oracle
-              - as: displayName
-                field: customerName
-        - filter:
-            field: ACTIVE
-            eq: 1
+        - $project:
+            ID: 1
+            NAME: 1
+            EMAIL: 1
+            ACTIVE: 1
+        - $unset: EMAIL
+        - $rename:
+            NAME: customerName
+        - $addFields:
+            source: oracle
+            displayName: "$customerName"
+        - $match:
+            ACTIVE: 1

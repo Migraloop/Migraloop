@@ -113,15 +113,15 @@ fn unwind_pipeline() -> &'static str {
         collection: orders_unwound
       outputIdentity: [ORDER_ID]
       transform:
-        - project:
-            fields: [ID, NAME]
-        - equiLookup:
+        - $project:
+            ID: 1
+            NAME: 1
+        - $lookup:
             from: ORDERS
             localField: ID
             foreignField: CUSTOMER_ID
             as: orders
-        - unwind:
-            path: orders
+        - $unwind: "$orders"
 "#
 }
 
