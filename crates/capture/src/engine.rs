@@ -39,6 +39,24 @@ pub trait IncrementalCaptureSession: Send {
         table: &str,
         from_position: CapturePosition,
     ) -> Result<usize, CaptureError>;
+
+    /// Prefetch many tables in one Capture session when the adapter can amortize
+    /// setup (OCI LogMiner START/END). Default fans out to per-table fetch.
+    fn prefetch_tables_limited(
+        &self,
+        requests: &[(String, String, CapturePosition, Option<usize>)],
+    ) -> Result<Vec<Vec<ChangeEvent>>, CaptureError> {
+        let mut out = Vec::with_capacity(requests.len());
+        for (schema, table, from_position, limit) in requests {
+            out.push(self.fetch_changes_in_schema_limited(
+                schema,
+                table,
+                *from_position,
+                *limit,
+            )?);
+        }
+        Ok(out)
+    }
 }
 
 impl IncrementalCaptureSession for IncrementalCapture {
@@ -69,6 +87,13 @@ impl IncrementalCaptureSession for IncrementalCapture {
         from_position: CapturePosition,
     ) -> Result<usize, CaptureError> {
         IncrementalCapture::count_changes_in_schema(self, schema, table, from_position)
+    }
+
+    fn prefetch_tables_limited(
+        &self,
+        requests: &[(String, String, CapturePosition, Option<usize>)],
+    ) -> Result<Vec<Vec<ChangeEvent>>, CaptureError> {
+        IncrementalCapture::prefetch_tables_limited(self, requests)
     }
 }
 

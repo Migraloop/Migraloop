@@ -111,21 +111,66 @@ impl OciLogMiner {
         from_position: CapturePosition,
         limit: Option<usize>,
     ) -> Result<Vec<ChangeEvent>, CaptureError> {
-        let conn = connect_oracle(&self.connect, &self.password)?;
-        let owner = resolve_oracle_schema(&self.connect, schema);
-        let contents = fetch_logminer_contents(
-            &conn,
-            &self.connect.host,
-            &owner,
-            table,
+        let results = self.prefetch_tables_limited(&[(
+            schema.to_string(),
+            table.to_string(),
             from_position,
             limit,
-        )?;
-        Ok(change_events_from_logminer_contents(
-            &contents,
-            table,
-            from_position,
-        ))
+        )])?;
+        Ok(results.into_iter().next().unwrap_or_default())
+    }
+
+    /// Prefetch many tables inside **one** LogMiner START/END session (#252).
+    ///
+    /// Mega-mix Deployments otherwise pay a full SCN-range `START_LOGMNR` per
+    /// Base table (including paused Pipelines that still advance Base). Shared
+    /// session keeps idle-table probes from re-scanning the Direct evidence burst.
+    pub fn prefetch_tables_limited(
+        &self,
+        requests: &[(String, String, CapturePosition, Option<usize>)],
+    ) -> Result<Vec<Vec<ChangeEvent>>, CaptureError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = connect_oracle(&self.connect, &self.password)?;
+        let host = self.connect.host.as_str();
+        let end_scn = current_scn(&conn, host)?;
+        let end_scn_i64 = end_scn.as_i64();
+        let min_start = requests
+            .iter()
+            .map(|(_, _, from, _)| from.as_i64())
+            .min()
+            .unwrap_or(end_scn_i64);
+        if end_scn_i64 < min_start {
+            return Ok(requests.iter().map(|_| Vec::new()).collect());
+        }
+
+        conn.execute(DBMS_LOGMNR_START_LOGMNR, &[&min_start, &end_scn_i64])
+            .map_err(|err| map_oracle_error(host, err))?;
+
+        let result = (|| {
+            let mut out = Vec::with_capacity(requests.len());
+            for (schema, table, from_position, limit) in requests {
+                let owner = resolve_oracle_schema(&self.connect, schema);
+                let contents = read_table_contents_in_session(
+                    &conn,
+                    host,
+                    &owner,
+                    table,
+                    *from_position,
+                    *limit,
+                )?;
+                out.push(change_events_from_logminer_contents(
+                    &contents,
+                    table,
+                    *from_position,
+                ));
+            }
+            Ok(out)
+        })();
+
+        let _ = conn.execute(DBMS_LOGMNR_END_LOGMNR, &[]);
+        result
     }
 
     /// Count pending Incremental DML rows for Sync/Delivery Health lag (ADR-0020).
@@ -182,7 +227,8 @@ fn count_logminer_contents(
     result
 }
 
-fn fetch_logminer_contents(
+/// Read one table from an already-started LogMiner session.
+fn read_table_contents_in_session(
     conn: &Connection,
     host: &str,
     owner: &str,
@@ -206,17 +252,8 @@ fn fetch_logminer_contents(
         });
     }
 
-    let end_scn = current_scn(conn, host)?;
     let start_scn = from_position.as_i64();
-    let end_scn_i64 = end_scn.as_i64();
-    if end_scn_i64 < start_scn {
-        return Ok(Vec::new());
-    }
-
-    conn.execute(DBMS_LOGMNR_START_LOGMNR, &[&start_scn, &end_scn_i64])
-        .map_err(|err| map_oracle_error(host, err))?;
-
-    let result = read_mined_contents(
+    read_mined_contents(
         conn,
         host,
         &owner,
@@ -225,12 +262,7 @@ fn fetch_logminer_contents(
         &columns,
         &primary_key,
         limit,
-    );
-
-    // Always attempt to end the session — ignore end errors if start/query already failed.
-    let _ = conn.execute(DBMS_LOGMNR_END_LOGMNR, &[]);
-
-    result
+    )
 }
 
 /// Build the OCI `V$LOGMNR_CONTENTS` query that reconstructs row images.

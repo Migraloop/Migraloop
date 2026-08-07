@@ -1186,6 +1186,62 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
         // dedupe keeps same-SCN siblings visible after a mid-SCN stop or bounded window
         // (issue #143). Prefer duplicates over gaps: Deliver each change before durable
         // Base/checkpoint/change-id persistence so a Delivery failure can retry.
+        //
+        // Shared LogMiner session prefetch (#252): one START/END for every ready Base
+        // table so idle tables (paused Pipelines still advance Base) do not each
+        // re-scan the mega-mix Direct evidence SCN range.
+        let shared_prefetch_limit = window.capacity().saturating_mul(4).max(window.capacity());
+        let mut shared_prefetch: BTreeMap<String, (VecDeque<ChangeEvent>, bool)> = BTreeMap::new();
+        {
+            let mut requests: Vec<(String, String, CapturePosition, Option<usize>)> = Vec::new();
+            let mut request_meta: Vec<(String, Option<usize>)> = Vec::new();
+            for (schema, table) in &tables {
+                let (dataset, _) = store
+                    .get_base_rows(table, Some(&deployment.name))
+                    .await
+                    .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+                if dataset.status == "initial_load_in_progress"
+                    || dataset.status == "initial_load_paused"
+                {
+                    continue;
+                }
+                let cutover = resume_for_incremental(
+                    table,
+                    dataset.capture_low_watermark,
+                    dataset.capture_checkpoint,
+                )?;
+                let applied_at_or_after = store
+                    .list_applied_change_ids_from_position(
+                        &deployment.name,
+                        schema,
+                        table,
+                        cutover.resume_from.as_i64(),
+                    )
+                    .await
+                    .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+                let fetch_limit =
+                    Some(shared_prefetch_limit.saturating_add(applied_at_or_after.len()));
+                requests.push((
+                    schema.clone(),
+                    table.clone(),
+                    cutover.resume_from,
+                    fetch_limit,
+                ));
+                request_meta.push((table.clone(), fetch_limit));
+            }
+            if !requests.is_empty() {
+                let batches = IncrementalCaptureSession::prefetch_tables_limited(
+                    &capture,
+                    &requests,
+                )
+                .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+                for ((table, fetch_limit), batch) in request_meta.into_iter().zip(batches) {
+                    let saturated = fetch_limit.is_some_and(|n| batch.len() >= n);
+                    shared_prefetch.insert(table, (VecDeque::from(batch), saturated));
+                }
+            }
+        }
+
         for (schema, table) in tables {
             let (dataset, base_rows) = store
                 .get_base_rows(&table, Some(&deployment.name))
@@ -1240,14 +1296,25 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
             }
 
             let mut windows_processed = 0usize;
-            // Same-SCN bulk inserts (mega-mix CONNECT BY) leave many siblings after one
-            // bounded window. Keep filtered leftovers so later windows do not re-START
-            // LogMiner and re-MINE already-seen rows (#252 / issue #143 inclusive resume).
-            let mut leftover_changes: VecDeque<ChangeEvent> = VecDeque::new();
+            // Seed from shared-session prefetch when present; otherwise open Capture
+            // for this table (tables skipped during the shared pass).
+            let (mut leftover_changes, prefetch_saturated, from_shared_prefetch) =
+                match shared_prefetch.remove(&table) {
+                    Some((queued, saturated)) => (queued, saturated, true),
+                    None => (VecDeque::new(), false, false),
+                };
             // Sticky: once a bounded fetch saturates, leftovers alone cannot prove the
             // Source is drained — COUNT until a later fetch returns unsaturated (#252
             // skips COUNT only when the whole burst fits in prefetch).
-            let mut source_backlog_incomplete = false;
+            let mut source_backlog_incomplete = prefetch_saturated;
+            // Poll Source until an unsaturated prefetch proves the burst is fully
+            // buffered in leftovers; then drain without padding fetches (inclusive
+            // SCN resume would otherwise re-mine the whole batch each pad, #252).
+            let mut source_capture_open = if from_shared_prefetch {
+                prefetch_saturated
+            } else {
+                true
+            };
 
             // ADR-0020 / #203: bounded Incremental windows via Backpressure module.
             // Capture only fills up to window capacity; Downstream slowness drains
@@ -1280,15 +1347,14 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                 }
 
                 let mut fetch_saturated = false;
-                if candidate_changes.len() < window.capacity() {
+                // Fetch only when the leftover buffer cannot supply the next window.
+                // Never pad a partial leftover window up to capacity — that re-opens
+                // LogMiner under inclusive SCN resume and re-mines already-buffered
+                // siblings (mega-mix Direct evidence, #252).
+                if candidate_changes.is_empty() && source_capture_open {
                     // Prefetch several windows in one LogMiner session (still bounded:
-                    // 4× capacity), then drain via leftovers. Same-SCN mega-mix bursts
-                    // otherwise re-START LogMiner once per window (#252).
-                    let prefetch = window
-                        .capacity()
-                        .saturating_mul(4)
-                        .saturating_sub(candidate_changes.len())
-                        .max(window.capacity() - candidate_changes.len());
+                    // 4× capacity), then drain via leftovers.
+                    let prefetch = window.capacity().saturating_mul(4).max(window.capacity());
                     let fetch_limit = Some(prefetch.saturating_add(applied_skip.len()));
                     let fetched_changes = capture
                         .fetch_changes_in_schema_limited(
@@ -1300,6 +1366,10 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                         .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                     fetch_saturated = fetch_limit.is_some_and(|n| fetched_changes.len() >= n);
                     source_backlog_incomplete = fetch_saturated;
+                    if !fetch_saturated {
+                        // Entire remaining Source burst is now in memory.
+                        source_capture_open = false;
+                    }
                     let mut filtered = fetched_changes
                         .into_iter()
                         .filter(|c| !applied_skip.contains(&c.change_id));

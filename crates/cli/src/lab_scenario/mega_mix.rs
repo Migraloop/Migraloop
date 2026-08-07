@@ -50,7 +50,10 @@ pub(crate) const TRANSFORM_INCREMENTAL_BATCH_ROWS: u64 = 200;
 pub(crate) const INCREMENTAL_BATCH_ROWS: u64 = DIRECT_INCREMENTAL_BATCH_ROWS;
 
 /// Bounded-window capacity for mega-mix evidence syncs (ADR-0020 / #252).
-pub(crate) const MEGA_MIX_SYNC_QUEUE_CAPACITY: &str = "16384";
+///
+/// Sized ≥ Direct evidence batch so one unsaturated prefetch + one window-batch
+/// Delivery can absorb the burst without leftover pad-fetches.
+pub(crate) const MEGA_MIX_SYNC_QUEUE_CAPACITY: &str = "65536";
 
 /// Per-Pipeline ID stride (> max batch) so solo/mix inserts never collide.
 pub(crate) const ID_STRIDE: i64 = 100_000;
