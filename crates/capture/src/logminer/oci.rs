@@ -286,10 +286,11 @@ fn mined_contents_sql(owner: &str, table: &str, columns: &[SourceColumn]) -> Str
         let name = &column.name;
         // Oracle requires schema.table.column for MINE_VALUE / COLUMN_PRESENT.
         let qualified = format!("{owner}.{table}.{name}");
-        // INSERT: SQL_REDO path (no MINE_VALUE). DELETE: identity from UNDO only.
-        // UPDATE: mine REDO + UNDO. CASE short-circuits PL/SQL mine on insert bursts.
+        // INSERT prefers SQL_REDO when parseable; REDO MINE_VALUE remains as
+        // fallback for DATE/TIMESTAMP/RAW SQL_REDO forms (ADR-0018). DELETE uses
+        // UNDO only. UPDATE mines REDO + UNDO. Skip UNDO mine on INSERT (#252).
         select_parts.push(format!(
-            "CASE WHEN OPERATION = 'UPDATE' THEN \
+            "CASE WHEN OPERATION IN ('INSERT', 'UPDATE') THEN \
                 DBMS_LOGMNR.MINE_VALUE(REDO_VALUE, '{qualified}') \
              ELSE NULL END AS \"R_{name}\""
         ));
@@ -350,53 +351,44 @@ fn read_mined_contents(
 
         let sql_redo: Option<String> = row.get(6).map_err(|err| map_oracle_error(host, err))?;
 
+        let mut redo = BTreeMap::new();
+        let mut undo = BTreeMap::new();
+        for (idx, column) in columns.iter().enumerate() {
+            // Fixed prefix: SCN..SSN + SQL_REDO (7 cols), then R/U pairs.
+            let redo_idx = 7 + idx * 2;
+            let undo_idx = redo_idx + 1;
+            let redo_text: Option<String> = row
+                .get(redo_idx)
+                .map_err(|err| map_oracle_error(host, err))?;
+            let undo_text: Option<String> = row
+                .get(undo_idx)
+                .map_err(|err| map_oracle_error(host, err))?;
+            redo.insert(column.name.clone(), mined_value_to_json(redo_text, column)?);
+            undo.insert(column.name.clone(), mined_value_to_json(undo_text, column)?);
+        }
+
         let (identity, after_image) = match op {
             LogMinerOperation::Insert => {
-                let sql = sql_redo.ok_or_else(|| CaptureError::OciUnavailable {
-                    host: host.to_string(),
-                    detail: format!(
-                        "LogMiner (OCI) INSERT at SCN {scn} for {owner}.{table} has empty SQL_REDO; \
-                         enable supplemental logging and DICT_FROM_ONLINE_CATALOG"
-                    ),
-                })?;
-                let after = parse_insert_sql_redo(&sql, columns, host)?;
+                // Prefer SQL_REDO for simple literal INSERT shapes; fall back to
+                // REDO MINE_VALUE when SQL_REDO uses TO_DATE/HEXTORAW/etc.
+                let after = sql_redo
+                    .as_deref()
+                    .and_then(|sql| parse_insert_sql_redo(sql, columns, host).ok())
+                    .unwrap_or(redo);
                 let identity = identity_from_row(&after, primary_key);
                 (identity, Some(after))
             }
-            LogMinerOperation::Update | LogMinerOperation::Delete => {
-                let mut redo = BTreeMap::new();
-                let mut undo = BTreeMap::new();
-                for (idx, column) in columns.iter().enumerate() {
-                    // Fixed prefix: SCN..SSN + SQL_REDO (7 cols), then R/U pairs.
-                    let redo_idx = 7 + idx * 2;
-                    let undo_idx = redo_idx + 1;
-                    let redo_text: Option<String> = row
-                        .get(redo_idx)
-                        .map_err(|err| map_oracle_error(host, err))?;
-                    let undo_text: Option<String> = row
-                        .get(undo_idx)
-                        .map_err(|err| map_oracle_error(host, err))?;
-                    redo.insert(column.name.clone(), mined_value_to_json(redo_text, column)?);
-                    undo.insert(column.name.clone(), mined_value_to_json(undo_text, column)?);
-                }
-                let identity = match op {
-                    LogMinerOperation::Delete => identity_from_row(&undo, primary_key),
-                    LogMinerOperation::Update => {
-                        let from_redo = identity_from_row(&redo, primary_key);
-                        if from_redo.values().any(|v| !v.is_null()) {
-                            from_redo
-                        } else {
-                            identity_from_row(&undo, primary_key)
-                        }
-                    }
-                    LogMinerOperation::Insert => unreachable!("INSERT handled above"),
+            LogMinerOperation::Delete => {
+                (identity_from_row(&undo, primary_key), None)
+            }
+            LogMinerOperation::Update => {
+                let from_redo = identity_from_row(&redo, primary_key);
+                let identity = if from_redo.values().any(|v| !v.is_null()) {
+                    from_redo
+                } else {
+                    identity_from_row(&undo, primary_key)
                 };
-                let after_image = match op {
-                    LogMinerOperation::Delete => None,
-                    LogMinerOperation::Update => Some(redo),
-                    LogMinerOperation::Insert => unreachable!("INSERT handled above"),
-                };
-                (identity, after_image)
+                (identity, Some(redo))
             }
         };
 
@@ -621,14 +613,14 @@ mod tests {
             !upper.contains("ROWNUM"),
             "MINE_VALUE query must not use ROWNUM limits (ORA-01323): {sql}"
         );
-        // INSERT uses SQL_REDO; UPDATE/DELETE keep MINE_VALUE (#252).
+        // SQL_REDO preferred for INSERT; REDO MINE_VALUE kept as type-safe fallback.
         assert!(
             upper.contains("SQL_REDO"),
             "INSERT fast path requires SQL_REDO projection: {sql}"
         );
         assert!(
-            upper.contains("CASE WHEN OPERATION = 'UPDATE' THEN"),
-            "REDO MINE_VALUE must run only for UPDATE: {sql}"
+            upper.contains("CASE WHEN OPERATION IN ('INSERT', 'UPDATE') THEN"),
+            "REDO MINE_VALUE must cover INSERT fallback + UPDATE: {sql}"
         );
         assert!(
             upper.contains("CASE WHEN OPERATION IN ('UPDATE', 'DELETE') THEN"),

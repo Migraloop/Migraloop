@@ -63,7 +63,7 @@ Tried / profiled on the Direct path toward mega-mix aggregate ≥100k e2e QPS
 | Platform Store **`record_sync_rows_progress`** (many Base mutations + applied change ids in one TX) + UNNEST bulk `applied_source_changes` | **Kept** — removes per-change Postgres TX overhead on Direct windows |
 | Pure-insert Direct windows use **`BaseRowMutation::Insert`** (bulk UNNEST, no JSON-containment DELETE) | **Kept** — mega-mix insert bursts were dominated by delete-before-insert scans; updates still use Upsert replace |
 | Same-SCN leftover buffer + 4× capacity prefetch + skip LogMiner COUNT when prefetch covers the burst | **Kept** — avoids re-START/re-MINE of already-filtered siblings under inclusive SCN resume (#143); sticky incomplete flag still COUNTs when fetch saturates (ADR-0020 lag) |
-| INSERT after-image via LogMiner **`SQL_REDO` parse** (skip per-column `MINE_VALUE` on INSERT; UPDATE/DELETE still mine) | **Kept** — removes PL/SQL mine on insert bursts (Oracle-side mine was not the e2e ceiling; still correctness-preserving) |
+| INSERT after-image via LogMiner **`SQL_REDO` parse** with REDO `MINE_VALUE` fallback | **Kept** — literal INSERT shapes avoid UNDO mine; DATE/TIMESTAMP/RAW fall back to REDO mine (ADR-0018) |
 | Do not **pad leftover windows** with another LogMiner fetch | **Kept** — inclusive SCN resume re-mined the whole Direct burst when leftovers < capacity |
 | **Shared LogMiner session** prefetch for all Base tables in one sync | **Kept** — paused Pipelines still advance Base; without amortization each idle table re-`START_LOGMNR` over the Direct evidence SCN range |
 | Mega-mix sync queue capacity **65536** (≥ Direct 50k batch) | **Kept** — one unsaturated prefetch + one window-batch Delivery when the burst fits |

@@ -1192,8 +1192,12 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
         // re-scan the mega-mix Direct evidence SCN range.
         let shared_prefetch_limit = window.capacity().saturating_mul(4).max(window.capacity());
         let mut shared_prefetch: BTreeMap<String, (VecDeque<ChangeEvent>, bool)> = BTreeMap::new();
-        {
-            let mut requests: Vec<(String, String, CapturePosition, Option<usize>)> = Vec::new();
+        // Amortize LogMiner START/END only when multiple Bases share one sync
+        // (mega-mix). Single-table Deployments keep the one-shot fetch path so
+        // rqg-perf Direct microbench is not charged a double metadata round-trip.
+        if tables.len() > 1 {
+            let mut requests: Vec<(String, String, CapturePosition, Option<usize>)> =
+                Vec::new();
             let mut request_meta: Vec<(String, Option<usize>)> = Vec::new();
             for (schema, table) in &tables {
                 let (dataset, _) = store
