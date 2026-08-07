@@ -28,7 +28,7 @@ migraloop apply -f deployment.yaml
 migraloop status
 ```
 
-`deployment.yaml` 中的 Transform Pipelines 應優先使用 Aggregation／SQL-like DX（`$project`、`$match`、`$group`…）；classic steps 仍 Upgrade Compatible—見 [Rich Transform](rich-transform.md) 與 [Pipeline](pipeline.md)。
+`deployment.yaml` 中的 Transform Pipelines 必須使用 Aggregation `$…` stages（`$project`、`$match`、`$group`…）；classic step 名稱與 SQL 別名會被拒絕—見 [Rich Transform](rich-transform.md) 與 [Pipeline](pipeline.md)。
 
 ## Local Sync Lab Fixture
 

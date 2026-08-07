@@ -186,11 +186,10 @@ async fn transform_pipeline_missing_output_identity_fails_apply() {
       target:
         collection: active_customers
       transform:
-        - project:
+        - $project:
             fields: [ID, NAME, ACTIVE]
-        - filter:
-            field: ACTIVE
-            eq: 1
+        - $match:
+            ACTIVE: 1
 "#;
     let config = write_config(
         &dir,
@@ -254,7 +253,7 @@ async fn transform_pipeline_malformed_project_fails_as_invalid_not_unsupported()
         collection: bad_project
       outputIdentity: [ID]
       transform:
-        - project:
+        - $project:
             fields: []
 "#;
     let config = write_config(
@@ -291,11 +290,10 @@ async fn transform_pipeline_filter_matching_no_rows_still_materializes_empty_der
         collection: nobody
       outputIdentity: [ID]
       transform:
-        - project:
+        - $project:
             fields: [ID, NAME, ACTIVE]
-        - filter:
-            field: ACTIVE
-            eq: 99
+        - $match:
+            ACTIVE: 99
 "#;
     let config = write_config(
         &dir,
@@ -362,9 +360,8 @@ async fn transform_pipeline_unsupported_operator_fails_apply_clearly() {
 
 #[tokio::test]
 async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_mongo() {
-    // Issue #233: preferred Aggregation DX on the product path (matches Lab `rt-project` /
-    // `rt-filter`). Classic Upgrade Compatibility: see
-    // transform_pipeline_classic_project_filter_still_applies_upgrade_compatible.
+    // ADR-0030 / issue #250: Aggregation-only authoring on the product path
+    // (matches Lab `rt-project` / `rt-filter`).
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
@@ -492,13 +489,13 @@ async fn transform_pipeline_project_filter_materializes_derived_and_delivers_to_
 }
 
 #[tokio::test]
-async fn transform_pipeline_classic_project_filter_still_applies_upgrade_compatible() {
-    // Issue #233: classic project/filter Deployments still apply (Upgrade Compatibility).
+async fn transform_pipeline_classic_and_sql_ish_authoring_fails_apply() {
+    // ADR-0030 / issue #250: classic step names and SQL-ish aliases rejected (no read-compat).
     let url = ephemeral_database_url().await;
     let mongo_database = unique_mongo_database();
     let dir = TempDir::new().expect("tempdir");
     let doubles = common::NamedScenarioDoubles::install(dir.path());
-    let pipeline = r#"
+    let classic_pipeline = r#"
     - name: active-customers-classic
       mode: transform
       source:
@@ -513,60 +510,51 @@ async fn transform_pipeline_classic_project_filter_still_applies_upgrade_compati
             field: ACTIVE
             eq: 1
 "#;
-    let config = write_config(
+    let classic_config = write_config(
         &dir,
-        "deployment.yaml",
-        &deployment_shell(&mongo_database, pipeline),
+        "classic.yaml",
+        &deployment_shell(&mongo_database, classic_pipeline),
+    );
+    let err = apply_expect_failure(&url, &classic_config, &doubles);
+    let lower = err.to_ascii_lowercase();
+    assert!(
+        lower.contains("unsupported") && lower.contains("project"),
+        "classic project must fail apply clearly, got:\n{err}"
+    );
+    assert!(
+        lower.contains("$project") || lower.contains("$match") || lower.contains("aggregation"),
+        "reject message must point at Aggregation `$…` authoring, got:\n{err}"
     );
 
-    migrate_and_apply(&url, &config, &doubles);
-
-    let derived = Command::new(bin())
-        .args([
-            "derived",
-            "--platform-store-url",
-            &url,
-            "--pipeline",
-            "active-customers-classic",
-        ])
-        .output()
-        .expect("run derived");
-    assert!(
-        derived.status.success(),
-        "derived inspect failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&derived.stdout),
-        String::from_utf8_lossy(&derived.stderr)
+    let url2 = ephemeral_database_url().await;
+    let mongo2 = unique_mongo_database();
+    let dir2 = TempDir::new().expect("tempdir");
+    let doubles2 = common::NamedScenarioDoubles::install(dir2.path());
+    let sqlish_pipeline = r#"
+    - name: active-customers-sqlish
+      mode: transform
+      source:
+        table: CUSTOMERS
+      target:
+        collection: active_customers_sqlish
+      outputIdentity: [ID]
+      transform:
+        - select:
+            fields: [ID, NAME, ACTIVE]
+        - where:
+            field: ACTIVE
+            eq: 1
+"#;
+    let sqlish_config = write_config(
+        &dir2,
+        "sqlish.yaml",
+        &deployment_shell(&mongo2, sqlish_pipeline),
     );
-    let derived_out = String::from_utf8_lossy(&derived.stdout);
+    let err = apply_expect_failure(&url2, &sqlish_config, &doubles2);
+    let lower = err.to_ascii_lowercase();
     assert!(
-        derived_out.contains("Alice") && derived_out.contains("Carol"),
-        "classic Upgrade Compatibility Derived must include ACTIVE=1 Alice/Carol, got:\n{derived_out}"
-    );
-    assert!(
-        !derived_out.contains("Bob"),
-        "classic Upgrade Compatibility Derived must filter out Bob, got:\n{derived_out}"
-    );
-
-    let target = Command::new(bin())
-        .env("MONGO_PASSWORD", "mongo-secret-value")
-        .args([
-            "target",
-            "--platform-store-url",
-            &url,
-            "--collection",
-            "active_customers_classic",
-        ])
-        .output()
-        .expect("run target");
-    assert!(
-        target.status.success(),
-        "target inspect failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&target.stdout),
-        String::from_utf8_lossy(&target.stderr)
-    );
-    let target_out = String::from_utf8_lossy(&target.stdout);
-    assert!(
-        target_out.contains("Alice") && target_out.contains("Carol") && !target_out.contains("Bob"),
-        "classic Upgrade Compatibility Delivery must keep project/filter outcomes, got:\n{target_out}"
+        lower.contains("unsupported")
+            && (lower.contains("select") || lower.contains("where")),
+        "SQL-ish select/where must fail apply clearly, got:\n{err}"
     );
 }

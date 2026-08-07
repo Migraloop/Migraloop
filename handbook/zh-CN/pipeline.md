@@ -48,7 +48,7 @@ pipelines:
 - Transform Pipelines 需要 `outputIdentity` 与非空的声明式 `transform`
 - `fields` 的 key 把 source/Managed 字段映射到 `{ as: string }` 或 `{ as: omit }`（ADR-0023；NUMBER classification 位于 shared `ColumnShape` 旁）
 
-Operator 形状见 [Rich Transform](rich-transform.md)（建议 Aggregation／SQL-like DX 如 `$project`／`$match`／`$lookup`／`$group`；classic steps 仍 Upgrade Compatible）。
+Operator 形状见 [Rich Transform](rich-transform.md)（仅 Aggregation `$project`／`$match`／`$lookup`／`$group`；classic 与 SQL 别名会被拒绝 — ADR-0030）。
 
 ## Lifecycle（control plane）
 

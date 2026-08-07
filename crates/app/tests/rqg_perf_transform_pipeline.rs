@@ -338,11 +338,10 @@ spec:
         collection: active_customers
       outputIdentity: [ID]
       transform:
-        - project:
+        - $project:
             fields: [ID, NAME, EMAIL, ACTIVE]
-        - filter:
-            field: ACTIVE
-            eq: 1
+        - $match:
+            ACTIVE: 1
 "#,
         host = mongo_host(),
         port = mongo_port(),

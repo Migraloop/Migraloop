@@ -63,7 +63,7 @@ pub struct PipelineSpec {
     #[serde(default)]
     pub output_identity: Option<Vec<String>>,
     /// Declarative Rich Transform steps: preferred Aggregation/SQL-like DX
-    /// (`$project`, `$match`, `$group`, …); classic steps remain Upgrade Compatible.
+    /// (`$project`, `$match`, `$group`, …); classic / SQL-ish aliases are rejected (ADR-0030).
     /// Rejected for Direct.
     #[serde(default)]
     pub transform: Option<Vec<serde_json::Value>>,

@@ -453,7 +453,7 @@ async fn transform_field_ops_script_and_unsupported_still_fail_apply() {
         collection: scripted
       outputIdentity: [ID]
       transform:
-        - addFields:
+        - $addFields:
             fields:
               - as: ok
                 value: 1
@@ -484,7 +484,7 @@ async fn transform_field_ops_script_and_unsupported_still_fail_apply() {
         collection: faceted
       outputIdentity: [ID]
       transform:
-        - rename:
+        - $rename:
             fields:
               - from: NAME
                 to: customerName

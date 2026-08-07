@@ -1,12 +1,13 @@
-//! Aggregation / SQL-like Rich Transform authoring (preferred DX).
+//! Aggregation-only Rich Transform authoring (ADR-0030).
 //!
-//! Accepts MongoDB Aggregation–shaped stages and thin SQL-ish aliases as the
-//! preferred declarative authoring form beside classic steps (Upgrade
-//! Compatibility). Every accepted shape normalizes to the same [`TransformOp`]
-//! IR so Affect Analysis and evaluation stay unchanged.
+//! Accepts MongoDB Aggregation–shaped stages as the sole declarative authoring
+//! surface. Every accepted shape normalizes to the same [`TransformOp`] IR so
+//! Affect Analysis and evaluation stay unchanged.
 //!
-//! Free-form scripts and unanalyzable Aggregation extensions (`pipeline`, `let`,
-//! multi-predicate `$match`, expression `$project`, …) remain rejected.
+//! Classic step names and SQL-ish aliases (`select` / `where` / `join`) are
+//! rejected. Free-form scripts and unanalyzable Aggregation extensions
+//! (`pipeline`, `let`, multi-predicate `$match`, expression `$project`, …)
+//! remain rejected.
 
 use serde_json::{Map, Value};
 
@@ -23,10 +24,10 @@ fn is_classic_fields_body(value: &Value) -> bool {
         .is_some_and(|o| o.contains_key("fields") && o.keys().all(|k| k == "fields"))
 }
 
-/// Try parsing one step as Aggregation-like / SQL-alias DX.
+/// Try parsing one step as an Aggregation `$…` stage.
 ///
-/// Returns `None` when the step is not an Aggregation/SQL-alias shape (caller
-/// continues with the current declarative form).
+/// Returns `None` when the step is not a supported Aggregation stage name
+/// (caller reports [`TransformError::UnsupportedOperator`]).
 pub(crate) fn try_parse_aggregation_step(
     obj: &Map<String, Value>,
 ) -> Result<Option<TransformOp>, TransformError> {
@@ -36,12 +37,12 @@ pub(crate) fn try_parse_aggregation_step(
     }
     let (name, value) = obj.iter().next().expect("len == 1");
     let op = match name.as_str() {
-        "$project" | "select" => Some(parse_project_dx(value)?),
-        "$match" | "where" => Some(parse_match_dx(value)?),
+        "$project" => Some(parse_project_dx(value)?),
+        "$match" => Some(parse_match_dx(value)?),
         "$addFields" | "$set" => Some(parse_add_fields_dx(value)?),
         "$unset" => Some(parse_unset_dx(value)?),
         "$rename" => Some(parse_rename_dx(value)?),
-        "$lookup" | "join" => Some(parse_lookup_dx(value)?),
+        "$lookup" => Some(parse_lookup_dx(value)?),
         "$unwind" => Some(parse_unwind_dx(value)?),
         "$unionWith" => Some(parse_union_with_dx(value)?),
         "$group" => Some(parse_group_dx(value)?),
@@ -58,7 +59,7 @@ fn parse_project_dx(value: &Value) -> Result<TransformOp, TransformError> {
     // Aggregation inclusion map: { ID: 1, NAME: true } — inclusion only.
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid(
-            "$project/select must be an object with fields or an inclusion map".to_string(),
+            "$project must be an object with fields or an inclusion map".to_string(),
         )
     })?;
     if obj.is_empty() {
@@ -120,13 +121,12 @@ fn parse_match_dx(value: &Value) -> Result<TransformOp, TransformError> {
     }
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid(
-            "$match/where must be an object with one equality predicate".to_string(),
+            "$match must be an object with one equality predicate".to_string(),
         )
     })?;
     if obj.len() != 1 {
         return Err(TransformError::Invalid(
-            "$match/where supports exactly one equality predicate (no $and/$or/multi-field)"
-                .to_string(),
+            "$match supports exactly one equality predicate (no $and/$or/multi-field)".to_string(),
         ));
     }
     let (field, pred) = obj.iter().next().expect("len == 1");
@@ -300,14 +300,13 @@ fn parse_rename_dx(value: &Value) -> Result<TransformOp, TransformError> {
 fn parse_lookup_dx(value: &Value) -> Result<TransformOp, TransformError> {
     let obj = value.as_object().ok_or_else(|| {
         TransformError::Invalid(
-            "$lookup/join must be an object with from, localField, foreignField, and as"
-                .to_string(),
+            "$lookup must be an object with from, localField, foreignField, and as".to_string(),
         )
     })?;
     for banned in ["pipeline", "let", "asOf"] {
         if obj.contains_key(banned) {
             return Err(TransformError::Invalid(format!(
-                "$lookup/join does not support `{banned}`; only declarative equijoin from/localField/foreignField/as (optional fromSchema) so Affect Analysis stays correct"
+                "$lookup does not support `{banned}`; only declarative equijoin from/localField/foreignField/as (optional fromSchema) so Affect Analysis stays correct"
             )));
         }
     }
@@ -537,7 +536,7 @@ fn parse_group_dx(value: &Value) -> Result<TransformOp, TransformError> {
             "$sum" | "$min" | "$max" | "$avg" | "$count" => {
                 if add_to_set.is_some() {
                     return Err(TransformError::Invalid(
-                        "$group cannot mix $addToSet with other aggregations in v1; use addToSet alone or groupBy aggregates"
+                        "$group cannot mix $addToSet with other aggregations in v1; use $addToSet alone or $sum/$count/$min/$max/$avg"
                             .to_string(),
                     ));
                 }
@@ -605,8 +604,7 @@ mod tests {
             .collect()
     }
 
-    /// Normalize IR so map-iteration order (serde_json BTreeMap) does not fail
-    /// semantic equivalence against classic arrays.
+    /// Normalize IR so map-iteration order does not fail semantic equality.
     fn normalize_ops(mut ops: Vec<TransformOp>) -> Vec<TransformOp> {
         for op in &mut ops {
             match op {
@@ -630,154 +628,84 @@ mod tests {
         ops
     }
 
-    fn assert_ops_eq(old: &[Value], new: &[Value]) {
-        let old_ops = normalize_ops(parse_transform_steps(old).expect("old form"));
-        let new_ops = normalize_ops(parse_transform_steps(new).expect("new DX form"));
-        assert_eq!(old_ops, new_ops, "IR must match for old vs Aggregation DX");
+    fn parse_ops(steps: &[Value]) -> Vec<TransformOp> {
+        normalize_ops(parse_transform_steps(steps).expect("Aggregation form"))
     }
 
     #[test]
-    fn project_filter_field_ops_equivalence() {
-        assert_ops_eq(
-            &[
-                json!({"project": {"fields": ["ID", "NAME", "STATUS", "EMAIL"]}}),
-                json!({"filter": {"field": "STATUS", "eq": "OPEN"}}),
-                json!({"addFields": {"fields": [
-                    {"as": "currency", "value": "USD"},
-                    {"as": "displayName", "field": "NAME"}
-                ]}}),
-                json!({"rename": {"fields": [{"from": "NAME", "to": "customerName"}]}}),
-                json!({"remove": {"fields": ["EMAIL"]}}),
-            ],
-            &[
-                json!({"$project": {"ID": 1, "NAME": 1, "STATUS": 1, "EMAIL": 1}}),
-                json!({"$match": {"STATUS": "OPEN"}}),
-                json!({"$addFields": {
-                    "currency": {"$literal": "USD"},
-                    "displayName": "$NAME"
-                }}),
-                json!({"$rename": {"NAME": "customerName"}}),
-                json!({"$unset": ["EMAIL"]}),
-            ],
-        );
+    fn project_match_field_ops_parse_to_analyzable_ir() {
+        let ops = parse_ops(&[
+            json!({"$project": {"ID": 1, "NAME": 1, "STATUS": 1, "EMAIL": 1}}),
+            json!({"$match": {"STATUS": "OPEN"}}),
+            json!({"$addFields": {
+                "currency": {"$literal": "USD"},
+                "displayName": "$NAME"
+            }}),
+            json!({"$rename": {"NAME": "customerName"}}),
+            json!({"$unset": ["EMAIL"]}),
+        ]);
+        assert_eq!(ops.len(), 5);
+        assert!(matches!(ops[0], TransformOp::Project { .. }));
+        assert!(matches!(ops[1], TransformOp::FilterEq { .. }));
+        assert!(matches!(ops[2], TransformOp::AddFields { .. }));
+        assert!(matches!(ops[3], TransformOp::Rename { .. }));
+        assert!(matches!(ops[4], TransformOp::Remove { .. }));
+
         // Order-preserving Aggregation body (fields array under $project).
-        assert_ops_eq(
-            &[json!({"project": {"fields": ["ID", "NAME", "STATUS", "EMAIL"]}})],
-            &[json!({"$project": {"fields": ["ID", "NAME", "STATUS", "EMAIL"]}})],
-        );
-        // SQL-ish aliases
-        assert_ops_eq(
-            &[
-                json!({"project": {"fields": ["ID", "NAME"]}}),
-                json!({"filter": {"field": "STATUS", "eq": "OPEN"}}),
-            ],
-            &[
-                json!({"select": {"fields": ["ID", "NAME"]}}),
-                json!({"where": {"field": "STATUS", "eq": "OPEN"}}),
-            ],
-        );
+        let fields_body = parse_ops(&[json!({"$project": {"fields": ["ID", "NAME", "STATUS", "EMAIL"]}})]);
+        let inclusion = parse_ops(&[json!({"$project": {"ID": 1, "NAME": 1, "STATUS": 1, "EMAIL": 1}})]);
+        assert_eq!(fields_body, inclusion);
     }
 
     #[test]
-    fn join_lookup_unwind_union_groupby_equivalence() {
-        assert_ops_eq(
-            &[json!({
-                "equiLookup": {
-                    "from": "ORDERS",
-                    "localField": "ID",
-                    "foreignField": "CUSTOMER_ID",
-                    "as": "orders"
-                }
-            })],
-            &[json!({
-                "$lookup": {
-                    "from": "ORDERS",
-                    "localField": "ID",
-                    "foreignField": "CUSTOMER_ID",
-                    "as": "orders"
-                }
-            })],
-        );
-        assert_ops_eq(
-            &[json!({"equiLookup": {
+    fn lookup_unwind_union_group_parse_to_analyzable_ir() {
+        let lookup = parse_ops(&[json!({
+            "$lookup": {
                 "from": "ORDERS",
                 "localField": "ID",
                 "foreignField": "CUSTOMER_ID",
                 "as": "orders"
-            }})],
-            &[json!({"join": {
-                "from": "ORDERS",
-                "localField": "ID",
-                "foreignField": "CUSTOMER_ID",
-                "as": "orders"
-            }})],
-        );
-        assert_ops_eq(
-            &[json!({"unwind": {"path": "orders"}})],
-            &[json!({"$unwind": "$orders"})],
-        );
-        assert_ops_eq(
-            &[json!({"union": {"from": "WEST_CUSTOMERS"}})],
-            &[json!({"$unionWith": {"coll": "WEST_CUSTOMERS"}})],
-        );
-        assert_ops_eq(
-            &[json!({"union": {"from": "WEST_CUSTOMERS"}})],
-            &[json!({"$unionWith": "WEST_CUSTOMERS"})],
-        );
-        assert_ops_eq(
-            &[json!({
-                "groupBy": {
-                    "keys": ["CUSTOMER_ID"],
-                    "aggregates": [
-                        {"op": "count", "field": "ORDER_ID", "as": "ORDER_COUNT"},
-                        {"op": "min", "field": "AMOUNT", "as": "MIN_AMOUNT"},
-                        {"op": "max", "field": "AMOUNT", "as": "MAX_AMOUNT"},
-                        {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"},
-                        {"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}
-                    ]
-                }
-            })],
-            &[json!({
-                "$group": {
-                    "_id": "$CUSTOMER_ID",
-                    "ORDER_COUNT": {"$count": "$ORDER_ID"},
-                    "MIN_AMOUNT": {"$min": "$AMOUNT"},
-                    "MAX_AMOUNT": {"$max": "$AMOUNT"},
-                    "AVG_AMOUNT": {"$avg": "$AMOUNT"},
-                    "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}
-                }
-            })],
-        );
-        assert_ops_eq(
-            &[json!({"distinct": {"fields": ["CUSTOMER_ID"]}})],
-            &[json!({"$group": {"_id": "$CUSTOMER_ID"}})],
-        );
-        assert_ops_eq(
-            &[json!({
-                "addToSet": {
-                    "keys": ["CUSTOMER_ID"],
-                    "field": "AMOUNT",
-                    "as": "AMOUNTS"
-                }
-            })],
-            &[json!({
-                "$group": {
-                    "_id": "$CUSTOMER_ID",
-                    "AMOUNTS": {"$addToSet": "$AMOUNT"}
-                }
-            })],
-        );
-    }
-
-    #[test]
-    fn aggregation_dx_affect_and_eval_match_classic() {
-        let classic = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
             }
-        })])
-        .unwrap();
+        })]);
+        assert!(matches!(lookup[0], TransformOp::EquiLookup { .. }));
+
+        let unwind = parse_ops(&[json!({"$unwind": "$orders"})]);
+        assert_eq!(
+            unwind,
+            parse_ops(&[json!({"$unwind": {"path": "orders"}})])
+        );
+
+        let union_coll = parse_ops(&[json!({"$unionWith": {"coll": "WEST_CUSTOMERS"}})]);
+        let union_str = parse_ops(&[json!({"$unionWith": "WEST_CUSTOMERS"})]);
+        assert_eq!(union_coll, union_str);
+        assert!(matches!(union_coll[0], TransformOp::Union { .. }));
+
+        let group = parse_ops(&[json!({
+            "$group": {
+                "_id": "$CUSTOMER_ID",
+                "ORDER_COUNT": {"$count": "$ORDER_ID"},
+                "MIN_AMOUNT": {"$min": "$AMOUNT"},
+                "MAX_AMOUNT": {"$max": "$AMOUNT"},
+                "AVG_AMOUNT": {"$avg": "$AMOUNT"},
+                "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}
+            }
+        })]);
+        assert!(matches!(group[0], TransformOp::GroupBy { .. }));
+
+        let distinct = parse_ops(&[json!({"$group": {"_id": "$CUSTOMER_ID"}})]);
+        assert!(matches!(distinct[0], TransformOp::Distinct { .. }));
+
+        let add_to_set = parse_ops(&[json!({
+            "$group": {
+                "_id": "$CUSTOMER_ID",
+                "AMOUNTS": {"$addToSet": "$AMOUNT"}
+            }
+        })]);
+        assert!(matches!(add_to_set[0], TransformOp::AddToSet { .. }));
+    }
+
+    #[test]
+    fn aggregation_group_affect_and_eval_stay_correct() {
         let agg = parse_transform_steps(&[json!({
             "$group": {
                 "_id": "$CUSTOMER_ID",
@@ -785,7 +713,6 @@ mod tests {
             }
         })])
         .unwrap();
-        assert_eq!(classic, agg);
 
         let rows = vec![
             row(&[
@@ -802,9 +729,10 @@ mod tests {
             ]),
         ];
         let secondary = BTreeMap::new();
-        let classic_out = evaluate_transform_with_bases(&classic, &rows, &secondary).unwrap();
-        let agg_out = evaluate_transform_with_bases(&agg, &rows, &secondary).unwrap();
-        assert_eq!(classic_out, agg_out);
+        let out = evaluate_transform_with_bases(&agg, &rows, &secondary).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("CUSTOMER_ID"), Some(&json!(1)));
+        assert_eq!(out[0].get("TOTAL_AMOUNT"), Some(&json!("15.00")));
 
         let after_address_only = row(&[
             ("ORDER_ID", json!(1)),
@@ -821,34 +749,28 @@ mod tests {
             primary_rows: &rows,
             secondary_bases: &secondary,
         };
-        let analysis_classic = analyze_base_change(&classic, &ctx, None).unwrap();
-        let analysis_agg = analyze_base_change(&agg, &ctx, None).unwrap();
-        assert_eq!(analysis_classic.outcome, analysis_agg.outcome);
+        let analysis = analyze_base_change(&agg, &ctx, None).unwrap();
+        assert_eq!(analysis.outcome, crate::AffectOutcome::SkipUnusedFields);
     }
 
     #[test]
-    fn project_match_and_lookup_affect_eval_match_classic() {
-        let classic_pf = parse_transform_steps(&[
-            json!({"project": {"fields": ["ID", "NAME", "ACTIVE"]}}),
-            json!({"filter": {"field": "ACTIVE", "eq": 1}}),
-        ])
-        .unwrap();
+    fn project_match_and_lookup_affect_eval_stay_correct() {
         let agg_pf = parse_transform_steps(&[
             json!({"$project": {"fields": ["ID", "NAME", "ACTIVE"]}}),
             json!({"$match": {"ACTIVE": 1}}),
         ])
         .unwrap();
-        assert_eq!(classic_pf, agg_pf);
 
         let rows = vec![
             row(&[("ID", json!(1)), ("NAME", json!("A")), ("ACTIVE", json!(1)), ("EMAIL", json!("a"))]),
             row(&[("ID", json!(2)), ("NAME", json!("B")), ("ACTIVE", json!(0)), ("EMAIL", json!("b"))]),
         ];
         let secondary = BTreeMap::new();
-        assert_eq!(
-            evaluate_transform_with_bases(&classic_pf, &rows, &secondary).unwrap(),
-            evaluate_transform_with_bases(&agg_pf, &rows, &secondary).unwrap()
-        );
+        let out = evaluate_transform_with_bases(&agg_pf, &rows, &secondary).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("NAME"), Some(&json!("A")));
+        assert!(out[0].get("EMAIL").is_none());
+
         let after_email = row(&[
             ("ID", json!(1)),
             ("NAME", json!("A")),
@@ -865,19 +787,10 @@ mod tests {
             secondary_bases: &secondary,
         };
         assert_eq!(
-            analyze_base_change(&classic_pf, &ctx, None).unwrap().outcome,
-            analyze_base_change(&agg_pf, &ctx, None).unwrap().outcome
+            analyze_base_change(&agg_pf, &ctx, None).unwrap().outcome,
+            crate::AffectOutcome::SkipUnusedFields
         );
 
-        let classic_join = parse_transform_steps(&[json!({
-            "equiLookup": {
-                "from": "ORDERS",
-                "localField": "ID",
-                "foreignField": "CUSTOMER_ID",
-                "as": "orders"
-            }
-        })])
-        .unwrap();
         let agg_join = parse_transform_steps(&[json!({
             "$lookup": {
                 "from": "ORDERS",
@@ -887,7 +800,6 @@ mod tests {
             }
         })])
         .unwrap();
-        assert_eq!(classic_join, agg_join);
         let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("A"))])];
         let mut secondary_orders = BTreeMap::new();
         secondary_orders.insert(
@@ -898,10 +810,10 @@ mod tests {
                 ("AMOUNT", json!("5.00")),
             ])],
         );
-        assert_eq!(
-            evaluate_transform_with_bases(&classic_join, &customers, &secondary_orders).unwrap(),
-            evaluate_transform_with_bases(&agg_join, &customers, &secondary_orders).unwrap()
-        );
+        let joined =
+            evaluate_transform_with_bases(&agg_join, &customers, &secondary_orders).unwrap();
+        assert_eq!(joined.len(), 1);
+        assert!(joined[0].get("orders").is_some());
     }
 
     #[test]
@@ -953,20 +865,128 @@ mod tests {
     }
 
     #[test]
-    fn classic_form_still_parses_unchanged() {
-        // Issue #233: classic steps remain Upgrade Compatible after Aggregation DX contract.
-        let ops = parse_transform_steps(&[
-            json!({"project": {"fields": ["ID", "NAME"]}}),
-            json!({"filter": {"field": "STATUS", "eq": "OPEN"}}),
-            json!({"groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL"}]
-            }}),
-        ])
-        .unwrap();
-        assert_eq!(ops.len(), 3);
-        assert!(matches!(ops[0], TransformOp::Project { .. }));
-        assert!(matches!(ops[1], TransformOp::FilterEq { .. }));
-        assert!(matches!(ops[2], TransformOp::GroupBy { .. }));
+    fn classic_step_names_are_rejected() {
+        // ADR-0030 / issue #250: classic step-name authoring removed (no read-compat).
+        for (step, name) in [
+            (
+                json!({"project": {"fields": ["ID", "NAME"]}}),
+                "project",
+            ),
+            (
+                json!({"filter": {"field": "STATUS", "eq": "OPEN"}}),
+                "filter",
+            ),
+            (
+                json!({"addFields": {"fields": [{"as": "x", "value": 1}]}}),
+                "addFields",
+            ),
+            (
+                json!({"rename": {"fields": [{"from": "A", "to": "B"}]}}),
+                "rename",
+            ),
+            (json!({"remove": {"fields": ["EMAIL"]}}), "remove"),
+            (
+                json!({
+                    "equiLookup": {
+                        "from": "ORDERS",
+                        "localField": "ID",
+                        "foreignField": "CUSTOMER_ID",
+                        "as": "orders"
+                    }
+                }),
+                "equiLookup",
+            ),
+            (json!({"unwind": {"path": "orders"}}), "unwind"),
+            (json!({"union": {"from": "WEST"}}), "union"),
+            (
+                json!({
+                    "groupBy": {
+                        "keys": ["CUSTOMER_ID"],
+                        "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL"}]
+                    }
+                }),
+                "groupBy",
+            ),
+            (json!({"distinct": {"fields": ["CUSTOMER_ID"]}}), "distinct"),
+            (
+                json!({
+                    "addToSet": {
+                        "keys": ["CUSTOMER_ID"],
+                        "field": "AMOUNT",
+                        "as": "AMOUNTS"
+                    }
+                }),
+                "addToSet",
+            ),
+        ] {
+            let err = parse_transform_steps(&[step]).expect_err(name);
+            match &err {
+                TransformError::UnsupportedOperator(got) => {
+                    assert_eq!(got, name, "unsupported operator name for classic `{name}`");
+                }
+                other => panic!("classic `{name}` must be UnsupportedOperator, got {other:?}"),
+            }
+            let msg = err.to_string();
+            assert!(
+                msg.contains("$project") || msg.contains("$match") || msg.contains("$group"),
+                "reject message must point Operators at Aggregation `$…` forms, got: {msg}"
+            );
+            assert!(
+                !msg.contains("classic steps") && !msg.contains("select/where/join"),
+                "reject message must not advertise removed classic/SQL-ish surfaces, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_ish_aliases_are_rejected() {
+        // ADR-0030 / issue #250: select/where/join aliases removed.
+        for (step, name) in [
+            (json!({"select": {"fields": ["ID", "NAME"]}}), "select"),
+            (
+                json!({"where": {"field": "STATUS", "eq": "OPEN"}}),
+                "where",
+            ),
+            (
+                json!({
+                    "join": {
+                        "from": "ORDERS",
+                        "localField": "ID",
+                        "foreignField": "CUSTOMER_ID",
+                        "as": "orders"
+                    }
+                }),
+                "join",
+            ),
+        ] {
+            let err = parse_transform_steps(&[step]).expect_err(name);
+            match &err {
+                TransformError::UnsupportedOperator(got) => {
+                    assert_eq!(got, name, "unsupported operator name for alias `{name}`");
+                }
+                other => panic!("SQL-ish `{name}` must be UnsupportedOperator, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_aggregation_stages_still_reject_clearly() {
+        for (step, needle) in [
+            (json!({"$sort": {"AMOUNT": 1}}), "$sort"),
+            (json!({"$limit": 10}), "$limit"),
+            (json!({"$facet": {}}), "$facet"),
+        ] {
+            let err = parse_transform_steps(&[step]).expect_err(needle);
+            match &err {
+                TransformError::UnsupportedOperator(got) => {
+                    assert_eq!(got, needle);
+                }
+                other => panic!("{needle} must be UnsupportedOperator, got {other:?}"),
+            }
+            assert!(
+                !err.to_string().contains("silent"),
+                "unsupported Aggregation stages must fail clearly"
+            );
+        }
     }
 }

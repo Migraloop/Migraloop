@@ -11,14 +11,19 @@ Transform Pipelines 必須宣告：
 - `outputIdentity` — Delivery insert/update/delete 用的穩定 key 欄位
 - `transform` — 宣告式 operator 步驟的有序列表
 
-## Authoring forms
+## Authoring surface
 
-Operator 可用下列任一形式撰寫同一組可分析 surface—兩者都正規化成同一 IR，供 **Affect Analysis** 使用：
+Operator **只能**以 MongoDB Aggregation–shaped stages 撰寫 Rich Transform，且相同能力使用
+**相同的 stage／accumulator 名稱**（`$project`、`$match`、`$lookup`、`$group`…）。Stages
+會正規化成同一可分析 IR，供 **Affect Analysis** 使用。不要求完整 Aggregation 功能對等—
+不支援的 stages 會明確拒絕。平台自行評估並維護 Derived Datasets；**不會**在 Target
+MongoDB 上當 compute engine 執行該 pipeline。
 
-1. **Aggregation / SQL-like DX（建議）** — 接近 MongoDB Aggregation 的 stages（`$project`、`$match`、`$lookup`、`$group`…），以及精簡 SQL 別名（`select`、`where`、`join`）。這是新 Pipeline 與出貨 Lab Scenarios 的支援撰寫路徑。
-2. **Classic steps（Upgrade Compatibility）** — `project`、`filter`、`equiLookup`、`groupBy`…。使用 classic steps 的既有 Deployments 可持續 apply，無需強制改寫。
+Classic step 名稱（`project`／`filter`／`groupBy`／…）與 SQL 別名（`select`／`where`／`join`）
+會被 **拒絕**，且 **沒有** read-compat 視窗、**沒有** 自動遷移（ADR-0030）。請先把那些
+Deployments 改寫成 `$…` stages，再執行 `migraloop apply`。
 
-範例（建議的 Aggregation 形式）：
+範例：
 
 ```yaml
 transform:
@@ -30,43 +35,27 @@ transform:
       ACTIVE: 1
 ```
 
-等效 SQL 別名：
+支援的 Aggregation stages（無法分析的擴充仍會被拒絕）：
 
-```yaml
-transform:
-  - select:
-      fields: [ID, NAME, ACTIVE]
-  - where:
-      field: ACTIVE
-      eq: 1
-```
+| Stage | 說明 |
+| --- | --- |
+| `$project` | inclusion map（`FIELD: 1`）或 `{ fields: [...] }` |
+| `$match` | 僅單欄 equality |
+| `$addFields` / `$set` | `"$field"` 複製或 `{ $literal: ... }`／JSON literal |
+| `$unset` | 欄位名或名稱陣列 |
+| `$rename` | `{ FROM: TO }` map |
+| `$lookup` | 僅 equijoin—不可用 `pipeline` / `let` |
+| `$unwind` | path 字串或 `{ path }`—不可用 `preserveNullAndEmptyArrays` |
+| `$unionWith` | `coll` / `from` / 字串—不可用 nested `pipeline` |
+| `$group` | `_id: "$KEY"`；accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet`。`$count` 需欄位 ref（`{ $count: "$ORDER_ID" }` = SQL `COUNT(field)`），不是 Mongo 空的 `{ $count: {} }`。Distinct = 只有 `_id` 的 `$group` |
 
-受限 Aggregation stages 對應如下（無法分析的擴充仍會被拒絕）：
-
-| Aggregation / SQL-like | Classic 等效 | 說明 |
-| --- | --- | --- |
-| `$project` / `select` | `project` | inclusion map（`FIELD: 1`）或 `{ fields: [...] }` |
-| `$match` / `where` | `filter` | 僅單欄 equality |
-| `$addFields` / `$set` | `addFields` | `"$field"` 複製或 `{ $literal: ... }`／JSON literal |
-| `$unset` | `remove` | 欄位名或名稱陣列 |
-| `$rename` | `rename` | `{ FROM: TO }` map |
-| `$lookup` / `join` | `equiLookup` | 僅 equijoin—不可用 `pipeline` / `let` |
-| `$unwind` | `unwind` | path 字串或 `{ path }`—不可用 `preserveNullAndEmptyArrays` |
-| `$unionWith` | `union` | `coll` / `from` / 字串—不可用 nested `pipeline` |
-| `$group` | `groupBy` / `distinct` / `addToSet` | `_id: "$KEY"`；accumulators `$sum`/`$count`/`$min`/`$max`/`$avg`/`$addToSet`。`$count` 需欄位 ref（`{ $count: "$ORDER_ID" }` = SQL `COUNT(field)`），不是 Mongo 空的 `{ $count: {} }` |
-
-為可讀性，每個 Pipeline 建議只用一種形式；同一列表混用 classic 與 Aggregation 步驟在各自合法時也被允許。
-
-### Migration notes
-
-- **保留 classic YAML 不需 wipe。** 升級 app 不會強制 Operator 改寫 classic `project`／`filter`／`groupBy`／… Deployments（Upgrade Compatibility／ADR-0014）。Classic steps 仍可解析；既有 Deployments 可持續 Sync。
-- **新撰寫應使用 Aggregation DX。** Lab Scenarios 與 handbook 範例以 `$project`／`$match`／`$group`／… 為支援風格。
-- **在設定中改寫形式屬於 Pipeline revision。** 撰寫的 `transform` JSON 會原樣儲存。以 IR 等效的 Aggregation YAML 取代 classic steps（或反向）會改變已儲存的宣告，因此 `migraloop apply` 會視為 **語意 Pipeline revision**：暫停該 Pipeline 舊的 Delivery、重建 Derived Dataset、重新 Deliver（含 delete reconciliation），再 resume。建議在已規劃 revision 視窗時遷移—或讓 classic Deployments 維持不變。
-- **目錄中的能力名稱仍用 classic。** Coverage 列與 glossary 仍以 `project`／`equiLookup`／`groupBy` 稱呼可分析 surface；撰寫可用任一形式。
+Lab Scenarios、samples 與本 handbook 都只使用 `$…`。變更已撰寫的 `transform` JSON 屬於
+**語意 Pipeline revision**（暫停 Delivery、重建 Derived、重新 Deliver、再 resume）—與其他
+transform 變更相同。
 
 ## v1 operator surface（已實作）
 
-目前出貨的 parser 接受這些可分析 operators（Oracle → MongoDB 切片）—以下以建議的 Aggregation 形式說明。Classic 等效仍支援（見上方對應表）。
+目前出貨的 parser 接受這些可分析 Aggregation stages（Oracle → MongoDB 切片）：
 
 ### `$project`
 
@@ -186,7 +175,7 @@ Maintenance State。
     as: orders
 ```
 
-請用帶相同 equijoin 欄位的受限 Aggregation `$lookup`／`join`（或 classic `equiLookup`）。
+請用帶相同 equijoin 欄位的受限 Aggregation `$lookup`。
 自由形式 Mongo `$lookup` 擴充（`pipeline`／`let`）會被拒絕，以維持 **Affect Analysis**
 正確。任一侧 Base 的變更只更新受影響的 primary Output Identities；`$project` 後 unused 的
 primary 欄位（例如 EMAIL）仍會跳過 recompute。嵌入的 foreign 列含完整 Base 欄位，因此

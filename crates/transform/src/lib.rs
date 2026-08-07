@@ -1,14 +1,14 @@
 //! Rich Transform operators and Affect Analysis.
 //!
-//! Declarative project, addFields, rename, remove, filter (eq), equiLookup,
-//! unwind, union, groupBy (sum/count/min/max/avg), distinct, and addToSet over
-//! Base Dataset rows. Preferred authoring is Aggregation / SQL-like DX
-//! (`$project`, `$match`, `$group`, …); classic steps remain Upgrade Compatible.
-//! Both normalize to the same analyzable IR. Free-form scripts and unanalyzable
-//! Aggregation extensions (`pipeline`, `let`, expression `$project`, …) are
-//! rejected at parse time. Affect Analysis skips Derived recompute when only
-//! unused Base fields change, and (with Maintenance State) when distinct/addToSet
-//! value-level semantics prove no Derived change.
+//! Operators author MongoDB Aggregation–shaped stages only (`$project`,
+//! `$match`, `$lookup`, `$group`, …). Those stages normalize to an analyzable IR
+//! covering project, addFields, rename, remove, filter (eq), equiLookup, unwind,
+//! union, groupBy (sum/count/min/max/avg), distinct, and addToSet over Base
+//! Dataset rows. Classic step names and SQL-ish aliases are rejected (ADR-0030).
+//! Free-form scripts and unanalyzable Aggregation extensions (`pipeline`, `let`,
+//! expression `$project`, …) are rejected at parse time. Affect Analysis skips
+//! Derived recompute when only unused Base fields change, and (with Maintenance
+//! State) when distinct/addToSet value-level semantics prove no Derived change.
 
 mod aggregation_dx;
 
@@ -22,9 +22,9 @@ pub const SEAM: &str = "transform";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransformError {
-    #[error("Transform Pipeline rejects free-form scripts; use declarative analyzable operators only (classic steps or Aggregation/SQL-like $project/$match/$group/… forms)")]
+    #[error("Transform Pipeline rejects free-form scripts; use declarative Aggregation stages only ($project/$match/$group/…)")]
     FreeFormScript,
-    #[error("unsupported Rich Transform operator: {0}; v1 allows classic steps (project/addFields/rename/remove/filter/equiLookup/unwind/union/groupBy/distinct/addToSet) and Aggregation/SQL-like aliases ($project/$match/$addFields/$set/$unset/$rename/$lookup/$unwind/$unionWith/$group, select/where/join)")]
+    #[error("unsupported Rich Transform operator: {0}; v1 allows Aggregation stages $project/$match/$addFields/$set/$unset/$rename/$lookup/$unwind/$unionWith/$group (unsupported Aggregation stages and classic/SQL-ish names are rejected)")]
     UnsupportedOperator(String),
     #[error("invalid Rich Transform: {0}")]
     Invalid(String),
@@ -245,34 +245,23 @@ pub type OutputColumn = migraloop_types::ColumnShape;
 
 /// Parse one declarative transform step JSON object into an analyzable operator.
 ///
-/// Accepted Aggregation / SQL-like DX (preferred; normalizes to the same IR):
-/// - `{ "$project": { "FIELD": 1, ... } }` / `{ "select": { "fields": [...] } }`
-/// - `{ "$match": { "FIELD": value } }` / `{ "where": { "field", "eq" } }`
+/// Accepted Aggregation stages only (normalize to the same IR):
+/// - `{ "$project": { "FIELD": 1, ... } }` or `{ "$project": { "fields": [...] } }`
+/// - `{ "$match": { "FIELD": value } }`
 /// - `{ "$addFields"|"$set": { "as": "$field"|{"$literal": ...}|literal } }`
 /// - `{ "$unset": "FIELD"|["FIELD", ...] }`
 /// - `{ "$rename": { "FROM": "TO" } }`
-/// - `{ "$lookup"|"join": { "from", "localField", "foreignField", "as" } }` (equijoin only)
+/// - `{ "$lookup": { "from", "localField", "foreignField", "as" } }` (equijoin only)
 /// - `{ "$unwind": "$path"|{ "path" } }`
 /// - `{ "$unionWith": "COLL"|{ "coll"|"from" } }`
 /// - `{ "$group": { "_id": "$KEY", "OUT": { "$sum"|"$count"|…: "$FIELD" } } }`
 ///
-/// Accepted classic steps (Upgrade Compatibility):
-/// - `{ "project": { "fields": [...] } }`
-/// - `{ "addFields": { "fields": [{ "as": "...", "value": ... } | { "as": "...", "field": "..." }] } }`
-/// - `{ "rename": { "fields": [{ "from": "...", "to": "..." }] } }`
-/// - `{ "remove": { "fields": [...] } }`
-/// - `{ "filter": { "field": "...", "eq": ... } }`
-/// - `{ "equiLookup": { "from": "...", "localField": "...", "foreignField": "...", "as": "...", "fromSchema?": "..." } }`
-/// - `{ "unwind": { "path": "..." } }`
-/// - `{ "union": { "from": "...", "fromSchema?": "..." } }`
-/// - `{ "groupBy": { "keys": [...], "aggregates": [{ "op": "sum"|"count"|"min"|"max"|"avg", "field": "...", "as": "..." }] } }`
-/// - `{ "distinct": { "fields": [...] } }`
-/// - `{ "addToSet": { "keys": [...], "field": "...", "as": "..." } }`
-///
 /// Rejected shapes (clear errors):
+/// - classic step names (`project` / `filter` / `groupBy` / …) — no read-compat (ADR-0030)
+/// - SQL-ish aliases (`select` / `where` / `join`)
 /// - `{ "script": "..." }` / `{ "function": "..." }`
 /// - Aggregation extensions that break Affect Analysis (`pipeline`, `let`, …)
-/// - any other operator object
+/// - unsupported Aggregation stages (e.g. `$sort`, `$facet`)
 /// - malformed operators (reported as invalid, not unsupported)
 pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, TransformError> {
     let obj = step.as_object().ok_or_else(|| {
@@ -286,105 +275,6 @@ pub fn parse_transform_step_value(step: &Value) -> Result<TransformOp, Transform
 
     if let Some(op) = aggregation_dx::try_parse_aggregation_step(obj)? {
         return Ok(op);
-    }
-
-    if obj.contains_key("project") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "project step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_project(obj.get("project").expect("project key"));
-    }
-
-    if obj.contains_key("addFields") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "addFields step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_add_fields(obj.get("addFields").expect("addFields key"));
-    }
-
-    if obj.contains_key("rename") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "rename step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_rename(obj.get("rename").expect("rename key"));
-    }
-
-    if obj.contains_key("remove") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "remove step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_remove(obj.get("remove").expect("remove key"));
-    }
-
-    if obj.contains_key("filter") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "filter step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_filter(obj.get("filter").expect("filter key"));
-    }
-
-    if obj.contains_key("equiLookup") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "equiLookup step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_equi_lookup(obj.get("equiLookup").expect("equiLookup key"));
-    }
-
-    if obj.contains_key("unwind") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "unwind step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_unwind(obj.get("unwind").expect("unwind key"));
-    }
-
-    if obj.contains_key("union") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "union step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_union(obj.get("union").expect("union key"));
-    }
-
-    if obj.contains_key("groupBy") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "groupBy step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_group_by(obj.get("groupBy").expect("groupBy key"));
-    }
-
-    if obj.contains_key("distinct") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "distinct step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_distinct(obj.get("distinct").expect("distinct key"));
-    }
-
-    if obj.contains_key("addToSet") {
-        if obj.len() != 1 {
-            return Err(TransformError::Invalid(
-                "addToSet step must not mix other operators in the same step".to_string(),
-            ));
-        }
-        return parse_add_to_set(obj.get("addToSet").expect("addToSet key"));
     }
 
     let name = obj
@@ -3567,7 +3457,7 @@ mod tests {
 
     #[test]
     fn malformed_project_is_invalid_not_unsupported() {
-        let steps = vec![json!({"project": {"fields": []}})];
+        let steps = vec![json!({"$project": {"fields": []}})];
         let err = parse_transform_steps(&steps).unwrap_err();
         assert!(
             matches!(err, TransformError::Invalid(_)),
@@ -3579,8 +3469,8 @@ mod tests {
     #[test]
     fn project_then_filter_eq() {
         let ops = parse_transform_steps(&[
-            json!({"project": {"fields": ["ID", "NAME", "ACTIVE"]}}),
-            json!({"filter": {"field": "ACTIVE", "eq": 1}}),
+            json!({"$project": {"fields": ["ID", "NAME", "ACTIVE"]}}),
+            json!({"$match": {"ACTIVE": 1}}),
         ])
         .unwrap();
         let rows = vec![
@@ -3605,12 +3495,7 @@ mod tests {
 
     #[test]
     fn group_by_sum_totals() {
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         let rows = vec![
             row(&[
@@ -3643,26 +3528,20 @@ mod tests {
 
     #[test]
     fn group_by_accepts_count_min_max_avg() {
-        // Issue #126: parser must accept the remaining v1 groupBy aggregate ops.
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [
-                    {"op": "count", "field": "ORDER_ID", "as": "ORDER_COUNT"},
-                    {"op": "min", "field": "AMOUNT", "as": "MIN_AMOUNT"},
-                    {"op": "max", "field": "AMOUNT", "as": "MAX_AMOUNT"},
-                    {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"}
-                ]
-            }
-        })])
+        // Issue #126: parser must accept the remaining v1 $group aggregate ops.
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "ORDER_COUNT": {"$count": "$ORDER_ID"}, "MIN_AMOUNT": {"$min": "$AMOUNT"}, "MAX_AMOUNT": {"$max": "$AMOUNT"}, "AVG_AMOUNT": {"$avg": "$AMOUNT"}}})])
         .unwrap();
         match &ops[0] {
             TransformOp::GroupBy { aggregates, .. } => {
                 assert_eq!(aggregates.len(), 4);
-                assert_eq!(aggregates[0].op, AggregateOp::Count);
-                assert_eq!(aggregates[1].op, AggregateOp::Min);
-                assert_eq!(aggregates[2].op, AggregateOp::Max);
-                assert_eq!(aggregates[3].op, AggregateOp::Avg);
+                let by_name: BTreeMap<&str, AggregateOp> = aggregates
+                    .iter()
+                    .map(|a| (a.as_name.as_str(), a.op))
+                    .collect();
+                assert_eq!(by_name["ORDER_COUNT"], AggregateOp::Count);
+                assert_eq!(by_name["MIN_AMOUNT"], AggregateOp::Min);
+                assert_eq!(by_name["MAX_AMOUNT"], AggregateOp::Max);
+                assert_eq!(by_name["AVG_AMOUNT"], AggregateOp::Avg);
             }
             other => panic!("expected GroupBy, got {other:?}"),
         }
@@ -3671,18 +3550,7 @@ mod tests {
     #[test]
     fn group_by_count_min_max_avg_totals() {
         // Known-good literals: customer 1 has amounts 10.00 + 30.00 → count 2, min 10, max 30, avg 20.
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [
-                    {"op": "count", "field": "ORDER_ID", "as": "ORDER_COUNT"},
-                    {"op": "min", "field": "AMOUNT", "as": "MIN_AMOUNT"},
-                    {"op": "max", "field": "AMOUNT", "as": "MAX_AMOUNT"},
-                    {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"},
-                    {"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}
-                ]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "ORDER_COUNT": {"$count": "$ORDER_ID"}, "MIN_AMOUNT": {"$min": "$AMOUNT"}, "MAX_AMOUNT": {"$max": "$AMOUNT"}, "AVG_AMOUNT": {"$avg": "$AMOUNT"}, "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         let rows = vec![
             row(&[
@@ -3726,12 +3594,7 @@ mod tests {
 
     #[test]
     fn group_by_count_skips_null_field_values() {
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "count", "field": "AMOUNT", "as": "AMOUNT_COUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "AMOUNT_COUNT": {"$count": "$AMOUNT"}}})])
         .unwrap();
         let rows = vec![
             row(&[("CUSTOMER_ID", json!(1)), ("AMOUNT", json!("10.00"))]),
@@ -3744,12 +3607,7 @@ mod tests {
 
     #[test]
     fn group_by_avg_preserves_decimal_precision_without_ieee_double() {
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "AVG_AMOUNT": {"$avg": "$AMOUNT"}}})])
         .unwrap();
         // 0.10 + 0.20 → avg 0.15 exactly (not IEEE 0.15000000000000002).
         let rows = vec![
@@ -3761,18 +3619,7 @@ mod tests {
     }
 
     fn rich_groupby_ops() -> Vec<TransformOp> {
-        parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [
-                    {"op": "count", "field": "ORDER_ID", "as": "ORDER_COUNT"},
-                    {"op": "min", "field": "AMOUNT", "as": "MIN_AMOUNT"},
-                    {"op": "max", "field": "AMOUNT", "as": "MAX_AMOUNT"},
-                    {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"},
-                    {"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}
-                ]
-            }
-        })])
+        parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "ORDER_COUNT": {"$count": "$ORDER_ID"}, "MIN_AMOUNT": {"$min": "$AMOUNT"}, "MAX_AMOUNT": {"$max": "$AMOUNT"}, "AVG_AMOUNT": {"$avg": "$AMOUNT"}, "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap()
     }
 
@@ -3910,12 +3757,7 @@ mod tests {
 
     #[test]
     fn affect_analysis_skips_unused_address_update() {
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         let pre = row(&[
             ("ORDER_ID", json!(100)),
@@ -3935,12 +3777,7 @@ mod tests {
 
     #[test]
     fn group_by_sum_preserves_decimal_precision_without_ieee_double() {
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         // Classic binary-float trap: 0.1 + 0.2 != 0.3 in IEEE double.
         let rows = vec![
@@ -3953,12 +3790,7 @@ mod tests {
 
     #[test]
     fn affect_analysis_recomputes_on_amount_update() {
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         let pre = row(&[
             ("ORDER_ID", json!(100)),
@@ -3986,12 +3818,7 @@ mod tests {
     fn affect_analysis_recomputes_old_and_new_identities_on_group_key_change() {
         // US38 / issue #18: group-key change must use pre-apply Base visibility so both
         // old and new Output Identities are returned — never only the after-image key.
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         let pre = row(&[
             ("ORDER_ID", json!(200)),
@@ -4021,12 +3848,7 @@ mod tests {
 
     #[test]
     fn evaluate_for_identities_omits_empty_old_group_after_key_move() {
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         // After moving order 200 from customer 2 → 3, Base no longer has customer 2 rows.
         let base_rows = vec![
@@ -4060,12 +3882,7 @@ mod tests {
     fn evaluate_for_identities_adjusts_old_group_when_sibling_rows_remain() {
         // Spec "adjusts/removes": when the old group still has other Base rows, recompute
         // must return an adjusted sum for the old identity (not omit it).
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         // Moved order 100 from customer 1 → 3; order 101 remains on customer 1.
         let base_rows = vec![
@@ -4106,18 +3923,18 @@ mod tests {
     #[test]
     fn add_fields_rename_remove_evaluate_and_skip_unused() {
         let ops = parse_transform_steps(&[
-            json!({"project": {"fields": ["ID", "NAME", "EMAIL", "ACTIVE"]}}),
-            json!({"remove": {"fields": ["EMAIL"]}}),
-            json!({"rename": {"fields": [{"from": "NAME", "to": "customerName"}]}}),
+            json!({"$project": {"fields": ["ID", "NAME", "EMAIL", "ACTIVE"]}}),
+            json!({"$unset": {"fields": ["EMAIL"]}}),
+            json!({"$rename": {"fields": [{"from": "NAME", "to": "customerName"}]}}),
             json!({
-                "addFields": {
+                "$addFields": {
                     "fields": [
                         {"as": "source", "value": "oracle"},
                         {"as": "displayName", "field": "customerName"}
                     ]
                 }
             }),
-            json!({"filter": {"field": "ACTIVE", "eq": 1}}),
+            json!({"$match": {"ACTIVE": 1}}),
         ])
         .unwrap();
 
@@ -4203,7 +4020,7 @@ mod tests {
 
     #[test]
     fn remove_only_skips_removed_field_updates_in_open_passthrough() {
-        let ops = parse_transform_steps(&[json!({"remove": {"fields": ["ADDRESS"]}})]).unwrap();
+        let ops = parse_transform_steps(&[json!({"$unset": {"fields": ["ADDRESS"]}})]).unwrap();
         let pre = row(&[
             ("ORDER_ID", json!(100)),
             ("AMOUNT", json!("42.50")),
@@ -4232,9 +4049,9 @@ mod tests {
     #[test]
     fn malformed_add_fields_rename_remove_are_invalid_not_unsupported() {
         for step in [
-            json!({"addFields": {"fields": []}}),
-            json!({"rename": {"fields": [{"from": "A"}]}}),
-            json!({"remove": {"fields": []}}),
+            json!({"$addFields": {"fields": []}}),
+            json!({"$rename": {"fields": [{"from": "A"}]}}),
+            json!({"$unset": {"fields": []}}),
         ] {
             let err = parse_transform_steps(&[step]).unwrap_err();
             assert!(
@@ -4248,9 +4065,9 @@ mod tests {
     #[test]
     fn equi_lookup_parse_evaluate_and_affect_both_bases() {
         let ops = parse_transform_steps(&[
-            json!({"project": {"fields": ["ID", "NAME"]}}),
+            json!({"$project": {"fields": ["ID", "NAME"]}}),
             json!({
-                "equiLookup": {
+                "$lookup": {
                     "from": "ORDERS",
                     "localField": "ID",
                     "foreignField": "CUSTOMER_ID",
@@ -4463,7 +4280,7 @@ mod tests {
         }
 
         let err = parse_transform_steps(&[json!({
-            "equiLookup": {
+            "$lookup": {
                 "from": "ORDERS",
                 "localField": "ID",
                 "foreignField": "CUSTOMER_ID",
@@ -4496,16 +4313,16 @@ mod tests {
         // rename ID → customerId, then equiLookup on customerId — foreign Affect must
         // still resolve primary Output Identities.
         let ops = parse_transform_steps(&[
-            json!({"rename": {"fields": [{"from": "ID", "to": "customerId"}]}}),
+            json!({"$rename": {"fields": [{"from": "ID", "to": "customerId"}]}}),
             json!({
-                "equiLookup": {
+                "$lookup": {
                     "from": "ORDERS",
                     "localField": "customerId",
                     "foreignField": "CUSTOMER_ID",
                     "as": "orders"
                 }
             }),
-            json!({"rename": {"fields": [{"from": "orders", "to": "orderList"}]}}),
+            json!({"$rename": {"fields": [{"from": "orders", "to": "orderList"}]}}),
         ])
         .unwrap();
         let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("Alice"))])];
@@ -4543,14 +4360,14 @@ mod tests {
     fn equi_lookup_removed_as_skips_foreign_affect() {
         let ops = parse_transform_steps(&[
             json!({
-                "equiLookup": {
+                "$lookup": {
                     "from": "ORDERS",
                     "localField": "ID",
                     "foreignField": "CUSTOMER_ID",
                     "as": "orders"
                 }
             }),
-            json!({"remove": {"fields": ["orders"]}}),
+            json!({"$unset": {"fields": ["orders"]}}),
         ])
         .unwrap();
         let customers = vec![row(&[("ID", json!(1)), ("NAME", json!("Alice"))])];
@@ -4583,22 +4400,14 @@ mod tests {
     #[test]
     fn distinct_and_add_to_set_parse_and_evaluate() {
         // Issue #128: declarative distinct / addToSet.
-        let distinct_ops = parse_transform_steps(&[json!({
-            "distinct": { "fields": ["CUSTOMER_ID"] }
-        })])
+        let distinct_ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID"}})])
         .unwrap();
         match &distinct_ops[0] {
             TransformOp::Distinct { fields } => assert_eq!(fields, &["CUSTOMER_ID".to_string()]),
             other => panic!("expected Distinct, got {other:?}"),
         }
 
-        let add_ops = parse_transform_steps(&[json!({
-            "addToSet": {
-                "keys": ["CUSTOMER_ID"],
-                "field": "AMOUNT",
-                "as": "AMOUNTS"
-            }
-        })])
+        let add_ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "AMOUNTS": {"$addToSet": "$AMOUNT"}}})])
         .unwrap();
         match &add_ops[0] {
             TransformOp::AddToSet {
@@ -4662,21 +4471,14 @@ mod tests {
 
     #[test]
     fn group_by_sum_does_not_require_maintenance_state() {
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         assert!(initial_maintenance_state(&ops, &[]).unwrap().is_none());
     }
 
     #[test]
     fn distinct_value_level_affect_skips_duplicate_keys_via_maintenance_state() {
-        let ops = parse_transform_steps(&[json!({
-            "distinct": { "fields": ["CUSTOMER_ID"] }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID"}})])
         .unwrap();
 
         let base = vec![
@@ -4782,13 +4584,7 @@ mod tests {
 
     #[test]
     fn add_to_set_value_level_affect_skips_duplicate_members() {
-        let ops = parse_transform_steps(&[json!({
-            "addToSet": {
-                "keys": ["CUSTOMER_ID"],
-                "field": "AMOUNT",
-                "as": "AMOUNTS"
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "AMOUNTS": {"$addToSet": "$AMOUNT"}}})])
         .unwrap();
         let base = vec![
             row(&[
@@ -4908,20 +4704,14 @@ mod tests {
         // Prefix rename must align Affect Analysis keys/values with Maintenance State.
         let ops = parse_transform_steps(&[
             json!({
-                "rename": {
+                "$rename": {
                     "fields": [
                         {"from": "CUSTOMER_ID", "to": "CUST"},
                         {"from": "AMOUNT", "to": "AMT"}
                     ]
                 }
             }),
-            json!({
-                "addToSet": {
-                    "keys": ["CUST"],
-                    "field": "AMT",
-                    "as": "AMTS"
-                }
-            }),
+            json!({"$group": {"_id": "$CUST", "AMTS": {"$addToSet": "$AMT"}}}),
         ])
         .unwrap();
         let base = vec![
@@ -4983,14 +4773,9 @@ mod tests {
     #[test]
     fn infer_derived_columns_empty_filter_preserves_projected_schema() {
         let ops = parse_transform_steps(&[
-            json!({"project": {"fields": ["ID", "NAME", "AMOUNT"]}}),
-            json!({"filter": {"field": "AMOUNT", "eq": "999.99"}}),
-            json!({
-                "groupBy": {
-                    "keys": ["NAME"],
-                    "aggregates": [{"op": "sum", "field": "AMOUNT", "as": "TOTAL"}]
-                }
-            }),
+            json!({"$project": {"fields": ["ID", "NAME", "AMOUNT"]}}),
+            json!({"$match": {"AMOUNT": "999.99"}}),
+            json!({"$group": {"_id": "$NAME", "TOTAL": {"$sum": "$AMOUNT"}}}),
         ])
         .unwrap();
         let primary = vec![
@@ -5027,16 +4812,7 @@ mod tests {
     fn infer_derived_columns_avg_uses_decimal128_not_source_long_scale() {
         // Source AMOUNT is integer (scale 0 → Long). Avg quotients are decimals and
         // must Delivery as Decimal128 (ADR-0023), not inherit Long.
-        let ops = parse_transform_steps(&[json!({
-            "groupBy": {
-                "keys": ["CUSTOMER_ID"],
-                "aggregates": [
-                    {"op": "avg", "field": "AMOUNT", "as": "AVG_AMOUNT"},
-                    {"op": "count", "field": "AMOUNT", "as": "ORDER_COUNT"},
-                    {"op": "sum", "field": "AMOUNT", "as": "TOTAL_AMOUNT"}
-                ]
-            }
-        })])
+        let ops = parse_transform_steps(&[json!({"$group": {"_id": "$CUSTOMER_ID", "AVG_AMOUNT": {"$avg": "$AMOUNT"}, "ORDER_COUNT": {"$count": "$AMOUNT"}, "TOTAL_AMOUNT": {"$sum": "$AMOUNT"}}})])
         .unwrap();
         let primary = vec![
             OutputColumn {
@@ -5065,7 +4841,7 @@ mod tests {
     #[test]
     fn infer_derived_columns_marks_equilookup_and_addtoset_as_json() {
         let lookup_ops = parse_transform_steps(&[json!({
-            "equiLookup": {
+            "$lookup": {
                 "from": "ORDERS",
                 "localField": "ID",
                 "foreignField": "CUSTOMER_ID",
@@ -5073,13 +4849,7 @@ mod tests {
             }
         })])
         .unwrap();
-        let add_ops = parse_transform_steps(&[json!({
-            "addToSet": {
-                "keys": ["ID"],
-                "field": "NAME",
-                "as": "NAMES"
-            }
-        })])
+        let add_ops = parse_transform_steps(&[json!({"$group": {"_id": "$ID", "NAMES": {"$addToSet": "$NAME"}}})])
         .unwrap();
         let primary = vec![
             OutputColumn {
@@ -5104,16 +4874,16 @@ mod tests {
     #[test]
     fn unwind_parse_evaluate_flatten_and_affect() {
         let ops = parse_transform_steps(&[
-            json!({"project": {"fields": ["ID", "NAME"]}}),
+            json!({"$project": {"fields": ["ID", "NAME"]}}),
             json!({
-                "equiLookup": {
+                "$lookup": {
                     "from": "ORDERS",
                     "localField": "ID",
                     "foreignField": "CUSTOMER_ID",
                     "as": "orders"
                 }
             }),
-            json!({"unwind": {"path": "orders"}}),
+            json!({"$unwind": {"path": "orders"}}),
         ])
         .unwrap();
         match &ops[2] {
@@ -5246,13 +5016,13 @@ mod tests {
 
         // Scalar unwind (literal array via addFields).
         let scalar_ops = parse_transform_steps(&[
-            json!({"project": {"fields": ["ID"]}}),
+            json!({"$project": {"fields": ["ID"]}}),
             json!({
-                "addFields": {
+                "$addFields": {
                     "fields": [{"as": "tags", "value": ["a", "b"]}]
                 }
             }),
-            json!({"unwind": {"path": "$tags"}}),
+            json!({"$unwind": {"path": "$tags"}}),
         ])
         .unwrap();
         let scalar_out = evaluate_transform(&scalar_ops, &[row(&[("ID", json!(1))])]).unwrap();
@@ -5274,7 +5044,7 @@ mod tests {
         }
 
         let err = parse_transform_steps(&[json!({
-            "unwind": {
+            "$unwind": {
                 "path": "orders",
                 "preserveNullAndEmptyArrays": true
             }
@@ -5290,8 +5060,8 @@ mod tests {
             .contains("preservenullandemptyarrays"));
 
         let err = parse_transform_steps(&[
-            json!({"unwind": {"path": "orders"}}),
-            json!({"distinct": {"fields": ["ORDER_ID"]}}),
+            json!({"$unwind": {"path": "orders"}}),
+            json!({"$group": {"_id": "$ORDER_ID"}}),
         ])
         .unwrap_err();
         assert!(
@@ -5306,11 +5076,11 @@ mod tests {
         // Issue #130: declarative multi-Base union.
         let ops = parse_transform_steps(&[
             json!({
-                "union": {
+                "$unionWith": {
                     "from": "WEST_CUSTOMERS"
                 }
             }),
-            json!({"project": {"fields": ["ID", "NAME"]}}),
+            json!({"$project": {"fields": ["ID", "NAME"]}}),
         ])
         .unwrap();
         match &ops[0] {
@@ -5471,7 +5241,7 @@ mod tests {
         }
 
         let err = parse_transform_steps(&[json!({
-            "union": {
+            "$unionWith": {
                 "from": "WEST_CUSTOMERS",
                 "pipeline": [{"$match": {}}]
             }
@@ -5484,8 +5254,8 @@ mod tests {
         assert!(err.to_string().to_ascii_lowercase().contains("pipeline"));
 
         let err = parse_transform_steps(&[
-            json!({"union": {"from": "WEST_CUSTOMERS"}}),
-            json!({"distinct": {"fields": ["ID"]}}),
+            json!({"$unionWith": {"from": "WEST_CUSTOMERS"}}),
+            json!({"$group": {"_id": "$ID"}}),
         ])
         .unwrap_err();
         assert!(
