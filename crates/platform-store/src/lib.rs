@@ -33,6 +33,11 @@ const INCREMENTAL_SYNC_ADVISORY_LOCK_KEY: i64 = 0x4D47_5F53_594E_4301; // "MG_SY
 /// seam — not Target Output Identity.
 #[derive(Debug, Clone, Copy)]
 pub enum BaseRowMutation<'a> {
+    /// Insert a Base row known not to exist yet (skip delete-before-insert; #252).
+    Insert {
+        identity: &'a serde_json::Map<String, serde_json::Value>,
+        row: &'a serde_json::Map<String, serde_json::Value>,
+    },
     /// Insert or replace the Base row matching `identity` (JSON containment on PK fields).
     Upsert {
         identity: &'a serde_json::Map<String, serde_json::Value>,
@@ -600,35 +605,96 @@ impl PlatformStore {
         mutation: BaseRowMutation<'_>,
         applied_changes: &[(String, i64)],
     ) -> Result<(), PlatformStoreError> {
+        self.record_sync_rows_progress(dataset, &[mutation], applied_changes)
+            .await
+    }
+
+    /// Record many Incremental Capture Base mutations + applied change ids in one TX.
+    ///
+    /// Window-batch Direct Incremental path (issue #252): Deliver-before-checkpoint
+    /// still holds when Runtime flushes Target Delivery for the window first, then
+    /// calls this once for all collapsed Base identity mutations and change ids.
+    /// Untouched peers are never rewritten.
+    ///
+    /// Upserts are applied as delete-by-identity then bulk `UNNEST` insert so large
+    /// insert-heavy Direct windows avoid per-row UPDATE+INSERT round-trips.
+    pub async fn record_sync_rows_progress(
+        &self,
+        dataset: &BaseDataset,
+        mutations: &[BaseRowMutation<'_>],
+        applied_changes: &[(String, i64)],
+    ) -> Result<(), PlatformStoreError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(PlatformStoreError::Persist)?;
         upsert_base_dataset_metadata_in_tx(&mut tx, dataset).await?;
-        match mutation {
-            BaseRowMutation::Upsert { identity, row } => {
-                upsert_base_row_by_identity_in_tx(
-                    &mut tx,
-                    &dataset.deployment_name,
-                    &dataset.source_schema,
-                    &dataset.source_table,
-                    identity,
-                    row,
-                )
-                .await?;
-            }
-            BaseRowMutation::Delete { identity } => {
-                delete_base_row_by_identity_in_tx(
-                    &mut tx,
-                    &dataset.deployment_name,
-                    &dataset.source_schema,
-                    &dataset.source_table,
-                    identity,
-                )
-                .await?;
+
+        let mut delete_identities: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut replace_identities: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut insert_rows: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
+        for mutation in mutations {
+            match mutation {
+                BaseRowMutation::Insert { identity: _, row } => {
+                    insert_rows.push(row);
+                }
+                BaseRowMutation::Upsert { identity, row } => {
+                    replace_identities.push(identity);
+                    insert_rows.push(row);
+                }
+                BaseRowMutation::Delete { identity } => {
+                    delete_identities.push(identity);
+                }
             }
         }
+
+        // Removals first (explicit deletes + identities being replaced). Pure Insert
+        // mutations skip JSON-containment DELETE — critical for large Direct windows.
+        delete_base_rows_by_identities_in_tx(
+            &mut tx,
+            &dataset.deployment_name,
+            &dataset.source_schema,
+            &dataset.source_table,
+            &delete_identities,
+        )
+        .await?;
+        delete_base_rows_by_identities_in_tx(
+            &mut tx,
+            &dataset.deployment_name,
+            &dataset.source_schema,
+            &dataset.source_table,
+            &replace_identities,
+        )
+        .await?;
+
+        if !insert_rows.is_empty() {
+            let next_ordinal: i32 = sqlx::query_scalar(
+                r#"
+                SELECT COALESCE(MAX(row_ordinal), -1) + 1
+                FROM base_rows
+                WHERE deployment_name = $1 AND source_schema = $2 AND source_table = $3
+                "#,
+            )
+            .bind(&dataset.deployment_name)
+            .bind(&dataset.source_schema)
+            .bind(&dataset.source_table)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(PlatformStoreError::Persist)?;
+            let owned_rows: Vec<serde_json::Map<String, serde_json::Value>> =
+                insert_rows.iter().map(|row| (*row).clone()).collect();
+            insert_base_rows_bulk_in_tx(
+                &mut tx,
+                &dataset.deployment_name,
+                &dataset.source_schema,
+                &dataset.source_table,
+                &owned_rows,
+                next_ordinal,
+            )
+            .await?;
+        }
+
         record_applied_source_changes_in_tx(
             &mut tx,
             &dataset.deployment_name,
@@ -2251,25 +2317,45 @@ async fn delete_base_row_by_identity_in_tx(
     source_table: &str,
     identity: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), PlatformStoreError> {
-    let identity_json = identity_json_for_containment(identity)?;
+    delete_base_rows_by_identities_in_tx(
+        tx,
+        deployment_name,
+        source_schema,
+        source_table,
+        &[identity],
+    )
+    .await
+}
+
+/// Delete Base rows whose JSON contains any of the given identities (batch #252).
+async fn delete_base_rows_by_identities_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    deployment_name: &str,
+    source_schema: &str,
+    source_table: &str,
+    identities: &[&serde_json::Map<String, serde_json::Value>],
+) -> Result<(), PlatformStoreError> {
+    if identities.is_empty() {
+        return Ok(());
+    }
+    let mut identity_jsons = Vec::with_capacity(identities.len());
+    for identity in identities {
+        identity_jsons.push(identity_json_for_containment(identity)?);
+    }
     sqlx::query(
         r#"
-            DELETE FROM base_rows
-            WHERE ctid = (
-                SELECT ctid FROM base_rows
-                WHERE deployment_name = $1
-                  AND source_schema = $2
-                  AND source_table = $3
-                  AND row_json::jsonb @> $4::jsonb
-                ORDER BY row_ordinal
-                LIMIT 1
-            )
+            DELETE FROM base_rows b
+            USING UNNEST($4::text[]) AS id(identity_json)
+            WHERE b.deployment_name = $1
+              AND b.source_schema = $2
+              AND b.source_table = $3
+              AND b.row_json::jsonb @> id.identity_json::jsonb
             "#,
     )
     .bind(deployment_name)
     .bind(source_schema)
     .bind(source_table)
-    .bind(&identity_json)
+    .bind(&identity_jsons)
     .execute(&mut **tx)
     .await
     .map_err(PlatformStoreError::Persist)?;
@@ -2364,24 +2450,34 @@ async fn record_applied_source_changes_in_tx(
     source_table: &str,
     changes: &[(String, i64)],
 ) -> Result<(), PlatformStoreError> {
-    for (change_id, position) in changes {
-        sqlx::query(
-            r#"
-                INSERT INTO applied_source_changes (
-                    deployment_name, source_schema, source_table, change_id, position
-                ) VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (deployment_name, source_schema, source_table, change_id) DO NOTHING
-                "#,
-        )
-        .bind(deployment_name)
-        .bind(source_schema)
-        .bind(source_table)
-        .bind(change_id)
-        .bind(position)
-        .execute(&mut **tx)
-        .await
-        .map_err(PlatformStoreError::Persist)?;
+    if changes.is_empty() {
+        return Ok(());
     }
+    // Bulk UNNEST insert for Direct Incremental window batches (#252).
+    let change_ids: Vec<&str> = changes.iter().map(|(id, _)| id.as_str()).collect();
+    let positions: Vec<i64> = changes.iter().map(|(_, pos)| *pos).collect();
+    let deployment_names = vec![deployment_name; changes.len()];
+    let source_schemas = vec![source_schema; changes.len()];
+    let source_tables = vec![source_table; changes.len()];
+    sqlx::query(
+        r#"
+            INSERT INTO applied_source_changes (
+                deployment_name, source_schema, source_table, change_id, position
+            )
+            SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[]
+            )
+            ON CONFLICT (deployment_name, source_schema, source_table, change_id) DO NOTHING
+            "#,
+    )
+    .bind(&deployment_names)
+    .bind(&source_schemas)
+    .bind(&source_tables)
+    .bind(&change_ids)
+    .bind(&positions)
+    .execute(&mut **tx)
+    .await
+    .map_err(PlatformStoreError::Persist)?;
     Ok(())
 }
 

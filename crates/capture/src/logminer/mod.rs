@@ -12,6 +12,7 @@ mod contract;
 mod inject;
 mod oci;
 mod source;
+mod sql_redo;
 
 pub use contents::{
     change_events_from_logminer_contents, logminer_change_id, logminer_content_order,

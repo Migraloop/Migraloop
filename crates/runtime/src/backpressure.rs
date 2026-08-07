@@ -139,7 +139,7 @@ mod tests {
             queue_capacity: 0,
             delivery_delay_ms: None,
         });
-        assert_eq!(window.capacity(), 256);
+        assert_eq!(window.capacity(), 2048);
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
 
         let default_window = BoundedWindow::from_options(&BackpressureOptions::default());
         assert!(!default_window.is_full(0));
-        assert!(default_window.is_full(256));
+        assert!(default_window.is_full(2048));
     }
 
     #[test]

@@ -61,7 +61,7 @@ Lab Scenario `initial-load-throttled` exercises chunked progress, pause/resume, 
 
 When Platform Store apply, Derived maintenance, or Target Delivery cannot keep up (ADR-0020):
 
-- Stages use **bounded queues** (default Incremental window `MIGRALOOP_SYNC_QUEUE_CAPACITY`, 256) and slow capture/apply
+- Stages use **bounded queues** (default Incremental window `MIGRALOOP_SYNC_QUEUE_CAPACITY`, 2048) and slow capture/apply
 - Sync Health and Delivery Health both expose `lag=` for remaining work in the current window; `sync` prints `Backpressure: queue_depth=… capacity=…` when the window is full or Downstream is delayed
 - Unbounded in-memory buffering / OOM-as-backpressure is rejected
 - Pausing an entire Pipeline solely because the Target is slow is **not** the default

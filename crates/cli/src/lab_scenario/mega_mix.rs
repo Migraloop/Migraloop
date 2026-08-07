@@ -2,9 +2,9 @@
 //!
 //! Deployment-realistic mix covering every shipped path family, with solo
 //! baselines, mix Incremental e2e QPS, Direct/Transform path aggregates, and
-//! the 0.7 / 0.95 multi-Pipeline gates. Absolute 100k/50k floors are reported
-//! honestly but are not Scenario accept thresholds on this ticket (later
-//! throughput children raise product performance).
+//! the 0.7 / 0.95 multi-Pipeline gates. Absolute floors are Lab-manual evidence
+//! (Direct ≥100k is #252; Transform ≥50k is #253) — not Scenario `accept`
+//! thresholds in CI.
 
 use std::fmt::Write as _;
 use std::sync::Mutex;
@@ -39,15 +39,35 @@ pub(crate) const GATE_PER_PIPELINE_RATIO: f64 = 0.95;
 pub(crate) const DIRECT_FLOOR_QPS: f64 = 100_000.0;
 pub(crate) const TRANSFORM_FLOOR_QPS: f64 = 50_000.0;
 
-/// Source rows injected per Pipeline during each solo / mix Incremental window.
-/// Modest on purpose: this ticket ships the harness + honest gate reporting;
-/// absolute floors may still fail until later throughput tickets.
-pub(crate) const INCREMENTAL_BATCH_ROWS: u64 = 100;
+/// Direct Pipeline Incremental batch for ≥100k path-aggregate evidence (#252).
+///
+/// Sized to amortize one-shot `sync` startup + LogMiner open. Transform stays on
+/// a smaller batch until #253 raises that path (shared harness, separate floors).
+pub(crate) const DIRECT_INCREMENTAL_BATCH_ROWS: u64 = 50_000;
+/// Transform Pipeline Incremental batch (modest until #253 throughput leap).
+pub(crate) const TRANSFORM_INCREMENTAL_BATCH_ROWS: u64 = 200;
+/// Backward-compatible alias — Direct evidence batch (#252).
+pub(crate) const INCREMENTAL_BATCH_ROWS: u64 = DIRECT_INCREMENTAL_BATCH_ROWS;
 
+/// Bounded-window capacity for mega-mix evidence syncs (ADR-0020 / #252).
+///
+/// Sized ≥ Direct evidence batch so one unsaturated prefetch + one window-batch
+/// Delivery can absorb the burst without leftover pad-fetches.
+pub(crate) const MEGA_MIX_SYNC_QUEUE_CAPACITY: &str = "65536";
+
+/// Per-Pipeline ID stride (> max batch) so solo/mix inserts never collide.
+pub(crate) const ID_STRIDE: i64 = 100_000;
 /// ID base for solo Incremental inserts (avoids colliding with seed / correctness mutate).
-pub(crate) const SOLO_ID_BASE: i64 = 10_000;
+pub(crate) const SOLO_ID_BASE: i64 = 1_000_000;
 /// ID base for mix Incremental inserts.
-pub(crate) const MIX_ID_BASE: i64 = 20_000;
+pub(crate) const MIX_ID_BASE: i64 = 100_000_000;
+
+pub(crate) fn batch_rows_for_path(path: PathKind) -> u64 {
+    match path {
+        PathKind::Direct => DIRECT_INCREMENTAL_BATCH_ROWS,
+        PathKind::Transform => TRANSFORM_INCREMENTAL_BATCH_ROWS,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathKind {
@@ -287,7 +307,7 @@ pub(crate) fn format_mega_mix_report_section(evidence: &MegaMixEvidence) -> Stri
     }
     let _ = writeln!(
         out,
-        "    floor_direct_100k={} (evidence; not Scenario accept on #251)",
+        "    floor_direct_100k={} (Lab-manual evidence #252; not Scenario accept)",
         if evidence.floor_direct_pass {
             "pass"
         } else {
@@ -296,7 +316,7 @@ pub(crate) fn format_mega_mix_report_section(evidence: &MegaMixEvidence) -> Stri
     );
     let _ = writeln!(
         out,
-        "    floor_transform_50k={} (evidence; not Scenario accept on #251)",
+        "    floor_transform_50k={} (Lab-manual evidence #253; not Scenario accept)",
         if evidence.floor_transform_pass {
             "pass"
         } else {
@@ -321,103 +341,108 @@ pub(crate) fn covers_required_path_families(pipelines: &[MegaMixPipeline]) -> bo
 }
 
 /// SQL body (no sqlplus preamble) inserting `n` Incremental rows starting at `id_base`.
+///
+/// Uses Oracle `CONNECT BY` bulk inserts so large Direct evidence batches (#252)
+/// do not expand into tens of thousands of single-row statements.
 /// Returns `(sql, source_rows_counted_for_qps)`.
 pub(crate) fn incremental_batch_sql(table: &str, id_base: i64, n: u64) -> (String, u64) {
     let mut sql = String::new();
+    if n == 0 {
+        return (sql, 0);
+    }
+    let id_end = id_base + n as i64 - 1;
     match table {
         "LAB_MM_DIRECT_A" | "LAB_MM_DIRECT_B" => {
-            for i in 0..n {
-                let id = id_base + i as i64;
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO {table} (ID, NAME) VALUES ({id}, 'mm-{id}');"
-                );
-            }
+            let _ = writeln!(
+                sql,
+                "INSERT INTO {table} (ID, NAME)\n\
+                 SELECT {id_base} + LEVEL - 1, 'mm-' || TO_CHAR({id_base} + LEVEL - 1)\n\
+                 FROM dual CONNECT BY LEVEL <= {n};"
+            );
             (sql, n)
         }
         "LAB_MM_PROJECT" => {
-            for i in 0..n {
-                let id = id_base + i as i64;
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO {table} (ID, NAME, EMAIL) VALUES ({id}, 'mm-{id}', 'mm-{id}@example.com');"
-                );
-            }
+            let _ = writeln!(
+                sql,
+                "INSERT INTO {table} (ID, NAME, EMAIL)\n\
+                 SELECT {id_base} + LEVEL - 1,\n\
+                        'mm-' || TO_CHAR({id_base} + LEVEL - 1),\n\
+                        'mm-' || TO_CHAR({id_base} + LEVEL - 1) || '@example.com'\n\
+                 FROM dual CONNECT BY LEVEL <= {n};"
+            );
             (sql, n)
         }
         "LAB_MM_FIELD_OPS" | "LAB_MM_MATCH" => {
-            for i in 0..n {
-                let id = id_base + i as i64;
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO {table} (ID, NAME, EMAIL, ACTIVE) VALUES ({id}, 'mm-{id}', 'mm-{id}@example.com', 1);"
-                );
-            }
+            let _ = writeln!(
+                sql,
+                "INSERT INTO {table} (ID, NAME, EMAIL, ACTIVE)\n\
+                 SELECT {id_base} + LEVEL - 1,\n\
+                        'mm-' || TO_CHAR({id_base} + LEVEL - 1),\n\
+                        'mm-' || TO_CHAR({id_base} + LEVEL - 1) || '@example.com',\n\
+                        1\n\
+                 FROM dual CONNECT BY LEVEL <= {n};"
+            );
             (sql, n)
         }
         "LAB_MM_LOOKUP_CUSTOMERS" => {
-            for i in 0..n {
-                let id = id_base + i as i64;
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO LAB_MM_LOOKUP_CUSTOMERS (ID, NAME) VALUES ({id}, 'mm-{id}');"
-                );
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO LAB_MM_LOOKUP_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES ({id}, {id}, 1.00);"
-                );
-            }
+            let _ = writeln!(
+                sql,
+                "INSERT INTO LAB_MM_LOOKUP_CUSTOMERS (ID, NAME)\n\
+                 SELECT {id_base} + LEVEL - 1, 'mm-' || TO_CHAR({id_base} + LEVEL - 1)\n\
+                 FROM dual CONNECT BY LEVEL <= {n};\n\
+                 INSERT INTO LAB_MM_LOOKUP_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT)\n\
+                 SELECT {id_base} + LEVEL - 1, {id_base} + LEVEL - 1, 1.00\n\
+                 FROM dual CONNECT BY LEVEL <= {n};"
+            );
             (sql, n)
         }
         "LAB_MM_EAST" => {
-            for i in 0..n {
-                let id = id_base + i as i64;
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO LAB_MM_EAST (ID, NAME) VALUES ({id}, 'east-mm-{id}');"
-                );
-            }
+            let _ = writeln!(
+                sql,
+                "INSERT INTO LAB_MM_EAST (ID, NAME)\n\
+                 SELECT {id_base} + LEVEL - 1, 'east-mm-' || TO_CHAR({id_base} + LEVEL - 1)\n\
+                 FROM dual CONNECT BY LEVEL <= {n};"
+            );
             (sql, n)
         }
         "LAB_MM_UNWIND_CUSTOMERS" => {
-            for i in 0..n {
-                let id = id_base + i as i64;
-                let order_id = id_base + 100_000 + i as i64;
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO LAB_MM_UNWIND_CUSTOMERS (ID, NAME) VALUES ({id}, 'mm-{id}');"
-                );
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO LAB_MM_UNWIND_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT) VALUES ({order_id}, {id}, 1.00);"
-                );
-            }
+            let order_base = id_base + ID_STRIDE;
+            let _ = writeln!(
+                sql,
+                "INSERT INTO LAB_MM_UNWIND_CUSTOMERS (ID, NAME)\n\
+                 SELECT {id_base} + LEVEL - 1, 'mm-' || TO_CHAR({id_base} + LEVEL - 1)\n\
+                 FROM dual CONNECT BY LEVEL <= {n};\n\
+                 INSERT INTO LAB_MM_UNWIND_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT)\n\
+                 SELECT {order_base} + LEVEL - 1, {id_base} + LEVEL - 1, 1.00\n\
+                 FROM dual CONNECT BY LEVEL <= {n};"
+            );
             (sql, n)
         }
         "LAB_MM_GROUP_ORDERS" => {
-            for i in 0..n {
-                let id = id_base + i as i64;
-                let customer = id_base + 1_000 + i as i64;
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO LAB_MM_GROUP_ORDERS (ID, CUSTOMER_ID, AMOUNT, NOTE) VALUES ({id}, {customer}, 3, 'mm');"
-                );
-            }
+            let customer_base = id_base + ID_STRIDE;
+            let _ = writeln!(
+                sql,
+                "INSERT INTO LAB_MM_GROUP_ORDERS (ID, CUSTOMER_ID, AMOUNT, NOTE)\n\
+                 SELECT {id_base} + LEVEL - 1, {customer_base} + LEVEL - 1, 3, 'mm'\n\
+                 FROM dual CONNECT BY LEVEL <= {n};"
+            );
             (sql, n)
         }
         "LAB_MM_DIST_ORDERS" => {
-            for i in 0..n {
-                let id = id_base + i as i64;
-                let customer = id_base + 2_000 + i as i64;
-                let _ = writeln!(
-                    sql,
-                    "INSERT INTO LAB_MM_DIST_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS) VALUES ({id}, {customer}, 3.00, 'mm');"
-                );
-            }
+            let customer_base = id_base + (ID_STRIDE * 2);
+            let _ = writeln!(
+                sql,
+                "INSERT INTO LAB_MM_DIST_ORDERS (ORDER_ID, CUSTOMER_ID, AMOUNT, ADDRESS)\n\
+                 SELECT {id_base} + LEVEL - 1, {customer_base} + LEVEL - 1, 3.00, 'mm'\n\
+                 FROM dual CONNECT BY LEVEL <= {n};"
+            );
             (sql, n)
         }
         other => {
-            let _ = writeln!(sql, "-- unsupported mega-mix workload table: {other}");
+            let _ = writeln!(
+                sql,
+                "-- unsupported mega-mix workload table: {other} (ids {id_base}..{id_end})"
+            );
             (sql, 0)
         }
     }
@@ -537,7 +562,11 @@ mod tests {
         assert!(rendered.contains("floor_direct_100k=fail"), "{rendered}");
         assert!(rendered.contains("floor_transform_50k=fail"), "{rendered}");
         assert!(
-            rendered.contains("not Scenario accept on #251"),
+            rendered.contains("Lab-manual evidence #252"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Lab-manual evidence #253"),
             "{rendered}"
         );
     }
@@ -556,10 +585,11 @@ mod tests {
         let (sql, n) = incremental_batch_sql("LAB_MM_DIRECT_A", 10_000, 3);
         assert_eq!(n, 3);
         assert!(sql.contains("INSERT INTO LAB_MM_DIRECT_A"));
-        assert!(sql.contains("10000"));
-        assert!(sql.contains("10002"));
+        assert!(sql.contains("CONNECT BY LEVEL <= 3"), "{sql}");
+        assert!(sql.contains("10000"), "{sql}");
         let (sql, n) = incremental_batch_sql("LAB_MM_LOOKUP_CUSTOMERS", 10_000, 2);
         assert_eq!(n, 2);
         assert!(sql.contains("LAB_MM_LOOKUP_ORDERS"));
+        assert!(sql.contains("CONNECT BY LEVEL <= 2"), "{sql}");
     }
 }

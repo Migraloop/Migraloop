@@ -81,6 +81,23 @@ impl IncrementalCapture {
         }
     }
 
+    /// Prefetch many tables; OCI amortizes one LogMiner START/END (#252).
+    pub fn prefetch_tables_limited(
+        &self,
+        requests: &[(String, String, CapturePosition, Option<usize>)],
+    ) -> Result<Vec<Vec<ChangeEvent>>, CaptureError> {
+        match self {
+            Self::Contract(c) => {
+                let mut out = Vec::with_capacity(requests.len());
+                for (_schema, table, from_position, limit) in requests {
+                    out.push(c.fetch_changes_limited(table, *from_position, *limit)?);
+                }
+                Ok(out)
+            }
+            Self::Oci(o) => o.prefetch_tables_limited(requests),
+        }
+    }
+
     /// Count pending Incremental changes for Sync/Delivery Health lag (ADR-0020).
     ///
     /// Does not materialize full row images — used so lag can reflect backlog under

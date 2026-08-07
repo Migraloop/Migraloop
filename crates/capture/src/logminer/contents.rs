@@ -2,7 +2,8 @@
 //!
 //! Mirrors the fields Incremental Capture needs from `V$LOGMNR_CONTENTS`
 //! (SCN, OPERATION, SEG_OWNER, TABLE_NAME, RS_ID, SSN, and reconstructed row
-//! images from supplemental logging) without parsing SQL_REDO text.
+//! images). OCI INSERT reconstruction may parse `SQL_REDO` (#252); UPDATE/DELETE
+//! still use `MINE_VALUE` images.
 
 use std::collections::BTreeMap;
 

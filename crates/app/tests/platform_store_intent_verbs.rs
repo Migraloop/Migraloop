@@ -365,6 +365,141 @@ async fn record_sync_row_progress_upserts_one_row_without_dropping_peers() {
     assert_eq!(unapplied, vec!["chg-153".to_string()]);
 }
 
+/// Direct Incremental window batch persist (#252): many Base mutations + change ids
+/// in one TX must leave peers intact and record every applied id.
+#[tokio::test]
+async fn record_sync_rows_progress_batches_mutations_without_dropping_peers() {
+    let store = open_migrated_store().await;
+    store
+        .upsert_deployment(&sample_deployment("intent-sync-rows"))
+        .await
+        .expect("upsert Deployment");
+
+    let mut seed_rows = Vec::new();
+    for id in 1..=50 {
+        let mut row = serde_json::Map::new();
+        row.insert("ID".to_string(), serde_json::json!(id));
+        row.insert("NAME".to_string(), serde_json::json!(format!("name-{id}")));
+        seed_rows.push(row);
+    }
+    let mut dataset = sample_base("intent-sync-rows");
+    dataset.row_count = 50;
+    dataset.status = "incremental".to_string();
+    dataset.sync_applied_changes = 0;
+    dataset.capture_checkpoint = Some(100);
+    dataset.columns = vec![
+        BaseColumn {
+            name: "ID".to_string(),
+            data_type: "NUMBER".to_string(),
+            precision: Some(10),
+            scale: Some(0),
+        },
+        BaseColumn {
+            name: "NAME".to_string(),
+            data_type: "VARCHAR2".to_string(),
+            precision: Some(100),
+            scale: None,
+        },
+    ];
+    store
+        .replace_base_dataset(&dataset, &seed_rows)
+        .await
+        .expect("seed Base rows");
+
+    let mut identity_10 = serde_json::Map::new();
+    identity_10.insert("ID".to_string(), serde_json::json!(10));
+    let mut updated_10 = identity_10.clone();
+    updated_10.insert("NAME".to_string(), serde_json::json!("name-10-batched"));
+
+    let mut identity_51 = serde_json::Map::new();
+    identity_51.insert("ID".to_string(), serde_json::json!(51));
+    let mut inserted_51 = identity_51.clone();
+    inserted_51.insert("NAME".to_string(), serde_json::json!("name-51"));
+
+    let mut identity_1 = serde_json::Map::new();
+    identity_1.insert("ID".to_string(), serde_json::json!(1));
+
+    dataset.row_count = 50;
+    dataset.sync_applied_changes = 3;
+    dataset.capture_checkpoint = Some(160);
+    dataset.sync_lag = 0;
+    store
+        .record_sync_rows_progress(
+            &dataset,
+            &[
+                BaseRowMutation::Upsert {
+                    identity: &identity_10,
+                    row: &updated_10,
+                },
+                BaseRowMutation::Insert {
+                    identity: &identity_51,
+                    row: &inserted_51,
+                },
+                BaseRowMutation::Delete {
+                    identity: &identity_1,
+                },
+            ],
+            &[
+                ("chg-158".to_string(), 158),
+                ("chg-159".to_string(), 159),
+                ("chg-160".to_string(), 160),
+            ],
+        )
+        .await
+        .expect("batched Base mutations");
+
+    let (loaded, rows) = store
+        .get_base_rows("CUSTOMERS", Some("intent-sync-rows"))
+        .await
+        .expect("load Base after batch");
+    assert_eq!(loaded.row_count, 50);
+    assert_eq!(loaded.sync_applied_changes, 3);
+    assert_eq!(loaded.capture_checkpoint, Some(160));
+    assert_eq!(rows.len(), 50, "peers must survive batched Sync persist");
+
+    let row_10 = rows
+        .iter()
+        .find(|r| r.data.get("ID") == Some(&serde_json::json!(10)))
+        .expect("row 10 present");
+    assert_eq!(
+        row_10.data.get("NAME"),
+        Some(&serde_json::json!("name-10-batched"))
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.data.get("ID") == Some(&serde_json::json!(51))),
+        "inserted row 51 must be present"
+    );
+    assert!(
+        rows
+            .iter()
+            .all(|r| r.data.get("ID") != Some(&serde_json::json!(1))),
+        "deleted row 1 must be gone"
+    );
+    assert!(
+        rows
+            .iter()
+            .any(|r| r.data.get("ID") == Some(&serde_json::json!(2))),
+        "untouched peer row 2 must remain"
+    );
+
+    let unapplied = store
+        .filter_unapplied_change_ids(
+            "intent-sync-rows",
+            "APP",
+            "CUSTOMERS",
+            &[
+                "chg-158".to_string(),
+                "chg-159".to_string(),
+                "chg-160".to_string(),
+                "chg-161".to_string(),
+            ],
+        )
+        .await
+        .expect("filter applied");
+    assert_eq!(unapplied, vec!["chg-161".to_string()]);
+}
+
 /// Transform Sync throughput seam (#231): Affect recompute must not DELETE+rewrite
 /// untouched Derived peers (ADR-0029 Transform path, mirrors Base #230).
 #[tokio::test]
