@@ -571,6 +571,20 @@ async fn apply_direct_incremental_window<T: TargetEngine>(
         return Ok(());
     }
 
+    // Identities present before this window — used to skip Store DELETE on pure inserts.
+    let pre_window_keys: BTreeSet<String> = rows
+        .iter()
+        .map(|row| {
+            let mut identity_map = serde_json::Map::new();
+            for field in &dataset.primary_key {
+                if let Some(value) = row.get(field) {
+                    identity_map.insert(field.clone(), value.clone());
+                }
+            }
+            migraloop_types::output_identity_key(&serde_json::Value::Object(identity_map))
+        })
+        .collect();
+
     // Same-key order into Base (ADR-0029).
     let owned_changes: Vec<ChangeEvent> = row_changes.iter().map(|c| (*c).clone()).collect();
     if let Err(err) = apply_change_events_to_base_rows(
@@ -785,14 +799,24 @@ async fn apply_direct_incremental_window<T: TargetEngine>(
         lag_after,
     );
 
-    // Keep mutation references alive for the Store call.
+    // Keep mutation references alive for the Store call. Pure inserts (new keys)
+    // skip delete-before-insert — JSON-containment DELETE over tens of thousands of
+    // identities dominates mega-mix Direct windows otherwise (#252).
     let owned_mutations: Vec<(
+        String,
         serde_json::Map<String, serde_json::Value>,
         Option<serde_json::Map<String, serde_json::Value>>,
-    )> = base_by_key.into_values().collect();
+    )> = base_by_key
+        .into_iter()
+        .map(|(key, (identity, row))| (key, identity, row))
+        .collect();
     let mutation_refs: Vec<BaseRowMutation<'_>> = owned_mutations
         .iter()
-        .map(|(identity, row)| match row {
+        .map(|(key, identity, row)| match row {
+            Some(row) if !pre_window_keys.contains(key) => BaseRowMutation::Insert {
+                identity,
+                row,
+            },
             Some(row) => BaseRowMutation::Upsert { identity, row },
             None => BaseRowMutation::Delete { identity },
         })

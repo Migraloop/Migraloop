@@ -431,7 +431,7 @@ async fn record_sync_rows_progress_batches_mutations_without_dropping_peers() {
                     identity: &identity_10,
                     row: &updated_10,
                 },
-                BaseRowMutation::Upsert {
+                BaseRowMutation::Insert {
                     identity: &identity_51,
                     row: &inserted_51,
                 },

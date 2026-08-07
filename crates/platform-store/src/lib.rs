@@ -33,6 +33,11 @@ const INCREMENTAL_SYNC_ADVISORY_LOCK_KEY: i64 = 0x4D47_5F53_594E_4301; // "MG_SY
 /// seam — not Target Output Identity.
 #[derive(Debug, Clone, Copy)]
 pub enum BaseRowMutation<'a> {
+    /// Insert a Base row known not to exist yet (skip delete-before-insert; #252).
+    Insert {
+        identity: &'a serde_json::Map<String, serde_json::Value>,
+        row: &'a serde_json::Map<String, serde_json::Value>,
+    },
     /// Insert or replace the Base row matching `identity` (JSON containment on PK fields).
     Upsert {
         identity: &'a serde_json::Map<String, serde_json::Value>,
@@ -627,13 +632,16 @@ impl PlatformStore {
         upsert_base_dataset_metadata_in_tx(&mut tx, dataset).await?;
 
         let mut delete_identities: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
-        let mut upsert_identities: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
-        let mut upsert_rows: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut replace_identities: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
+        let mut insert_rows: Vec<&serde_json::Map<String, serde_json::Value>> = Vec::new();
         for mutation in mutations {
             match mutation {
+                BaseRowMutation::Insert { identity: _, row } => {
+                    insert_rows.push(row);
+                }
                 BaseRowMutation::Upsert { identity, row } => {
-                    upsert_identities.push(identity);
-                    upsert_rows.push(row);
+                    replace_identities.push(identity);
+                    insert_rows.push(row);
                 }
                 BaseRowMutation::Delete { identity } => {
                     delete_identities.push(identity);
@@ -641,7 +649,8 @@ impl PlatformStore {
             }
         }
 
-        // Removals first (explicit deletes + identities about to be replaced).
+        // Removals first (explicit deletes + identities being replaced). Pure Insert
+        // mutations skip JSON-containment DELETE — critical for large Direct windows.
         delete_base_rows_by_identities_in_tx(
             &mut tx,
             &dataset.deployment_name,
@@ -655,11 +664,11 @@ impl PlatformStore {
             &dataset.deployment_name,
             &dataset.source_schema,
             &dataset.source_table,
-            &upsert_identities,
+            &replace_identities,
         )
         .await?;
 
-        if !upsert_rows.is_empty() {
+        if !insert_rows.is_empty() {
             let next_ordinal: i32 = sqlx::query_scalar(
                 r#"
                 SELECT COALESCE(MAX(row_ordinal), -1) + 1
@@ -674,7 +683,7 @@ impl PlatformStore {
             .await
             .map_err(PlatformStoreError::Persist)?;
             let owned_rows: Vec<serde_json::Map<String, serde_json::Value>> =
-                upsert_rows.iter().map(|row| (*row).clone()).collect();
+                insert_rows.iter().map(|row| (*row).clone()).collect();
             insert_base_rows_bulk_in_tx(
                 &mut tx,
                 &dataset.deployment_name,
