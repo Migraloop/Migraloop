@@ -12,7 +12,7 @@
 //! CLI is a thin adapter over [`run_incremental_sync`] /
 //! [`supervise_continuous_incremental_sync`] (#208).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use migraloop_capture::{
     normalize_change_temporals, CapturePosition, ChangeEvent, ChangeOp,
@@ -1240,6 +1240,10 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
             }
 
             let mut windows_processed = 0usize;
+            // Same-SCN bulk inserts (mega-mix CONNECT BY) leave many siblings after one
+            // bounded window. Keep filtered leftovers so later windows do not re-START
+            // LogMiner and re-MINE already-seen rows (#252 / issue #143 inclusive resume).
+            let mut leftover_changes: VecDeque<ChangeEvent> = VecDeque::new();
 
             // ADR-0020 / #203: bounded Incremental windows via Backpressure module.
             // Capture only fills up to window capacity; Downstream slowness drains
@@ -1259,22 +1263,45 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                     .await
                     .map_err(|err| RuntimeError::Failed(err.to_string()))?;
                 let applied_skip: BTreeSet<_> = applied_at_or_after.into_iter().collect();
-                let fetch_limit = window.fetch_limit(applied_skip.len());
 
-                // Count Source backlog without materializing row images so Sync/
-                // Delivery Health lag can reflect delay under a bounded window.
-                let source_pending_total = capture
-                    .count_changes_in_schema(&schema, &table, resume_from)
-                    .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-                let source_pending = source_pending_total.saturating_sub(applied_skip.len());
-                let fetched_changes = capture
-                    .fetch_changes_in_schema_limited(&schema, &table, resume_from, fetch_limit)
-                    .map_err(|err| RuntimeError::Failed(err.to_string()))?;
-                let candidate_changes = window.take_up_to_capacity(
-                    fetched_changes
+                let mut candidate_changes: Vec<ChangeEvent> = Vec::new();
+                while candidate_changes.len() < window.capacity() {
+                    let Some(change) = leftover_changes.pop_front() else {
+                        break;
+                    };
+                    if applied_skip.contains(&change.change_id) {
+                        continue;
+                    }
+                    candidate_changes.push(change);
+                }
+
+                let mut fetch_saturated = false;
+                if candidate_changes.len() < window.capacity() {
+                    let need = window.capacity() - candidate_changes.len();
+                    let fetch_limit = Some(need.saturating_add(applied_skip.len()));
+                    // Skip a separate LogMiner COUNT session when draining leftovers or
+                    // fetching the next slice — one START_LOGMNR per window (#252).
+                    let fetched_changes = capture
+                        .fetch_changes_in_schema_limited(
+                            &schema,
+                            &table,
+                            resume_from,
+                            fetch_limit,
+                        )
+                        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+                    fetch_saturated = fetch_limit.is_some_and(|n| fetched_changes.len() >= n);
+                    let mut filtered = fetched_changes
                         .into_iter()
-                        .filter(|c| !applied_skip.contains(&c.change_id)),
-                );
+                        .filter(|c| !applied_skip.contains(&c.change_id));
+                    while candidate_changes.len() < window.capacity() {
+                        let Some(change) = filtered.next() else {
+                            break;
+                        };
+                        candidate_changes.push(change);
+                    }
+                    leftover_changes.extend(filtered);
+                }
+
                 let table_schema_changes: Vec<SchemaChangeEvent> = injected_schema_changes
                     .iter()
                     .filter(|c| c.table.eq_ignore_ascii_case(&table))
@@ -1300,8 +1327,14 @@ async fn sync_deployment_incremental<S: SourceEngine, T: TargetEngine>(
                     .iter()
                     .filter(|c| unapplied_set.contains(&c.change_id))
                     .count();
-                // Source count is from inclusive resume_from minus already-applied ids.
-                // Window fetch may be smaller; lag uses full Source+schema pending.
+                // Lag from materialized window + leftovers (+1 when fetch saturated).
+                // Avoids a second LogMiner COUNT session per window (#252).
+                let source_pending = candidate_changes
+                    .iter()
+                    .filter(|c| unapplied_set.contains(&c.change_id))
+                    .count()
+                    .saturating_add(leftover_changes.len())
+                    .saturating_add(usize::from(fetch_saturated));
                 let pending_at_window_start = source_pending.saturating_add(schema_pending);
                 let mut items: Vec<IncrementalItem> = candidate_changes
                     .into_iter()

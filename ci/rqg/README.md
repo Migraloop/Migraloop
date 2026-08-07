@@ -62,6 +62,9 @@ Tried / profiled on the Direct path toward mega-mix aggregate ≥100k e2e QPS
 | Direct-only Incremental **window-batch** Target Delivery (collapse same-key to final state; ordered Mongo multi-doc upsert/delete) | **Kept** — removes per-change Mongo round-trips on Direct tables; preserves ADR-0029 same-key order into Base and Deliver-before-checkpoint at window granularity |
 | Platform Store **`record_sync_rows_progress`** (many Base mutations + applied change ids in one TX) + UNNEST bulk `applied_source_changes` | **Kept** — removes per-change Postgres TX overhead on Direct windows |
 | Pure-insert Direct windows use **`BaseRowMutation::Insert`** (bulk UNNEST, no JSON-containment DELETE) | **Kept** — mega-mix insert bursts were dominated by delete-before-insert scans; updates still use Upsert replace |
+| Same-SCN leftover buffer + skip per-window LogMiner COUNT | **Kept** — avoids re-START/re-MINE of already-filtered siblings under inclusive SCN resume (#143); lag derived from window+leftovers |
+| Composite `(SCN, RS_ID, SSN)` resume cursor | **Deferred** — leftovers cover the multi-window same-SCN case without Store schema change |
+| Cross-key parallel Direct Delivery / multi-table parallel Capture | **Deferred** — capture session amortization first; revisit if floors still miss on warm hardware |
 | Raise default bounded-window capacity 256 → **2048** (still ADR-0020 bounded; Lab mega-mix uses 16384) | **Kept** — fewer windows per large evidence batch |
 | Mega-mix Direct evidence batch **50k** rows via Oracle `CONNECT BY`; QPS timer starts after Source inject | **Kept** — floor is measurable; Transform stays on a smaller batch until #253 |
 | Cross-key parallel Direct Delivery (multi-task) | **Deferred** — window batching + Store TX collapse gave the primary win; parallel Delivery adds ordering/poison complexity for later exhaustion if floors still tight |
