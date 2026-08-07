@@ -57,9 +57,10 @@ use self::correctness::{
     parse_inspect_row_count, parse_target_document_count,
 };
 use self::mega_mix::{
-    e2e_qps, evaluate_mega_mix_gates, format_mega_mix_report_section, incremental_batch_sql,
-    mega_mix_pipelines, store_pending_evidence, take_pending_evidence, PipelineQpsSample,
-    INCREMENTAL_BATCH_ROWS, MEGA_MIX_DEPLOYMENT, MEGA_MIX_ID, MIX_ID_BASE, SOLO_ID_BASE,
+    covers_required_path_families, e2e_qps, evaluate_mega_mix_gates,
+    format_mega_mix_report_section, incremental_batch_sql, mega_mix_pipelines,
+    store_pending_evidence, take_pending_evidence, PipelineQpsSample, INCREMENTAL_BATCH_ROWS,
+    MEGA_MIX_DEPLOYMENT, MEGA_MIX_ID, MIX_ID_BASE, SOLO_ID_BASE,
 };
 use self::namespace::{mutate_namespace_from_recipe, prepare_namespace, wipe_namespace};
 use self::recipe::{
@@ -3972,6 +3973,11 @@ async fn run_mega_mix_protocol(
     ctx: &ProductPathRunContext,
 ) -> Result<AdapterOutcome, CliError> {
     let pipelines = mega_mix_pipelines();
+    if !covers_required_path_families(pipelines) {
+        return Err(CliError::Failed(
+            "internal: mega-mix catalog missing a required path family (#251)".to_string(),
+        ));
+    }
     println!(
         "Lab Scenario: mega-mix solo baseline protocol \
 (same Fixture sizing; pause siblings; Incremental batch={INCREMENTAL_BATCH_ROWS})..."
