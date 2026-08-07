@@ -1,8 +1,8 @@
 //! Operator-visible seam: Transform Pipeline MVP (issue #16 / PRD) plus
-//! Aggregation/SQL-like Rich Transform DX expand (issue #232).
+//! Aggregation-only Rich Transform authoring (issue #250 / ADR-0030).
 //!
 //! Agreed seam: CLI config/status + Derived Dataset + Target documents.
-//! Classic declarative steps and Aggregation-like stages both accepted;
+//! Aggregation `$…` stages only; classic / SQL-ish aliases rejected;
 //! Output Identity required; free-form scripts rejected.
 
 mod common;

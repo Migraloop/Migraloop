@@ -62,7 +62,7 @@ pub struct PipelineSpec {
     /// Required Output Identity field names for Transform Pipelines.
     #[serde(default)]
     pub output_identity: Option<Vec<String>>,
-    /// Declarative Rich Transform steps: preferred Aggregation/SQL-like DX
+    /// Declarative Rich Transform steps: Aggregation `$…` stages only
     /// (`$project`, `$match`, `$group`, …); classic / SQL-ish aliases are rejected (ADR-0030).
     /// Rejected for Direct.
     #[serde(default)]
